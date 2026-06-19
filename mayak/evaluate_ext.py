@@ -191,6 +191,71 @@ def calibration_quality_report(model, clims, shift, manifest="data/manifest.csv"
           f"{np.abs(D['mu'] - y).mean():.3f} °C")
 
 
+@torch.no_grad()
+def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
+                           out_dir="runs/plots", time_key="test",
+                           station_splits=("train", "unseen_test"),
+                           shift=None, seed=0):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    os.makedirs(out_dir, exist_ok=True)
+    model.eval()
+    ds = EvalSet(clims, station_splits=station_splits, manifest=manifest, time_key=time_key)
+    rng = np.random.default_rng(seed)
+    idx = np.sort(rng.choice(len(ds), size=min(n, len(ds)), replace=False))
+    leads = np.arange(1, H + 1)
+    cols = 2; rows = (len(idx) + cols - 1) // cols
+    fig, axes = plt.subplots(rows, cols, figsize=(13, 2.9 * rows))
+    axes = np.atleast_1d(axes).ravel()
+    for k, i in enumerate(idx):
+        item = ds[int(i)]
+        batch = {key: (v[None] if torch.is_tensor(v) else v) for key, v in item.items()}
+        out = model(batch)
+        mu = out["mu"][0].cpu().numpy(); q = out["q"][0].cpu().numpy()
+        if shift is not None:
+            q = apply_conformal(q, shift); mu = q[:, 3]
+        y = item["y"].numpy(); muc = item["mu_clim_fut"].numpy()
+        sid, _t, seen = ds.items[int(i)]; zone = ds.clims[sid]["koppen"]
+        ax = axes[k]
+        ax.fill_between(leads, q[:, 0], q[:, 6], alpha=0.2, color="tab:blue", label="90%-интервал")
+        ax.plot(leads, y, color="black", lw=1.6, label="факт")
+        ax.plot(leads, mu, color="tab:blue", lw=1.5, label="МАЯК (медиана)")
+        ax.plot(leads, muc, color="tab:red", lw=1.0, ls="--", label="климатология")
+        ax.set_title(f"{sid} · зона {zone} · {seen}", fontsize=9)
+        ax.set_xlabel("лид, ч"); ax.set_ylabel("T, °C"); ax.grid(alpha=0.3)
+        if k == 0:
+            ax.legend(fontsize=7, loc="best")
+    for ax in axes[len(idx):]:
+        ax.axis("off")
+    fig.suptitle("Прогноз МАЯК vs факт (примеры)", y=1.0, fontsize=12)
+    fig.tight_layout()
+    p = os.path.join(out_dir, "forecast_examples.png")
+    fig.savefig(p, dpi=130, bbox_inches="tight"); plt.close(fig)
+    print("Сохранено:", p)
+    return p
+
+
+def stage_a_field_check(model, clims, manifest="data/manifest.csv",
+                        station_split="unseen_val", time_key="test"):
+    """Критерий этапа A"""
+    ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest,
+                 time_key=time_key, L=0)
+    D = gather(model, ds)
+    y, mu, muc = D["y"], D["mu"], D["mu_clim"]
+    mse_field = float(((mu - y) ** 2).mean())
+    mse_clim = float(((muc - y) ** 2).mean())
+    ratio = mse_field / max(mse_clim, 1e-9)
+    bias = float(np.abs(mu - muc).mean())
+    print(f"\n[Проверка этапа A] поле на {station_split} (L=0, окон: {len(ds)}):")
+    print(f"  MSE поля         = {mse_field:7.3f}")
+    print(f"  MSE климатологии = {mse_clim:7.3f}   ← эталон")
+    print(f"  отношение        = {ratio:7.3f}   ← цель ≤ 1.05")
+    print(f"  |поле − климат|  = {bias:7.3f} °C ← цель → 0")
+    print(f"  ИТОГ: {'OK — поле генерализует' if ratio <= 1.05 else 'НЕ ПРОЙДЕНО — поле недоучено/переобучено на train; этап B на таком поле смысла мало'}")
+    return dict(mse_field=mse_field, mse_clim=mse_clim, ratio=ratio, bias=bias)
+
+
 def main():
     import argparse
     from mayak.lit import LitMayak, LitBaseline
@@ -229,6 +294,12 @@ def main():
     if shift is not None:
         print("\n=== Влияние конформной калибровки (пункт 4) ===")
         calibration_quality_report(named["МАЯК"], clims, shift, args.manifest)
+
+    print("\n=== Графики прогноз vs факт (примеры МАЯК) ===")
+    plot_forecast_examples(named["МАЯК"], clims, manifest=args.manifest,
+                           n=args.n_examples, out_dir=args.out_dir, shift=shift)
+    plot_forecast_examples(named["МАЯК"], clims, manifest=args.manifest, n=args.n_examples,
+                         out_dir=args.out_dir + "/unseen", station_splits=("unseen_test",), shift=shift)
 
 
 if __name__ == "__main__":

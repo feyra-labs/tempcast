@@ -5,9 +5,9 @@ import torch.nn as nn
 
 class LocEncoder(nn.Module):
     """Случайные Фурье-признаки точки на сфере"""
-    OUT = 96 + 5 # используется другими модулями как размер входа
+    OUT = 48 + 2 #48 + 5
 
-    def __init__(self, n_freq: int = 48, f_scale: float = 25.0, f_max: float = 133.0):
+    def __init__(self, n_freq: int = 24, f_scale: float = 12.0, f_max: float = 30.0): # 48, 25, 133
         super().__init__()
         g = torch.Generator().manual_seed(7)
         W = torch.randn(3, n_freq, generator=g) * f_scale
@@ -24,5 +24,5 @@ class LocEncoder(nn.Module):
                            torch.sin(phi)], dim=-1)
         proj = xyz @ self.W
         e = (elev_m / 3000.0).clamp(-0.5, 2.0).unsqueeze(-1)
-        return torch.cat([torch.sin(proj), torch.cos(proj), xyz,
+        return torch.cat([torch.sin(proj), torch.cos(proj), #xyz,
                           (lat_deg.abs() / 90.0).unsqueeze(-1), e], dim=-1)

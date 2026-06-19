@@ -79,23 +79,42 @@ class LitMayak(L.LightningModule):
             self.log(f"val/mae_{h}h", mae, batch_size=y.shape[0])
         return loss
 
+    # def configure_optimizers(self):
+    #     decay, no_decay = [], []
+    #     for name, p in self.model.named_parameters():
+    #         if not p.requires_grad:
+    #             continue
+    #         if name.endswith(NO_WD_SUFFIX):
+    #             no_decay.append(p)
+    #         else:
+    #             decay.append(p)
+    #     opt = torch.optim.AdamW(
+    #         [{"params": decay, "weight_decay": self.hparams.weight_decay},
+    #          {"params": no_decay, "weight_decay": 0.0}],
+    #         lr=self.hparams.lr, betas=(0.9, 0.95))
+    #     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+    #         opt, T_max=self.hparams.total_steps)
+    #     return {"optimizer": opt,
+    #             "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+
     def configure_optimizers(self):
-        decay, no_decay = [], []
-        for name, p in self.model.named_parameters():
+        no_decay, field, rest = [], [], []
+        for n, p in self.model.named_parameters():
             if not p.requires_grad:
                 continue
-            if name.endswith(NO_WD_SUFFIX):
+            if n.split(".")[-1] in NO_WD_SUFFIX:
                 no_decay.append(p)
+            elif n.startswith("field."):
+                field.append(p)
             else:
-                decay.append(p)
+                rest.append(p)
         opt = torch.optim.AdamW(
-            [{"params": decay, "weight_decay": self.hparams.weight_decay},
+            [{"params": rest,     "weight_decay": self.hparams.weight_decay},
+             {"params": field,    "weight_decay": 0.5},
              {"params": no_decay, "weight_decay": 0.0}],
             lr=self.hparams.lr, betas=(0.9, 0.95))
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=self.hparams.total_steps)
-        return {"optimizer": opt,
-                "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.hparams.total_steps)
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
     
 class LitBaseline(L.LightningModule):
     """Обучение нейробейзлайнов GRU/DLinear"""

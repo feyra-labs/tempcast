@@ -19,8 +19,9 @@ def mayak_loss(out, y):
 
     dead = (out["Eg"].sum(-1) < 0.05).float()
     anchor = ((out["ratio"] - 1.0) ** 2 * dead).mean()
+    r_anchor = (out["r"] ** 2 * dead).mean() 
 
-    return pinball + 1e-3 * kl + 1e-4 * energy + 1e-2 * anchor
+    return pinball + 1e-3 * kl + 1e-4 * energy + 1e-2 * anchor + 0.1 * r_anchor
 
 def pinball_loss(out, y):
     """Только pinball по 7 квантилям в аномальной шкале — для нейробейзлайнов"""

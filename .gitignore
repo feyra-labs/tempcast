@@ -3,4 +3,5 @@ docs/
 __pycache__/
 lightning_logs/
 /data/
-runs/
+climatologies_abb34c29.pkl
+version*/

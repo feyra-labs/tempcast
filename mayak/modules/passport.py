@@ -11,8 +11,11 @@ class Fingerprint(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.prior = nn.Linear(LocEncoder.OUT, 2 * DZ)
-        nn.init.zeros_(self.prior.bias)
+        # self.prior = nn.Linear(LocEncoder.OUT, 2 * DZ)
+        # nn.init.zeros_(self.prior.bias)
+        self.prior_m = nn.Parameter(torch.zeros(DZ))
+        self.prior_s = nn.Parameter(torch.zeros(DZ))
+
         self.gru = nn.GRU(input_size=7, hidden_size=32, batch_first=True)
         self.obs = nn.Linear(32, 2 * DZ)
 
@@ -24,8 +27,11 @@ class Fingerprint(nn.Module):
         sample: True на обучении (репараметризация), False на инференсе (берём m)
         """
         # --- прайор ---
-        p = self.prior(loc)
-        m0, v0 = p[:, :DZ], F.softplus(p[:, DZ:]) + 1e-3
+        # p = self.prior(loc)
+        # m0, v0 = p[:, :DZ], F.softplus(p[:, DZ:]) + 1e-3
+        B = loc.shape[0]
+        m0 = self.prior_m.unsqueeze(0).expand(B, -1)
+        v0 = (F.softplus(self.prior_s) + 1e-3).unsqueeze(0).expand(B, -1)
 
         # --- свидетельства из суточных сводок ---
         x = torch.cat([summaries, day_mask.unsqueeze(-1)], dim=-1)

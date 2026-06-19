@@ -110,8 +110,8 @@ class WindowDataset(Dataset):
             x_hist[:, 0] = x_hist[:, 0] + off * mask_hist[:, 0]
             y = y + off
 
-            lat = lat + float(r.uniform(-0.15, 0.15))
-            lon = lon + float(r.uniform(-0.15, 0.15))
+            lat = lat + float(r.uniform(-0.40, 0.40))
+            lon = lon + float(r.uniform(-0.40, 0.40))
 
             x_hist[:, 2] = np.clip(x_hist[:, 2], 0, 100) * (mask_hist[:, 2] > 0)
 
@@ -131,7 +131,7 @@ class WindowDataset(Dataset):
 class HoldoutDataset(Dataset):
     """Детерминированные окна для валидации/оценки: фиксированный L, без аугментаций"""
     def __init__(self, manifest, station_split="unseen_val", time_key="calib",
-                 every_hours=72, L=L_MAX, max_windows=4000):
+                 every_hours=72, L=L_MAX, max_windows=8000):
         import csv, os
         root = os.path.dirname(manifest)
         with open(manifest) as f:

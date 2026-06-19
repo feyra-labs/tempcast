@@ -1,6 +1,8 @@
 """Бейзлайны прогноза: климатология, damped persistence, seasonal-naive,
 GRU seq2seq, DLinear"""
+import hashlib
 import csv, os
+import pickle
 import numpy as np
 from scipy.stats import norm
 import torch
@@ -14,8 +16,17 @@ from mayak.data.splits import time_bounds
 ZQ = norm.ppf(np.array(QUANTILES)).astype(np.float32)
 
 
-def fit_climatologies(manifest):
+def fit_climatologies(manifest, force=False):
     root = os.path.dirname(manifest)
+
+    cache_key = hashlib.md5(os.path.abspath(manifest).encode()).hexdigest()[:8]
+    cache_file = os.path.join("runs", f"climatologies_{cache_key}.pkl")
+
+    if os.path.exists(cache_file) and not force:
+        print(f"Loading climatologies from {cache_file}")
+        with open(cache_file, "rb") as f:
+            return pickle.load(f)
+
     out = {}
     with open(manifest) as f:
         for r in csv.DictReader(f):
@@ -30,6 +41,11 @@ def fit_climatologies(manifest):
             out[r["id"]] = dict(clim=clim, lat=float(r["lat"]), lon=float(r["lon"]),
                                 elev=float(r["elev"]), koppen=r["koppen"],
                                 x=x, mask=mask, N=N, t0d=t0d, t0h=t0h)
+            
+    with open(cache_file, "wb") as f:
+        pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    print(f"Saved climatologies to {cache_file}")
     return out
 
 
@@ -114,11 +130,18 @@ class GRUSeq2Seq(nn.Module):
 
     def forward(self, batch):
         x = batch["x_hist"]; m = batch["mask_hist"]
-        B = x.shape[0]
+        
+        # Примерная нрмировка входных данных (T, P, RH) для улучшения сходимости модели
+        T, P, RH = x[..., 0], x[..., 1], x[..., 2]
+        xn = torch.stack([T / 30.0, (P - 1013.0) / 50.0, (RH - 50.0) / 50.0], dim=-1)
+
         coord = torch.stack([batch["lat"], batch["lon"], batch["elev"]], -1) / \
             torch.tensor([90.0, 180.0, 1000.0], device=x.device)
         coord_seq = coord[:, None, :].expand(-1, x.shape[1], -1)
-        inp = torch.cat([x * m, m, coord_seq], dim=-1)
+
+        # inp = torch.cat([x * m, m, coord_seq], dim=-1)
+        inp = torch.cat([xn * m, m, coord_seq], dim=-1)
+
         h, _ = self.gru(inp)
         last = h[:, -1]
         feat = torch.cat([last, coord], dim=-1)

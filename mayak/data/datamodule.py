@@ -12,7 +12,7 @@ from mayak.data.dataset import WindowDataset, HoldoutDataset
 class MayakData(L.LightningDataModule):
     def __init__(self, manifest="data/manifest.csv", curriculum="full",
                  batch_size=256, windows_per_epoch=200_000,
-                 num_workers=4, seed=0):
+                 num_workers=4, seed=0, val_L=672):
         super().__init__()
         self.save_hyperparameters()
 
@@ -23,7 +23,7 @@ class MayakData(L.LightningDataModule):
                                       windows_per_epoch=h.windows_per_epoch,
                                       seed=h.seed)
         self.val_ds = HoldoutDataset(h.manifest, station_split="unseen_val",
-                                     time_key="calib", every_hours=72)
+                                     time_key="calib", every_hours=72, L=h.val_L)
 
     def train_dataloader(self):
         h = self.hparams

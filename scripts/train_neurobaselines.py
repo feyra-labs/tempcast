@@ -9,8 +9,9 @@
 """
 import argparse
 import pytorch_lightning as L
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 from pytorch_lightning.loggers import CSVLogger
+import torch
 
 from mayak.data.datamodule import MayakData
 from mayak.lit import LitBaseline
@@ -36,6 +37,7 @@ def main():
         dm = MayakData(manifest=args.manifest, curriculum="full",
                        batch_size=args.batch, windows_per_epoch=args.windows,
                        num_workers=args.workers)
+        print('>>> Обучение...')
         ckpt = ModelCheckpoint(dirpath=f"runs/baseline_{name}", monitor="val/loss",
                                save_top_k=1, mode="min", filename="best")
         trainer = L.Trainer(
@@ -44,7 +46,7 @@ def main():
             val_check_interval=args.val_every, check_val_every_n_epoch=None,
             limit_val_batches=args.val_batches, log_every_n_steps=20,
             logger=CSVLogger("runs", name=f"baseline_{name}"),
-            callbacks=[ckpt, LearningRateMonitor("step")])
+            callbacks=[ckpt, LearningRateMonitor("step"), EarlyStopping(monitor="val/loss", patience=5, mode="min")])
         trainer.fit(lit, datamodule=dm)
         print(f"    лучший чекпойнт: {ckpt.best_model_path}")
 

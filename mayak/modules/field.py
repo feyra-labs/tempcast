@@ -11,14 +11,14 @@ class ClimateField(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.fc1 = nn.Linear(LocEncoder.OUT, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.head = nn.Linear(128, 36 + 21 + 21)
+        self.fc1 = nn.Linear(LocEncoder.OUT, 48) # 128
+        self.fc2 = nn.Linear(48, 48) # 128
+        self.head = nn.Linear(48, 36 + 21 + 21) # 128
         with torch.no_grad():
             self.head.weight.mul_(0.1)
             self.head.bias.zero_()
             self.head.bias[36] = inv_softplus(torch.tensor(2.2)).item()
-        self.film = nn.Linear(DZ, 2 * 128)
+        self.film = nn.Linear(DZ, 2 * 48) # 128
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)
 
@@ -38,8 +38,10 @@ class ClimateField(nn.Module):
         h = F.gelu(self.fc1(loc))
         h = self.fc2(h)
         if z is not None:
-            gb = self.film(z)
-            h = h * (1 + gb[:, :128]) + gb[:, 128:]
+            gb = torch.tanh(self.film(z))
+            h = h * (1 + 0.3 * gb[:, :48]) + 0.3 * gb[:, 48:]  # 128
+            # gb = self.film(z)
+            # h = h * (1 + gb[:, :128]) + gb[:, 128:]
         c = self.head(F.gelu(h))
         return c[:, :36], c[:, 36:57], c[:, 57:78]
 
