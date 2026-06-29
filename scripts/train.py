@@ -50,30 +50,30 @@ def main():
     ap.add_argument("--val-batches", type=int, default=20)
     args = ap.parse_args()
 
-    # lit = LitMayak()
-    # print(">>> Этап A: только L=0 (стабилизация климат-поля)")
-    # best_a = run_stage(lit, args.manifest, "L0", args.steps_a, args,
-    #                    tag="stageA", val_L=0)
-    # from mayak import baselines as BL
-    # from mayak.eval import stage_a_field_check, pure_field_check, l0_decompose
-    # from torch.utils.data import DataLoader
-    # from mayak.eval import EvalSet
-    # clims = BL.fit_climatologies(args.manifest)
-    # lit = LitMayak.load_from_checkpoint(best_a)
-    lit = LitMayak.load_from_checkpoint('runs/stageA/best.ckpt', map_location="cpu")
-    # stage_a_field_check(lit.model, clims, args.manifest, station_split="unseen_val")
-    # stage_a_field_check(lit.model, clims, args.manifest, station_split="train")
-    # pure_field_check(lit.model, clims, args.manifest, station_split="unseen_val")
-    # pure_field_check(lit.model, clims, args.manifest, station_split="train")
-    # l0_decompose(lit.model, clims, args.manifest, station_split="unseen_val")
-    # l0_decompose(lit.model, clims, args.manifest, station_split="train")
+    lit = LitMayak()
+    print(">>> Этап A: только L=0 (стабилизация климат-поля)")
+    best_a = run_stage(lit, args.manifest, "L0", args.steps_a, args,
+                       tag="stageA", val_L=0)
+    from mayak import baselines as BL
+    from mayak.eval import stage_a_field_check, pure_field_check, l0_decompose
+    from torch.utils.data import DataLoader
+    from mayak.eval import EvalSet
+    clims = BL.fit_climatologies(args.manifest)
+    lit = LitMayak.load_from_checkpoint(best_a)
+    # lit = LitMayak.load_from_checkpoint('runs/stageA/best.ckpt', map_location="cpu")
+    stage_a_field_check(lit.model, clims, args.manifest, station_split="unseen_val")
+    stage_a_field_check(lit.model, clims, args.manifest, station_split="train")
+    pure_field_check(lit.model, clims, args.manifest, station_split="unseen_val")
+    pure_field_check(lit.model, clims, args.manifest, station_split="train")
+    l0_decompose(lit.model, clims, args.manifest, station_split="unseen_val")
+    l0_decompose(lit.model, clims, args.manifest, station_split="train")
 
-    # w = lit.model.loc.W.norm(dim=0)
-    # print("W норма  макс:", float(w.max()), " среднее:", float(w.mean()))
+    w = lit.model.loc.W.norm(dim=0)
+    print("W норма  макс:", float(w.max()), " среднее:", float(w.mean()))
 
-    # ds = EvalSet(clims, station_splits=("unseen_val",), manifest=args.manifest, time_key="test", L=0)
-    # zs = [lit.model(b)["z"].abs().mean().item() for b in DataLoader(ds, batch_size=128)]
-    # print("|z| при L=0 (unseen):", sum(zs)/len(zs)) 
+    ds = EvalSet(clims, station_splits=("unseen_val",), manifest=args.manifest, time_key="test", L=0)
+    zs = [lit.model(b)["z"].abs().mean().item() for b in DataLoader(ds, batch_size=128)]
+    print("|z| при L=0 (unseen):", sum(zs)/len(zs)) 
 
     print(">>> Этап B: полный куррикулум")
     best = run_stage(lit, args.manifest, "full", args.steps_b, args, tag="stageB", val_L=672)

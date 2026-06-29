@@ -259,13 +259,15 @@ def plot_metric_curves(tables, out_dir="runs/plots"):
 def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
                            out_dir="runs/plots", time_key="test",
                            station_splits=("train", "unseen_test"),
-                           shift=None, seed=0):
+                           shift=None, seed=0, L=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     os.makedirs(out_dir, exist_ok=True)
     model.eval()
-    ds = EvalSet(clims, station_splits=station_splits, manifest=manifest, time_key=time_key)
+    kw = {} if L is None else {"L": L}
+    ds = EvalSet(clims, station_splits=station_splits, manifest=manifest,
+                 time_key=time_key, **kw)
     rng = np.random.default_rng(seed)
     idx = np.sort(rng.choice(len(ds), size=min(n, len(ds)), replace=False))
     leads = np.arange(1, H + 1)
@@ -294,7 +296,11 @@ def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
         ax.axis("off")
     fig.suptitle("Прогноз МАЯК vs факт (примеры)", y=1.0, fontsize=12)
     fig.tight_layout()
-    p = os.path.join(out_dir, "forecast_examples.png")
+
+    suff = "" if L is None else f"_L{L}"
+    fig.suptitle(f"Прогноз МАЯК vs факт (примеры{', L='+str(L) if L is not None else ''})",
+                 y=1.0, fontsize=12)
+    p = os.path.join(out_dir, f"forecast_examples{suff}.png")
     fig.savefig(p, dpi=130, bbox_inches="tight"); plt.close(fig)
     print("Сохранено:", p)
     return p
@@ -472,6 +478,37 @@ def l0_decompose(model, clims, manifest="data/manifest.csv", station_split="trai
     print(f"        |o| = {oo/n:.3f}   e = {ee/Z.numel()*Z.shape[1]:.3f}  (ждём ≈0 при L=0)")
 
 
+def diurnal_amplitude(series):
+    H = series.shape[-1]; t = np.arange(H)
+    c = np.cos(2 * np.pi * t / 24.0); s = np.sin(2 * np.pi * t / 24.0)
+    a = (series * c).mean(-1); b = (series * s).mean(-1)
+    return 2.0 * np.sqrt(a ** 2 + b ** 2)
+
+
+def plot_amplitude_scatter(model, clims, manifest="data/manifest.csv", out_dir="runs/plots",
+                           time_key="test", max_points=4000, seed=0):
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    os.makedirs(out_dir, exist_ok=True)
+    D = gather(model, EvalSet(clims, manifest=manifest, time_key=time_key))
+    ap = diurnal_amplitude(D["mu"]); ar = diurnal_amplitude(D["y"])
+    idx = np.random.default_rng(seed).choice(len(ap), min(max_points, len(ap)), replace=False)
+    ap, ar = ap[idx], ar[idx]
+    slope = float(np.polyfit(ar, ap, 1)[0]); bias = float((ap - ar).mean())
+    lim = float(max(ar.max(), ap.max())) * 1.05
+    fig, axx = plt.subplots(figsize=(6, 6))
+    axx.scatter(ar, ap, s=6, alpha=0.3)
+    axx.plot([0, lim], [0, lim], "k--", lw=1, label="1:1 (идеал)")
+    axx.set_xlim(0, lim); axx.set_ylim(0, lim)
+    axx.set_xlabel("факт: суточная амплитуда, °C")
+    axx.set_ylabel("прогноз: суточная амплитуда, °C")
+    axx.set_title(f"Суточная амплитуда\nнаклон={slope:.2f}, смещение={bias:+.2f}°C")
+    axx.legend(); axx.grid(alpha=0.3)
+    p = os.path.join(out_dir, "amplitude_scatter.png")
+    fig.tight_layout(); fig.savefig(p, dpi=130); plt.close(fig)
+    print(f"Сохранено: {p}  (наклон {slope:.2f} — <1 значит модель ЗАНИЖАЕТ суточный ход)")
+    return p
+
+
 def main():
     import argparse
     from mayak.lit import LitMayak, LitBaseline
@@ -530,6 +567,11 @@ def main():
     plot_forecast_examples(mayak, clims, manifest=args.manifest, n=args.n_examples,
                            out_dir=args.out_dir + "/unseen",
                            station_splits=("unseen_test",), shift=shift)
+    plot_forecast_examples(mayak, clims, n=args.n_examples, L=0, out_dir="runs/plots")
+    plot_forecast_examples(mayak, clims, n=args.n_examples, L=0, station_splits=("unseen_test",),
+                       out_dir=args.out_dir + "/unseen")
+    print("\n=== Суточные амплитуды ===")
+    plot_amplitude_scatter(mayak, clims, manifest=args.manifest, out_dir=args.out_dir)
 
 
 if __name__ == "__main__":

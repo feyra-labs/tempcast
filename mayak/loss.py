@@ -3,10 +3,6 @@ from mayak.constants import QUANTILES
 
 
 def mayak_loss(out, y):
-    """Pinball по 7 квантилям в аномальной шкале + KL паспорта +
-    энергия мод + якорь разброса.
-    """
-
     sg = out["sigma_c"].detach().clamp(0.8, 12.0)
     taus = torch.tensor(QUANTILES, dtype=y.dtype, device=y.device)
 
@@ -19,7 +15,7 @@ def mayak_loss(out, y):
 
     dead = (out["Eg"].sum(-1) < 0.05).float()
     anchor = ((out["ratio"] - 1.0) ** 2 * dead).mean()
-    r_anchor = (out["r"] ** 2 * dead).mean() 
+    r_anchor = (out["r"] ** 2 * dead).mean()
 
     return pinball + 1e-3 * kl + 1e-4 * energy + 1e-2 * anchor + 0.1 * r_anchor
 
