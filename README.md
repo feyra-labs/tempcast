@@ -193,7 +193,7 @@ python scripts/calibrate.py --ckpt runs/stageB/best.ckpt --out runs/conformal.np
 python mayak/evaluate_ext.py --ckpt runs/stageB/best.ckpt \
     --gru-ckpt runs/baseline_gru/best.ckpt \
     --dlinear-ckpt runs/baseline_dlinear/best.ckpt \
-    --conformal runs/conformal.npy --out-dir assets
+    --conformal runs/conformal.npy --out-dir runs/plots
 ```
 
 <details>
