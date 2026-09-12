@@ -90,30 +90,29 @@ class WindowDataset(Dataset):
 
         lat, lon, elev = s["lat"], s["lon"], s["elev"]
 
-        if self.curriculum != "L0" or True:
-            r = self.rng
-            if L > 0 and r.random() < 0.3:
-                glen = int(r.integers(1, 25)); gst = int(r.integers(L_MAX - L, L_MAX))
-                mask_hist[gst:min(L_MAX, gst + glen)] = 0.0
+        r = self.rng
+        if L > 0 and r.random() < 0.3:
+            glen = int(r.integers(1, 25)); gst = int(r.integers(L_MAX - L, L_MAX))
+            mask_hist[gst:min(L_MAX, gst + glen)] = 0.0
 
-            if r.random() < 0.1:
-                mask_hist[:, 2] = 0.0
-            if r.random() < 0.1:
-                mask_hist[:, 1] = 0.0
+        if r.random() < 0.1:
+            mask_hist[:, 2] = 0.0
+        if r.random() < 0.1:
+            mask_hist[:, 1] = 0.0
 
-            noise = np.stack([r.normal(0, 0.2, L_MAX),
-                              r.normal(0, 0.5, L_MAX),
-                              r.normal(0, 2.0, L_MAX)], axis=-1).astype(np.float32)
-            x_hist = x_hist + noise * mask_hist
+        noise = np.stack([r.normal(0, 0.2, L_MAX),
+                          r.normal(0, 0.5, L_MAX),
+                          r.normal(0, 2.0, L_MAX)], axis=-1).astype(np.float32)
+        x_hist = x_hist + noise * mask_hist
 
+        if L > 0:
             off = float(r.uniform(-0.7, 0.7))
             x_hist[:, 0] = x_hist[:, 0] + off * mask_hist[:, 0]
             y = y + off
-
             lat = lat + float(r.uniform(-0.40, 0.40))
             lon = lon + float(r.uniform(-0.40, 0.40))
 
-            x_hist[:, 2] = np.clip(x_hist[:, 2], 0, 100) * (mask_hist[:, 2] > 0)
+        x_hist[:, 2] = np.clip(x_hist[:, 2], 0, 100) * (mask_hist[:, 2] > 0)
 
         return {
             "lat": torch.tensor(lat, dtype=torch.float32),
