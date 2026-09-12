@@ -144,10 +144,11 @@ flowchart LR
 ```bash
 git clone https://github.com/feyra-labs/tempcast.git
 cd tempcast
-python -m venv .venv && source .venv/bin/activate
-pip install -e .            # или: pip install -r requirements.txt
+
+uv sync
+
+Для запуска: uv run python ...
 ```
-Зависимости: `torch`, `pytorch-lightning`, `numpy`, `pandas`, `matplotlib` (+ `onnx`/`onnxruntime` для экспорта на устройство).
 
 ---
 

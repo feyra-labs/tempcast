@@ -1,7 +1,21 @@
-venv/
-docs/
+# Python
 __pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# Experiment outputs
+runs/
 lightning_logs/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Other
+docs/
 /data/
-climatologies_abb34c29.pkl
-version*/
