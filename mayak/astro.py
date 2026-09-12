@@ -4,7 +4,7 @@ import math
 import numpy as np
 import torch
 import torch.nn.functional as F
-from constants import MAGNUS_A, MAGNUS_B
+from mayak.constants import MAGNUS_A, MAGNUS_B
 
 
 def astro_features(doy, hour_utc, lat_deg, lon_deg):
