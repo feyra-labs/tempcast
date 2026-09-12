@@ -5,7 +5,7 @@ __pycache__/
 .venv/
 
 # Experiment outputs
-runs/
+runs/*
 lightning_logs/
 
 # IDE
@@ -18,4 +18,4 @@ Thumbs.db
 
 # Other
 docs/
-/data/
+/data/*
