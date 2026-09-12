@@ -1,7 +1,10 @@
 """Детерминированные признаки Солнца, календаря и термодинамики"""
 import math
+
+import numpy as np
 import torch
 import torch.nn.functional as F
+from constants import MAGNUS_A, MAGNUS_B
 
 
 def astro_features(doy, hour_utc, lat_deg, lon_deg):
@@ -27,5 +30,13 @@ def astro_features(doy, hour_utc, lat_deg, lon_deg):
 def dewpoint_c(T, RH):
     """Точка росы по Магнусу"""
     rh = RH.clamp(1.0, 100.0)
-    g = torch.log(rh / 100.0) + 17.625 * T / (243.04 + T)
-    return 243.04 * g / (17.625 - g)
+    gamma = (torch.log(rh / 100.0) + MAGNUS_A * T / (MAGNUS_B + T))
+    return MAGNUS_B * gamma / (MAGNUS_A - gamma)
+
+
+def rh_from_dewpoint(T, Td):
+    """Обратная формула Магнуса."""
+    gamma_T = MAGNUS_A * T / (MAGNUS_B + T)
+    gamma_Td = MAGNUS_A * Td / (MAGNUS_B + Td)
+    rh = 100.0 * np.exp(gamma_Td - gamma_T)
+    return np.clip(rh, 0.0, 100.0).astype(np.float32)

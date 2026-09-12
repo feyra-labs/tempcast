@@ -14,6 +14,9 @@ N_CH = 13 # число входных каналов энкодера
 QUANTILES = (0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95)
 NQ = len(QUANTILES)
 
+MAGNUS_A = 17.625
+MAGNUS_B = 243.04
+
 
 def inv_softplus(y: torch.Tensor) -> torch.Tensor:
     """x такой, что softplus(x) = y"""
