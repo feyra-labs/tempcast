@@ -21,7 +21,7 @@ class MAYAK(nn.Module):
         self.passport = Fingerprint()
         self.encoder = SynopticEncoder()
         self.readout = LaplaceReadout()
-        self.propagator =  ModalPropagator()
+        self.propagator = ModalPropagator()
         self.heads = Heads()
 
     @staticmethod
@@ -53,10 +53,11 @@ class MAYAK(nn.Module):
     
     @staticmethod
     def daily_summaries(aT, adP24, vt):
-        Bsz = aT.shape[0]
-        a = aT.view(Bsz, 28, 24)
-        v = vt.view(Bsz, 28, 24)
-        p = adP24.view(Bsz, 28, 24)
+        Bsz, Lh = aT.shape
+        D = Lh // 24
+        a = aT.view(Bsz, D, 24)
+        v = vt.view(Bsz, D, 24)
+        p = adP24.view(Bsz, D, 24)
         n = v.sum(-1)
         mean = (a * v).sum(-1) / n.clamp(min=1.0)
         mx = a.masked_fill(v < 0.5, -1e4).amax(-1)
