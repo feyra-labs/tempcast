@@ -5,13 +5,19 @@
 import argparse, csv, math, os
 import numpy as np
 
+
 def koppen_for(lat):
     a = abs(lat)
-    if a < 15:  return "Af"
-    if a < 30:  return "BWh"
-    if a < 45:  return "Cfb"
-    if a < 60:  return "Dfb"
+    if a < 15:
+        return "Af"
+    if a < 30:
+        return "BWh"
+    if a < 45:
+        return "Cfb"
+    if a < 60:
+        return "Dfb"
     return "ET"
+
 
 def make_station(rng, lat, lon, elev, n_hours, t0_doy, t0_hour):
     h = np.arange(n_hours, dtype=np.float64)
@@ -20,7 +26,7 @@ def make_station(rng, lat, lon, elev, n_hours, t0_doy, t0_hour):
     phi = math.radians(lat)
 
     annual_mean = 27.0 - 0.55 * abs(lat) - 0.0065 * elev
-    annual_amp  = 2.0 + 0.35 * abs(lat)
+    annual_amp = 2.0 + 0.35 * abs(lat)
     season_phase = 0.0 if lat >= 0 else math.pi
     seasonal = annual_amp * np.cos(2 * math.pi * (doy - 200) / 365.24 + season_phase)
 
@@ -49,6 +55,7 @@ def make_station(rng, lat, lon, elev, n_hours, t0_doy, t0_hour):
 
     valid = np.ones(n_hours, dtype=np.uint8)
     return (T.astype(np.float32), P.astype(np.float32), RH.astype(np.float32), valid)
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -79,8 +86,10 @@ def main():
 
     with open(os.path.join(args.out, "manifest.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["id", "lat", "lon", "elev", "koppen"])
-        w.writeheader(); w.writerows(rows)
+        w.writeheader();
+        w.writerows(rows)
     print(f"Готово: {args.n_stations} станций × {n_hours} ч в {args.out}/stations/, манифест {args.out}/manifest.csv")
+
 
 if __name__ == "__main__":
     main()

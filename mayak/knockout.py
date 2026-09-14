@@ -10,9 +10,12 @@ VARIANTS = ["none", "no_r", "no_sun", "no_D", "no_S", "no_W",
 
 
 def _group_slices():
-    names = ["R", "D", "S", "W"]; sl = {}; i = 0
+    names = ["R", "D", "S", "W"];
+    sl = {};
+    i = 0
     for nm, g in zip(names, GROUPS):
-        sl[nm] = slice(i, i + g); i += g
+        sl[nm] = slice(i, i + g);
+        i += g
     return sl
 
 
@@ -42,22 +45,30 @@ def knockout(model, which):
 
         if which in ("no_R", "no_D", "no_S", "no_W"):
             s = sl[which.split("_")[1]]
+
             def h_ro(m, i, o):
                 a_re, a_im, e = o
-                a_re = a_re.clone(); a_im = a_im.clone()
-                a_re[:, s] = 0.0; a_im[:, s] = 0.0
+                a_re = a_re.clone()
+                a_im = a_im.clone()
+                a_re[:, s] = 0.0
+                a_im[:, s] = 0.0
                 return a_re, a_im, e
+
             handles.append(model.readout.register_forward_hook(h_ro))
 
         if which == "no_sun":
             def pre_enc(m, args):
                 (ch,) = args
-                ch = ch.clone(); ch[:, 5:8] = 0.0
+                ch = ch.clone()
+                ch[:, 5:8] = 0.0
                 return (ch,)
+
             handles.append(model.encoder.register_forward_pre_hook(pre_enc))
+
             def pre_heads(m, args):
                 o, Eg, sun, ls, z, e = args
                 return (o, Eg, torch.zeros_like(sun), ls, z, e)
+
             handles.append(model.heads.register_forward_pre_hook(pre_heads))
 
         yield
@@ -78,23 +89,26 @@ def knockout_table(model, clims, manifest="data/manifest.csv", time_key="test",
     kw = {} if L is None else {"L": L}
     ds = EvalSet(clims, station_splits=station_splits, manifest=manifest,
                  time_key=time_key, **kw)
-    y = None; mse_clim = None; rows = {}
+    y = None;
+    mse_clim = None;
+    rows = {}
     for v in variants:
         with knockout(model, v):
             D = gather(model, ds)
         if y is None:
-            y = D["y"]; mse_clim = mse_clim_per_lead(y, D["mu_clim"])
+            y = D["y"];
+            mse_clim = mse_clim_per_lead(y, D["mu_clim"])
         rows[v] = {h: _skill(D["mu"], y, mse_clim, h) for h in leads}
 
     full = rows["none"]
     tag = "" if L is None else f"  (L={L})"
     print(f"\n=== Knockout-абляции{tag} ===")
-    hdr = f"{'выключено':>16}" + "".join(f"{'Sk@'+str(h):>9}" for h in leads) \
-          + "  |  " + "".join(f"{'Δ@'+str(h):>9}" for h in leads)
+    hdr = f"{'выключено':>16}" + "".join(f"{'Sk@' + str(h):>9}" for h in leads) \
+          + "  |  " + "".join(f"{'Δ@' + str(h):>9}" for h in leads)
     print(hdr)
     for v in variants:
         sk = "".join(f"{rows[v][h]:>+9.1%}" for h in leads)
-        dr = "" if v == "none" else "".join(f"{full[h]-rows[v][h]:>+9.1%}" for h in leads)
+        dr = "" if v == "none" else "".join(f"{full[h] - rows[v][h]:>+9.1%}" for h in leads)
         print(f"{v:>16}{sk}  |  {dr}")
     return rows
 

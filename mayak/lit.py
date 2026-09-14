@@ -7,13 +7,13 @@ from mayak.model import MAYAK
 from mayak.loss import mayak_loss, pinball_loss
 from mayak.baselines import GRUSeq2Seq, DLinear
 
-
 NO_WD_SUFFIX = ("raw_tau", "p_w", "p_k")
 LEADS = [1, 3, 6, 12, 24, 48, 72, 120, 168]
 
 
 class EMA:
     """Экспоненциальное скользящее среднее весов модели"""
+
     def __init__(self, model, decay=0.999):
         self.decay = decay
         self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
@@ -79,24 +79,6 @@ class LitMayak(L.LightningModule):
             self.log(f"val/mae_{h}h", mae, batch_size=y.shape[0])
         return loss
 
-    # def configure_optimizers(self):
-    #     decay, no_decay = [], []
-    #     for name, p in self.model.named_parameters():
-    #         if not p.requires_grad:
-    #             continue
-    #         if name.endswith(NO_WD_SUFFIX):
-    #             no_decay.append(p)
-    #         else:
-    #             decay.append(p)
-    #     opt = torch.optim.AdamW(
-    #         [{"params": decay, "weight_decay": self.hparams.weight_decay},
-    #          {"params": no_decay, "weight_decay": 0.0}],
-    #         lr=self.hparams.lr, betas=(0.9, 0.95))
-    #     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-    #         opt, T_max=self.hparams.total_steps)
-    #     return {"optimizer": opt,
-    #             "lr_scheduler": {"scheduler": sched, "interval": "step"}}
-
     def configure_optimizers(self):
         no_decay, field, rest = [], [], []
         for n, p in self.model.named_parameters():
@@ -109,15 +91,17 @@ class LitMayak(L.LightningModule):
             else:
                 rest.append(p)
         opt = torch.optim.AdamW(
-            [{"params": rest,     "weight_decay": self.hparams.weight_decay},
-             {"params": field,    "weight_decay": 0.5},
+            [{"params": rest, "weight_decay": self.hparams.weight_decay},
+             {"params": field, "weight_decay": 0.5},
              {"params": no_decay, "weight_decay": 0.0}],
             lr=self.hparams.lr, betas=(0.9, 0.95))
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.hparams.total_steps)
         return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
-    
+
+
 class LitBaseline(L.LightningModule):
     """Обучение нейробейзлайнов GRU/DLinear"""
+
     def __init__(self, model_name="gru", lr=3e-3, weight_decay=1e-2,
                  total_steps=200_000, ema_decay=0.999):
         super().__init__()
@@ -148,7 +132,8 @@ class LitBaseline(L.LightningModule):
             self.ema.restore(self.model)
 
     def validation_step(self, batch, _):
-        out = self.model(batch); y = batch["y"]
+        out = self.model(batch);
+        y = batch["y"]
         loss = pinball_loss(out, y)
         self.log("val/loss", loss, prog_bar=True, batch_size=y.shape[0])
         med = out["q"][..., 3]

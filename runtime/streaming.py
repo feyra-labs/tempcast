@@ -2,12 +2,13 @@
 import numpy as np
 import torch
 
-from mayak.constants import L_MAX, H, M, DZ
+from mayak.constants import H, M, DZ
 from mayak.astro import astro_features
 from mayak.data.qc import PHYS
 
 RF = 256
 LEAD_BINS = [(1, 6), (7, 24), (25, 72), (73, 168)]
+
 
 def _lead_bin(h1):
     for i, (a, b) in enumerate(LEAD_BINS):
@@ -15,10 +16,13 @@ def _lead_bin(h1):
             return i
     return len(LEAD_BINS) - 1
 
+
 class StreamingMayak:
     def __init__(self, model, lat, lon, elev, conformal=None):
         self.m = model.eval()
-        self.lat = float(lat); self.lon = float(lon); self.elev = float(elev)
+        self.lat = float(lat)
+        self.lon = float(lon)
+        self.elev = float(elev)
 
         if conformal is None:
             self.conformal = None
@@ -33,14 +37,19 @@ class StreamingMayak:
             self.base_coefs = self.m.field.coefficients(self.loc)
             tau, omega, kappa = self.m.readout.constants()
         self.tau, self.omega, self.kappa = tau, omega, kappa
-        self.n_re = torch.zeros(1, M); self.n_im = torch.zeros(1, M); self.e = torch.zeros(1, M)
+        self.n_re = torch.zeros(1, M)
+        self.n_im = torch.zeros(1, M)
+        self.e = torch.zeros(1, M)
         self.buf_x = np.zeros((RF, 3), np.float32)
         self.buf_m = np.zeros((RF, 3), np.float32)
         self.buf_doy = np.zeros(RF, np.float32)
         self.buf_hour = np.zeros(RF, np.float32)
         self.filled = 0
-        self.day_summ = torch.zeros(1, 28, 6); self.day_mask = torch.zeros(1, 28)
-        self._cur_day_aT = []; self._cur_day_dp = []; self._hours_in_day = 0
+        self.day_summ = torch.zeros(1, 28, 6)
+        self.day_mask = torch.zeros(1, 28)
+        self._cur_day_aT = []
+        self._cur_day_dp = []
+        self._hours_in_day = 0
         self.z = self._recompute_passport()
 
     def _recompute_passport(self):
@@ -59,16 +68,18 @@ class StreamingMayak:
                                      torch.tensor([[self.lon]]))
             mu0, sg0, df0 = self.m.field.evaluate(self.base_coefs, astro_h)
             ch, aT, vt = self.m.build_channels(x, mk, astro_h, mu0, sg0, df0)
-            feats = self.m.encoder(ch)                    # (1,RF,C)
+            feats = self.m.encoder(ch)
         return feats[:, -1], aT[:, -1], vt[:, -1], ch[:, 3, -1]
 
     @staticmethod
     def _qc_point(T, P, RH):
-        out = np.zeros(3, np.float32); mask = np.zeros(3, np.float32)
+        out = np.zeros(3, np.float32)
+        mask = np.zeros(3, np.float32)
         for j, (name, val) in enumerate([("T", T), ("P", P), ("RH", RH)]):
             lo, hi = PHYS[name]
             if val is not None and lo <= val <= hi and np.isfinite(val):
-                out[j] = val; mask[j] = 1.0
+                out[j] = val;
+                mask[j] = 1.0
         return out, mask
 
     def warm_start(self, x_hist, mask_hist, doy_hist, hour_hist):
@@ -98,19 +109,25 @@ class StreamingMayak:
 
     def step(self, T, P, RH, doy, hour):
         xj, mj = self._qc_point(T, P, RH)
-        self.buf_x[:-1] = self.buf_x[1:]; self.buf_x[-1] = xj
-        self.buf_m[:-1] = self.buf_m[1:]; self.buf_m[-1] = mj
-        self.buf_doy[:-1] = self.buf_doy[1:]; self.buf_doy[-1] = doy
-        self.buf_hour[:-1] = self.buf_hour[1:]; self.buf_hour[-1] = hour
+        self.buf_x[:-1] = self.buf_x[1:]
+        self.buf_x[-1] = xj
+        self.buf_m[:-1] = self.buf_m[1:]
+        self.buf_m[-1] = mj
+        self.buf_doy[:-1] = self.buf_doy[1:]
+        self.buf_doy[-1] = doy
+        self.buf_hour[:-1] = self.buf_hour[1:]
+        self.buf_hour[-1] = hour
         self.filled = min(RF, self.filled + 1)
         feat, aT, vt, dp = self._features_over_buffer()
         with torch.no_grad():
             self.n_re, self.n_im, self.e = self.m.readout.step(
                 (self.n_re, self.n_im, self.e), feat, vt)
-        self._cur_day_aT.append(float(aT)); self._cur_day_dp.append(float(dp))
+        self._cur_day_aT.append(float(aT))
+        self._cur_day_dp.append(float(dp))
         self._hours_in_day += 1
         if self._hours_in_day >= 24:
-            a = torch.tensor(self._cur_day_aT); p = torch.tensor(self._cur_day_dp)
+            a = torch.tensor(self._cur_day_aT)
+            p = torch.tensor(self._cur_day_dp)
             summ = torch.tensor([a.mean(), a.max(), a.min(), p.mean(), len(a) / 24.0, 1.0])
             self.day_summ = torch.cat([self.day_summ[:, 1:], summ[None, None]], dim=1)
             self.day_mask = torch.cat([self.day_mask[:, 1:], torch.ones(1, 1)], dim=1)
@@ -156,12 +173,14 @@ class StreamingMayak:
 
     def load_state(self, raw):
         off = 0
+
         def take(shape, dtype):
             nonlocal off
             cnt = int(np.prod(shape))
             arr = np.frombuffer(raw, dtype=dtype, count=cnt, offset=off).reshape(shape).copy()
             off += cnt * np.dtype(dtype).itemsize
             return arr
+
         self.n_re = torch.from_numpy(take((1, M), np.float32))
         self.n_im = torch.from_numpy(take((1, M), np.float32))
         self.e = torch.from_numpy(take((1, M), np.float32))

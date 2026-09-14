@@ -10,8 +10,10 @@ import numpy as np
 
 PHYS = {"T": (-90.0, 60.0), "RH": (0.0, 100.0), "P": (300.0, 1100.0)}
 
+
 def _mad_mask(x, valid, win=12, thresh=6.0):
-    n = len(x); ok = np.ones(n, dtype=bool)
+    n = len(x)
+    ok = np.ones(n, dtype=bool)
     half = win // 2
     for i in range(n):
         lo, hi = max(0, i - half), min(n, i + half + 1)
@@ -23,6 +25,7 @@ def _mad_mask(x, valid, win=12, thresh=6.0):
         if abs(x[i] - med) > thresh * 1.4826 * mad:
             ok[i] = False
     return ok
+
 
 def run_qc(T, P, RH, valid):
     valid = valid.astype(bool)

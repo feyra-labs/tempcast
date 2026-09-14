@@ -1,9 +1,9 @@
-"""Расширения стенда оценки (аддендум к §20–§21):
+"""Расширения стенда оценки:
   * сбор предсказаний МАЯК + нейробейзлайнов (GRU/DLinear) + статистических бейзлайнов;
   * графики по каждой метрике (Skill/MAE/RMSE/CRPS/PICP90/Winkler) — линия на модель;
   * разрез метрик по климатическим зонам Кёппена;
-  * проверка холодного старта L=0 (медиана = поле, интервалы калиброваны) — пункт 3;
-  * отчёт о влиянии конформной калибровки (PICP/CRPS/MAE до и после) — пункт 4.
+  * проверка холодного старта L=0 (медиана = поле, интервалы калиброваны);
+  * отчёт о влиянии конформной калибровки (PICP/CRPS/MAE до и после).
 Зависит только от уже существующих модулей проекта."""
 import os
 import numpy as np
@@ -65,6 +65,7 @@ def build_tables(preds, aux, leads=FINE_LEADS):
     return {name: metric_table(y, p["mu"], p["q"], mse_clim, leads=leads)
             for name, p in preds.items()}
 
+
 def plot_metric_curves(tables, out_dir="runs/plots"):
     import matplotlib
     matplotlib.use("Agg")
@@ -83,11 +84,15 @@ def plot_metric_curves(tables, out_dir="runs/plots"):
             ax.set_ylim(0, 1)
         if met == "Skill":
             ax.axhline(0.0, ls="--", lw=1, color="gray")
-        ax.set_xlabel("лид, ч"); ax.set_ylabel(met)
+        ax.set_xlabel("лид, ч")
+        ax.set_ylabel(met)
         ax.set_title(f"{met} по горизонту прогноза")
-        ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
         p = os.path.join(out_dir, f"metric_{met}.png")
-        fig.tight_layout(); fig.savefig(p, dpi=130); plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(p, dpi=130)
+        plt.close(fig)
         paths.append(p)
     return paths
 
@@ -97,7 +102,9 @@ def koppen_per_window(ds):
 
 
 def zone_breakdown(preds, aux, koppen, leads=(24, 72), model="МАЯК", min_windows=20):
-    y = aux["y"]; p = preds[model]; rows = {}
+    y = aux["y"];
+    p = preds[model];
+    rows = {}
     for z in sorted(set(koppen.tolist())):
         m = koppen == z
         if int(m.sum()) < min_windows:
@@ -118,7 +125,7 @@ def zone_breakdown(preds, aux, koppen, leads=(24, 72), model="МАЯК", min_win
 def print_zone_breakdown(rows, leads=(24, 72)):
     hdr = f"{'зона':>6} {'окон':>6}"
     for h in leads:
-        hdr += f" {'Sk@'+str(h)+'ч':>9} {'MAE@'+str(h):>9} {'P90@'+str(h):>9}"
+        hdr += f" {'Sk@' + str(h) + 'ч':>9} {'MAE@' + str(h):>9} {'P90@' + str(h):>9}"
     print(hdr)
     for z, d in rows.items():
         line = f"{z:>6} {d['n']:>6}"
@@ -133,13 +140,16 @@ def _gather_full(model, ds, device="cpu", batch_size=128):
     model.eval().to(device)
     dl = DataLoader(ds, batch_size=batch_size)
     keys = ["mu", "q", "o", "r", "e", "sigma_c"]
-    acc = {k: [] for k in keys}; acc["y"] = []; acc["mu_clim"] = []
+    acc = {k: [] for k in keys}
+    acc["y"] = [];
+    acc["mu_clim"] = []
     for b in dl:
         bb = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
         out = model(bb)
         for k in keys:
             acc[k].append(out[k].cpu().numpy())
-        acc["y"].append(b["y"].numpy()); acc["mu_clim"].append(b["mu_clim_fut"].numpy())
+        acc["y"].append(b["y"].numpy())
+        acc["mu_clim"].append(b["mu_clim_fut"].numpy())
     return {k: np.concatenate(v, 0) for k, v in acc.items()}
 
 
@@ -185,7 +195,7 @@ def calibration_quality_report(model, clims, shift, manifest="data/manifest.csv"
         c1 = pinball_crps(y[:, sl], q1[:, sl]).mean()
         m0 = np.abs(q0[:, sl, 3] - y[:, sl]).mean()
         m1 = np.abs(q1[:, sl, 3] - y[:, sl]).mean()
-        print(f"{str(a)+'-'+str(b):>11} {p0:>10.1%} {p1:>13.1%} "
+        print(f"{str(a) + '-' + str(b):>11} {p0:>10.1%} {p1:>13.1%} "
               f"{c0:>9.3f} {c1:>11.3f} {m0:>10.3f} {m1:>13.3f}")
     print(f"  MAE точечного прогноза mu (конформная таблица его НЕ трогает): "
           f"{np.abs(D['mu'] - y).mean():.3f} °C")
@@ -205,25 +215,32 @@ def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
     rng = np.random.default_rng(seed)
     idx = np.sort(rng.choice(len(ds), size=min(n, len(ds)), replace=False))
     leads = np.arange(1, H + 1)
-    cols = 2; rows = (len(idx) + cols - 1) // cols
+    cols = 2;
+    rows = (len(idx) + cols - 1) // cols
     fig, axes = plt.subplots(rows, cols, figsize=(13, 2.9 * rows))
     axes = np.atleast_1d(axes).ravel()
     for k, i in enumerate(idx):
         item = ds[int(i)]
         batch = {key: (v[None] if torch.is_tensor(v) else v) for key, v in item.items()}
         out = model(batch)
-        mu = out["mu"][0].cpu().numpy(); q = out["q"][0].cpu().numpy()
+        mu = out["mu"][0].cpu().numpy()
+        q = out["q"][0].cpu().numpy()
         if shift is not None:
-            q = apply_conformal(q, shift); mu = q[:, 3]
-        y = item["y"].numpy(); muc = item["mu_clim_fut"].numpy()
-        sid, _t, seen = ds.items[int(i)]; zone = ds.clims[sid]["koppen"]
+            q = apply_conformal(q, shift)
+            mu = q[:, 3]
+        y = item["y"].numpy()
+        muc = item["mu_clim_fut"].numpy()
+        sid, _t, seen = ds.items[int(i)]
+        zone = ds.clims[sid]["koppen"]
         ax = axes[k]
         ax.fill_between(leads, q[:, 0], q[:, 6], alpha=0.2, color="tab:blue", label="90%-интервал")
         ax.plot(leads, y, color="black", lw=1.6, label="факт")
         ax.plot(leads, mu, color="tab:blue", lw=1.5, label="МАЯК (медиана)")
         ax.plot(leads, muc, color="tab:red", lw=1.0, ls="--", label="климатология")
         ax.set_title(f"{sid} · зона {zone} · {seen}", fontsize=9)
-        ax.set_xlabel("лид, ч"); ax.set_ylabel("T, °C"); ax.grid(alpha=0.3)
+        ax.set_xlabel("лид, ч")
+        ax.set_ylabel("T, °C")
+        ax.grid(alpha=0.3)
         if k == 0:
             ax.legend(fontsize=7, loc="best")
     for ax in axes[len(idx):]:
@@ -231,7 +248,8 @@ def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
     fig.suptitle("Прогноз МАЯК vs факт (примеры)", y=1.0, fontsize=12)
     fig.tight_layout()
     p = os.path.join(out_dir, "forecast_examples.png")
-    fig.savefig(p, dpi=130, bbox_inches="tight"); plt.close(fig)
+    fig.savefig(p, dpi=130, bbox_inches="tight")
+    plt.close(fig)
     print("Сохранено:", p)
     return p
 
@@ -252,7 +270,8 @@ def stage_a_field_check(model, clims, manifest="data/manifest.csv",
     print(f"  MSE климатологии = {mse_clim:7.3f}   ← эталон")
     print(f"  отношение        = {ratio:7.3f}   ← цель ≤ 1.05")
     print(f"  |поле − климат|  = {bias:7.3f} °C ← цель → 0")
-    print(f"  ИТОГ: {'OK — поле генерализует' if ratio <= 1.05 else 'НЕ ПРОЙДЕНО — поле недоучено/переобучено на train; этап B на таком поле смысла мало'}")
+    print(
+        f"  ИТОГ: {'OK — поле генерализует' if ratio <= 1.05 else 'НЕ ПРОЙДЕНО — поле недоучено/переобучено на train; этап B на таком поле смысла мало'}")
     return dict(mse_field=mse_field, mse_clim=mse_clim, ratio=ratio, bias=bias)
 
 
@@ -289,17 +308,17 @@ def main():
     print_zone_breakdown(zone_breakdown(preds, aux, koppen_per_window(ds)))
 
     shift = np.load(args.conformal) if args.conformal else None
-    print("\n=== Холодный старт L=0 (пункт 3) ===")
+    print("\n=== Холодный старт L=0 ===")
     coldstart_L0_check(named["МАЯК"], clims, args.manifest, shift=shift)
     if shift is not None:
-        print("\n=== Влияние конформной калибровки (пункт 4) ===")
+        print("\n=== Влияние конформной калибровки ===")
         calibration_quality_report(named["МАЯК"], clims, shift, args.manifest)
 
     print("\n=== Графики прогноз vs факт (примеры МАЯК) ===")
     plot_forecast_examples(named["МАЯК"], clims, manifest=args.manifest,
                            n=args.n_examples, out_dir=args.out_dir, shift=shift)
     plot_forecast_examples(named["МАЯК"], clims, manifest=args.manifest, n=args.n_examples,
-                         out_dir=args.out_dir + "/unseen", station_splits=("unseen_test",), shift=shift)
+                           out_dir=args.out_dir + "/unseen", station_splits=("unseen_test",), shift=shift)
 
 
 if __name__ == "__main__":

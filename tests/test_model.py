@@ -13,9 +13,9 @@ def _toy_batch(B=2, L=L_MAX, seed=0):
     x_hist = torch.zeros(B, L_MAX, 3)
     mask_hist = torch.zeros(B, L_MAX, 3)
     if L > 0:
-        x_hist[:, L_MAX - L:, 0] = 15 + torch.randn(B, L, generator=g)      # T
-        x_hist[:, L_MAX - L:, 1] = 1013 + torch.randn(B, L, generator=g)    # P
-        x_hist[:, L_MAX - L:, 2] = 60 + 10 * torch.randn(B, L, generator=g) # RH
+        x_hist[:, L_MAX - L:, 0] = 15 + torch.randn(B, L, generator=g)  # T
+        x_hist[:, L_MAX - L:, 1] = 1013 + torch.randn(B, L, generator=g)  # P
+        x_hist[:, L_MAX - L:, 2] = 60 + 10 * torch.randn(B, L, generator=g)  # RH
         x_hist[:, L_MAX - L:, 2].clamp_(1, 100)
         mask_hist[:, L_MAX - L:] = 1.0
 
@@ -25,8 +25,8 @@ def _toy_batch(B=2, L=L_MAX, seed=0):
     hour_fut = (torch.rand(B, H, generator=g) * 24).float()
 
     return {
-        "lat":  torch.rand(B, generator=g) * 120 - 60,
-        "lon":  torch.rand(B, generator=g) * 360 - 180,
+        "lat": torch.rand(B, generator=g) * 120 - 60,
+        "lon": torch.rand(B, generator=g) * 360 - 180,
         "elev": torch.rand(B, generator=g) * 500,
         "x_hist": x_hist, "mask_hist": mask_hist,
         "doy_hist": doy_hist, "hour_hist": hour_hist,
@@ -153,12 +153,12 @@ def test_backward():
     hf = torch.arange(1, H + 1, dtype=torch.float32)
 
     y = (
-        12.0
-        + 6.0
-        * torch.sin(
-            2.0 * math.pi * (L_MAX + hf) / 24.0
-        )
-        + torch.randn(2, H)
+            12.0
+            + 6.0
+            * torch.sin(
+        2.0 * math.pi * (L_MAX + hf) / 24.0
+    )
+            + torch.randn(2, H)
     )
 
     loss = mayak_loss(out, y)
@@ -167,8 +167,6 @@ def test_backward():
 
     loss.backward()
 
-    # Убеждаемся, что backward действительно прошёл и хотя бы
-    # один обучаемый параметр получил градиент.
     grads = [
         p.grad
         for p in model.parameters()

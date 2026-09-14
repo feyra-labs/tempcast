@@ -40,8 +40,6 @@ class ClimateField(nn.Module):
         if z is not None:
             gb = torch.tanh(self.film(z))
             h = h * (1 + 0.3 * gb[:, :48]) + 0.3 * gb[:, 48:]  # 128
-            # gb = self.film(z)
-            # h = h * (1 + gb[:, :128]) + gb[:, 128:]
         c = self.head(F.gelu(h))
         return c[:, :36], c[:, 36:57], c[:, 57:78]
 

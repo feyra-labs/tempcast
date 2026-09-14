@@ -130,8 +130,7 @@ class GRUSeq2Seq(nn.Module):
 
     def forward(self, batch):
         x = batch["x_hist"]; m = batch["mask_hist"]
-        
-        # Примерная нрмировка входных данных (T, P, RH) для улучшения сходимости модели
+
         T, P, RH = x[..., 0], x[..., 1], x[..., 2]
         xn = torch.stack([T / 30.0, (P - 1013.0) / 50.0, (RH - 50.0) / 50.0], dim=-1)
 

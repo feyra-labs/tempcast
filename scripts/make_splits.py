@@ -10,9 +10,11 @@
 import argparse, csv
 import numpy as np
 
+
 def lat_band(lat):
     a = abs(float(lat))
     return "eq" if a < 23.5 else ("mid" if a < 50 else "pol")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -45,9 +47,11 @@ def main():
 
     with open(args.manifest, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["id", "lat", "lon", "elev", "koppen", "split"])
-        w.writeheader(); w.writerows(rows)
+        w.writeheader();
+        w.writerows(rows)
     from collections import Counter
     print("Сплиты:", dict(Counter(r["split"] for r in rows)))
+
 
 if __name__ == "__main__":
     main()

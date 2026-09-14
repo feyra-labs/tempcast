@@ -1,5 +1,7 @@
 """Датасет обучающих окон с куррикулумом холодного старта и аугментациями"""
-import csv, math, os
+import csv
+import os
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -86,13 +88,14 @@ class WindowDataset(Dataset):
 
         fut = np.arange(t, t + H)
         doy_f, hour_f = _calendar(s["t0_doy"], s["t0_hour"], fut)
-        y = s["x"][fut, 0].astype(np.float32).copy()   # T в будущем
+        y = s["x"][fut, 0].astype(np.float32).copy()  # T в будущем
 
         lat, lon, elev = s["lat"], s["lon"], s["elev"]
 
         r = self.rng
         if L > 0 and r.random() < 0.3:
-            glen = int(r.integers(1, 25)); gst = int(r.integers(L_MAX - L, L_MAX))
+            glen = int(r.integers(1, 25))
+            gst = int(r.integers(L_MAX - L, L_MAX))
             mask_hist[gst:min(L_MAX, gst + glen)] = 0.0
 
         if r.random() < 0.1:
@@ -126,9 +129,11 @@ class WindowDataset(Dataset):
             "hour_fut": torch.from_numpy(hour_f),
             "y": torch.from_numpy(y),
         }
-    
+
+
 class HoldoutDataset(Dataset):
     """Детерминированные окна для валидации/оценки: фиксированный L, без аугментаций"""
+
     def __init__(self, manifest, station_split="unseen_val", time_key="calib",
                  every_hours=72, L=L_MAX, max_windows=8000):
         import csv, os
@@ -156,15 +161,18 @@ class HoldoutDataset(Dataset):
         return len(self.meta)
 
     def __getitem__(self, i):
-        m = self.meta[i]; t, L = m["t"], m["L"]
+        m = self.meta[i]
+        t, L = m["t"], m["L"]
         L = min(L, t)
-        k = np.arange(L_MAX); abs_h = t - L_MAX + k
+        k = np.arange(L_MAX)
+        abs_h = t - L_MAX + k
         doy_h, hour_h = _calendar(m["t0d"], m["t0h"], abs_h)
         x_hist = np.zeros((L_MAX, 3), np.float32)
         mask_hist = np.zeros((L_MAX, 3), np.float32)
         if L > 0:
             src = np.arange(t - L, t)
-            x_hist[L_MAX - L:] = m["x"][src]; mask_hist[L_MAX - L:] = m["mask"][src]
+            x_hist[L_MAX - L:] = m["x"][src]
+            mask_hist[L_MAX - L:] = m["mask"][src]
         fut = np.arange(t, t + H)
         doy_f, hour_f = _calendar(m["t0d"], m["t0h"], fut)
         y = m["x"][fut, 0].astype(np.float32)

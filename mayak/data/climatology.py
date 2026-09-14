@@ -1,6 +1,7 @@
 """Эмпирическая климатология гармонической регрессией по doy, hour"""
 import numpy as np
 
+
 def _design(doy, hour, n_year=3, n_day=3):
     """Матрица признаков: константа + годовые + суточные + смешанные гармоники"""
     cols = [np.ones_like(doy)]
@@ -13,12 +14,14 @@ def _design(doy, hour, n_year=3, n_day=3):
     cols += [np.cos(wy * doy) * np.cos(wd * hour), np.cos(wy * doy) * np.sin(wd * hour)]
     return np.stack(cols, axis=-1)
 
+
 class Climatology:
     """Гармоническая климатология одной станции + остаток"""
+
     def __init__(self, n_year=3, n_day=3):
         self.n_year, self.n_day = n_year, n_day
         self.beta = None
-        self.sigma = None 
+        self.sigma = None
 
     def fit(self, doy, hour, T, mask):
         m = mask > 0

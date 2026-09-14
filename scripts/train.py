@@ -6,7 +6,7 @@
 
 Запуск полный:
     python scripts/train.py --steps-a 10000 --steps-b 200000 --batch 256 \
-        --windows 200000 --workers 8 --accelerator gpu --precision bf16-mixed
+        --windows 200000 --workers 8 --accelerator gpu
 """
 import argparse
 import pytorch_lightning as L
@@ -14,7 +14,6 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, Ea
 from pytorch_lightning.loggers import CSVLogger
 
 from mayak.data.datamodule import MayakData
-from mayak.evaluate_ext import coldstart_L0_check
 from mayak.lit import LitMayak
 
 
@@ -30,7 +29,8 @@ def run_stage(lit, manifest, curriculum, max_steps, args, tag, val_L=672):
         precision=args.precision, gradient_clip_val=1.0,
         val_check_interval=args.val_every, check_val_every_n_epoch=None,
         limit_val_batches=args.val_batches, logger=CSVLogger("runs", name=tag),
-        log_every_n_steps=20, callbacks=[ckpt, LearningRateMonitor("step"), EarlyStopping(monitor="val/loss", patience=5, mode="min")],
+        log_every_n_steps=20,
+        callbacks=[ckpt, LearningRateMonitor("step"), EarlyStopping(monitor="val/loss", patience=5, mode="min")],
         enable_progress_bar=True)
     trainer.fit(lit, datamodule=dm)
     return ckpt.best_model_path
@@ -73,7 +73,7 @@ def main():
 
     ds = EvalSet(clims, station_splits=("unseen_val",), manifest=args.manifest, time_key="test", L=0)
     zs = [lit.model(b)["z"].abs().mean().item() for b in DataLoader(ds, batch_size=128)]
-    print("|z| при L=0 (unseen):", sum(zs)/len(zs)) 
+    print("|z| при L=0 (unseen):", sum(zs) / len(zs))
 
     print(">>> Этап B: полный куррикулум")
     best = run_stage(lit, args.manifest, "full", args.steps_b, args, tag="stageB", val_L=672)

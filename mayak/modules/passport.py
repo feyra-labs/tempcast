@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mayak.constants import DZ
-from mayak.modules.loc import LocEncoder
 
 
 class Fingerprint(nn.Module):
@@ -11,8 +10,6 @@ class Fingerprint(nn.Module):
 
     def __init__(self):
         super().__init__()
-        # self.prior = nn.Linear(LocEncoder.OUT, 2 * DZ)
-        # nn.init.zeros_(self.prior.bias)
         self.prior_m = nn.Parameter(torch.zeros(DZ))
         self.prior_s = nn.Parameter(torch.zeros(DZ))
 
@@ -26,14 +23,10 @@ class Fingerprint(nn.Module):
         day_mask: (B, 28) есть ли данные в этих сутках (доля валидных часов > 0)
         sample: True на обучении (репараметризация), False на инференсе (берём m)
         """
-        # --- прайор ---
-        # p = self.prior(loc)
-        # m0, v0 = p[:, :DZ], F.softplus(p[:, DZ:]) + 1e-3
         B = loc.shape[0]
         m0 = self.prior_m.unsqueeze(0).expand(B, -1)
         v0 = (F.softplus(self.prior_s) + 1e-3).unsqueeze(0).expand(B, -1)
 
-        # --- свидетельства из суточных сводок ---
         x = torch.cat([summaries, day_mask.unsqueeze(-1)], dim=-1)
         _, hN = self.gru(x * day_mask.unsqueeze(-1))
         o = self.obs(hN[-1])
@@ -41,7 +34,6 @@ class Fingerprint(nn.Module):
         prec1 = F.softplus(o[:, DZ:]) * n_days 
         prec0 = 1.0 / v0
 
-        # --- якорь ---
         prec = prec0 + prec1
         m = (prec0 * m0 + prec1 * (m0 + o[:, :DZ])) / prec
         v = 1.0 / prec

@@ -147,7 +147,7 @@ cd tempcast
 
 uv sync
 
-Для запуска: uv run python ...
+uv run python ...
 ```
 
 ---
@@ -179,7 +179,7 @@ python scripts/train.py --manifest data/manifest.csv \
     --accelerator gpu --precision 32
 
 # (опц.) нейробейзлайны для сравнения
-python scripts/train_baselines.py --models gru dlinear --steps 200000
+python scripts/train_neurobaselines.py --models gru dlinear --steps 200000
 ```
 Лучшие чекпойнты сохраняются в `runs/stageB/best.ckpt` (и `runs/baseline_*`).
 

@@ -1,4 +1,3 @@
-# runtime/run_inference.py
 """Пример сквозного инференса МАЯК на устройстве (потоковый путь A):
 загрузка модели и конформной таблицы → восстановление состояния после ребута →
 почасовые шаги по данным датчиков → выпуск прогноза → атомарное сохранение
@@ -16,7 +15,7 @@ from mayak.constants import H
 from mayak.lit import LitMayak
 from runtime.streaming import StreamingMayak, safe_forecast
 
-STATE_FILES = ["runtime/state_a.bin", "runtime/state_b.bin"]   # чередуемые (щадим SD)
+STATE_FILES = ["runtime/state_a.bin", "runtime/state_b.bin"]
 
 
 def utc_to_doy_hour(dt):
@@ -32,7 +31,8 @@ def future_calendar(issue_time, horizon=H):
     doy = np.empty(horizon, np.float32); hour = np.empty(horizon, np.float32)
     for h in range(1, horizon + 1):
         d, hr = utc_to_doy_hour(issue_time + timedelta(hours=h))
-        doy[h - 1] = d; hour[h - 1] = hr
+        doy[h - 1] = d
+        hour[h - 1] = hr
     return doy, hour
 
 

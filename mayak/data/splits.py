@@ -1,5 +1,6 @@
 """Границы временных сплитов в индексах часа"""
 
+
 def time_bounds(n_hours, hours_per_year=8766, calib_days=60):
     """Возвращает словарь с диапазонами [начало, конец) в часах.
 
@@ -12,5 +13,5 @@ def time_bounds(n_hours, hours_per_year=8766, calib_days=60):
     return {
         "train": (0, calib_start),
         "calib": (calib_start, test_start),
-        "test":  (test_start, n_hours),
+        "test": (test_start, n_hours),
     }

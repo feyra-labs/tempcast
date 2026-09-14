@@ -11,7 +11,6 @@ import argparse
 import pytorch_lightning as L
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor, EarlyStopping
 from pytorch_lightning.loggers import CSVLogger
-import torch
 
 from mayak.data.datamodule import MayakData
 from mayak.lit import LitBaseline

@@ -43,35 +43,43 @@ class EvalSet(Dataset):
                 self.items.append((sid, t, "seen" if sp == "train" else "unseen"))
         if len(self.items) > max_windows:
             self.items = self.items[:: len(self.items) // max_windows][:max_windows]
-        self.clims = clims; self.L = L
+        self.clims = clims
+        self.L = L
 
     def __len__(self):
         return len(self.items)
 
     def __getitem__(self, i):
         sid, t, seen = self.items[i]
-        s = self.clims[sid]; clim = s["clim"]; t0d, t0h = s["t0d"], s["t0h"]
+        s = self.clims[sid]
+        clim = s["clim"]
+        t0d, t0h = s["t0d"], s["t0h"]
         if self.L is None:
             L = min(t, L_MAX)
         elif self.L == 0:
             L = 0
         else:
             L = min(self.L, t, L_MAX)
-        k = np.arange(L_MAX); abs_h = t - L_MAX + k
+        k = np.arange(L_MAX)
+        abs_h = t - L_MAX + k
         doy_h = (t0d + (t0h + abs_h) / 24.0) % 365.24
         hour_h = (t0h + abs_h) % 24.0
-        x_hist = np.zeros((L_MAX, 3), np.float32); mask_hist = np.zeros((L_MAX, 3), np.float32)
+        x_hist = np.zeros((L_MAX, 3), np.float32)
+        mask_hist = np.zeros((L_MAX, 3), np.float32)
         if L > 0:
             src = np.arange(t - L, t)
-            x_hist[L_MAX - L:] = s["x"][src]; mask_hist[L_MAX - L:] = s["mask"][src]
+            x_hist[L_MAX - L:] = s["x"][src]
+            mask_hist[L_MAX - L:] = s["mask"][src]
         fut = np.arange(t, t + H)
         doy_f = (t0d + (t0h + fut) / 24.0) % 365.24
         hour_f = (t0h + fut) % 24.0
         y = s["x"][fut, 0].astype(np.float32)
         mu_clim_fut = clim.predict(doy_f, hour_f).astype(np.float32)
-        kh = np.arange(max(t - 24, 0), t); mh = s["mask"][kh, 0]
+        kh = np.arange(max(t - 24, 0), t)
+        mh = s["mask"][kh, 0]
         if mh.sum() >= 1:
-            dh = (t0d + (t0h + kh) / 24.0) % 365.24; hh = (t0h + kh) % 24.0
+            dh = (t0d + (t0h + kh) / 24.0) % 365.24
+            hh = (t0h + kh) % 24.0
             a_recent = float(((s["x"][kh, 0] - clim.predict(dh, hh)) * mh).sum() / mh.sum())
         else:
             a_recent = 0.0
@@ -106,7 +114,8 @@ def metric_table(y, mu, q, mse_clim_lead, leads=(1, 3, 6, 12, 24, 48, 72, 120, 1
     for h in leads:
         j = h - 1
         e = mu[:, j] - y[:, j]
-        mae = np.abs(e).mean(); rmse = np.sqrt((e ** 2).mean())
+        mae = np.abs(e).mean()
+        rmse = np.sqrt((e ** 2).mean())
         skill = 1.0 - (e ** 2).mean() / max(mse_clim_lead[j], 1e-9)
         lo80, hi80 = q[:, j, 1], q[:, j, 5]
         lo90, hi90 = q[:, j, 0], q[:, j, 6]
@@ -132,10 +141,15 @@ def gather(model, dataset, device="cpu", batch_size=128):
     for b in dl:
         bb = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
         o = model(bb)
-        ys.append(b["y"].numpy()); mus.append(o["mu"].cpu().numpy()); qs.append(o["q"].cpu().numpy())
-        mucl.append(b["mu_clim_fut"].numpy()); seen.append(b["seen"].numpy())
-        a_rec.append(b["a_recent"].numpy()); sig_cl.append(b["sigma_clim"].numpy())
-        xh.append(b["x_hist"].numpy()); mh.append(b["mask_hist"].numpy())
+        ys.append(b["y"].numpy())
+        mus.append(o["mu"].cpu().numpy())
+        qs.append(o["q"].cpu().numpy())
+        mucl.append(b["mu_clim_fut"].numpy())
+        seen.append(b["seen"].numpy())
+        a_rec.append(b["a_recent"].numpy())
+        sig_cl.append(b["sigma_clim"].numpy())
+        xh.append(b["x_hist"].numpy())
+        mh.append(b["mask_hist"].numpy())
     cat = lambda L: np.concatenate(L, 0)
     return dict(y=cat(ys), mu=cat(mus), q=cat(qs), mu_clim=cat(mucl), seen=cat(seen),
                 a_recent=cat(a_rec), sigma_clim=cat(sig_cl), x_hist=cat(xh), mask_hist=cat(mh))
@@ -198,7 +212,9 @@ def koppen_per_window(ds):
 
 
 def zone_breakdown(preds, aux, koppen, leads=(24, 72), model="МАЯК", min_windows=20):
-    y = aux["y"]; p = preds[model]; rows = {}
+    y = aux["y"]
+    p = preds[model]
+    rows = {}
     for z in sorted(set(koppen.tolist())):
         m = koppen == z
         if int(m.sum()) < min_windows:
@@ -219,7 +235,7 @@ def zone_breakdown(preds, aux, koppen, leads=(24, 72), model="МАЯК", min_win
 def print_zone_breakdown(rows, leads=(24, 72)):
     hdr = f"{'зона':>6} {'окон':>6}"
     for h in leads:
-        hdr += f" {'Sk@'+str(h)+'ч':>9} {'MAE@'+str(h):>9} {'P90@'+str(h):>9}"
+        hdr += f" {'Sk@' + str(h) + 'ч':>9} {'MAE@' + str(h):>9} {'P90@' + str(h):>9}"
     print(hdr)
     for z, d in rows.items():
         line = f"{z:>6} {d['n']:>6}"
@@ -246,11 +262,15 @@ def plot_metric_curves(tables, out_dir="runs/plots"):
             ax.set_ylim(0, 1)
         if met == "Skill":
             ax.axhline(0.0, ls="--", lw=1, color="gray")
-        ax.set_xlabel("лид, ч"); ax.set_ylabel(met)
+        ax.set_xlabel("лид, ч")
+        ax.set_ylabel(met)
         ax.set_title(f"{met} по горизонту прогноза")
-        ax.legend(fontsize=8); ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+        ax.grid(alpha=0.3)
         p = os.path.join(out_dir, f"metric_{met}.png")
-        fig.tight_layout(); fig.savefig(p, dpi=130); plt.close(fig)
+        fig.tight_layout()
+        fig.savefig(p, dpi=130)
+        plt.close(fig)
         paths.append(p)
     return paths
 
@@ -271,25 +291,32 @@ def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
     rng = np.random.default_rng(seed)
     idx = np.sort(rng.choice(len(ds), size=min(n, len(ds)), replace=False))
     leads = np.arange(1, H + 1)
-    cols = 2; rows = (len(idx) + cols - 1) // cols
+    cols = 2;
+    rows = (len(idx) + cols - 1) // cols
     fig, axes = plt.subplots(rows, cols, figsize=(13, 2.9 * rows))
     axes = np.atleast_1d(axes).ravel()
     for k, i in enumerate(idx):
         item = ds[int(i)]
         batch = {key: (v[None] if torch.is_tensor(v) else v) for key, v in item.items()}
         out = model(batch)
-        mu = out["mu"][0].cpu().numpy(); q = out["q"][0].cpu().numpy()
+        mu = out["mu"][0].cpu().numpy()
+        q = out["q"][0].cpu().numpy()
         if shift is not None:
-            q = apply_conformal(q, shift); mu = q[:, 3]
-        y = item["y"].numpy(); muc = item["mu_clim_fut"].numpy()
-        sid, _t, seen = ds.items[int(i)]; zone = ds.clims[sid]["koppen"]
+            q = apply_conformal(q, shift)
+            mu = q[:, 3]
+        y = item["y"].numpy()
+        muc = item["mu_clim_fut"].numpy()
+        sid, _t, seen = ds.items[int(i)]
+        zone = ds.clims[sid]["koppen"]
         ax = axes[k]
         ax.fill_between(leads, q[:, 0], q[:, 6], alpha=0.2, color="tab:blue", label="90%-интервал")
         ax.plot(leads, y, color="black", lw=1.6, label="факт")
         ax.plot(leads, mu, color="tab:blue", lw=1.5, label="МАЯК (медиана)")
         ax.plot(leads, muc, color="tab:red", lw=1.0, ls="--", label="климатология")
         ax.set_title(f"{sid} · зона {zone} · {seen}", fontsize=9)
-        ax.set_xlabel("лид, ч"); ax.set_ylabel("T, °C"); ax.grid(alpha=0.3)
+        ax.set_xlabel("лид, ч")
+        ax.set_ylabel("T, °C")
+        ax.grid(alpha=0.3)
         if k == 0:
             ax.legend(fontsize=7, loc="best")
     for ax in axes[len(idx):]:
@@ -298,10 +325,11 @@ def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
     fig.tight_layout()
 
     suff = "" if L is None else f"_L{L}"
-    fig.suptitle(f"Прогноз МАЯК vs факт (примеры{', L='+str(L) if L is not None else ''})",
+    fig.suptitle(f"Прогноз МАЯК vs факт (примеры{', L=' + str(L) if L is not None else ''})",
                  y=1.0, fontsize=12)
     p = os.path.join(out_dir, f"forecast_examples{suff}.png")
-    fig.savefig(p, dpi=130, bbox_inches="tight"); plt.close(fig)
+    fig.savefig(p, dpi=130, bbox_inches="tight")
+    plt.close(fig)
     print("Сохранено:", p)
     return p
 
@@ -312,13 +340,16 @@ def _gather_full(model, ds, device="cpu", batch_size=128):
     model.eval().to(device)
     dl = DataLoader(ds, batch_size=batch_size)
     keys = ["mu", "q", "o", "r", "e", "sigma_c"]
-    acc = {k: [] for k in keys}; acc["y"] = []; acc["mu_clim"] = []
+    acc = {k: [] for k in keys}
+    acc["y"] = []
+    acc["mu_clim"] = []
     for b in dl:
         bb = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
         out = model(bb)
         for k in keys:
             acc[k].append(out[k].cpu().numpy())
-        acc["y"].append(b["y"].numpy()); acc["mu_clim"].append(b["mu_clim_fut"].numpy())
+        acc["y"].append(b["y"].numpy())
+        acc["mu_clim"].append(b["mu_clim_fut"].numpy())
     return {k: np.concatenate(v, 0) for k, v in acc.items()}
 
 
@@ -336,7 +367,7 @@ def coldstart_curve(model, clims, manifest="data/manifest.csv",
         res[L] = float(sk)
         print(f"  L={L:>4} ч : Skill-24ч = {sk:+.1%}")
     if res.get(672, 0) > 0:
-        print(f"  Доля при L=24ч от полного: {res.get(24,0)/res[672]:.0%}  (цель ≥80%)")
+        print(f"  Доля при L=24ч от полного: {res.get(24, 0) / res[672]:.0%}  (цель ≥80%)")
     return res
 
 
@@ -382,7 +413,7 @@ def calibration_quality_report(model, clims, shift, manifest="data/manifest.csv"
         c1 = pinball_crps(y[:, sl], q1[:, sl]).mean()
         m0 = np.abs(q0[:, sl, 3] - y[:, sl]).mean()
         m1 = np.abs(q1[:, sl, 3] - y[:, sl]).mean()
-        print(f"{str(a)+'-'+str(b):>11} {p0:>10.1%} {p1:>13.1%} "
+        print(f"{str(a) + '-' + str(b):>11} {p0:>10.1%} {p1:>13.1%} "
               f"{c0:>9.3f} {c1:>11.3f} {m0:>10.3f} {m1:>13.3f}")
     print(f"  MAE точечного прогноза mu (конформная таблица его НЕ трогает): "
           f"{np.abs(D['mu'] - y).mean():.3f} °C")
@@ -444,7 +475,8 @@ def pure_field_check(model, clims, manifest="data/manifest.csv",
     ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest,
                  time_key=time_key, L=0)
     model.eval()
-    e2 = ec = bias = 0.0; n = 0
+    e2 = ec = bias = 0.0
+    n = 0
     for b in DataLoader(ds, batch_size=128):
         lat, lon, elev = b["lat"], b["lon"], b["elev"]
         loc = model.loc(lat, lon, elev)
@@ -452,59 +484,74 @@ def pure_field_check(model, clims, manifest="data/manifest.csv",
         coefs = model.field.coefficients(loc)
         mu_c, _, _ = model.field.evaluate(coefs, astro_f)
         y, muc = b["y"], b["mu_clim_fut"]
-        e2 += float(((mu_c - y) ** 2).sum()); ec += float(((muc - y) ** 2).sum())
-        bias += float((mu_c - muc).abs().sum()); n += y.numel()
-    print(f"ЧИСТОЕ поле на {station_split}: ratio={e2/max(ec,1e-9):.3f}, "
-          f"|поле−клим|={bias/n:.3f}°C  (окон: {len(ds)})")
-    
+        e2 += float(((mu_c - y) ** 2).sum())
+        ec += float(((muc - y) ** 2).sum())
+        bias += float((mu_c - muc).abs().sum())
+        n += y.numel()
+    print(f"ЧИСТОЕ поле на {station_split}: ratio={e2 / max(ec, 1e-9):.3f}, "
+          f"|поле−клим|={bias / n:.3f}°C  (окон: {len(ds)})")
+
 
 @torch.no_grad()
 def l0_decompose(model, clims, manifest="data/manifest.csv", station_split="train"):
     from torch.utils.data import DataLoader
     ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest, time_key="test", L=0)
     model.eval()
-    Z=[]; sr=oo=ee=0.0; n=0
+    Z = []
+    sr = oo = ee = 0.0
+    n = 0
     for b in DataLoader(ds, batch_size=128):
         out = model(b)
         Z.append(out["z"])
-        sr += float((out["sigma_c"]*out["r"]).abs().sum())
+        sr += float((out["sigma_c"] * out["r"]).abs().sum())
         oo += float(out["o"].abs().sum())
         ee += float(out["e"].abs().sum())
-        n  += out["mu"].numel()
+        n += out["mu"].numel()
     Z = torch.cat(Z, 0)
     print(f"[{station_split}] std(z) по станциям = {float(Z.std(0).mean()):.3f}  "
           f"(≈0 → прайор глобальный; >0 → прайор зависит от loc = меморизатор)")
-    print(f"        |σ·r| = {sr/n:.3f}°C  (≈0 → r заглушён; >0 → r ещё активен и фитит)")
-    print(f"        |o| = {oo/n:.3f}   e = {ee/Z.numel()*Z.shape[1]:.3f}  (ждём ≈0 при L=0)")
+    print(f"        |σ·r| = {sr / n:.3f}°C  (≈0 → r заглушён; >0 → r ещё активен и фитит)")
+    print(f"        |o| = {oo / n:.3f}   e = {ee / Z.numel() * Z.shape[1]:.3f}  (ждём ≈0 при L=0)")
 
 
 def diurnal_amplitude(series):
-    H = series.shape[-1]; t = np.arange(H)
-    c = np.cos(2 * np.pi * t / 24.0); s = np.sin(2 * np.pi * t / 24.0)
-    a = (series * c).mean(-1); b = (series * s).mean(-1)
+    H = series.shape[-1];
+    t = np.arange(H)
+    c = np.cos(2 * np.pi * t / 24.0);
+    s = np.sin(2 * np.pi * t / 24.0)
+    a = (series * c).mean(-1);
+    b = (series * s).mean(-1)
     return 2.0 * np.sqrt(a ** 2 + b ** 2)
 
 
 def plot_amplitude_scatter(model, clims, manifest="data/manifest.csv", out_dir="runs/plots",
                            time_key="test", max_points=4000, seed=0):
-    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    import matplotlib;
+    matplotlib.use("Agg");
+    import matplotlib.pyplot as plt
     os.makedirs(out_dir, exist_ok=True)
     D = gather(model, EvalSet(clims, manifest=manifest, time_key=time_key))
-    ap = diurnal_amplitude(D["mu"]); ar = diurnal_amplitude(D["y"])
+    ap = diurnal_amplitude(D["mu"])
+    ar = diurnal_amplitude(D["y"])
     idx = np.random.default_rng(seed).choice(len(ap), min(max_points, len(ap)), replace=False)
     ap, ar = ap[idx], ar[idx]
-    slope = float(np.polyfit(ar, ap, 1)[0]); bias = float((ap - ar).mean())
+    slope = float(np.polyfit(ar, ap, 1)[0]);
+    bias = float((ap - ar).mean())
     lim = float(max(ar.max(), ap.max())) * 1.05
     fig, axx = plt.subplots(figsize=(6, 6))
     axx.scatter(ar, ap, s=6, alpha=0.3)
     axx.plot([0, lim], [0, lim], "k--", lw=1, label="1:1 (идеал)")
-    axx.set_xlim(0, lim); axx.set_ylim(0, lim)
+    axx.set_xlim(0, lim);
+    axx.set_ylim(0, lim)
     axx.set_xlabel("факт: суточная амплитуда, °C")
     axx.set_ylabel("прогноз: суточная амплитуда, °C")
     axx.set_title(f"Суточная амплитуда\nнаклон={slope:.2f}, смещение={bias:+.2f}°C")
-    axx.legend(); axx.grid(alpha=0.3)
+    axx.legend();
+    axx.grid(alpha=0.3)
     p = os.path.join(out_dir, "amplitude_scatter.png")
-    fig.tight_layout(); fig.savefig(p, dpi=130); plt.close(fig)
+    fig.tight_layout();
+    fig.savefig(p, dpi=130);
+    plt.close(fig)
     print(f"Сохранено: {p}  (наклон {slope:.2f} — <1 значит модель ЗАНИЖАЕТ суточный ход)")
     return p
 
@@ -569,7 +616,7 @@ def main():
                            station_splits=("unseen_test",), shift=shift)
     plot_forecast_examples(mayak, clims, n=args.n_examples, L=0, out_dir="runs/plots")
     plot_forecast_examples(mayak, clims, n=args.n_examples, L=0, station_splits=("unseen_test",),
-                       out_dir=args.out_dir + "/unseen")
+                           out_dir=args.out_dir + "/unseen")
     print("\n=== Суточные амплитуды ===")
     plot_amplitude_scatter(mayak, clims, manifest=args.manifest, out_dir=args.out_dir)
 

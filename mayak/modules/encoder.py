@@ -1,4 +1,3 @@
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -19,7 +18,8 @@ class DSBlock(nn.Module):
         h = self.dw(F.pad(x, (2 * self.d, 0)))
         h = F.gelu(self.gn(self.pw(h)))
         return x + h
-    
+
+
 class SynopticEncoder(nn.Module):
     """Каузальный TCN: 12 depthwise-separable блоков, рецептивное поле ≈127 ч."""
 
