@@ -18,9 +18,9 @@ ZQ = norm.ppf(np.array(QUANTILES)).astype(np.float32)
 
 def fit_climatologies(manifest, force=False):
     root = os.path.dirname(manifest)
-
     cache_key = hashlib.md5(os.path.abspath(manifest).encode()).hexdigest()[:8]
     cache_file = os.path.join("runs", f"climatologies_{cache_key}.pkl")
+    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
 
     if os.path.exists(cache_file) and not force:
         print(f"Loading climatologies from {cache_file}")
@@ -41,7 +41,7 @@ def fit_climatologies(manifest, force=False):
             out[r["id"]] = dict(clim=clim, lat=float(r["lat"]), lon=float(r["lon"]),
                                 elev=float(r["elev"]), koppen=r["koppen"],
                                 x=x, mask=mask, N=N, t0d=t0d, t0h=t0h)
-            
+
     with open(cache_file, "wb") as f:
         pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
 
