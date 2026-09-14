@@ -18,7 +18,7 @@ class Fingerprint(nn.Module):
 
     def forward(self, loc, summaries, day_mask, sample: bool):
         """
-        loc: (B, 101) координатные признаки
+        loc: (B, 50) координатные признаки
         summaries: (B, 28, 6) суточные сводки (см. daily_summaries в model.py)
         day_mask: (B, 28) есть ли данные в этих сутках (доля валидных часов > 0)
         sample: True на обучении (репараметризация), False на инференсе (берём m)
