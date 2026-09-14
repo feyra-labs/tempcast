@@ -152,14 +152,7 @@ def test_backward():
 
     hf = torch.arange(1, H + 1, dtype=torch.float32)
 
-    y = (
-            12.0
-            + 6.0
-            * torch.sin(
-        2.0 * math.pi * (L_MAX + hf) / 24.0
-    )
-            + torch.randn(2, H)
-    )
+    y = (12.0 + 6.0 * torch.sin(2.0 * math.pi * (L_MAX + hf) / 24.0) + torch.randn(2, H))
 
     loss = mayak_loss(out, y)
 
