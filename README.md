@@ -1,6 +1,6 @@
 <h1 align="center">МАЯК</h1>
 <p align="center">
-  <b>Калиброванный вероятностный прогноз приземной температуры на 168 часов — из одной метеостанции, с работой на устройстве в режиме O(1)/час.</b>
+  <b>Калиброванный вероятностный прогноз приземной температуры на 168 часов — из одной метеостанции, с работой на устройстве в режиме O(M)/час.</b>
 </p>
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="MIT">
@@ -232,16 +232,17 @@ python runtime/run_inference.py --ckpt runs/stageB/best.ckpt \
 ```
 mayak/
   modules/        loc, field, passport, encoder, readout, propagator, heads
-  model.py        сборка MAYAK + smoke-тест
+  model.py        сборка MAYAK
   astro.py        солнечно-календарные признаки, точка росы
-  loss.py         pinball + регуляризаторы
+  loss.py         pinball метрика
   lit.py          LightningModule (МАЯК и бейзлайны), EMA
   baselines.py    климатология / damped / seasonal / GRU / DLinear
   data/           загрузчик, окна, суточные сводки, сплиты
-  evaluate_ext.py метрики, графики, разрез по зонам, холодный старт
+  evaluate.py     метрики, графики, разрез по зонам, холодный старт
   knockout.py     абляции обученной модели (без переобучения)
-scripts/          make_synth, make_splits, train, train_baselines, calibrate, export_onnx
-runtime/          streaming.py (потоковый рантайм), run_inference.py
+  runtime/        treaming.py (потоковый рантайм), run_inference.py
+scripts/          make_synth, make_real, make_splits, train, train_baselines, calibrate, export_onnx, plot_loss
+
 ```
 </details>
 
