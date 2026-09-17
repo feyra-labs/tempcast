@@ -55,9 +55,8 @@ def main():
     best_a = run_stage(lit, args.manifest, "L0", args.steps_a, args,
                        tag="stageA", val_L=0)
     from mayak import baselines as BL
-    from mayak.eval import stage_a_field_check, pure_field_check, l0_decompose
+    from mayak.evaluate import stage_a_field_check, pure_field_check, l0_decompose, EvalSet
     from torch.utils.data import DataLoader
-    from mayak.eval import EvalSet
     clims = BL.fit_climatologies(args.manifest)
     lit = LitMayak.load_from_checkpoint(best_a)
     # lit = LitMayak.load_from_checkpoint('runs/stageA/best.ckpt', map_location="cpu")
