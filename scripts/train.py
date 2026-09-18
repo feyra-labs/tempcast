@@ -37,6 +37,8 @@ def run_stage(lit, manifest, curriculum, max_steps, args, tag, val_L=672):
 
 
 def main():
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", default="data/manifest.csv")
     ap.add_argument("--steps-a", type=int, default=10_000)

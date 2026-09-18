@@ -17,6 +17,8 @@ from mayak.lit import LitBaseline
 
 
 def main():
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     ap = argparse.ArgumentParser()
     ap.add_argument("--models", nargs="+", default=["gru", "dlinear"])
     ap.add_argument("--manifest", default="data/manifest.csv")

@@ -12,8 +12,23 @@ from mayak.constants import H, QUANTILES
 from mayak.data.qc import run_qc
 from mayak.data.climatology import Climatology
 from mayak.data.splits import time_bounds
+from mayak.data.dataset import _calendar
 
 ZQ = norm.ppf(np.array(QUANTILES)).astype(np.float32)
+
+RECENT_HOURS = 24
+RECENT_MIN_VALID = 6
+
+
+def recent_anomaly(xT, mT, clim, t, t0d, t0h,
+                   hours=RECENT_HOURS, min_valid=RECENT_MIN_VALID):
+    kh = np.arange(max(t - hours, 0), t)
+    mh = (mT[kh] > 0).astype(np.float64)
+    if mh.sum() < min_valid:
+        return 0.0, False
+    doy, hour = _calendar(t0d, t0h, kh)
+    a = ((xT[kh] - clim.predict(doy, hour)) * mh).sum() / mh.sum()
+    return float(a), True
 
 
 def fit_climatologies(manifest, force=False):
@@ -65,29 +80,24 @@ def fit_damped_persistence(clims, n_windows=20000, seed=0):
     rng = np.random.default_rng(seed)
     sids = list(clims.keys())
     Sxx = np.zeros(H); Sxy = np.zeros(H)
-    res_sq = np.zeros(H); cnt = 0
     per = max(1, n_windows // len(sids))
     for sid in sids:
         s = clims[sid]; lo, hi = time_bounds(s["N"])["train"]
         if hi - lo < 24 + H + 1:
             continue
         clim = s["clim"]; t0d, t0h = s["t0d"], s["t0h"]
+        xT, mT = s["x"][:, 0], s["mask"][:, 0]
         for _ in range(per):
             t = int(rng.integers(lo + 24, hi - H))
-            kh = np.arange(t - 24, t)
-            mh = s["mask"][kh, 0]
-            if mh.sum() < 6:
+            anom_recent, ok = recent_anomaly(xT, mT, clim, t, t0d, t0h)
+            if not ok:
                 continue
-            doy_h = (t0d + (t0h + kh) / 24.0) % 365.24
-            hour_h = (t0h + kh) % 24.0
-            anom_recent = ((s["x"][kh, 0] - clim.predict(doy_h, hour_h)) * mh).sum() / mh.sum()
             kf = np.arange(t, t + H)
-            doy_f = (t0d + (t0h + kf) / 24.0) % 365.24
-            hour_f = (t0h + kf) % 24.0
-            anom_fut = s["x"][kf, 0] - clim.predict(doy_f, hour_f)
-            Sxx += anom_recent ** 2
+            mf = (mT[kf] > 0).astype(np.float64)
+            doy_f, hour_f = _calendar(t0d, t0h, kf)
+            anom_fut = (xT[kf] - clim.predict(doy_f, hour_f)) * mf
+            Sxx += anom_recent ** 2 * mf
             Sxy += anom_recent * anom_fut
-            cnt += 1
     r = np.where(Sxx > 1e-6, Sxy / np.maximum(Sxx, 1e-6), 0.0)
     r = np.clip(r, 0.0, 1.0).astype(np.float32)
     return r
@@ -100,18 +110,17 @@ def damped_persistence_forecast(a_recent, mu_clim_fut, sigma_clim, r):
     return mu, quantiles_from_normal(mu, sig)
 
 
-def seasonal_naive_forecast(x_hist, mask_hist, sigma_clim, period=24):
-    B = x_hist.shape[0]
-    T = x_hist[..., 0]; v = mask_hist[..., 0]
-    mu = np.zeros((B, H), np.float32)
-    for h in range(1, H + 1):
-        idx = 672 - period + ((h - 1) % period)
-        col = T[:, idx].copy()
-        bad = v[:, idx] < 0.5
-        if bad.any():
-            last_valid = np.where(v[:, -1] > 0.5, T[:, -1], 0.0)
-            col[bad] = last_valid[bad]
-        mu[:, h - 1] = col
+def seasonal_naive_forecast(x_hist, mask_hist, mu_clim_fut, sigma_clim, period=24):
+    B, Lh = x_hist.shape[:2]
+    D = Lh // period
+    T = x_hist[:, Lh - D * period:, 0].reshape(B, D, period)[:, ::-1]
+    v = (mask_hist[:, Lh - D * period:, 0] > 0.5).reshape(B, D, period)[:, ::-1]
+    has = v.any(axis=1)
+    k = v.argmax(axis=1)
+    last = np.take_along_axis(T, k[:, None, :], axis=1)[:, 0]
+    slot = np.arange(H) % period
+    mu = np.where(has[:, slot], last[:, slot], np.asarray(mu_clim_fut, np.float32))
+    mu = mu.astype(np.float32)
     sig = np.broadcast_to(np.asarray(sigma_clim, np.float32).reshape(-1, 1), mu.shape)
     return mu, quantiles_from_normal(mu, sig)
 

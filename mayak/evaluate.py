@@ -16,6 +16,10 @@ from torch.utils.data import Dataset, DataLoader
 
 from mayak.constants import L_MAX, H, QUANTILES
 from mayak import baselines as BL
+from mayak.data.dataset import _calendar, slice_history, slice_target, valid_starts
+from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats
+from mayak.metrics import (pinball_crps, metric_table, wmean, skill,
+                           coverage, inside)
 
 Q = np.array(QUANTILES, np.float32)
 SEASON = ["DJF", "MAM", "JJA", "SON"]
@@ -37,7 +41,8 @@ def _bin(h1):
 class EvalSet(Dataset):
     def __init__(self, clims, station_splits=("train", "unseen_test"),
                  manifest="data/manifest.csv", time_key="test",
-                 every_hours=72, L=None, max_windows=6000):
+                 every_hours=72, L=None, max_windows=6000,
+                 target_mask=DEFAULT_TARGET_MASK):
         import csv
         from mayak.data.splits import time_bounds
         split_of = {}
@@ -45,13 +50,17 @@ class EvalSet(Dataset):
             for r in csv.DictReader(f):
                 split_of[r["id"]] = r["split"]
         self.items = []
+        self.filter_stats = FilterStats()
         for sid, s in clims.items():
             sp = split_of.get(sid)
             if sp not in station_splits:
                 continue
             lo, hi = time_bounds(s["N"])[time_key]
-            for t in range(lo + 1, hi - H, every_hours):
+            cand, ok = valid_starts(s["mask"][:, 0], lo, hi, every_hours, cfg=target_mask)
+            self.filter_stats.add(len(cand), len(ok))
+            for t in ok.tolist():
                 self.items.append((sid, t, "seen" if sp == "train" else "unseen"))
+        self.filter_stats.report(f"eval/{time_key}")
         if len(self.items) > max_windows:
             self.items = self.items[:: len(self.items) // max_windows][:max_windows]
         self.clims = clims
@@ -73,27 +82,13 @@ class EvalSet(Dataset):
             L = min(self.L, t, L_MAX)
         k = np.arange(L_MAX)
         abs_h = t - L_MAX + k
-        doy_h = (t0d + (t0h + abs_h) / 24.0) % 365.24
-        hour_h = (t0h + abs_h) % 24.0
-        x_hist = np.zeros((L_MAX, 3), np.float32)
-        mask_hist = np.zeros((L_MAX, 3), np.float32)
-        if L > 0:
-            src = np.arange(t - L, t)
-            x_hist[L_MAX - L:] = s["x"][src]
-            mask_hist[L_MAX - L:] = s["mask"][src]
+        doy_h, hour_h = _calendar(t0d, t0h, abs_h)
+        x_hist, mask_hist = slice_history(s["x"], s["mask"], t, L)
         fut = np.arange(t, t + H)
-        doy_f = (t0d + (t0h + fut) / 24.0) % 365.24
-        hour_f = (t0h + fut) % 24.0
-        y = s["x"][fut, 0].astype(np.float32)
+        doy_f, hour_f = _calendar(t0d, t0h, fut)
+        y, y_mask = slice_target(s["x"], s["mask"], t)
         mu_clim_fut = clim.predict(doy_f, hour_f).astype(np.float32)
-        kh = np.arange(max(t - 24, 0), t)
-        mh = s["mask"][kh, 0]
-        if mh.sum() >= 1:
-            dh = (t0d + (t0h + kh) / 24.0) % 365.24
-            hh = (t0h + kh) % 24.0
-            a_recent = float(((s["x"][kh, 0] - clim.predict(dh, hh)) * mh).sum() / mh.sum())
-        else:
-            a_recent = 0.0
+        a_recent, _ = BL.recent_anomaly(s["x"][:, 0], s["mask"][:, 0], clim, t, t0d, t0h)
         return {
             "lat": torch.tensor(s["lat"], dtype=torch.float32),
             "lon": torch.tensor(s["lon"], dtype=torch.float32),
@@ -104,6 +99,7 @@ class EvalSet(Dataset):
             "doy_fut": torch.from_numpy(doy_f.astype(np.float32)),
             "hour_fut": torch.from_numpy(hour_f.astype(np.float32)),
             "y": torch.from_numpy(y),
+            "y_mask": torch.from_numpy(y_mask),
             "mu_clim_fut": torch.from_numpy(mu_clim_fut),
             "sigma_clim": torch.tensor(clim.sigma, dtype=torch.float32),
             "a_recent": torch.tensor(a_recent, dtype=torch.float32),
@@ -113,42 +109,12 @@ class EvalSet(Dataset):
         }
 
 
-def pinball_crps(y, q):
-    err = y[..., None] - q
-    pin = np.maximum(Q * err, (Q - 1) * err)
-    return 2.0 * pin.mean(axis=-1)
+def mse_clim_per_lead(y, mu_clim, w):
+    return wmean((mu_clim - y) ** 2, w, axis=0)
 
 
-def metric_table(y, mu, q, mse_clim_lead, leads=(1, 3, 6, 12, 24, 48, 72, 120, 168)):
-    out = {}
-    crps = pinball_crps(y, q)
-    for h in leads:
-        j = h - 1
-        e = mu[:, j] - y[:, j]
-        mae = np.abs(e).mean()
-        rmse = np.sqrt((e ** 2).mean())
-        skill = 1.0 - (e ** 2).mean() / max(mse_clim_lead[j], 1e-9)
-        lo80, hi80 = q[:, j, 1], q[:, j, 5]
-        lo90, hi90 = q[:, j, 0], q[:, j, 6]
-        picp80 = ((y[:, j] >= lo80) & (y[:, j] <= hi80)).mean()
-        picp90 = ((y[:, j] >= lo90) & (y[:, j] <= hi90)).mean()
-        a = 0.10
-        width = hi90 - lo90
-        wink = (width
-                + (2 / a) * (lo90 - y[:, j]) * (y[:, j] < lo90)
-                + (2 / a) * (y[:, j] - hi90) * (y[:, j] > hi90)).mean()
-        out[h] = dict(MAE=float(mae), RMSE=float(rmse), Skill=float(skill),
-                      CRPS=float(crps[:, j].mean()), PICP80=float(picp80),
-                      PICP90=float(picp90), Winkler90=float(wink))
-    return out
-
-
-def mse_clim_per_lead(y, mu_clim):
-    return ((mu_clim - y) ** 2).mean(axis=0)
-
-
-def coverage90(y, q):
-    return float(((y >= q[..., 0]) & (y <= q[..., 6])).mean())
+def coverage90(y, q, w):
+    return coverage(y, q, w)
 
 
 def apply_conformal(q, shift):
@@ -162,12 +128,13 @@ def apply_conformal(q, shift):
 def gather(model, dataset, device="cpu", batch_size=128):
     model.eval().to(device)
     dl = DataLoader(dataset, batch_size=batch_size)
-    ys, mus, qs, mucl, seen = [], [], [], [], []
+    ys, yms, mus, qs, mucl, seen = [], [], [], [], [], []
     a_rec, sig_cl, xh, mh = [], [], [], []
     for b in dl:
         bb = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
         o = model(bb)
         ys.append(b["y"].numpy())
+        yms.append(b["y_mask"].numpy())
         mus.append(o["mu"].cpu().numpy())
         qs.append(o["q"].cpu().numpy())
         mucl.append(b["mu_clim_fut"].numpy())
@@ -177,7 +144,7 @@ def gather(model, dataset, device="cpu", batch_size=128):
         xh.append(b["x_hist"].numpy())
         mh.append(b["mask_hist"].numpy())
     cat = lambda L: np.concatenate(L, 0)
-    return dict(y=cat(ys), mu=cat(mus), q=cat(qs), mu_clim=cat(mucl), seen=cat(seen),
+    return dict(y=cat(ys), y_mask=cat(yms), mu=cat(mus), q=cat(qs), mu_clim=cat(mucl), seen=cat(seen),
                 a_recent=cat(a_rec), sigma_clim=cat(sig_cl), x_hist=cat(xh), mask_hist=cat(mh))
 
 
@@ -189,6 +156,7 @@ def _gather_full(model, ds, device="cpu", batch_size=128):
     keys = ["mu", "q", "o", "r", "e", "sigma_c"]
     acc = {k: [] for k in keys}
     acc["y"] = []
+    acc["y_mask"] = []
     acc["mu_clim"] = []
     for b in dl:
         bb = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
@@ -196,6 +164,7 @@ def _gather_full(model, ds, device="cpu", batch_size=128):
         for k in keys:
             acc[k].append(out[k].cpu().numpy())
         acc["y"].append(b["y"].numpy())
+        acc["y_mask"].append(b["y_mask"].numpy())
         acc["mu_clim"].append(b["mu_clim_fut"].numpy())
     return {k: np.concatenate(v, 0) for k, v in acc.items()}
 
@@ -217,15 +186,14 @@ def add_statistical_baselines(preds, aux, r_damped=None):
     if r_damped is not None:
         mu_b, q_b = BL.damped_persistence_forecast(aux["a_recent"], mucl, sig, r_damped)
         preds["Damped persistence"] = dict(mu=mu_b, q=q_b)
-    mu_b, q_b = BL.seasonal_naive_forecast(aux["x_hist"], aux["mask_hist"], sig, period=24)
+    mu_b, q_b = BL.seasonal_naive_forecast(aux["x_hist"], aux["mask_hist"], mucl, sig, period=24)
     preds["Seasonal-naive 24ч"] = dict(mu=mu_b, q=q_b)
     return preds
 
 
 def build_tables(preds, aux, leads=FINE_LEADS):
-    y = aux["y"]
-    mse_clim = mse_clim_per_lead(y, aux["mu_clim"])
-    return {name: metric_table(y, p["mu"], p["q"], mse_clim, leads=leads)
+    y, w, muc = aux["y"], aux["y_mask"], aux["mu_clim"]
+    return {name: metric_table(y, p["mu"], p["q"], muc, w, leads=leads)
             for name, p in preds.items()}
 
 
@@ -242,7 +210,7 @@ def koppen_per_window(ds):
 
 
 def zone_breakdown(preds, aux, koppen, leads=(24, 72), model="МАЯК", min_windows=20):
-    y = aux["y"]
+    y, w = aux["y"], aux["y_mask"]
     p = preds[model]
     rows = {}
     for z in sorted(set(koppen.tolist())):
@@ -252,12 +220,10 @@ def zone_breakdown(preds, aux, koppen, leads=(24, 72), model="МАЯК", min_win
         d = {"n": int(m.sum())}
         for h in leads:
             j = h - 1
-            e = p["mu"][m, j] - y[m, j]
-            mc = ((aux["mu_clim"][m, j] - y[m, j]) ** 2).mean()
-            lo, hi = p["q"][m, j, 0], p["q"][m, j, 6]
-            d[h] = dict(skill=float(1 - (e ** 2).mean() / max(mc, 1e-9)),
-                        mae=float(np.abs(e).mean()),
-                        picp90=float(((y[m, j] >= lo) & (y[m, j] <= hi)).mean()))
+            yj, wj = y[m, j], w[m, j]
+            d[h] = dict(skill=skill(yj, p["mu"][m, j], aux["mu_clim"][m, j], wj),
+                        mae=float(wmean(np.abs(p["mu"][m, j] - yj), wj)),
+                        picp90=float(wmean(inside(yj, p["q"][m, j, 0], p["q"][m, j, 6]), wj)))
         rows[z] = d
     return rows
 
@@ -334,7 +300,7 @@ def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
         if shift is not None:
             q = apply_conformal(q, shift)
             mu = q[:, 3]
-        y = item["y"].numpy()
+        y = np.where(item["y_mask"].numpy() > 0, item["y"].numpy(), np.nan)  # дыры видны
         muc = item["mu_clim_fut"].numpy()
         sid, _t, seen = ds.items[int(i)]
         zone = ds.clims[sid]["koppen"]
@@ -364,14 +330,17 @@ def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
     return p
 
 
-def diurnal_amplitude(series):
-    H = series.shape[-1]
-    t = np.arange(H)
-    c = np.cos(2 * np.pi * t / 24.0)
-    s = np.sin(2 * np.pi * t / 24.0)
-    a = (series * c).mean(-1)
-    b = (series * s).mean(-1)
-    return 2.0 * np.sqrt(a ** 2 + b ** 2)
+def diurnal_amplitude(series, w=None):
+    n = series.shape[-1]
+    t = np.arange(n)
+    X = np.stack([np.ones(n), np.cos(2 * np.pi * t / 24.0), np.sin(2 * np.pi * t / 24.0)], -1)
+    w = np.ones_like(series) if w is None else (np.asarray(w) > 0).astype(np.float64)
+    ys = np.where(w > 0, series, 0.0)
+    A = np.einsum("nh,hi,hj->nij", w, X, X) + 1e-9 * np.eye(3)
+    b = np.einsum("nh,hi,nh->ni", w, X, ys)
+    coef = np.linalg.solve(A, b[..., None])[..., 0]
+    amp = np.hypot(coef[:, 1], coef[:, 2])
+    return np.where(w.sum(-1) >= 6, amp, np.nan)
 
 
 def plot_amplitude_scatter(model, clims, manifest="data/manifest.csv", out_dir="runs/plots",
@@ -381,8 +350,10 @@ def plot_amplitude_scatter(model, clims, manifest="data/manifest.csv", out_dir="
     import matplotlib.pyplot as plt
     os.makedirs(out_dir, exist_ok=True)
     D = gather(model, EvalSet(clims, manifest=manifest, time_key=time_key))
-    ap = diurnal_amplitude(D["mu"])
-    ar = diurnal_amplitude(D["y"])
+    ap = diurnal_amplitude(D["mu"], D["y_mask"])
+    ar = diurnal_amplitude(D["y"], D["y_mask"])
+    keep = np.isfinite(ap) & np.isfinite(ar)
+    ap, ar = ap[keep], ar[keep]
     idx = np.random.default_rng(seed).choice(len(ap), min(max_points, len(ap)), replace=False)
     ap, ar = ap[idx], ar[idx]
     slope = float(np.polyfit(ar, ap, 1)[0])
@@ -417,19 +388,17 @@ def evaluate_all(model, clims, manifest="data/manifest.csv", r_damped=None,
         preds, aux = collect_predictions(named, ds)
         preds = add_statistical_baselines(preds, aux, r_damped=r_damped)
 
-    y = aux["y"]
-    mse_clim = mse_clim_per_lead(y, aux["mu_clim"])
+    y, w, muc = aux["y"], aux["y_mask"], aux["mu_clim"]
     for name, p in preds.items():
         print(f"\n=== {name} ===")
-        show(metric_table(y, p["mu"], p["q"], mse_clim))
+        show(metric_table(y, p["mu"], p["q"], muc, w))
 
     j = 24 - 1
     mu_mayak = preds["МАЯК"]["mu"]
     for tag, mask in [("seen", aux["seen"] == 0), ("unseen", aux["seen"] == 1)]:
         if mask.sum() == 0:
             continue
-        e = mu_mayak[mask, j] - y[mask, j]
-        sk = 1 - (e ** 2).mean() / max(mse_clim[j], 1e-9)
+        sk = skill(y[mask, j], mu_mayak[mask, j], muc[mask, j], w[mask, j])
         print(f"Skill-24ч [{tag}]: {sk:+.1%}  (окон: {int(mask.sum())})")
     return preds, aux, ds
 
@@ -442,9 +411,7 @@ def coldstart_curve(model, clims, manifest="data/manifest.csv",
         ds = EvalSet(clims, manifest=manifest, time_key="test", L=L, every_hours=120)
         D = gather(model, ds)
         j = 24 - 1
-        mse_clim = ((D["mu_clim"][:, j] - D["y"][:, j]) ** 2).mean()
-        e = D["mu"][:, j] - D["y"][:, j]
-        sk = 1 - (e ** 2).mean() / max(mse_clim, 1e-9)
+        sk = skill(D["y"][:, j], D["mu"][:, j], D["mu_clim"][:, j], D["y_mask"][:, j])
         res[L] = float(sk)
         print(f"  L={L:>4} ч : Skill-24ч = {sk:+.1%}")
     if res.get(672, 0) > 0:
@@ -458,7 +425,7 @@ def coldstart_L0_check(model, clims, manifest="data/manifest.csv", shift=None):
     o_abs = float(np.abs(D["o"]).mean())
     e_mean = float(np.abs(D["e"]).mean())
     dev = np.abs(D["sigma_c"] * (D["o"] + D["r"]))
-    p_before = coverage90(D["y"], D["q"])
+    p_before = coverage90(D["y"], D["q"], D["y_mask"])
     diff_clim = float(np.abs(D["mu"] - D["mu_clim"]).mean())
 
     print(f"  mean|o| = {o_abs:.3f} σ   (аномалия включена? должно быть ≈0)")
@@ -469,7 +436,7 @@ def coldstart_L0_check(model, clims, manifest="data/manifest.csv", shift=None):
           f"(ожидается мало: поле ≈ климатология, критерий этапа A)")
     print(f"  PICP-90 при L=0 = {p_before:.1%}  (цель 86–94%)", end="")
     if shift is not None:
-        p_after = coverage90(D["y"], apply_conformal(D["q"], shift))
+        p_after = coverage90(D["y"], apply_conformal(D["q"], shift), D["y_mask"])
         print(f"  →  после конформной {p_after:.1%}")
     else:
         print()
@@ -480,24 +447,23 @@ def coldstart_L0_check(model, clims, manifest="data/manifest.csv", shift=None):
 def calibration_quality_report(model, clims, shift, manifest="data/manifest.csv"):
     ds = EvalSet(clims, manifest=manifest, time_key="test", every_hours=72)
     D = gather(model, ds)
-    y, q0 = D["y"], D["q"]
+    y, q0, w = D["y"], D["q"], D["y_mask"]
     q1 = apply_conformal(q0, shift)
     print(f"{'бин лидов':>11} {'PICP90 до':>10} {'PICP90 после':>13} "
           f"{'CRPS до':>9} {'CRPS после':>11} {'MAEмед до':>10} {'MAEмед после':>13}")
     for a, b in LEAD_BINS:
         sl = slice(a - 1, b)
-        lo0, hi0 = q0[:, sl, 0], q0[:, sl, 6]
-        lo1, hi1 = q1[:, sl, 0], q1[:, sl, 6]
-        p0 = ((y[:, sl] >= lo0) & (y[:, sl] <= hi0)).mean()
-        p1 = ((y[:, sl] >= lo1) & (y[:, sl] <= hi1)).mean()
-        c0 = pinball_crps(y[:, sl], q0[:, sl]).mean()
-        c1 = pinball_crps(y[:, sl], q1[:, sl]).mean()
-        m0 = np.abs(q0[:, sl, 3] - y[:, sl]).mean()
-        m1 = np.abs(q1[:, sl, 3] - y[:, sl]).mean()
+        ys, ws = y[:, sl], w[:, sl]
+        p0 = coverage(ys, q0[:, sl], ws)
+        p1 = coverage(ys, q1[:, sl], ws)
+        c0 = wmean(pinball_crps(ys, q0[:, sl]), ws)
+        c1 = wmean(pinball_crps(ys, q1[:, sl]), ws)
+        m0 = wmean(np.abs(q0[:, sl, 3] - ys), ws)
+        m1 = wmean(np.abs(q1[:, sl, 3] - ys), ws)
         print(f"{str(a) + '-' + str(b):>11} {p0:>10.1%} {p1:>13.1%} "
               f"{c0:>9.3f} {c1:>11.3f} {m0:>10.3f} {m1:>13.3f}")
     print(f"  MAE точечного прогноза mu (конформная таблица его НЕ трогает): "
-          f"{np.abs(D['mu'] - y).mean():.3f} °C")
+          f"{wmean(np.abs(D['mu'] - y), w):.3f} °C")
 
 
 def stage_a_field_check(model, clims, manifest="data/manifest.csv",
@@ -506,9 +472,9 @@ def stage_a_field_check(model, clims, manifest="data/manifest.csv",
     ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest,
                  time_key=time_key, L=0)
     D = gather(model, ds)
-    y, mu, muc = D["y"], D["mu"], D["mu_clim"]
-    mse_field = float(((mu - y) ** 2).mean())
-    mse_clim = float(((muc - y) ** 2).mean())
+    y, mu, muc, w = D["y"], D["mu"], D["mu_clim"], D["y_mask"]
+    mse_field = float(wmean((mu - y) ** 2, w))
+    mse_clim = float(wmean((muc - y) ** 2, w))
     ratio = mse_field / max(mse_clim, 1e-9)
     bias = float(np.abs(mu - muc).mean())
     print(f"\n[Проверка этапа A] поле на {station_split} (L=0, окон: {len(ds)}):")
@@ -516,7 +482,11 @@ def stage_a_field_check(model, clims, manifest="data/manifest.csv",
     print(f"  MSE климатологии = {mse_clim:7.3f}   ← эталон")
     print(f"  отношение        = {ratio:7.3f}   ← цель ≤ 1.05")
     print(f"  |поле − климат|  = {bias:7.3f} °C ← цель → 0")
-    print(f"  ИТОГ: {'OK — поле генерализует' if ratio <= 1.05 else 'НЕ ПРОЙДЕНО — поле недоучено/переобучено на train; этап B на таком поле смысла мало'}")
+    if ratio <= 1.05:
+        print(f"  ИТОГ: OK — поле генерализует")
+    else:
+        print(
+            f"  ИТОГ: НЕ ПРОЙДЕНО — поле недоучено/переобучено на train; этап B на таком поле смысла мало")
     return dict(mse_field=mse_field, mse_clim=mse_clim, ratio=ratio, bias=bias)
 
 
@@ -536,9 +506,9 @@ def pure_field_check(model, clims, manifest="data/manifest.csv",
         astro_f = astro_features(b["doy_fut"], b["hour_fut"], lat[:, None], lon[:, None])
         coefs = model.field.coefficients(loc)
         mu_c, _, _ = model.field.evaluate(coefs, astro_f)
-        y, muc = b["y"], b["mu_clim_fut"]
-        e2 += float(((mu_c - y) ** 2).sum())
-        ec += float(((muc - y) ** 2).sum())
+        y, muc, w = b["y"], b["mu_clim_fut"], b["y_mask"]
+        e2 += float((((mu_c - y) ** 2) * w).sum())
+        ec += float((((muc - y) ** 2) * w).sum())
         bias += float((mu_c - muc).abs().sum())
         n += y.numel()
     print(f"ЧИСТОЕ поле на {station_split}: ratio={e2 / max(ec, 1e-9):.3f}, "
@@ -572,14 +542,15 @@ def compare_ablation(model_full, model_ablated, clims, manifest="data/manifest.c
     for tag, mdl in [("full", model_full), ("ablated", model_ablated)]:
         D = gather(mdl, ds)
         j = lead - 1
-        mse_clim = ((D["mu_clim"][:, j] - D["y"][:, j]) ** 2).mean()
-        out[tag] = 1 - ((D["mu"][:, j] - D["y"][:, j]) ** 2).mean() / max(mse_clim, 1e-9)
+        out[tag] = skill(D["y"][:, j], D["mu"][:, j], D["mu_clim"][:, j], D["y_mask"][:, j])
     print(f"Skill-{lead}ч: full {out['full']:+.1%}  vs  ablated {out['ablated']:+.1%}  "
           f"(падение {out['full'] - out['ablated']:+.1%})")
     return out
 
 
 def main():
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     import argparse
     from mayak.lit import LitMayak, LitBaseline
     ap = argparse.ArgumentParser()

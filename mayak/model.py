@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mayak.constants import M, H
 from mayak.astro import astro_features, dewpoint_c
 from mayak.modules.loc import LocEncoder
 from mayak.modules.field import ClimateField
@@ -25,6 +24,11 @@ class MAYAK(nn.Module):
         self.heads = Heads()
 
     @staticmethod
+    def lag_valid(v, k):
+        vs = F.pad(v, (k, 0))[..., :v.shape[-1]]
+        return v * vs
+
+    @staticmethod
     def build_channels(x, mask, astro_h, mu_c, sigma_c, defc):
         T, P, RH = x[..., 0], x[..., 1], x[..., 2]
         vt, vp, vr = mask[..., 0], mask[..., 1], mask[..., 2]
@@ -35,8 +39,7 @@ class MAYAK(nn.Module):
 
         def dP(p, vpm, k, scale):
             ps = F.pad(p, (k, 0))[..., :p.shape[-1]]
-            vs = F.pad(vpm, (k, 0))[..., :p.shape[-1]]
-            return (((p - ps) / scale).clamp(-4, 4)) * vpm * vs
+            return (((p - ps) / scale).clamp(-4, 4)) * MAYAK.lag_valid(vpm, k)
 
         sin_d, cos_d, _, czp, sin_y, cos_y = astro_h
         ch = torch.stack([
@@ -52,19 +55,26 @@ class MAYAK(nn.Module):
         return ch, aT, vt
     
     @staticmethod
-    def daily_summaries(aT, adP24, vt):
+    def daily_summaries(aT, adP24, vt, vp24):
+        """Суточные сводки по 24-часовым блокам.
+
+        aT, vt   — аномалия T и её маска;
+        adP24    — канал разности давления за 24 ч, vp24 — его маска.
+        Среднее каждого канала нормируется на число валидных часов своего канала.
+        """
         Bsz, Lh = aT.shape
         D = Lh // 24
-        a = aT.view(Bsz, D, 24)
-        v = vt.view(Bsz, D, 24)
-        p = adP24.view(Bsz, D, 24)
+        a = aT.reshape(Bsz, D, 24)
+        v = vt.reshape(Bsz, D, 24)
+        p = adP24.reshape(Bsz, D, 24)
+        vp = vp24.reshape(Bsz, D, 24)
         n = v.sum(-1)
         mean = (a * v).sum(-1) / n.clamp(min=1.0)
         mx = a.masked_fill(v < 0.5, -1e4).amax(-1)
         mn = a.masked_fill(v < 0.5, 1e4).amin(-1)
         has = (n > 0).float()
         mx, mn = mx * has, mn * has
-        mp = (p * v).sum(-1) / n.clamp(min=1.0)
+        mp = (p * vp).sum(-1) / vp.sum(-1).clamp(min=1.0)
         s = torch.stack([mean, mx, mn, mp, n / 24.0, has], dim=-1)
         return s, has
     
@@ -81,7 +91,8 @@ class MAYAK(nn.Module):
         mu0, sg0, df0 = self.field.evaluate(self.field.coefficients(loc), astro_h)
         ch, aT, vt = self.build_channels(x, mask, astro_h, mu0, sg0, df0)
 
-        summ, day_mask = self.daily_summaries(aT, ch[:, 3], vt)
+        summ, day_mask = self.daily_summaries(aT, ch[:, 3], vt,
+                                              self.lag_valid(mask[..., 1], 24))
         z, kl = self.passport(loc, summ, day_mask, sample=self.training)
 
         feats = self.encoder(ch)

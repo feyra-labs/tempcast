@@ -23,8 +23,11 @@ class Climatology:
         self.beta = None
         self.sigma = None
 
-    def fit(self, doy, hour, T, mask):
+    def fit(self, doy, hour, T, mask, min_valid=24 * 30):
+        """Подгонка только по валидным часам (1.7); значения под маской не читаются."""
         m = mask > 0
+        if m.sum() < min_valid:
+            raise ValueError(f"мало валидных часов для климатологии: {int(m.sum())} < {min_valid}")
         A = _design(doy[m], hour[m], self.n_year, self.n_day)
         y = T[m]
         self.beta, *_ = np.linalg.lstsq(A, y, rcond=None)

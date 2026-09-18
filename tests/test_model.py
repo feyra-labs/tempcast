@@ -2,8 +2,8 @@ import math
 
 import torch
 
-from mayak.constants import L_MAX
-from mayak.model import MAYAK, M, H, astro_features
+from mayak.constants import L_MAX, M, H
+from mayak.model import MAYAK, astro_features
 from mayak.loss import mayak_loss
 
 
@@ -32,6 +32,7 @@ def _toy_batch(B=2, L=L_MAX, seed=0):
         "doy_hist": doy_hist, "hour_hist": hour_hist,
         "doy_fut": doy_fut, "hour_fut": hour_fut,
         "y": torch.randn(B, H, generator=g),
+        "y_mask": torch.ones(B, H),
     }
 
 
@@ -154,7 +155,7 @@ def test_backward():
 
     y = (12.0 + 6.0 * torch.sin(2.0 * math.pi * (L_MAX + hf) / 24.0) + torch.randn(2, H))
 
-    loss = mayak_loss(out, y)
+    loss = mayak_loss(out, y, torch.ones_like(y))
 
     assert torch.isfinite(loss), "loss должен быть конечным"
 

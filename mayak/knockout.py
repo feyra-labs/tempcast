@@ -3,18 +3,19 @@ import contextlib
 import torch
 
 from mayak.constants import GROUPS
-from mayak.evaluate import EvalSet, gather, mse_clim_per_lead
+from mayak.evaluate import EvalSet, gather
+from mayak.metrics import skill_per_lead
 
 VARIANTS = ["none", "no_r", "no_sun", "no_D", "no_S", "no_W",
             "no_compression", "no_passport"]
 
 
 def _group_slices():
-    names = ["R", "D", "S", "W"];
+    names = ["R", "D", "S", "W"]
     sl = {};
     i = 0
     for nm, g in zip(names, GROUPS):
-        sl[nm] = slice(i, i + g);
+        sl[nm] = slice(i, i + g)
         i += g
     return sl
 
@@ -78,27 +79,18 @@ def knockout(model, which):
         model.readout.disable_compression = prev_dc
 
 
-def _skill(mu, y, mse_clim, h):
-    j = h - 1
-    return float(1.0 - ((mu[:, j] - y[:, j]) ** 2).mean() / max(mse_clim[j], 1e-9))
-
-
 def knockout_table(model, clims, manifest="data/manifest.csv", time_key="test",
                    leads=(6, 24, 72, 168), L=None,
                    station_splits=("train", "unseen_test"), variants=VARIANTS):
     kw = {} if L is None else {"L": L}
     ds = EvalSet(clims, station_splits=station_splits, manifest=manifest,
                  time_key=time_key, **kw)
-    y = None;
-    mse_clim = None;
     rows = {}
     for v in variants:
         with knockout(model, v):
             D = gather(model, ds)
-        if y is None:
-            y = D["y"];
-            mse_clim = mse_clim_per_lead(y, D["mu_clim"])
-        rows[v] = {h: _skill(D["mu"], y, mse_clim, h) for h in leads}
+        sk = skill_per_lead(D["y"], D["mu"], D["mu_clim"], D["y_mask"])
+        rows[v] = {h: float(sk[h - 1]) for h in leads}
 
     full = rows["none"]
     tag = "" if L is None else f"  (L={L})"

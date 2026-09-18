@@ -38,6 +38,19 @@ class EMA:
             self.backup = None
 
 
+def log_val_metrics(module, out, batch, loss):
+    y, w = batch["y"], batch["y_mask"]
+    module.log("val/loss", loss, prog_bar=True, batch_size=max(int(w.sum()), 1))
+    med = out["q"][..., 3]
+    for h in LEADS:
+        wj = w[:, h - 1]
+        n = int(wj.sum())
+        if n == 0:
+            continue
+        mae = ((med[:, h - 1] - y[:, h - 1]).abs() * wj).sum() / n
+        module.log(f"val/mae_{h}h", mae, batch_size=n)
+
+
 class LitMayak(L.LightningModule):
     def __init__(self, lr=3e-3, weight_decay=1e-2, total_steps=200_000,
                  ema_decay=0.999):
@@ -52,7 +65,7 @@ class LitMayak(L.LightningModule):
 
     def training_step(self, batch, _):
         out = self.model(batch)
-        loss = mayak_loss(out, batch["y"])
+        loss = mayak_loss(out, batch["y"], batch["y_mask"])
         self.log("train/loss", loss, prog_bar=True, batch_size=batch["y"].shape[0])
         return loss
 
@@ -70,13 +83,8 @@ class LitMayak(L.LightningModule):
 
     def validation_step(self, batch, _):
         out = self.model(batch)
-        y = batch["y"]
-        loss = mayak_loss(out, y)
-        self.log("val/loss", loss, prog_bar=True, batch_size=y.shape[0])
-        med = out["q"][..., 3]
-        for h in LEADS:
-            mae = (med[:, h - 1] - y[:, h - 1]).abs().mean()
-            self.log(f"val/mae_{h}h", mae, batch_size=y.shape[0])
+        loss = mayak_loss(out, batch["y"], batch["y_mask"])
+        log_val_metrics(self, out, batch, loss)
         return loss
 
     def configure_optimizers(self):
@@ -115,7 +123,7 @@ class LitBaseline(L.LightningModule):
 
     def training_step(self, batch, _):
         out = self.model(batch)
-        loss = pinball_loss(out, batch["y"])
+        loss = pinball_loss(out, batch["y"], batch["y_mask"])
         self.log("train/loss", loss, prog_bar=True, batch_size=batch["y"].shape[0])
         return loss
 
@@ -132,14 +140,9 @@ class LitBaseline(L.LightningModule):
             self.ema.restore(self.model)
 
     def validation_step(self, batch, _):
-        out = self.model(batch);
-        y = batch["y"]
-        loss = pinball_loss(out, y)
-        self.log("val/loss", loss, prog_bar=True, batch_size=y.shape[0])
-        med = out["q"][..., 3]
-        for h in LEADS:
-            self.log(f"val/mae_{h}h", (med[:, h - 1] - y[:, h - 1]).abs().mean(),
-                     batch_size=y.shape[0])
+        out = self.model(batch)
+        loss = pinball_loss(out, batch["y"], batch["y_mask"])
+        log_val_metrics(self, out, batch, loss)
         return loss
 
     def configure_optimizers(self):

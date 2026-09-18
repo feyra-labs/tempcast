@@ -1,9 +1,10 @@
 import argparse
 import numpy as np
 
-from mayak.constants import QUANTILES, H
+from mayak.constants import H
 from mayak import baselines as BL
 from mayak.evaluate import EvalSet, gather
+from mayak.metrics import coverage, fit_conformal_shift
 
 LEAD_BINS = [(1, 6), (7, 24), (25, 72), (73, 168)]
 
@@ -18,15 +19,7 @@ def lead_bin_index(h1):
 def fit_conformal(model, clims, manifest="data/manifest.csv"):
     ds = EvalSet(clims, manifest=manifest, time_key="calib", every_hours=24)
     D = gather(model, ds)
-    y, q = D["y"], D["q"]
-    nb = len(LEAD_BINS)
-    shift = np.zeros((nb, len(QUANTILES)), np.float32)
-    for bi, (a, b) in enumerate(LEAD_BINS):
-        sl = slice(a - 1, b)
-        resid = (y[:, sl, None] - q[:, sl, :]).reshape(-1, len(QUANTILES))
-        for qi, tau in enumerate(QUANTILES):
-            shift[bi, qi] = np.quantile(resid[:, qi], tau)
-    return shift
+    return fit_conformal_shift(D["y"], D["q"], D["y_mask"], LEAD_BINS)
 
 
 def apply_conformal(q, shift):
@@ -38,12 +31,9 @@ def apply_conformal(q, shift):
     return q
 
 
-def coverage90(y, q):
-    lo, hi = q[..., 0], q[..., 6]
-    return float(((y >= lo) & (y <= hi)).mean())
-
-
 def main():
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     from mayak.lit import LitMayak
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
@@ -60,8 +50,8 @@ def main():
 
     ds = EvalSet(clims, manifest=args.manifest, time_key="test", every_hours=72)
     D = gather(lit.model, ds)
-    before = coverage90(D["y"], D["q"])
-    after = coverage90(D["y"], apply_conformal(D["q"], shift))
+    before = coverage(D["y"], D["q"], D["y_mask"])
+    after = coverage(D["y"], apply_conformal(D["q"], shift), D["y_mask"])
     print(f"PICP-90 на тесте: до {before:.1%}  →  после {after:.1%}  (цель 86–94%)")
 
 

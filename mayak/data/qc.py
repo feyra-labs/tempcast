@@ -8,6 +8,8 @@
 """
 import numpy as np
 
+from mayak.data.masking import enforce_invariant
+
 PHYS = {"T": (-90.0, 60.0), "RH": (0.0, 100.0), "P": (300.0, 1100.0)}
 
 
@@ -39,5 +41,4 @@ def run_qc(T, P, RH, valid):
         masks[name] = (base & mad_ok).astype(np.float32)
     x = np.stack([T, P, RH], axis=-1).astype(np.float32)
     mask = np.stack([masks["T"], masks["P"], masks["RH"]], axis=-1).astype(np.float32)
-    x = np.where(mask > 0, x, 0.0).astype(np.float32)
-    return x, mask
+    return enforce_invariant(x, mask)  # 1.1: инвариант после контроля качества

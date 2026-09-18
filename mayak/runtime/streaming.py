@@ -47,10 +47,13 @@ class StreamingMayak:
         self.filled = 0
         self.day_summ = torch.zeros(1, 28, 6)
         self.day_mask = torch.zeros(1, 28)
-        self._cur_day_aT = []
-        self._cur_day_dp = []
-        self._hours_in_day = 0
+        self._reset_day()
         self.z = self._recompute_passport()
+
+    def _reset_day(self):
+        self._cur_day_aT, self._cur_day_dp = [], []
+        self._cur_day_vt, self._cur_day_vp24 = [], []
+        self._hours_in_day = 0
 
     def _recompute_passport(self):
         with torch.no_grad():
@@ -68,8 +71,9 @@ class StreamingMayak:
                                      torch.tensor([[self.lon]]))
             mu0, sg0, df0 = self.m.field.evaluate(self.base_coefs, astro_h)
             ch, aT, vt = self.m.build_channels(x, mk, astro_h, mu0, sg0, df0)
+            vp24 = self.m.lag_valid(mk[..., 1], 24)
             feats = self.m.encoder(ch)
-        return feats[:, -1], aT[:, -1], vt[:, -1], ch[:, 3, -1]
+        return feats[:, -1], aT[:, -1], vt[:, -1], ch[:, 3, -1], vp24[:, -1]
 
     @staticmethod
     def _qc_point(T, P, RH):
@@ -92,7 +96,8 @@ class StreamingMayak:
                                      torch.tensor([[self.lon]]))
             mu0, sg0, df0 = self.m.field.evaluate(self.base_coefs, astro_h)
             ch, aT, vt = self.m.build_channels(x, mk, astro_h, mu0, sg0, df0)
-            self.day_summ, self.day_mask = self.m.daily_summaries(aT, ch[:, 3], vt)
+            self.day_summ, self.day_mask = self.m.daily_summaries(
+                aT, ch[:, 3], vt, self.m.lag_valid(mk[..., 1], 24))
             self.z = self._recompute_passport()
             feats = self.m.encoder(ch)
             state = (self.n_re, self.n_im, self.e)
@@ -118,21 +123,23 @@ class StreamingMayak:
         self.buf_hour[:-1] = self.buf_hour[1:]
         self.buf_hour[-1] = hour
         self.filled = min(RF, self.filled + 1)
-        feat, aT, vt, dp = self._features_over_buffer()
+        feat, aT, vt, dp, vp24 = self._features_over_buffer()
         with torch.no_grad():
             self.n_re, self.n_im, self.e = self.m.readout.step(
                 (self.n_re, self.n_im, self.e), feat, vt)
         self._cur_day_aT.append(float(aT))
         self._cur_day_dp.append(float(dp))
+        self._cur_day_vt.append(float(vt))
+        self._cur_day_vp24.append(float(vp24))
         self._hours_in_day += 1
         if self._hours_in_day >= 24:
-            a = torch.tensor(self._cur_day_aT)
-            p = torch.tensor(self._cur_day_dp)
-            summ = torch.tensor([a.mean(), a.max(), a.min(), p.mean(), len(a) / 24.0, 1.0])
-            self.day_summ = torch.cat([self.day_summ[:, 1:], summ[None, None]], dim=1)
-            self.day_mask = torch.cat([self.day_mask[:, 1:], torch.ones(1, 1)], dim=1)
+            t = lambda v: torch.tensor(v, dtype=torch.float32)[None]
+            summ, has = self.m.daily_summaries(t(self._cur_day_aT), t(self._cur_day_dp),
+                                               t(self._cur_day_vt), t(self._cur_day_vp24))
+            self.day_summ = torch.cat([self.day_summ[:, 1:], summ], dim=1)
+            self.day_mask = torch.cat([self.day_mask[:, 1:], has], dim=1)
             self.z = self._recompute_passport()
-            self._cur_day_aT, self._cur_day_dp, self._hours_in_day = [], [], 0
+            self._reset_day()
 
     @torch.no_grad()
     def forecast(self, doy_fut, hour_fut):
