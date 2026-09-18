@@ -172,6 +172,8 @@ uv run python ...
 # (опц.) демо-данные для smoke-прогона
 python scripts/make_synth.py
 python scripts/make_splits.py --manifest data/manifest.csv
+# офлайн QC + климатология → кэш (повторный запуск при тех же данных — секунды)
+python scripts/build_cache.py --manifest data/manifest.csv --jobs 8
 
 # двухэтапное обучение МАЯК
 python scripts/train.py --manifest data/manifest.csv \
@@ -191,7 +193,7 @@ python scripts/calibrate.py --ckpt runs/stageB/best.ckpt --out runs/conformal.np
 
 # полный отчёт: таблицы метрик, графики по горизонту, примеры прогнозов,
 # разрез по климатическим зонам, холодный старт, влияние калибровки
-python mayak/evaluate.py --ckpt runs/stageB/best.ckpt \
+python -m mayak.evaluate --ckpt runs/stageB/best.ckpt \
     --gru-ckpt runs/baseline_gru/best.ckpt \
     --dlinear-ckpt runs/baseline_dlinear/best.ckpt \
     --conformal runs/conformal.npy --out-dir runs/plots \
@@ -205,7 +207,7 @@ python mayak/evaluate.py --ckpt runs/stageB/best.ckpt \
 
 Понять вклад каждого компонента в **уже обученной** модели, без переобучения:
 ```bash
-python mayak/knockout.py --ckpt runs/stageB/best.ckpt
+python -m mayak.knockout --ckpt runs/stageB/best.ckpt
 ```
 Выключает по очереди солнечные каналы, группы мод, паспорт и т.д. через forward-hooks и печатает падение Skill по лидам.
 </details>
@@ -217,7 +219,7 @@ python mayak/knockout.py --ckpt runs/stageB/best.ckpt
 python scripts/export_onnx.py --ckpt runs/stageB/best.ckpt --out runtime/mayak.onnx
 
 # потоковый инференс: восстановление состояния → почасовые шаги → выпуск прогноза
-python runtime/run_inference.py --ckpt runs/stageB/best.ckpt \
+python -m mayak.runtime.run_inference --ckpt runs/stageB/best.ckpt \
     --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2
 ```
 Потоковый рантайм (`runtime/streaming.py`) обновляет состояние за `O(M)` на новый час, переживает перезагрузку (сериализация < 4 КБ), при отказе датчиков плавно деградирует к климатологии (watchdog-фолбэк). Требуются **координаты точки и часы UTC** — без них солнечная геометрия не определена.

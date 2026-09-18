@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 
+from mayak.timeaxis import to_hourly_grid
 
 KG_MAP = {
      1: "Af",
@@ -71,24 +72,6 @@ def get_koppen_reader(tif_path):
     return get_koppen
 
 
-def compute_t0(ts):
-    doy = (
-        ts.dayofyear
-        - 1
-        + ts.hour / 24.0
-        + ts.minute / 1440.0
-        + ts.second / 86400.0
-    )
-
-    hour = (
-        ts.hour
-        + ts.minute / 60.0
-        + ts.second / 3600.0
-    )
-
-    return np.float32(doy), np.float32(hour)
-
-
 def main():
     parser = argparse.ArgumentParser()
 
@@ -151,23 +134,18 @@ def main():
         lon = float(g["longitude"].iloc[0])
         elev = float(g["elevation_m"].iloc[0])
 
-        T = g["temperature_2m"].astype(np.float32).to_numpy()
-
-        P = g["surface_pressure"].astype(np.float32).to_numpy()
-
-        RH = g["relative_humidity_2m"].astype(np.float32).to_numpy()
-
-        valid = (
-            np.isfinite(T)
-            & np.isfinite(P)
-            & np.isfinite(RH)
-        ).astype(np.uint8)
-
-        first_ts = g["time"].iloc[0]
-
-        t0_doy, t0_hour = compute_t0(first_ts)
-
         sid = str(point_id)
+
+        try:
+            t0, cols = to_hourly_grid(g["time"], {
+                "T": g["temperature_2m"].to_numpy(),
+                "P": g["surface_pressure"].to_numpy(),
+                "RH": g["relative_humidity_2m"].to_numpy()})
+        except ValueError as e:
+            raise ValueError(f"станция {sid}: ряд нельзя привести к почасовой сетке: {e}") from e
+        T, P, RH = cols["T"], cols["P"], cols["RH"]
+
+        valid = np.isfinite(np.stack([T, P, RH], axis=-1)).astype(np.uint8)
 
         np.savez_compressed(
             stations_dir / f"{sid}.npz",
@@ -175,8 +153,7 @@ def main():
             P=P,
             RH=RH,
             valid=valid,
-            t0_doy=t0_doy,
-            t0_hour=t0_hour,
+            t0_utc_h=np.int64(t0),
         )
 
         koppen = get_koppen(lat, lon)

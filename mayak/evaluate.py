@@ -16,7 +16,8 @@ from torch.utils.data import Dataset, DataLoader
 
 from mayak.constants import L_MAX, H, QUANTILES
 from mayak import baselines as BL
-from mayak.data.dataset import _calendar, slice_history, slice_target, valid_starts
+from mayak.data.dataset import slice_history, slice_target, valid_starts
+from mayak.timeaxis import window_calendar
 from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats
 from mayak.metrics import (pinball_crps, metric_table, wmean, skill,
                            coverage, inside)
@@ -43,12 +44,9 @@ class EvalSet(Dataset):
                  manifest="data/manifest.csv", time_key="test",
                  every_hours=72, L=None, max_windows=6000,
                  target_mask=DEFAULT_TARGET_MASK):
-        import csv
         from mayak.data.splits import time_bounds
-        split_of = {}
-        with open(manifest) as f:
-            for r in csv.DictReader(f):
-                split_of[r["id"]] = r["split"]
+        from mayak.data.store import read_manifest
+        split_of = {r["id"]: r.get("split") for r in read_manifest(manifest)}
         self.items = []
         self.filter_stats = FilterStats()
         for sid, s in clims.items():
@@ -73,7 +71,7 @@ class EvalSet(Dataset):
         sid, t, seen = self.items[i]
         s = self.clims[sid]
         clim = s["clim"]
-        t0d, t0h = s["t0d"], s["t0h"]
+        t0 = s["t0"]
         if self.L is None:
             L = min(t, L_MAX)
         elif self.L == 0:
@@ -82,13 +80,13 @@ class EvalSet(Dataset):
             L = min(self.L, t, L_MAX)
         k = np.arange(L_MAX)
         abs_h = t - L_MAX + k
-        doy_h, hour_h = _calendar(t0d, t0h, abs_h)
+        doy_h, hour_h = window_calendar(t0, abs_h)
         x_hist, mask_hist = slice_history(s["x"], s["mask"], t, L)
         fut = np.arange(t, t + H)
-        doy_f, hour_f = _calendar(t0d, t0h, fut)
+        doy_f, hour_f = window_calendar(t0, fut)
         y, y_mask = slice_target(s["x"], s["mask"], t)
         mu_clim_fut = clim.predict(doy_f, hour_f).astype(np.float32)
-        a_recent, _ = BL.recent_anomaly(s["x"][:, 0], s["mask"][:, 0], clim, t, t0d, t0h)
+        a_recent, _ = BL.recent_anomaly(s["x"][:, 0], s["mask"][:, 0], clim, t, t0)
         return {
             "lat": torch.tensor(s["lat"], dtype=torch.float32),
             "lon": torch.tensor(s["lon"], dtype=torch.float32),

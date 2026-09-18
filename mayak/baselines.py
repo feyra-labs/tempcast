@@ -1,18 +1,14 @@
 """Бейзлайны прогноза: климатология, damped persistence, seasonal-naive,
 GRU seq2seq, DLinear"""
-import hashlib
-import csv, os
-import pickle
 import numpy as np
 from scipy.stats import norm
 import torch
 import torch.nn as nn
 
 from mayak.constants import H, QUANTILES
-from mayak.data.qc import run_qc
-from mayak.data.climatology import Climatology
 from mayak.data.splits import time_bounds
-from mayak.data.dataset import _calendar
+from mayak.data.store import get_store
+from mayak.timeaxis import window_calendar
 
 ZQ = norm.ppf(np.array(QUANTILES)).astype(np.float32)
 
@@ -20,48 +16,22 @@ RECENT_HOURS = 24
 RECENT_MIN_VALID = 6
 
 
-def recent_anomaly(xT, mT, clim, t, t0d, t0h,
+def recent_anomaly(xT, mT, clim, t, t0,
                    hours=RECENT_HOURS, min_valid=RECENT_MIN_VALID):
     kh = np.arange(max(t - hours, 0), t)
     mh = (mT[kh] > 0).astype(np.float64)
     if mh.sum() < min_valid:
         return 0.0, False
-    doy, hour = _calendar(t0d, t0h, kh)
+    doy, hour = window_calendar(t0, kh)
     a = ((xT[kh] - clim.predict(doy, hour)) * mh).sum() / mh.sum()
     return float(a), True
 
 
 def fit_climatologies(manifest, force=False):
-    root = os.path.dirname(manifest)
-    cache_key = hashlib.md5(os.path.abspath(manifest).encode()).hexdigest()[:8]
-    cache_file = os.path.join("runs", f"climatologies_{cache_key}.pkl")
-    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
-
-    if os.path.exists(cache_file) and not force:
-        print(f"Loading climatologies from {cache_file}")
-        with open(cache_file, "rb") as f:
-            return pickle.load(f)
-
-    out = {}
-    with open(manifest) as f:
-        for r in csv.DictReader(f):
-            d = np.load(os.path.join(root, "stations", f"{r['id']}.npz"))
-            x, mask = run_qc(d["T"], d["P"], d["RH"], d["valid"])
-            N = x.shape[0]; lo, hi = time_bounds(N)["train"]
-            t0d, t0h = float(d["t0_doy"]), float(d["t0_hour"])
-            k = np.arange(lo, hi)
-            doy = (t0d + (t0h + k) / 24.0) % 365.24
-            hour = (t0h + k) % 24.0
-            clim = Climatology().fit(doy, hour, x[lo:hi, 0], mask[lo:hi, 0])
-            out[r["id"]] = dict(clim=clim, lat=float(r["lat"]), lon=float(r["lon"]),
-                                elev=float(r["elev"]), koppen=r["koppen"],
-                                x=x, mask=mask, N=N, t0d=t0d, t0h=t0h)
-
-    with open(cache_file, "wb") as f:
-        pickle.dump(out, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    print(f"Saved climatologies to {cache_file}")
-    return out
+    """Климатологии всех станций манифеста из кэша, без повторного QC и подгонки.
+    Возвращает {id: запись станции} с полями clim, x, mask, N, t0, lat, lon, elev, koppen.
+    """
+    return get_store(manifest, rebuild=force).clims()
 
 
 def quantiles_from_normal(mu, sigma):
@@ -85,16 +55,16 @@ def fit_damped_persistence(clims, n_windows=20000, seed=0):
         s = clims[sid]; lo, hi = time_bounds(s["N"])["train"]
         if hi - lo < 24 + H + 1:
             continue
-        clim = s["clim"]; t0d, t0h = s["t0d"], s["t0h"]
+        clim = s["clim"]; t0 = s["t0"]
         xT, mT = s["x"][:, 0], s["mask"][:, 0]
         for _ in range(per):
             t = int(rng.integers(lo + 24, hi - H))
-            anom_recent, ok = recent_anomaly(xT, mT, clim, t, t0d, t0h)
+            anom_recent, ok = recent_anomaly(xT, mT, clim, t, t0)
             if not ok:
                 continue
             kf = np.arange(t, t + H)
             mf = (mT[kf] > 0).astype(np.float64)
-            doy_f, hour_f = _calendar(t0d, t0h, kf)
+            doy_f, hour_f = window_calendar(t0, kf)
             anom_fut = (xT[kf] - clim.predict(doy_f, hour_f)) * mf
             Sxx += anom_recent ** 2 * mf
             Sxy += anom_recent * anom_fut

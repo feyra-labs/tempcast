@@ -1,10 +1,10 @@
 """Обучение нейробейзлайнов (GRU seq2seq, DLinear)
 
 Запуск полный:
-    python scripts/train_baselines.py --models gru dlinear --steps 200000 \
-        --batch 256 --windows 200000 --workers 8 --accelerator gpu --precision bf16-mixed
+    python scripts/train_neurobaselines.py --models gru dlinear --steps 200000 \
+        --batch 256 --windows 200000 --workers 8 --accelerator gpu
 Отладка:
-    python scripts/train_baselines.py --models gru dlinear --steps 1000 \
+    python scripts/train_neurobaselines.py --models gru dlinear --steps 1000 \
         --batch 32 --windows 2000 --workers 0 --accelerator cpu --precision 32 --val-every 200
 """
 import argparse

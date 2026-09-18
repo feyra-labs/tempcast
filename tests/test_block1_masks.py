@@ -12,6 +12,7 @@ from mayak.metrics import (fit_conformal_shift, metric_table, skill, wmean)
 
 NQ = len(QUANTILES)
 
+
 def _rand_q(g, B, Hh=H):
     """Монотонные квантили вокруг случайной медианы."""
     mu = 10 + 5 * torch.randn(B, Hh, generator=g)
@@ -263,7 +264,7 @@ def manifest(tmp_path_factory):
     rows = []
     rng = np.random.default_rng(0)
     for i, (split, lat) in enumerate([("train", 50.0), ("train", 10.0),
-                                       ("unseen_val", 45.0), ("unseen_test", 30.0)]):
+                                      ("unseen_val", 45.0), ("unseen_test", 30.0)]):
         h = np.arange(N_HOURS)
         T = 10 + 6 * np.sin(2 * np.pi * h / 24) + 0.3 * rng.standard_normal(N_HOURS)
         P = 1000 + 2 * np.sin(2 * np.pi * h / 100) + 0.2 * rng.standard_normal(N_HOURS)
@@ -274,7 +275,7 @@ def manifest(tmp_path_factory):
             valid[GAP_EVAL[0]:GAP_EVAL[1]] = 0
         np.savez(root / "stations" / f"s{i}.npz", T=T.astype(np.float32),
                  P=P.astype(np.float32), RH=RH.astype(np.float32), valid=valid,
-                 t0_doy=0.0, t0_hour=0.0)
+                 t0_utc_h=np.int64(0))
         rows.append(dict(id=f"s{i}", lat=lat, lon=0.0, elev=100.0, koppen="Cfb", split=split))
     path = root / "manifest.csv"
     with open(path, "w", newline="") as f:
@@ -449,15 +450,15 @@ def test_recent_anomaly_rule():
     xT = np.full(100, 3.0)
     mT = np.zeros(100)
     mT[90:95] = 1
-    assert recent_anomaly(xT, mT, clim, 100, 0.0, 0.0) == (0.0, False)
+    assert recent_anomaly(xT, mT, clim, 100, 0) == (0.0, False)
     mT[85] = 1
-    a, ok = recent_anomaly(np.where(mT > 0, xT, 1e6), mT, clim, 100, 0.0, 0.0)
+    a, ok = recent_anomaly(np.where(mT > 0, xT, 1e6), mT, clim, 100, 0)
     assert ok and a == pytest.approx(3.0)
 
 
 def _clims_case(garbage):
     from mayak.data.climatology import Climatology
-    from mayak.data.dataset import _calendar
+    from mayak.timeaxis import window_calendar
     rng = np.random.default_rng(0)
     n = N_HOURS
     h = np.arange(n)
@@ -466,9 +467,9 @@ def _clims_case(garbage):
     x = np.zeros((n, 3), np.float32)
     x[:, 0] = np.where(m > 0, T, garbage)
     mask = np.stack([m, m, m], -1)
-    doy, hour = _calendar(0.0, 0.0, h)
+    doy, hour = window_calendar(0, h)
     clim = Climatology().fit(doy[:1794], hour[:1794], x[:1794, 0], m[:1794])
-    return {"s": dict(clim=clim, N=n, t0d=0.0, t0h=0.0, x=x, mask=mask)}
+    return {"s": dict(clim=clim, N=n, t0=0, x=x, mask=mask)}
 
 
 def test_climatology_and_damped_persistence_ignore_masked_values():

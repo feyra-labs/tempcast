@@ -1,7 +1,11 @@
 """Границы временных сплитов в индексах часа"""
 
+SPLITS_VERSION = "1"  # поднимать при любом изменении логики time_bounds
+TIME_BOUNDS = dict(hours_per_year=8766, calib_days=60)
 
-def time_bounds(n_hours, hours_per_year=8766, calib_days=60):
+
+def time_bounds(n_hours, hours_per_year=TIME_BOUNDS["hours_per_year"],
+                calib_days=TIME_BOUNDS["calib_days"]):
     """Возвращает словарь с диапазонами [начало, конец) в часах.
 
     train  — всё, кроме последнего года и калибровочного хвоста перед ним;

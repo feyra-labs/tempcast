@@ -1,26 +1,38 @@
 """Датасет обучающих окон с куррикулумом холодного старта и аугментациями"""
-import csv
-import os
-
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 
 from mayak.constants import L_MAX, H
 from mayak.data.masking import (DEFAULT_TARGET_MASK, FilterStats, enforce_invariant,
                                 target_window_ok)
-from mayak.data.qc import run_qc
 from mayak.data.splits import time_bounds
+from mayak.data.store import get_store
+from mayak.timeaxis import window_calendar
+
+STREAM_SAMPLE, STREAM_AUG = 0, 1
 
 
-def _calendar(t0_doy, t0_hour, abs_hours):
-    doy = (t0_doy + (t0_hour + abs_hours) / 24.0) % 365.24
-    hour = (t0_hour + abs_hours) % 24.0
-    return doy.astype(np.float32), hour.astype(np.float32)
+def make_streams(base_seed, worker_id=0, salt=0):
+    """Два независимых генератора от тройки (сид, воркер, поток).
+
+    salt — база итератора DataLoader: при непостоянных воркерах она своя на каждую
+    эпоху, иначе каждая эпоха повторяла бы предыдущую окно в окно.
+    """
+    ss = np.random.SeedSequence(entropy=[int(base_seed), int(salt)], spawn_key=(int(worker_id),))
+    sample, aug = ss.spawn(2)
+    return np.random.default_rng(sample), np.random.default_rng(aug)
+
+
+def seed_worker(worker_id):
+    info = get_worker_info()
+    ds = info.dataset
+    if hasattr(ds, "seed_streams"):
+        ds.seed_streams(worker_id=info.id, salt=int(info.seed) - int(info.id))
 
 
 def slice_history(x, mask, t, L):
-    """История длины L, выровненная по правому краю буфера L_MAX. Инвариант соблюдён."""
+    """История длины L, выровненная по правому краю буфера L_MAX."""
     x_hist = np.zeros((L_MAX, 3), np.float32)
     mask_hist = np.zeros((L_MAX, 3), np.float32)
     if L > 0:
@@ -30,41 +42,39 @@ def slice_history(x, mask, t, L):
 
 
 def slice_target(x, mask, t):
-    """Цель — температура на [t, t + H) вместе с её маской (1.2).
+    """Цель — температура на [t, t + H) вместе с её маской.
 
-    Маска цели берётся только из данных (1.6): аугментации её не трогают.
+    Маска цели берётся только из данных: аугментации её не трогают.
     """
     fut = np.arange(t, t + H)
     return enforce_invariant(x[fut, 0], mask[fut, 0])
 
 
 def valid_starts(mask_T, lo, hi, step=1, cfg=DEFAULT_TARGET_MASK):
-    """Старты t ∈ [lo + 1, hi − H) с шагом step, прошедшие правило 1.5."""
     cand = np.arange(lo + 1, hi - H, step, dtype=np.int64)
     return cand, cand[target_window_ok(mask_T, cand, H, cfg)]
 
 
 class WindowDataset(Dataset):
     def __init__(self, manifest, split="train", curriculum="full",
-                 windows_per_epoch=200_000, seed=0, target_mask=DEFAULT_TARGET_MASK):
+                 windows_per_epoch=200_000, seed=0, target_mask=DEFAULT_TARGET_MASK,
+                 store=None):
         assert split in ("train",)
         assert curriculum in ("full", "L0")
         self.curriculum = curriculum
         self.n = windows_per_epoch
-        self.rng = np.random.default_rng(seed)
+        self.base_seed = int(seed)
+        self.seed_streams(worker_id=0, salt=0)
 
-        root = os.path.dirname(manifest)
-        with open(manifest) as f:
-            rows = [r for r in csv.DictReader(f) if r["split"] == "train"]
+        store = store or get_store(manifest)
+        rows = store.by_role("train")
         assert rows, "нет train-станций — запустите make_splits.py"
 
         self.st = []
         zone_count = {}
         self.filter_stats = FilterStats()
         for r in rows:
-            d = np.load(os.path.join(root, "stations", f"{r['id']}.npz"))
-            x, mask = run_qc(d["T"], d["P"], d["RH"], d["valid"])
-            N = x.shape[0]
+            x, mask, N = r["x"], r["mask"], r["N"]
             lo, hi = time_bounds(N)["train"]
             cand, ok = valid_starts(mask[:, 0], lo, hi, cfg=target_mask)
             self.filter_stats.add(len(cand), len(ok))
@@ -72,8 +82,7 @@ class WindowDataset(Dataset):
                 continue
             self.st.append(dict(
                 lat=float(r["lat"]), lon=float(r["lon"]), elev=float(r["elev"]),
-                koppen=r["koppen"], x=x, mask=mask, N=N,
-                t0_doy=float(d["t0_doy"]), t0_hour=float(d["t0_hour"]),
+                koppen=r["koppen"], x=x, mask=mask, N=N, t0=r["t0"],
                 tr=(lo, hi), starts=ok))
             zone_count[r["koppen"]] = zone_count.get(r["koppen"], 0) + 1
         self.filter_stats.report("train")
@@ -82,48 +91,50 @@ class WindowDataset(Dataset):
         w = np.array([1.0 / zone_count[s["koppen"]] for s in self.st])
         self.w = w / w.sum()
 
+    def seed_streams(self, worker_id=0, salt=0):
+        self.rng_sample, self.rng_aug = make_streams(self.base_seed, worker_id, salt)
+
     def __len__(self):
         return self.n
 
     def _sample_L(self):
+        r = self.rng_sample
         if self.curriculum == "L0":
             return 0
-        u = self.rng.random()
+        u = r.random()
         if u < 0.05:
             return 0
         if u < 0.20:
-            return int(self.rng.integers(1, 49))
+            return int(r.integers(1, 49))
         if u < 0.45:
-            return int(self.rng.integers(2 * 24, 10 * 24 + 1))
-        return int(self.rng.integers(10 * 24, L_MAX + 1))
+            return int(r.integers(2 * 24, 10 * 24 + 1))
+        return int(r.integers(10 * 24, L_MAX + 1))
 
     def __getitem__(self, _idx):
-        si = int(self.rng.choice(len(self.st), p=self.w))
+        r = self.rng_sample
+        si = int(r.choice(len(self.st), p=self.w))
         s = self.st[si]
         lo, _hi = s["tr"]
-        t = int(s["starts"][self.rng.integers(len(s["starts"]))])
+        t = int(s["starts"][r.integers(len(s["starts"]))])
 
         L = self._sample_L()
         L = min(L, t - lo)
         return self.build(s, t, L)
 
     def build(self, s, t, L):
-        """Окно станции s с началом горизонта t и историей L, с аугментациями.
-
-        Вынесено отдельно, чтобы тесты могли собрать окно в заданной точке.
-        """
+        """Окно станции s с началом горизонта t и историей L, с аугментациями."""
         k = np.arange(L_MAX)
         abs_h = t - L_MAX + k
-        doy_h, hour_h = _calendar(s["t0_doy"], s["t0_hour"], abs_h)
+        doy_h, hour_h = window_calendar(s["t0"], abs_h)
         x_hist, mask_hist = slice_history(s["x"], s["mask"], t, L)
 
         fut = np.arange(t, t + H)
-        doy_f, hour_f = _calendar(s["t0_doy"], s["t0_hour"], fut)
+        doy_f, hour_f = window_calendar(s["t0"], fut)
         y, y_mask = slice_target(s["x"], s["mask"], t)
 
         lat, lon, elev = s["lat"], s["lon"], s["elev"]
 
-        r = self.rng
+        r = self.rng_aug
         if L > 0 and r.random() < 0.3:
             glen = int(r.integers(1, 25))
             gst = int(r.integers(L_MAX - L, L_MAX))
@@ -140,8 +151,6 @@ class WindowDataset(Dataset):
         x_hist = x_hist + noise * mask_hist
 
         if L > 0:
-            # постоянное смещение прибора — единственная аугментация, которая
-            # касается цели (1.6, 9.5); маску цели она не меняет
             off = float(r.uniform(-0.7, 0.7))
             x_hist[:, 0] = x_hist[:, 0] + off * mask_hist[:, 0]
             y = y + off * y_mask
@@ -149,7 +158,6 @@ class WindowDataset(Dataset):
             lon = lon + float(r.uniform(-0.40, 0.40))
 
         x_hist[:, 2] = np.clip(x_hist[:, 2], 0, 100)
-        # 1.1 / 1.8: единственная точка восстановления инварианта после аугментаций
         x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
 
         return {
@@ -172,22 +180,17 @@ class HoldoutDataset(Dataset):
 
     def __init__(self, manifest, station_split="unseen_val", time_key="calib",
                  every_hours=72, L=L_MAX, max_windows=8000,
-                 target_mask=DEFAULT_TARGET_MASK):
-        root = os.path.dirname(manifest)
-        with open(manifest) as f:
-            rows = [r for r in csv.DictReader(f) if r["split"] == station_split]
+                 target_mask=DEFAULT_TARGET_MASK, store=None):
+        store = store or get_store(manifest)
         self.meta = []
         self.filter_stats = FilterStats()
-        for r in rows:
-            d = np.load(os.path.join(root, "stations", f"{r['id']}.npz"))
-            x, mask = run_qc(d["T"], d["P"], d["RH"], d["valid"])
-            N = x.shape[0]
+        for r in store.by_role(station_split):
+            x, mask, N = r["x"], r["mask"], r["N"]
             lo, hi = time_bounds(N)[time_key]
-            t0d, t0h = float(d["t0_doy"]), float(d["t0_hour"])
             cand, ok = valid_starts(mask[:, 0], lo, hi, every_hours, cfg=target_mask)
             self.filter_stats.add(len(cand), len(ok))
             for t in ok.tolist():
-                self.meta.append(dict(x=x, mask=mask, t=t, t0d=t0d, t0h=t0h,
+                self.meta.append(dict(x=x, mask=mask, t=t, t0=r["t0"],
                                       lat=float(r["lat"]), lon=float(r["lon"]),
                                       elev=float(r["elev"]), koppen=r["koppen"],
                                       split=station_split, L=L))
@@ -205,10 +208,10 @@ class HoldoutDataset(Dataset):
         L = min(L, t)
         k = np.arange(L_MAX)
         abs_h = t - L_MAX + k
-        doy_h, hour_h = _calendar(m["t0d"], m["t0h"], abs_h)
+        doy_h, hour_h = window_calendar(m["t0"], abs_h)
         x_hist, mask_hist = slice_history(m["x"], m["mask"], t, L)
         fut = np.arange(t, t + H)
-        doy_f, hour_f = _calendar(m["t0d"], m["t0h"], fut)
+        doy_f, hour_f = window_calendar(m["t0"], fut)
         y, y_mask = slice_target(m["x"], m["mask"], t)
         return {
             "lat": torch.tensor(m["lat"], dtype=torch.float32),

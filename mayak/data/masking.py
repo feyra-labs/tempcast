@@ -1,15 +1,3 @@
-"""Единая конвенция маски валидности (блок 1).
-
-Инвариант хранения (1.1): для любого массива значений ``x`` рядом лежит
-маска ``m`` той же формы (по каналам), и ``x == 0`` везде, где ``m == 0``.
-Инвариант восстанавливается принудительно в одной точке —
-:func:`enforce_invariant` — после контроля качества и после любой
-аугментации. Ни один потребитель не читает значения без маски.
-
-Правило отбора окон (1.5): окно ``[t, t + H)`` отбрасывается, если доля
-валидных часов цели ниже ``min_valid_frac`` либо в первых ``first_day_hours``
-часах нет ни одного валидного. Правило одинаково для обучения и оценки.
-"""
 from __future__ import annotations
 
 import logging
@@ -24,10 +12,7 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class TargetMaskConfig:
-    """Параметры отбора окон по маске цели.
-
-    Живёт отдельным датаклассом до блока 6, где войдёт в конфигурацию данных.
-    """
+    """Параметры отбора окон по маске цели."""
     min_valid_frac: float = 0.5
     first_day_hours: int = 24
 
@@ -42,11 +27,6 @@ DEFAULT_TARGET_MASK = TargetMaskConfig()
 
 
 def enforce_invariant(x, mask):
-    """Бинаризует маску и обнуляет значения там, где маска равна нулю.
-
-    Работает с numpy и torch, возвращает новую пару (x, mask) того же типа.
-    Нечисловые значения (NaN, inf) под нулевой маской тоже обнуляются.
-    """
     if torch.is_tensor(x):
         m = (mask > 0).to(x.dtype)
         return torch.where(m > 0, x, torch.zeros_like(x)), m
@@ -56,12 +36,6 @@ def enforce_invariant(x, mask):
 
 
 def target_window_ok(mask_T, starts, horizon, cfg: TargetMaskConfig = DEFAULT_TARGET_MASK):
-    """Векторная проверка правила 1.5 для набора стартов окон.
-
-    mask_T  — маска канала температуры станции, форма (N,);
-    starts  — индексы начала горизонта t (цель — часы [t, t + horizon));
-    Возвращает булев массив той же длины, что starts.
-    """
     starts = np.asarray(starts, dtype=np.int64)
     if starts.size == 0:
         return np.zeros(0, dtype=bool)
