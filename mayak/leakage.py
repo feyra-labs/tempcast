@@ -2,7 +2,8 @@
 
 Четыре проверки, вызываются перед обучением и перед оценкой:
 
-1. климатология каждой станции подогнана только по её обучающему окну;
+1. климатология каждой станции (среднее и масштаб остатка) подогнана только
+   по её обучающему окну;
 2. конформная таблица построена только по калибровочному окну и только
    на валидационных станциях;
 3. ни одно окно датасета не выходит за границу своего временного окна
@@ -85,17 +86,20 @@ def check_climatology(store, deep=False):
             _fail(f"климатология {sid}: подогнана по окну {got or 'неизвестно'}, "
                   f"а обучающее окно {want}")
         if deep:
-            from mayak.data.climatology import Climatology
-            from mayak.data.store import CLIM_PARAMS
+            from mayak.data.store import CLIM_PARAMS, new_climatology
             from mayak.timeaxis import window_calendar
             lo, hi = want
             d, h = window_calendar(s["t0"], np.arange(lo, hi))
-            ref = Climatology(CLIM_PARAMS["n_year"], CLIM_PARAMS["n_day"]).fit(
+            ref = new_climatology().fit(
                 d.astype(np.float64), h.astype(np.float64), s["x"][lo:hi, 0],
                 s["mask"][lo:hi, 0], min_valid=CLIM_PARAMS["min_valid"])
-            if not np.allclose(ref.beta, s["clim"].beta, rtol=1e-6, atol=1e-6):
-                _fail(f"климатология {sid}: коэффициенты не воспроизводятся "
-                      f"по обучающему окну {want}")
+            got = s["clim"]
+            same = (np.allclose(ref.beta, got.beta, rtol=1e-6, atol=1e-6)
+                    and got.scale_beta is not None
+                    and np.allclose(ref.scale_beta, got.scale_beta, rtol=1e-6, atol=1e-6))
+            if not same:
+                _fail(f"климатология {sid}: коэффициенты среднего или масштаба не "
+                      f"воспроизводятся по обучающему окну {want}")
 
 
 def check_windows(datasets, store=None):

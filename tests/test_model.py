@@ -33,6 +33,7 @@ def _toy_batch(B=2, L=L_MAX, seed=0):
         "doy_fut": doy_fut, "hour_fut": hour_fut,
         "y": torch.randn(B, H, generator=g),
         "y_mask": torch.ones(B, H),
+        "norm_scale": torch.full((B, H), 3.0),
     }
 
 
@@ -155,7 +156,7 @@ def test_backward():
 
     y = (12.0 + 6.0 * torch.sin(2.0 * math.pi * (L_MAX + hf) / 24.0) + torch.randn(2, H))
 
-    loss = mayak_loss(out, y, torch.ones_like(y))
+    loss = mayak_loss(out, dict(batch, y=y, y_mask=torch.ones_like(y)))
 
     assert torch.isfinite(loss), "loss должен быть конечным"
 

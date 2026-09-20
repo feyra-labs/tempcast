@@ -51,6 +51,7 @@ def _toy_batch(B=3, seed=0):
         "doy_fut": torch.rand(B, H, generator=g) * 365,
         "hour_fut": torch.rand(B, H, generator=g) * 24,
         "y": y, "y_mask": y_mask,
+        "norm_scale": 1.0 + 3.0 * torch.rand(B, H, generator=g),
     }
 
 
@@ -151,7 +152,7 @@ def test_training_with_masked_hours_equals_training_without_them():
         for i, (mdl, opt, b) in enumerate(zip(models, opts, (batch, garbage))):
             torch.manual_seed(100 + step)
             opt.zero_grad()
-            loss = mayak_loss(mdl(b), b["y"], b["y_mask"])
+            loss = mayak_loss(mdl(b), b)
             loss.backward()
             opt.step()
             losses[i].append(loss.item())
@@ -170,7 +171,7 @@ def test_baselines_loss_ignores_masked_hours(name):
     grads = []
     for y in (batch["y"], _with_garbage(batch["y"], batch["y_mask"], float("nan"))):
         model.zero_grad()
-        loss = pinball_loss(model(batch), y, batch["y_mask"])
+        loss = pinball_loss(model(batch), dict(batch, y=y))
         loss.backward()
         grads.append([p.grad.clone() for p in model.parameters() if p.grad is not None])
     assert all(torch.equal(a, b) for a, b in zip(*grads))

@@ -96,6 +96,8 @@ def seasonal_naive_forecast(x_hist, mask_hist, mu_clim_fut, sigma_clim, period=2
 
 
 class GRUSeq2Seq(nn.Module):
+    """GRU-кодировщик с прямой головой на весь горизонт."""
+
     def __init__(self, hidden=96, nq=len(QUANTILES)):
         super().__init__()
         self.nq = nq
@@ -131,10 +133,12 @@ class GRUSeq2Seq(nn.Module):
         offs = torch.cat([torch.zeros(H, 1, device=x.device), cum], dim=-1)
         offs = offs - offs[:, self.nq // 2:self.nq // 2 + 1]
         q = mu[..., None] + sig[..., None] * offs[None]
-        return {"q": q, "mu": mu, "sigma_c": sig}
+        return {"q": q, "mu": mu, "sigma": sig}
 
 
 class DLinear(nn.Module):
+    """DLinear: разложение скользящим средним и два линейных отображения по времени."""
+
     def __init__(self, L_in=672, kernel=25, nq=len(QUANTILES)):
         super().__init__()
         self.k = kernel
@@ -157,4 +161,4 @@ class DLinear(nn.Module):
         offs = torch.cat([torch.zeros(H, 1, device=T.device), torch.cumsum(gaps, -1)], dim=-1)
         offs = offs - offs[:, self.nq // 2:self.nq // 2 + 1]
         q = mu[..., None] + sig[..., None] * offs[None]
-        return {"q": q, "mu": mu, "sigma_c": sig}
+        return {"q": q, "mu": mu, "sigma": sig}

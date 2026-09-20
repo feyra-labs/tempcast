@@ -4,7 +4,7 @@
 состояния (<4 КБ). QC точки и watchdog-фолбэк — внутри StreamingMayak/safe_forecast.
 
 Запуск:
-    python -m mayak.runtime.run_inference --ckpt runs/stageB/best.ckpt \
+    python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt \
         --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2
 """
 import argparse, os

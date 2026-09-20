@@ -1,4 +1,4 @@
-"""Датасет обучающих окон с куррикулумом холодного старта и аугментациями"""
+"""Датасет обучающих окон с куррикулумом холодного старта и аугментациями."""
 import numpy as np
 import torch
 from torch.utils.data import Dataset, get_worker_info
@@ -50,6 +50,11 @@ def slice_target(x, mask, t):
     return enforce_invariant(x[fut, 0], mask[fut, 0])
 
 
+def norm_scale(clim, doy_f, hour_f):
+    """Нормировочный масштаб функции потерь на часах горизонта, °C, float32 (H,)."""
+    return clim.scale(doy_f, hour_f).astype(np.float32)
+
+
 def valid_starts(mask_T, lo, hi, step=1, cfg=DEFAULT_TARGET_MASK, history=0):
     """Кандидаты и годные старты t окна [lo, hi)."""
     cand = np.arange(lo + history, hi - H + 1, step, dtype=np.int64)
@@ -94,7 +99,7 @@ class WindowDataset(Dataset):
                 continue
             self.st.append(dict(
                 id=r["id"], lat=float(r["lat"]), lon=float(r["lon"]), elev=float(r["elev"]),
-                koppen=r["koppen"], x=x, mask=mask, N=N, t0=r["t0"],
+                koppen=r["koppen"], x=x, mask=mask, N=N, t0=r["t0"], clim=r["clim"],
                 tr=(lo, hi), starts=ok))
             zone_count[r["koppen"]] = zone_count.get(r["koppen"], 0) + 1
         self.filter_stats.report("train")
@@ -149,6 +154,7 @@ class WindowDataset(Dataset):
         fut = np.arange(t, t + H)
         doy_f, hour_f = window_calendar(s["t0"], fut)
         y, y_mask = slice_target(s["x"], s["mask"], t)
+        scale = norm_scale(s["clim"], doy_f, hour_f)
 
         lat, lon, elev = s["lat"], s["lon"], s["elev"]
 
@@ -190,6 +196,7 @@ class WindowDataset(Dataset):
             "hour_fut": torch.from_numpy(hour_f),
             "y": torch.from_numpy(y),
             "y_mask": torch.from_numpy(y_mask),
+            "norm_scale": torch.from_numpy(scale),
         }
 
 
@@ -211,6 +218,7 @@ class HoldoutDataset(Dataset):
             self.filter_stats.add(len(cand), len(ok))
             for t in ok.tolist():
                 self.meta.append(dict(id=r["id"], N=N, lo=lo, x=x, mask=mask, t=t, t0=r["t0"],
+                                      clim=r["clim"],
                                       lat=float(r["lat"]), lon=float(r["lon"]),
                                       elev=float(r["elev"]), koppen=r["koppen"],
                                       split=station_split, L=L))
@@ -247,4 +255,5 @@ class HoldoutDataset(Dataset):
             "doy_hist": torch.from_numpy(doy_h), "hour_hist": torch.from_numpy(hour_h),
             "doy_fut": torch.from_numpy(doy_f), "hour_fut": torch.from_numpy(hour_f),
             "y": torch.from_numpy(y), "y_mask": torch.from_numpy(y_mask),
+            "norm_scale": torch.from_numpy(norm_scale(m["clim"], doy_f, hour_f)),
         }

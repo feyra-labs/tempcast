@@ -130,10 +130,10 @@ flowchart LR
 
 <br>
 
-- **Лосс** (`mayak/loss.py`): pinball по 7 квантилям в аномальной шкале (нормировка на `σ` уравнивает вклад разных климатов) + регуляризаторы: KL паспорта, энергия мод, якорь интервала и затухание поправки при «мёртвой» энергии.
-- **Два этапа** (`scripts/train.py`): **A** — только `L=0` (стабилизация климат-поля; выбор лучшего поля по unseen-валидации), **B** — полный куррикулум длин истории. EMA весов; валидация на отложенных станциях.
+- **Лосс** (`mayak/loss.py`): pinball по 7 квантилям, где ошибка делится на **климатологический масштаб остатка станции** `norm_scale(doy, hour)` — он подгоняется по данным при сборке кэша и приходит в батче. Нормировка одна и та же для всех моделей и не зависит ни от одного их выхода. У МАЯК к ней добавляются регуляризаторы, не зависящие от цели: KL паспорта, энергия мод, якорь интервала и затухание поправки при «мёртвой» энергии.
+- **Единый протокол** (`mayak/protocol.py`, `scripts/train.py --arch ...`): два этапа — **A** только `L=0` (стабилизация климат-поля), **B** полный куррикулум длин истории; одинаковые шаги, батч, поток окон, оптимизатор, расписание, ранняя остановка, выбор чекпойнта по `val/loss` на валидационных станциях и EMA весов для всех архитектур. Отклонения от протокола объявляются явно и пишутся в журнал прогона `runs/<arch>/protocol.json`.
 - **Конформная доводка** (`scripts/calibrate.py`): сплит-конформная коррекция квантилей по бинам лидов на отдельном калибровочном периоде. Подтягивает покрытие к номиналу, не трогая точечный прогноз; на устройстве применяется тем же таблицей сдвигов.
-- **Бейзлайны** (`mayak/baselines.py`): климатология, damped persistence, seasonal-naive, GRU seq2seq, DLinear — обучаются тем же бюджетом и оцениваются на тех же окнах.
+- **Бейзлайны** (`mayak/baselines.py`): климатология, damped persistence, seasonal-naive, GRU seq2seq, DLinear — нейробейзлайны обучаются по тому же протоколу и с той же функцией потерь и оцениваются на тех же окнах.
 
 </details>
 
@@ -175,27 +175,24 @@ python scripts/make_splits.py --manifest data/manifest.csv
 # офлайн QC + климатология → кэш (повторный запуск при тех же данных — секунды)
 python scripts/build_cache.py --manifest data/manifest.csv --jobs 8
 
-# двухэтапное обучение МАЯК
-python scripts/train.py --manifest data/manifest.csv \
-    --steps-a 20000 --steps-b 200000 --batch 256 \
-    --accelerator gpu --precision 32
-
-# (опц.) нейробейзлайны для сравнения
-python scripts/train_neurobaselines.py --models gru dlinear --steps 200000
+# обучение по единому протоколу: модели отличаются только --arch
+python scripts/train.py --arch mayak   --manifest data/manifest.csv --accelerator gpu
+python scripts/train.py --arch gru     --manifest data/manifest.csv --accelerator gpu
+python scripts/train.py --arch dlinear --manifest data/manifest.csv --accelerator gpu
 ```
-Лучшие чекпойнты сохраняются в `runs/stageB/best.ckpt` (и `runs/baseline_*`).
+Лучшие чекпойнты сохраняются в `runs/<arch>/stageB/best.ckpt`, журнал прогона — в `runs/<arch>/protocol.json`.
 
 ### Оценка и воспроизведение графиков
 
 ```bash
 # конформная таблица (калибровка интервалов)
-python scripts/calibrate.py --ckpt runs/stageB/best.ckpt --out runs/conformal.npy
+python scripts/calibrate.py --ckpt runs/mayak/stageB/best.ckpt --out runs/conformal.npy
 
 # полный отчёт: таблицы метрик, графики по горизонту, примеры прогнозов,
 # разрез по климатическим зонам, холодный старт, влияние калибровки
-python -m mayak.evaluate --ckpt runs/stageB/best.ckpt \
-    --gru-ckpt runs/baseline_gru/best.ckpt \
-    --dlinear-ckpt runs/baseline_dlinear/best.ckpt \
+python -m mayak.evaluate --ckpt runs/mayak/stageB/best.ckpt \
+    --gru-ckpt runs/gru/stageB/best.ckpt \
+    --dlinear-ckpt runs/dlinear/stageB/best.ckpt \
     --conformal runs/conformal.npy --out-dir runs/plots \
     --n-examples 10
 ```
@@ -207,7 +204,7 @@ python -m mayak.evaluate --ckpt runs/stageB/best.ckpt \
 
 Понять вклад каждого компонента в **уже обученной** модели, без переобучения:
 ```bash
-python -m mayak.knockout --ckpt runs/stageB/best.ckpt
+python -m mayak.knockout --ckpt runs/mayak/stageB/best.ckpt
 ```
 Выключает по очереди солнечные каналы, группы мод, паспорт и т.д. через forward-hooks и печатает падение Skill по лидам.
 </details>
@@ -216,10 +213,10 @@ python -m mayak.knockout --ckpt runs/stageB/best.ckpt
 
 ```bash
 # экспорт (ONNX/int8 + копия конформной таблицы рядом с моделью)
-python scripts/export_onnx.py --ckpt runs/stageB/best.ckpt --out runtime/mayak.onnx
+python scripts/export_onnx.py --ckpt runs/mayak/stageB/best.ckpt --out runtime/mayak.onnx
 
 # потоковый инференс: восстановление состояния → почасовые шаги → выпуск прогноза
-python -m mayak.runtime.run_inference --ckpt runs/stageB/best.ckpt \
+python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt \
     --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2
 ```
 Потоковый рантайм (`runtime/streaming.py`) обновляет состояние за `O(M)` на новый час, переживает перезагрузку (сериализация < 4 КБ), при отказе датчиков плавно деградирует к климатологии (watchdog-фолбэк). Требуются **координаты точки и часы UTC** — без них солнечная геометрия не определена.
@@ -236,14 +233,15 @@ mayak/
   modules/        loc, field, passport, encoder, readout, propagator, heads
   model.py        сборка MAYAK
   astro.py        солнечно-календарные признаки, точка росы
-  loss.py         pinball метрика
-  lit.py          LightningModule (МАЯК и бейзлайны), EMA
+  loss.py         общая функция потерь (pinball / климатологический масштаб)
+  protocol.py     единый протокол обучения и функция запуска
+  lit.py          LightningModule (одна на все архитектуры), EMA
   baselines.py    климатология / damped / seasonal / GRU / DLinear
   data/           загрузчик, окна, суточные сводки, сплиты
   evaluate.py     метрики, графики, разрез по зонам, холодный старт
   knockout.py     абляции обученной модели (без переобучения)
   runtime/        treaming.py (потоковый рантайм), run_inference.py
-scripts/          make_synth, make_real, make_splits, train, train_baselines, calibrate, export_onnx, plot_loss
+scripts/          make_synth, make_real, make_splits, build_cache, train, train_neurobaselines, calibrate, export_onnx, plot_loss
 
 ```
 </details>

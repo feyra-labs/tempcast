@@ -6,7 +6,7 @@
 эффект поправки на тесте печатает mayak/evaluate.py (--conformal).
 
 Запуск:
-    python scripts/calibrate.py --ckpt runs/stageB/best.ckpt --out runs/conformal.npy
+    python scripts/calibrate.py --ckpt runs/mayak/stageB/best.ckpt --out runs/conformal.npy
 """
 import argparse
 

@@ -10,9 +10,13 @@ from mayak.modules.encoder import SynopticEncoder
 from mayak.modules.readout import LaplaceReadout
 from mayak.modules.propagator import ModalPropagator
 from mayak.modules.heads import Heads
+from mayak.loss import mayak_regularizers
 
 
 class MAYAK(nn.Module):
+    NO_WD_SUFFIX = ("raw_tau", "p_w", "p_k")
+    FIELD_WEIGHT_DECAY = 0.5
+
     def __init__(self):
         super().__init__()
         self.loc = LocEncoder()
@@ -22,6 +26,25 @@ class MAYAK(nn.Module):
         self.readout = LaplaceReadout()
         self.propagator = ModalPropagator()
         self.heads = Heads()
+
+    def regularization(self, out):
+        return mayak_regularizers(out)
+
+    def optim_groups(self, weight_decay):
+        """Группы параметров для оптимизатора протокола: [{name, params, weight_decay}]."""
+        no_decay, field, rest = [], [], []
+        for n, p in self.named_parameters():
+            if not p.requires_grad:
+                continue
+            if n.split(".")[-1] in self.NO_WD_SUFFIX:
+                no_decay.append(p)
+            elif n.startswith("field."):
+                field.append(p)
+            else:
+                rest.append(p)
+        return [dict(name="rest", params=rest, weight_decay=weight_decay),
+                dict(name="field", params=field, weight_decay=self.FIELD_WEIGHT_DECAY),
+                dict(name="no_decay", params=no_decay, weight_decay=0.0)]
 
     @staticmethod
     def lag_valid(v, k):

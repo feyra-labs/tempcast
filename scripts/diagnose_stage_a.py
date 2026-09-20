@@ -4,7 +4,7 @@
 и на обучающих (для сравнения — это окно в обучении не участвовало).
 
 Запуск:
-    python scripts/diagnose_stage_a.py --ckpt runs/stageA/best.ckpt
+    python scripts/diagnose_stage_a.py --ckpt runs/mayak/stageA/best.ckpt
 """
 import argparse
 import logging
@@ -23,7 +23,7 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     from mayak.lit import LitMayak
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True, help="чекпойнт этапа A (runs/stageA/best.ckpt)")
+    ap.add_argument("--ckpt", required=True, help="чекпойнт этапа A (runs/mayak/stageA/best.ckpt)")
     ap.add_argument("--manifest", default="data/manifest.csv")
     args = ap.parse_args()
 

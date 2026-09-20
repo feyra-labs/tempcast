@@ -24,8 +24,14 @@ from mayak.timeaxis import CALENDAR_VERSION, legacy_t0, window_calendar
 
 log = logging.getLogger(__name__)
 
-CACHE_FORMAT = "2"   # Увеличивать при изменении
-CLIM_PARAMS = dict(n_year=3, n_day=3, min_valid=24 * 30)
+CACHE_FORMAT = "3"   # Увеличивать при изменении
+CLIM_PARAMS = dict(n_year=3, n_day=3, scale_n_year=2, scale_n_day=2, min_valid=24 * 30)
+CLIM_BASIS = ("n_year", "n_day", "scale_n_year", "scale_n_day")
+
+
+def new_climatology():
+    """Пустая климатология с базисом из CLIM_PARAMS"""
+    return Climatology(**{k: CLIM_PARAMS[k] for k in CLIM_BASIS})
 
 
 def read_manifest(manifest):
@@ -93,13 +99,13 @@ def process_station(path):
     k = np.arange(lo, hi)
     doy, hour = window_calendar(src["t0"], k)
     try:
-        clim = Climatology(CLIM_PARAMS["n_year"], CLIM_PARAMS["n_day"]).fit(
+        clim = new_climatology().fit(
             doy.astype(np.float64), hour.astype(np.float64), x[lo:hi, 0], mask[lo:hi, 0],
             min_valid=CLIM_PARAMS["min_valid"])
     except ValueError as e:
         return dict(error=f"климатология: {e}")
     return dict(x=x, mask=mask, codes=codes, t0=src["t0"], beta=clim.beta, sigma=clim.sigma,
-                clim_fit=[int(lo), int(hi)])
+                scale_beta=clim.scale_beta, clim_fit=[int(lo), int(hi)])
 
 
 def _qc_fractions(codes):
@@ -129,7 +135,7 @@ def build_cache(manifest, cache_root=None, jobs=1, force=False):
     else:
         results = [process_station(p) for p in paths]
 
-    xs, ms, cs, betas, index, excluded, report = [], [], [], [], [], {}, []
+    xs, ms, cs, betas, scale_betas, index, excluded, report = [], [], [], [], [], [], {}, []
     off = 0
     for r, res in zip(rows, results):
         if "error" in res:
@@ -140,6 +146,7 @@ def build_cache(manifest, cache_root=None, jobs=1, force=False):
         ms.append(res["mask"]);
         cs.append(res["codes"])
         betas.append(res["beta"])
+        scale_betas.append(res["scale_beta"])
         index.append(dict(id=r["id"], offset=off, n=n, t0_utc_h=res["t0"], clim_sigma=res["sigma"],
                           clim_fit=res["clim_fit"]))
         report.append(dict(id=r["id"], n_hours=n, **_qc_fractions(res["codes"])))
@@ -157,6 +164,7 @@ def build_cache(manifest, cache_root=None, jobs=1, force=False):
     np.save(os.path.join(tmp, "mask.npy"), np.concatenate(ms))
     np.save(os.path.join(tmp, "qc.npy"), np.concatenate(cs))
     np.save(os.path.join(tmp, "clim_beta.npy"), np.stack(betas))
+    np.save(os.path.join(tmp, "clim_scale_beta.npy"), np.stack(scale_betas))
     with open(os.path.join(tmp, "index.json"), "w") as f:
         json.dump(index, f)
     all_codes = np.concatenate(cs)
@@ -199,6 +207,8 @@ def load_cache(path, rows, mmap=False):
     mask = np.load(os.path.join(path, "mask.npy"), mmap_mode=mode)
     qc = np.load(os.path.join(path, "qc.npy"), mmap_mode=mode)
     beta = np.load(os.path.join(path, "clim_beta.npy"))
+    scale_beta = np.load(os.path.join(path, "clim_scale_beta.npy"))
+    basis = {k: CLIM_PARAMS[k] for k in CLIM_BASIS}
     with open(os.path.join(path, "index.json")) as f:
         index = json.load(f)
     meta_of = {r["id"]: r for r in rows}
@@ -211,8 +221,7 @@ def load_cache(path, rows, mmap=False):
             koppen=r["koppen"], role=r.get("split"),
             x=x[a:a + n], mask=mask[a:a + n], qc=qc[a:a + n], N=n, t0=int(it["t0_utc_h"]),
             clim_fit=tuple(it["clim_fit"]),
-            clim=Climatology.from_params(beta[i], it["clim_sigma"],
-                                         CLIM_PARAMS["n_year"], CLIM_PARAMS["n_day"]))
+            clim=Climatology.from_params(beta[i], it["clim_sigma"], scale_beta[i], **basis))
     return store
 
 

@@ -16,7 +16,8 @@ from torch.utils.data import Dataset, DataLoader
 
 from mayak.constants import L_MAX, H, QUANTILES
 from mayak import baselines as BL
-from mayak.data.dataset import footprint, history_len, slice_history, slice_target, valid_starts
+from mayak.data.dataset import (footprint, history_len, norm_scale, slice_history, slice_target,
+                                valid_starts)
 from mayak.timeaxis import window_calendar
 from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats
 from mayak.metrics import (pinball_crps, metric_table, wmean, skill,
@@ -102,6 +103,7 @@ class EvalSet(Dataset):
             "hour_fut": torch.from_numpy(hour_f.astype(np.float32)),
             "y": torch.from_numpy(y),
             "y_mask": torch.from_numpy(y_mask),
+            "norm_scale": torch.from_numpy(norm_scale(clim, doy_f, hour_f)),
             "mu_clim_fut": torch.from_numpy(mu_clim_fut),
             "sigma_clim": torch.tensor(clim.sigma, dtype=torch.float32),
             "a_recent": torch.tensor(a_recent, dtype=torch.float32),
@@ -555,9 +557,9 @@ def main():
     import logging
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     import argparse
-    from mayak.lit import LitMayak, LitBaseline
+    from mayak.lit import LitMayak, load_model
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True, help="чекпойнт МАЯК (runs/stageB/best.ckpt)")
+    ap.add_argument("--ckpt", required=True, help="чекпойнт МАЯК (runs/mayak/stageB/best.ckpt)")
     ap.add_argument("--manifest", default="data/manifest.csv")
     ap.add_argument("--gru-ckpt", default=None)
     ap.add_argument("--dlinear-ckpt", default=None)
@@ -581,11 +583,9 @@ def main():
     mayak = LitMayak.load_from_checkpoint(args.ckpt, map_location="cpu").model
     named_extra = {}
     if args.gru_ckpt:
-        named_extra["GRU seq2seq"] = LitBaseline.load_from_checkpoint(
-            args.gru_ckpt, map_location="cpu").model
+        named_extra["GRU seq2seq"] = load_model(args.gru_ckpt)
     if args.dlinear_ckpt:
-        named_extra["DLinear"] = LitBaseline.load_from_checkpoint(
-            args.dlinear_ckpt, map_location="cpu").model
+        named_extra["DLinear"] = load_model(args.dlinear_ckpt)
 
     named_all = {"МАЯК": mayak, **named_extra}
     preds, aux = collect_predictions(named_all, ds)
