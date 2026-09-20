@@ -2,13 +2,26 @@
 import copy
 import torch
 import pytorch_lightning as L
+from pytorch_lightning.callbacks import Callback
 
+from mayak.leakage import SELECTION_KEY, selection_record
 from mayak.model import MAYAK
 from mayak.loss import mayak_loss, pinball_loss
 from mayak.baselines import GRUSeq2Seq, DLinear
 
 NO_WD_SUFFIX = ("raw_tau", "p_w", "p_k")
 LEADS = [1, 3, 6, 12, 24, 48, 72, 120, 168]
+
+
+class SelectionProvenance(Callback):
+    """Кладёт в каждый сохраняемый чекпойнт запись о том, на чём он выбирался:
+    метрика монитора, роль станций и временное окно валидационного датасета.
+     Без этой записи чек-лист не примет чекпойнт."""
+
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        cb = trainer.checkpoint_callback
+        monitor = getattr(cb, "monitor", None)
+        checkpoint[SELECTION_KEY] = selection_record(trainer.datamodule.val_ds, monitor)
 
 
 class EMA:

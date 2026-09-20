@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, get_worker_info
 from mayak.constants import L_MAX, H
 from mayak.data.masking import (DEFAULT_TARGET_MASK, FilterStats, enforce_invariant,
                                 target_window_ok)
-from mayak.data.splits import time_bounds
+from mayak.data.splits import ROLE_TRAIN, ROLE_VAL, time_bounds
 from mayak.data.store import get_store
 from mayak.timeaxis import window_calendar
 
@@ -50,9 +50,20 @@ def slice_target(x, mask, t):
     return enforce_invariant(x[fut, 0], mask[fut, 0])
 
 
-def valid_starts(mask_T, lo, hi, step=1, cfg=DEFAULT_TARGET_MASK):
-    cand = np.arange(lo + 1, hi - H, step, dtype=np.int64)
+def valid_starts(mask_T, lo, hi, step=1, cfg=DEFAULT_TARGET_MASK, history=0):
+    """Кандидаты и годные старты t окна [lo, hi)."""
+    cand = np.arange(lo + history, hi - H + 1, step, dtype=np.int64)
     return cand, cand[target_window_ok(mask_T, cand, H, cfg)]
+
+
+def history_len(L, t, lo):
+    """Фактическая длина истории: не больше L_MAX и не раньше начала окна сплита."""
+    return int(max(0, min(L_MAX if L is None else L, L_MAX, t - lo)))
+
+
+def footprint(t, L, lo):
+    """Часы, которые читает сэмпл: [t − фактическая история, t + H)."""
+    return t - history_len(L, t, lo), t + H
 
 
 class WindowDataset(Dataset):
@@ -67,7 +78,8 @@ class WindowDataset(Dataset):
         self.seed_streams(worker_id=0, salt=0)
 
         store = store or get_store(manifest)
-        rows = store.by_role("train")
+        self.station_role, self.time_key = ROLE_TRAIN, "train"
+        rows = store.by_role(ROLE_TRAIN)
         assert rows, "нет train-станций — запустите make_splits.py"
 
         self.st = []
@@ -75,13 +87,13 @@ class WindowDataset(Dataset):
         self.filter_stats = FilterStats()
         for r in rows:
             x, mask, N = r["x"], r["mask"], r["N"]
-            lo, hi = time_bounds(N)["train"]
+            lo, hi = time_bounds(N)[self.time_key]
             cand, ok = valid_starts(mask[:, 0], lo, hi, cfg=target_mask)
             self.filter_stats.add(len(cand), len(ok))
             if len(ok) == 0:
                 continue
             self.st.append(dict(
-                lat=float(r["lat"]), lon=float(r["lon"]), elev=float(r["elev"]),
+                id=r["id"], lat=float(r["lat"]), lon=float(r["lon"]), elev=float(r["elev"]),
                 koppen=r["koppen"], x=x, mask=mask, N=N, t0=r["t0"],
                 tr=(lo, hi), starts=ok))
             zone_count[r["koppen"]] = zone_count.get(r["koppen"], 0) + 1
@@ -93,6 +105,13 @@ class WindowDataset(Dataset):
 
     def seed_streams(self, worker_id=0, salt=0):
         self.rng_sample, self.rng_aug = make_streams(self.base_seed, worker_id, salt)
+
+    def footprints(self):
+        for s in self.st:
+            lo = s["tr"][0]
+            t = s["starts"]
+            yield dict(sid=s["id"], N=s["N"], time_key=self.time_key,
+                       lo=t - np.minimum(L_MAX, t - lo), hi=t + H)
 
     def __len__(self):
         return self.n
@@ -117,8 +136,7 @@ class WindowDataset(Dataset):
         lo, _hi = s["tr"]
         t = int(s["starts"][r.integers(len(s["starts"]))])
 
-        L = self._sample_L()
-        L = min(L, t - lo)
+        L = history_len(self._sample_L(), t, lo)
         return self.build(s, t, L)
 
     def build(self, s, t, L):
@@ -178,19 +196,21 @@ class WindowDataset(Dataset):
 class HoldoutDataset(Dataset):
     """Детерминированные окна для валидации/оценки: фиксированный L, без аугментаций"""
 
-    def __init__(self, manifest, station_split="unseen_val", time_key="calib",
+    def __init__(self, manifest, station_split=ROLE_VAL, time_key="val",
                  every_hours=72, L=L_MAX, max_windows=8000,
                  target_mask=DEFAULT_TARGET_MASK, store=None):
         store = store or get_store(manifest)
+        self.station_role, self.time_key = station_split, time_key
         self.meta = []
         self.filter_stats = FilterStats()
         for r in store.by_role(station_split):
             x, mask, N = r["x"], r["mask"], r["N"]
             lo, hi = time_bounds(N)[time_key]
-            cand, ok = valid_starts(mask[:, 0], lo, hi, every_hours, cfg=target_mask)
+            cand, ok = valid_starts(mask[:, 0], lo, hi, every_hours, cfg=target_mask,
+                                    history=L_MAX)
             self.filter_stats.add(len(cand), len(ok))
             for t in ok.tolist():
-                self.meta.append(dict(x=x, mask=mask, t=t, t0=r["t0"],
+                self.meta.append(dict(id=r["id"], N=N, lo=lo, x=x, mask=mask, t=t, t0=r["t0"],
                                       lat=float(r["lat"]), lon=float(r["lon"]),
                                       elev=float(r["elev"]), koppen=r["koppen"],
                                       split=station_split, L=L))
@@ -202,10 +222,16 @@ class HoldoutDataset(Dataset):
     def __len__(self):
         return len(self.meta)
 
+    def footprints(self):
+        for m in self.meta:
+            lo, hi = footprint(m["t"], m["L"], m["lo"])
+            yield dict(sid=m["id"], N=m["N"], time_key=self.time_key,
+                       lo=np.array([lo]), hi=np.array([hi]))
+
     def __getitem__(self, i):
         m = self.meta[i]
-        t, L = m["t"], m["L"]
-        L = min(L, t)
+        t = m["t"]
+        L = history_len(m["L"], t, m["lo"])
         k = np.arange(L_MAX)
         abs_h = t - L_MAX + k
         doy_h, hour_h = window_calendar(m["t0"], abs_h)

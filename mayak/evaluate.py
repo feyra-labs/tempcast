@@ -16,7 +16,7 @@ from torch.utils.data import Dataset, DataLoader
 
 from mayak.constants import L_MAX, H, QUANTILES
 from mayak import baselines as BL
-from mayak.data.dataset import slice_history, slice_target, valid_starts
+from mayak.data.dataset import footprint, history_len, slice_history, slice_target, valid_starts
 from mayak.timeaxis import window_calendar
 from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats
 from mayak.metrics import (pinball_crps, metric_table, wmean, skill,
@@ -47,14 +47,17 @@ class EvalSet(Dataset):
         from mayak.data.splits import time_bounds
         from mayak.data.store import read_manifest
         split_of = {r["id"]: r.get("split") for r in read_manifest(manifest)}
+        self.station_splits, self.time_key = tuple(station_splits), time_key
         self.items = []
+        self.bounds = {}
         self.filter_stats = FilterStats()
         for sid, s in clims.items():
             sp = split_of.get(sid)
             if sp not in station_splits:
                 continue
-            lo, hi = time_bounds(s["N"])[time_key]
-            cand, ok = valid_starts(s["mask"][:, 0], lo, hi, every_hours, cfg=target_mask)
+            lo, hi = self.bounds[sid] = time_bounds(s["N"])[time_key]
+            cand, ok = valid_starts(s["mask"][:, 0], lo, hi, every_hours, cfg=target_mask,
+                                    history=L_MAX)
             self.filter_stats.add(len(cand), len(ok))
             for t in ok.tolist():
                 self.items.append((sid, t, "seen" if sp == "train" else "unseen"))
@@ -67,17 +70,18 @@ class EvalSet(Dataset):
     def __len__(self):
         return len(self.items)
 
+    def footprints(self):
+        for sid, t, _seen in self.items:
+            lo, hi = footprint(t, self.L, self.bounds[sid][0])
+            yield dict(sid=sid, N=self.clims[sid]["N"], time_key=self.time_key,
+                       lo=np.array([lo]), hi=np.array([hi]))
+
     def __getitem__(self, i):
         sid, t, seen = self.items[i]
         s = self.clims[sid]
         clim = s["clim"]
         t0 = s["t0"]
-        if self.L is None:
-            L = min(t, L_MAX)
-        elif self.L == 0:
-            L = 0
-        else:
-            L = min(self.L, t, L_MAX)
+        L = history_len(self.L, t, self.bounds[sid][0])
         k = np.arange(L_MAX)
         abs_h = t - L_MAX + k
         doy_h, hour_h = window_calendar(t0, abs_h)
@@ -465,7 +469,7 @@ def calibration_quality_report(model, clims, shift, manifest="data/manifest.csv"
 
 
 def stage_a_field_check(model, clims, manifest="data/manifest.csv",
-                        station_split="unseen_val", time_key="test"):
+                        station_split="unseen_val", time_key="val"):
     """Критерий этапа A"""
     ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest,
                  time_key=time_key, L=0)
@@ -490,7 +494,7 @@ def stage_a_field_check(model, clims, manifest="data/manifest.csv",
 
 @torch.no_grad()
 def pure_field_check(model, clims, manifest="data/manifest.csv",
-                     station_split="unseen_val", time_key="test"):
+                     station_split="unseen_val", time_key="val"):
     """Чистое поле: field.coefficients(loc) БЕЗ паспорта (z=None) и БЕЗ r-головы."""
     from mayak.astro import astro_features
     ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest,
@@ -514,8 +518,9 @@ def pure_field_check(model, clims, manifest="data/manifest.csv",
 
 
 @torch.no_grad()
-def l0_decompose(model, clims, manifest="data/manifest.csv", station_split="train"):
-    ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest, time_key="test", L=0)
+def l0_decompose(model, clims, manifest="data/manifest.csv", station_split="train",
+                 time_key="val"):
+    ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest, time_key=time_key, L=0)
     model.eval()
     Z = []
     sr = oo = ee = 0.0
@@ -561,8 +566,17 @@ def main():
     ap.add_argument("--n-examples", type=int, default=10, help="число примеров прогноз vs факт")
     args = ap.parse_args()
 
-    clims = BL.fit_climatologies(args.manifest)
-    r = BL.fit_damped_persistence(clims, n_windows=20000)
+    from mayak.data.splits import ROLE_TRAIN
+    from mayak.data.store import get_store
+    from mayak.leakage import run_checklist
+    store = get_store(args.manifest)
+    clims = store.clims()
+    ds = EvalSet(clims, manifest=args.manifest, time_key="test")
+    run_checklist(store, datasets=[ds], conformal=args.conformal,
+                  checkpoints=[c for c in (args.ckpt, args.gru_ckpt, args.dlinear_ckpt) if c])
+
+    r = BL.fit_damped_persistence({k: s for k, s in clims.items() if s["role"] == ROLE_TRAIN},
+                                  n_windows=20000)
 
     mayak = LitMayak.load_from_checkpoint(args.ckpt, map_location="cpu").model
     named_extra = {}
@@ -573,7 +587,6 @@ def main():
         named_extra["DLinear"] = LitBaseline.load_from_checkpoint(
             args.dlinear_ckpt, map_location="cpu").model
 
-    ds = EvalSet(clims, manifest=args.manifest, time_key="test")
     named_all = {"МАЯК": mayak, **named_extra}
     preds, aux = collect_predictions(named_all, ds)
     preds = add_statistical_baselines(preds, aux, r_damped=r)

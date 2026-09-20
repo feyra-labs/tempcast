@@ -24,7 +24,7 @@ from mayak.timeaxis import CALENDAR_VERSION, legacy_t0, window_calendar
 
 log = logging.getLogger(__name__)
 
-CACHE_FORMAT = "1"
+CACHE_FORMAT = "2"   # Увеличивать при изменении
 CLIM_PARAMS = dict(n_year=3, n_day=3, min_valid=24 * 30)
 
 
@@ -86,7 +86,10 @@ def process_station(path):
     src = read_source(path)
     x, mask, codes = qc_station(src["T"], src["P"], src["RH"], src["valid"])
     n = x.shape[0]
-    lo, hi = time_bounds(n)["train"]
+    try:
+        lo, hi = time_bounds(n)["train"]
+    except ValueError as e:
+        return dict(error=f"сплиты: {e}")
     k = np.arange(lo, hi)
     doy, hour = window_calendar(src["t0"], k)
     try:
@@ -95,7 +98,8 @@ def process_station(path):
             min_valid=CLIM_PARAMS["min_valid"])
     except ValueError as e:
         return dict(error=f"климатология: {e}")
-    return dict(x=x, mask=mask, codes=codes, t0=src["t0"], beta=clim.beta, sigma=clim.sigma)
+    return dict(x=x, mask=mask, codes=codes, t0=src["t0"], beta=clim.beta, sigma=clim.sigma,
+                clim_fit=[int(lo), int(hi)])
 
 
 def _qc_fractions(codes):
@@ -136,7 +140,8 @@ def build_cache(manifest, cache_root=None, jobs=1, force=False):
         ms.append(res["mask"]);
         cs.append(res["codes"])
         betas.append(res["beta"])
-        index.append(dict(id=r["id"], offset=off, n=n, t0_utc_h=res["t0"], clim_sigma=res["sigma"]))
+        index.append(dict(id=r["id"], offset=off, n=n, t0_utc_h=res["t0"], clim_sigma=res["sigma"],
+                          clim_fit=res["clim_fit"]))
         report.append(dict(id=r["id"], n_hours=n, **_qc_fractions(res["codes"])))
         off += n
     if not index:
@@ -177,11 +182,6 @@ def build_cache(manifest, cache_root=None, jobs=1, force=False):
 
 @dataclass
 class StationStore:
-    """Все станции в памяти. Записи dict с полями, которые ждут потребители:
-    id, lat, lon, elev, koppen, role, x (float32), mask (uint8), qc (uint8),
-    N, t0 (часы UTC от эпохи), clim (Climatology).
-    x/mask/qc — представления (view) общих массивов, а не копии.
-    """
     key: str
     path: str
     stations: dict = field(default_factory=dict)
@@ -210,6 +210,7 @@ def load_cache(path, rows, mmap=False):
             id=it["id"], lat=float(r["lat"]), lon=float(r["lon"]), elev=float(r["elev"]),
             koppen=r["koppen"], role=r.get("split"),
             x=x[a:a + n], mask=mask[a:a + n], qc=qc[a:a + n], N=n, t0=int(it["t0_utc_h"]),
+            clim_fit=tuple(it["clim_fit"]),
             clim=Climatology.from_params(beta[i], it["clim_sigma"],
                                          CLIM_PARAMS["n_year"], CLIM_PARAMS["n_day"]))
     return store

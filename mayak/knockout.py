@@ -107,13 +107,17 @@ def knockout_table(model, clims, manifest="data/manifest.csv", time_key="test",
 
 def main():
     import argparse
-    from mayak import baselines as BL
     from mayak.lit import LitMayak
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--manifest", default="data/manifest.csv")
     args = ap.parse_args()
-    clims = BL.fit_climatologies(args.manifest)
+    from mayak.data.store import get_store
+    from mayak.leakage import run_checklist
+    store = get_store(args.manifest)
+    clims = store.clims()
+    run_checklist(store, datasets=[EvalSet(clims, manifest=args.manifest, time_key="test")],
+                  checkpoints=[args.ckpt])
     m = LitMayak.load_from_checkpoint(args.ckpt, map_location="cpu").model
     knockout_table(m, clims, args.manifest)
     knockout_table(m, clims, args.manifest, L=0,

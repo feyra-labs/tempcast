@@ -1,9 +1,22 @@
+"""Сплит-конформная поправка квантилей.
+
+Подгоняется строго на валидационных станциях в калибровочном окне. Рядом с
+таблицей сохраняются метаданные (<out>.meta.json): по ним чек-лист антиутечек
+проверяет, на каких данных она построена. Тестовое окно здесь не используется,
+эффект поправки на тесте печатает mayak/evaluate.py (--conformal).
+
+Запуск:
+    python scripts/calibrate.py --ckpt runs/stageB/best.ckpt --out runs/conformal.npy
+"""
 import argparse
+
 import numpy as np
 
 from mayak.constants import H
-from mayak import baselines as BL
+from mayak.data.splits import ROLE_VAL
+from mayak.data.store import get_store
 from mayak.evaluate import EvalSet, gather
+from mayak.leakage import CONFORMAL_TIME_KEY, conformal_record, run_checklist, save_conformal
 from mayak.metrics import coverage, fit_conformal_shift
 
 LEAD_BINS = [(1, 6), (7, 24), (25, 72), (73, 168)]
@@ -16,9 +29,13 @@ def lead_bin_index(h1):
     return len(LEAD_BINS) - 1
 
 
+def calibration_set(clims, manifest="data/manifest.csv"):
+    return EvalSet(clims, station_splits=(ROLE_VAL,), manifest=manifest,
+                   time_key=CONFORMAL_TIME_KEY, every_hours=24)
+
+
 def fit_conformal(model, clims, manifest="data/manifest.csv"):
-    ds = EvalSet(clims, manifest=manifest, time_key="calib", every_hours=24)
-    D = gather(model, ds)
+    D = gather(model, calibration_set(clims, manifest))
     return fit_conformal_shift(D["y"], D["q"], D["y_mask"], LEAD_BINS)
 
 
@@ -40,19 +57,22 @@ def main():
     ap.add_argument("--manifest", default="data/manifest.csv")
     ap.add_argument("--out", default="runs/conformal.npy")
     args = ap.parse_args()
-    lit = LitMayak.load_from_checkpoint(args.ckpt, map_location="cpu")
 
-    clims = BL.fit_climatologies(args.manifest)
-    shift = fit_conformal(lit.model, clims, args.manifest)
-    np.save(args.out, shift)
+    store = get_store(args.manifest)
+    clims = store.clims()
+    ds = calibration_set(clims, args.manifest)
+    run_checklist(store, datasets=[ds], checkpoints=[args.ckpt])
+
+    lit = LitMayak.load_from_checkpoint(args.ckpt, map_location="cpu")
+    D = gather(lit.model, ds)
+    shift = fit_conformal_shift(D["y"], D["q"], D["y_mask"], LEAD_BINS)
+    save_conformal(args.out, shift, conformal_record(ds, checkpoint=args.ckpt))
     print("Таблица поправок (бины лидов × квантили), °C:")
     print(np.round(shift, 3))
 
-    ds = EvalSet(clims, manifest=args.manifest, time_key="test", every_hours=72)
-    D = gather(lit.model, ds)
     before = coverage(D["y"], D["q"], D["y_mask"])
     after = coverage(D["y"], apply_conformal(D["q"], shift), D["y_mask"])
-    print(f"PICP-90 на тесте: до {before:.1%}  →  после {after:.1%}  (цель 86–94%)")
+    print(f"PICP-90 на калибровочном окне (в выборке): до {before:.1%}  →  после {after:.1%}")
 
 
 if __name__ == "__main__":

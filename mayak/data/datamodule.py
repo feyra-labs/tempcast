@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from mayak.data.dataset import HoldoutDataset, WindowDataset, seed_worker
+from mayak.data.splits import ROLE_VAL
 from mayak.data.store import get_store
 
 
@@ -19,14 +20,17 @@ class MayakData(L.LightningDataModule):
         self.save_hyperparameters()
 
     def setup(self, stage=None):
+        if getattr(self, "train_ds", None) is not None:
+            return
         h = self.hparams
         store = get_store(h.manifest)
         self.train_ds = WindowDataset(h.manifest, split="train",
                                       curriculum=h.curriculum,
                                       windows_per_epoch=h.windows_per_epoch,
                                       seed=h.seed, store=store)
-        self.val_ds = HoldoutDataset(h.manifest, station_split="unseen_val",
-                                     time_key="calib", every_hours=72, L=h.val_L,
+        self.store = store
+        self.val_ds = HoldoutDataset(h.manifest, station_split=ROLE_VAL,
+                                     time_key="val", every_hours=72, L=h.val_L,
                                      store=store)
 
     def train_dataloader(self):
