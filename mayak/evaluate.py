@@ -1,57 +1,93 @@
 """Единый стенд оценки МАЯК.
 
-Содержит:
-  * EvalSet — окна для оценки (seen/unseen станции, произвольная длина истории L);
-  * базовые метрики (MAE/RMSE/Skill/CRPS/PICP/Winkler) и печать таблиц;
-  * сбор предсказаний МАЯК + нейробейзлайнов (GRU/DLinear) + статистических бейзлайнов;
-  * графики по каждой метрике (Skill/MAE/RMSE/CRPS/PICP90/Winkler) — линия на модель;
-  * разрез метрик по климатическим зонам Кёппена;
-  * кривую холодного старта и проверку L=0 (медиана = поле, интервалы калиброваны);
+Все числа считает ``mayak/metrics.py`` - здесь только сбор окон, сбор
+предсказаний и печать. Содержит:
+
+  * EvalSet — окна для оценки со стратифицированной подвыборкой (фиксированное
+    число окон с каждой станции) и метаданными окон для разрезов;
+  * сбор предсказаний МАЯК + нейробейзлайнов (GRU/DLinear) + статистических;
+  * таблицы в двух видах агрегирования — пуловом и макро - с доверительными
+    интервалами блочного бутстрапа по станциям;
+  * разрезы: по лидам, ролям станций, полным зонам Кёппена, сезонам, длине
+    доступной истории и доле валидных часов в истории;
+  * метрики надёжности: гистограмма PIT, диаграмма надёжности, острота против
+    покрытия;
+  * графики по каждой метрике, кривую холодного старта и проверку L=0;
   * отчёт о влиянии конформной калибровки (PICP/CRPS/MAE до и после);
-  * проверки этапа A (поле), декомпозицию L=0, суточные амплитуды, ablation-сравнение."""
+  * проверки этапа A (поле), декомпозицию L=0, суточные амплитуды, ablation.
+"""
 import os
+
 import numpy as np
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 
-from mayak.constants import L_MAX, H, QUANTILES
 from mayak import baselines as BL
+from mayak.constants import H, L_MAX, QUANTILES
 from mayak.data.dataset import (footprint, history_len, norm_scale, slice_history, slice_target,
                                 valid_starts)
-from mayak.timeaxis import window_calendar
 from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats
-from mayak.metrics import (pinball_crps, metric_table, wmean, skill,
-                           coverage, inside)
+from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, apply_conformal, breakdown,
+                           by_lead, coverage, metric_table, pinball_crps, seed_spread, skill,
+                           wmean)
+from mayak.timeaxis import window_calendar, window_month
+from mayak.zones import SEASON_RU, normalize_zone, season_of
 
 Q = np.array(QUANTILES, np.float32)
-SEASON = ["DJF", "MAM", "JJA", "SON"]
-FINE_LEADS = (1, 2, 3, 4, 6, 8, 12, 18, 24, 36, 48, 72, 96, 120, 144, 168)
-LEAD_BINS = [(1, 6), (7, 24), (25, 72), (73, 168)]
+
+HISTORY_BINS = ((0, 0, "L=0"), (1, 24, "L 1-24ч"), (25, 168, "L 25-168ч"),
+                (169, L_MAX, f"L 169-{L_MAX}ч"))
+HIST_VALID_BINS = ((-0.01, 0.5, "<50%"), (0.5, 0.8, "50-80%"),
+                   (0.8, 0.95, "80-95%"), (0.95, 1.01, "95-100%"))
+MIN_WINDOWS, MIN_STATIONS = 20, 2
+BOOTSTRAP = dict(n_boot=1000, seed=0, level=0.90)
+
+BENCHMARK_NOTE = (
+    "Эталон скилла — эмпирическая климатология самой станции, подогнанная по её\n"
+    "многолетнему обучающему окну. При короткой истории эталон располагает бо́льшим\n"
+    "объёмом информации о станции, чем модель: оценка строга в пользу эталона.\n"
+    "Пуловая метрика — по всем парам «окно × лид» сразу, её доминируют станции\n"
+    "с большой изменчивостью; макро — среднее по станциям, «типичная станция».")
 
 
-def _season(doy):
-    return SEASON[int(((doy % 365.24) // 91.31)) % 4]
+def bin_label(value, bins):
+    for lo, hi, name in bins:
+        if lo <= value <= hi:
+            return name
+    return "прочее"
 
 
-def _bin(h1):
-    for i, (a, b) in enumerate(LEAD_BINS):
-        if a <= h1 <= b:
-            return i
-    return len(LEAD_BINS) - 1
+def stratified_items(per_station, max_windows=None, windows_per_station=None):
+    """Стратифицированная подвыборка окон: фиксированное число окон со станции."""
+    stations = [sid for sid, ts in per_station.items() if len(ts)]
+    if not stations:
+        return []
+    k = windows_per_station
+    if k is None and max_windows:
+        k = max(1, int(max_windows) // len(stations))
+    out = []
+    for sid in stations:
+        ts = list(per_station[sid])
+        if k is not None and len(ts) > k:
+            idx = np.unique(np.linspace(0, len(ts) - 1, k).round().astype(np.int64))
+            ts = [ts[i] for i in idx]
+        out += [(sid, int(t)) for t in ts]
+    return out
 
 
 class EvalSet(Dataset):
+    """Окна для оценки. ``items`` - пары (станция, час начала горизонта)."""
     def __init__(self, clims, station_splits=("train", "unseen_test"),
                  manifest="data/manifest.csv", time_key="test",
-                 every_hours=72, L=None, max_windows=6000,
+                 every_hours=72, L=None, max_windows=6000, windows_per_station=None,
                  target_mask=DEFAULT_TARGET_MASK):
         from mayak.data.splits import time_bounds
         from mayak.data.store import read_manifest
         split_of = {r["id"]: r.get("split") for r in read_manifest(manifest)}
         self.station_splits, self.time_key = tuple(station_splits), time_key
-        self.items = []
-        self.bounds = {}
+        self.bounds, self.roles = {}, {}
         self.filter_stats = FilterStats()
+        per_station = {}
         for sid, s in clims.items():
             sp = split_of.get(sid)
             if sp not in station_splits:
@@ -60,11 +96,10 @@ class EvalSet(Dataset):
             cand, ok = valid_starts(s["mask"][:, 0], lo, hi, every_hours, cfg=target_mask,
                                     history=L_MAX)
             self.filter_stats.add(len(cand), len(ok))
-            for t in ok.tolist():
-                self.items.append((sid, t, "seen" if sp == "train" else "unseen"))
+            self.roles[sid] = sp
+            per_station[sid] = ok.tolist()
         self.filter_stats.report(f"eval/{time_key}")
-        if len(self.items) > max_windows:
-            self.items = self.items[:: len(self.items) // max_windows][:max_windows]
+        self.items = stratified_items(per_station, max_windows, windows_per_station)
         self.clims = clims
         self.L = L
 
@@ -72,13 +107,30 @@ class EvalSet(Dataset):
         return len(self.items)
 
     def footprints(self):
-        for sid, t, _seen in self.items:
+        for sid, t in self.items:
             lo, hi = footprint(t, self.L, self.bounds[sid][0])
             yield dict(sid=sid, N=self.clims[sid]["N"], time_key=self.time_key,
                        lo=np.array([lo]), hi=np.array([hi]))
 
+    def window_meta(self):
+        sid_a, role, zone, season, hist, hvalid = [], [], [], [], [], []
+        for sid, t in self.items:
+            s = self.clims[sid]
+            L = history_len(self.L, t, self.bounds[sid][0])
+            m = s["mask"][t - L:t, 0] if L > 0 else np.zeros(0, np.float32)
+            month = int(np.asarray(window_month(s["t0"], [t])).ravel()[0])
+            sid_a.append(sid)
+            role.append(self.roles[sid])
+            zone.append(normalize_zone(s["koppen"]))
+            season.append(SEASON_RU[season_of(month, s["lat"])])
+            hist.append(L)
+            hvalid.append(float((m > 0).mean()) if L > 0 else 0.0)
+        return dict(station=np.array(sid_a, object), role=np.array(role, object),
+                    zone=np.array(zone, object), season=np.array(season, object),
+                    history=np.array(hist, np.int64), hist_valid=np.array(hvalid, np.float64))
+
     def __getitem__(self, i):
-        sid, t, seen = self.items[i]
+        sid, t = self.items[i]
         s = self.clims[sid]
         clim = s["clim"]
         t0 = s["t0"]
@@ -107,32 +159,18 @@ class EvalSet(Dataset):
             "mu_clim_fut": torch.from_numpy(mu_clim_fut),
             "sigma_clim": torch.tensor(clim.sigma, dtype=torch.float32),
             "a_recent": torch.tensor(a_recent, dtype=torch.float32),
-            "koppen_id": torch.tensor(hash(s["koppen"]) % 100, dtype=torch.long),
-            "season_id": torch.tensor(_season(float(doy_f[0])).__hash__() % 4, dtype=torch.long),
-            "seen": torch.tensor(0 if seen == "seen" else 1, dtype=torch.long),
         }
-
-
-def mse_clim_per_lead(y, mu_clim, w):
-    return wmean((mu_clim - y) ** 2, w, axis=0)
 
 
 def coverage90(y, q, w):
     return coverage(y, q, w)
 
 
-def apply_conformal(q, shift):
-    q = np.array(q, np.float32, copy=True)
-    for h in range(q.shape[-2]):
-        q[..., h, :] += shift[_bin(h + 1)]
-    return np.maximum.accumulate(q, axis=-1)
-
-
 @torch.no_grad()
 def gather(model, dataset, device="cpu", batch_size=128):
     model.eval().to(device)
     dl = DataLoader(dataset, batch_size=batch_size)
-    ys, yms, mus, qs, mucl, seen = [], [], [], [], [], []
+    ys, yms, mus, qs, mucl = [], [], [], [], []
     a_rec, sig_cl, xh, mh = [], [], [], []
     for b in dl:
         bb = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
@@ -142,13 +180,12 @@ def gather(model, dataset, device="cpu", batch_size=128):
         mus.append(o["mu"].cpu().numpy())
         qs.append(o["q"].cpu().numpy())
         mucl.append(b["mu_clim_fut"].numpy())
-        seen.append(b["seen"].numpy())
         a_rec.append(b["a_recent"].numpy())
         sig_cl.append(b["sigma_clim"].numpy())
         xh.append(b["x_hist"].numpy())
         mh.append(b["mask_hist"].numpy())
     cat = lambda L: np.concatenate(L, 0)
-    return dict(y=cat(ys), y_mask=cat(yms), mu=cat(mus), q=cat(qs), mu_clim=cat(mucl), seen=cat(seen),
+    return dict(y=cat(ys), y_mask=cat(yms), mu=cat(mus), q=cat(qs), mu_clim=cat(mucl),
                 a_recent=cat(a_rec), sigma_clim=cat(sig_cl), x_hist=cat(xh), mask_hist=cat(mh))
 
 
@@ -179,6 +216,7 @@ def collect_predictions(named_models, ds, device="cpu"):
         D = gather(mdl, ds, device=device)
         if aux is None:
             aux = D
+            aux["meta"] = ds.window_meta()
         preds[name] = dict(mu=D["mu"], q=D["q"])
     return preds, aux
 
@@ -195,10 +233,59 @@ def add_statistical_baselines(preds, aux, r_damped=None):
     return preds
 
 
+def evaluation_for(pred, aux, shift=None):
+    """Предсказания одной модели → ``Evaluation``"""
+    ev = Evaluation(y=aux["y"], mu=pred["mu"], q=pred["q"], mu_clim=aux["mu_clim"],
+                    w=aux["y_mask"], station=aux["meta"]["station"])
+    return ev.with_conformal(shift)
+
+
+def evaluations(preds, aux, shift=None):
+    return {name: evaluation_for(p, aux, shift) for name, p in preds.items()}
+
+
 def build_tables(preds, aux, leads=FINE_LEADS):
+    """Пуловые таблицы по лидам - вход для графиков ``plot_metric_curves``."""
     y, w, muc = aux["y"], aux["y_mask"], aux["mu_clim"]
     return {name: metric_table(y, p["mu"], p["q"], muc, w, leads=leads)
             for name, p in preds.items()}
+
+
+def _fmt(value, metric):
+    """Число в единицах метрики: скилл и покрытие - в процентах, остальное - в °C."""
+    if not np.isfinite(value):
+        return "—"
+    if metric == "Skill":
+        return f"{value:+.1%}"
+    if metric in ("PICP80", "PICP90"):
+        return f"{value:.1%}"
+    return f"{value:.2f}"
+
+
+def _cell(point, metric, ci_block=None):
+    """Значение метрики и, если есть, её доверительный интервал в тех же единицах."""
+    out = _fmt(point[metric], metric)
+    if ci_block is not None:
+        lo, hi = ci_block[metric]
+        if np.isfinite(lo) and np.isfinite(hi):
+            out += f" [{_fmt(lo, metric)}; {_fmt(hi, metric)}]"
+    return out
+
+
+def print_rows(rows, label="разрез", metrics=("Skill", "MAE", "RMSE", "CRPS", "PICP90"),
+               ci=False):
+    width = 24 if ci else 12
+    head = f"{label:>20} {'окон':>7} {'ст.':>5} {'агрег.':>7}"
+    for m in metrics:
+        head += f" {m:>{width}}"
+    print(head)
+    for name, s in rows.items():
+        cis = s.get("ci") if ci else None
+        for agg, title in (("pooled", "пул"), ("macro", "макро")):
+            line = f"{str(name):>20} {s['n_windows']:>7} {s['n_stations']:>5} {title:>7}"
+            for m in metrics:
+                line += f" {_cell(s[agg], m, cis and cis[agg]):>{width}}"
+            print(line)
 
 
 def show(tbl):
@@ -209,38 +296,97 @@ def show(tbl):
               f"{m['CRPS']:>6.2f} {m['PICP80']:>7.1%} {m['PICP90']:>7.1%} {m['Winkler90']:>7.2f}")
 
 
-def koppen_per_window(ds):
-    return np.array([ds.clims[sid]["koppen"] for sid, _t, _seen in ds.items])
+def print_lead_table(ev, leads=(1, 3, 6, 12, 24, 48, 72, 120, 168), ci=False, **kw):
+    rows = {str(h): s for h, s in by_lead(ev, leads=leads, ci=ci, **kw).items()}
+    print_rows(rows, label="лид, ч", ci=ci)
 
 
-def zone_breakdown(preds, aux, koppen, leads=(24, 72), model="МАЯК", min_windows=20):
-    y, w = aux["y"], aux["y_mask"]
-    p = preds[model]
-    rows = {}
-    for z in sorted(set(koppen.tolist())):
-        m = koppen == z
-        if int(m.sum()) < min_windows:
+def all_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS, min_stations=MIN_STATIONS,
+                   ci=False, **kw):
+    hist = np.array([bin_label(int(v), HISTORY_BINS) for v in meta["history"]], object)
+    hvalid = np.array([bin_label(float(v), HIST_VALID_BINS) for v in meta["hist_valid"]], object)
+    kwargs = dict(leads=leads, min_windows=min_windows, min_stations=min_stations, ci=ci, **kw)
+    return {
+        "роль станции": breakdown(ev, meta["role"], **kwargs),
+        "зона Кёппена": breakdown(ev, meta["zone"], **kwargs),
+        "сезон": breakdown(ev, meta["season"], **kwargs),
+        "длина истории": breakdown(ev, hist, **kwargs),
+        "валидность истории": breakdown(ev, hvalid, **kwargs),
+    }
+
+
+def print_breakdowns(ev, meta, leads=None, ci=False, **kw):
+    for name, rows in all_breakdowns(ev, meta, leads=leads, ci=ci, **kw).items():
+        print(f"\n--- разрез: {name} ---")
+        if not rows:
+            print("  (все страты меньше порога по числу окон или станций)")
             continue
-        d = {"n": int(m.sum())}
-        for h in leads:
-            j = h - 1
-            yj, wj = y[m, j], w[m, j]
-            d[h] = dict(skill=skill(yj, p["mu"][m, j], aux["mu_clim"][m, j], wj),
-                        mae=float(wmean(np.abs(p["mu"][m, j] - yj), wj)),
-                        picp90=float(wmean(inside(yj, p["q"][m, j, 0], p["q"][m, j, 6]), wj)))
-        rows[z] = d
-    return rows
+        print_rows(rows, label=name, ci=ci)
+
+
+def print_reliability(ev, lead_bins=LEAD_BINS):
+    """Гистограмма PIT (по всему горизонту и по бинам лидов), надёжность, острота."""
+    pit = ev.pit_histogram()
+    edges = ["<q05"] + [f"q{int(100 * Q[i]):02d}-q{int(100 * Q[i + 1]):02d}"
+                        for i in range(NQ - 1)] + [">q95"]
+    print("\n--- PIT: доля факта в бинах между квантилями (ожидание в скобках) ---")
+    print("  " + " ".join(f"{e:>11}" for e in edges))
+    print("  " + " ".join(f"{o:>5.1%}({e:>4.0%})" for o, e in zip(pit["observed"], pit["expected"])))
+    for name, p in ev.pit_by_lead_bin(lead_bins).items():
+        print(f"  лиды {name:>7}: " + " ".join(f"{o:>6.1%}" for o in p["observed"]))
+
+    rel = ev.reliability()
+    print("\n--- диаграмма надёжности: P(факт ≤ квантиль) ---")
+    print("  " + " ".join(f"{t:>8.0%}" for t in rel["nominal"]))
+    print("  " + " ".join(f"{e:>8.1%}" for e in rel["empirical"]))
+
+    print("\n--- острота против покрытия ---")
+    print(f"{'номинал':>9} {'факт':>9} {'ширина, °C':>12}")
+    for r in ev.sharpness_coverage():
+        print(f"{r['nominal']:>9.0%} {r['coverage']:>9.1%} {r['width']:>12.2f}")
+
+
+def print_seed_spread(evs_by_seed, lead=24):
+    summaries = [ev.restrict(leads=[lead]).summary() for ev in evs_by_seed]
+    print(f"\n--- разброс по {len(evs_by_seed)} сидам, лид {lead} ч ---")
+    print(f"{'метрика':>10} {'среднее':>10} {'мин':>10} {'макс':>10} {'ст.откл.':>10}")
+    for m, s in seed_spread(summaries).items():
+        if not np.isfinite(s["mean"]):
+            continue
+        print(f"{m:>10} {s['mean']:>10.3f} {s['min']:>10.3f} {s['max']:>10.3f} {s['std']:>10.3f}")
+
+
+def koppen_per_window(ds):
+    return np.array([normalize_zone(ds.clims[sid]["koppen"]) for sid, _t in ds.items])
+
+
+def zone_breakdown(preds, aux, koppen=None, leads=(24, 72), model="МАЯК",
+                   min_windows=MIN_WINDOWS, min_stations=MIN_STATIONS):
+    """Разрез по полным зонам Кёппена для одной модели: {зона: {лид: сводка}}."""
+    ev = evaluation_for(preds[model], aux)
+    keys = aux["meta"]["zone"] if koppen is None else np.asarray(koppen)
+    out = {}
+    for h in leads:
+        rows = breakdown(ev, keys, leads=[h], min_windows=min_windows, min_stations=min_stations)
+        for z, s in rows.items():
+            out.setdefault(z, {"n": s["n_windows"], "n_stations": s["n_stations"]})[h] = s
+    return out
 
 
 def print_zone_breakdown(rows, leads=(24, 72)):
-    hdr = f"{'зона':>6} {'окон':>6}"
+    hdr = f"{'зона':>6} {'окон':>6} {'ст.':>4}"
     for h in leads:
-        hdr += f" {'Sk@' + str(h) + 'ч':>9} {'MAE@' + str(h):>9} {'P90@' + str(h):>9}"
+        hdr += f" {'Sk@' + str(h) + 'пул':>10} {'Sk@' + str(h) + 'макро':>12} {'MAE@' + str(h):>9}"
     print(hdr)
     for z, d in rows.items():
-        line = f"{z:>6} {d['n']:>6}"
+        line = f"{z:>6} {d['n']:>6} {d['n_stations']:>4}"
         for h in leads:
-            line += f" {d[h]['skill']:>+9.1%} {d[h]['mae']:>9.2f} {d[h]['picp90']:>9.1%}"
+            s = d.get(h)
+            if s is None:
+                line += f" {'—':>10} {'—':>12} {'—':>9}"
+                continue
+            line += (f" {s['pooled']['Skill']:>+10.1%} {s['macro']['Skill']:>+12.1%} "
+                     f"{s['pooled']['MAE']:>9.2f}")
         print(line)
 
 
@@ -275,6 +421,62 @@ def plot_metric_curves(tables, out_dir="runs/plots"):
     return paths
 
 
+def plot_reliability(ev, out_dir="runs/plots", name="МАЯК"):
+    """Диаграмма надёжности и кривая «острота против покрытия» одной картинкой."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    os.makedirs(out_dir, exist_ok=True)
+    rel, sharp = ev.reliability(), ev.sharpness_coverage()
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(11, 4.6))
+    a1.plot([0, 1], [0, 1], "k--", lw=1, label="идеал")
+    a1.plot(rel["nominal"], rel["empirical"], marker="o", label=name)
+    a1.set_xlabel("номинальный уровень")
+    a1.set_ylabel("фактическая доля")
+    a1.set_title("Диаграмма надёжности")
+    a1.grid(alpha=0.3)
+    a1.legend(fontsize=8)
+    cov = [r["coverage"] for r in sharp]
+    wid = [r["width"] for r in sharp]
+    a2.plot(cov, wid, marker="o")
+    for r in sharp:
+        a2.annotate(f"{r['nominal']:.0%}", (r["coverage"], r["width"]), fontsize=8,
+                    textcoords="offset points", xytext=(4, 4))
+    a2.set_xlabel("фактическое покрытие")
+    a2.set_ylabel("средняя ширина интервала, °C")
+    a2.set_title("Острота против покрытия")
+    a2.grid(alpha=0.3)
+    p = os.path.join(out_dir, "reliability.png")
+    fig.tight_layout()
+    fig.savefig(p, dpi=130)
+    plt.close(fig)
+    return p
+
+
+def plot_pit(ev, out_dir="runs/plots"):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    os.makedirs(out_dir, exist_ok=True)
+    pit = ev.pit_histogram()
+    x = np.arange(len(pit["observed"]))
+    fig, ax = plt.subplots(figsize=(7.2, 4.2))
+    ax.bar(x, pit["observed"], width=0.7, label="факт")
+    ax.step(x, pit["expected"], where="mid", color="black", lw=1.2, label="ожидание")
+    ax.set_xticks(x)
+    ax.set_xticklabels(["<q05"] + [f"q{int(100 * Q[i]):02d}+" for i in range(NQ - 1)] + [">q95"],
+                       fontsize=7)
+    ax.set_ylabel("доля часов")
+    ax.set_title("Гистограмма PIT по бинам квантилей")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3, axis="y")
+    p = os.path.join(out_dir, "pit_histogram.png")
+    fig.tight_layout()
+    fig.savefig(p, dpi=130)
+    plt.close(fig)
+    return p
+
+
 @torch.no_grad()
 def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
                            out_dir="runs/plots", time_key="test",
@@ -306,14 +508,15 @@ def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
             mu = q[:, 3]
         y = np.where(item["y_mask"].numpy() > 0, item["y"].numpy(), np.nan)  # дыры видны
         muc = item["mu_clim_fut"].numpy()
-        sid, _t, seen = ds.items[int(i)]
-        zone = ds.clims[sid]["koppen"]
+        sid, _t = ds.items[int(i)]
+        zone = normalize_zone(ds.clims[sid]["koppen"])
+        role = ds.roles[sid]
         ax = axes[k]
         ax.fill_between(leads, q[:, 0], q[:, 6], alpha=0.2, color="tab:blue", label="90%-интервал")
         ax.plot(leads, y, color="black", lw=1.6, label="факт")
         ax.plot(leads, mu, color="tab:blue", lw=1.5, label="МАЯК (медиана)")
         ax.plot(leads, muc, color="tab:red", lw=1.0, ls="--", label="климатология")
-        ax.set_title(f"{sid} · зона {zone} · {seen}", fontsize=9)
+        ax.set_title(f"{sid} · зона {zone} · {role}", fontsize=9)
         ax.set_xlabel("лид, ч")
         ax.set_ylabel("T, °C")
         ax.grid(alpha=0.3)
@@ -321,7 +524,6 @@ def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
             ax.legend(fontsize=7, loc="best")
     for ax in axes[len(idx):]:
         ax.axis("off")
-    fig.suptitle("Прогноз МАЯК vs факт (примеры)", y=1.0, fontsize=12)
     fig.tight_layout()
 
     suff = "" if L is None else f"_L{L}"
@@ -382,7 +584,9 @@ def plot_amplitude_scatter(model, clims, manifest="data/manifest.csv", out_dir="
 
 
 def evaluate_all(model, clims, manifest="data/manifest.csv", r_damped=None,
-                 named_extra=None, ds=None, preds=None, aux=None):
+                 named_extra=None, ds=None, preds=None, aux=None, shift=None,
+                 ci=True, bootstrap=BOOTSTRAP):
+    """Главная таблица: все модели, обе агрегации, интервалы, разрезы для МАЯК."""
     if ds is None:
         ds = EvalSet(clims, manifest=manifest, time_key="test")
     if preds is None or aux is None:
@@ -392,18 +596,21 @@ def evaluate_all(model, clims, manifest="data/manifest.csv", r_damped=None,
         preds, aux = collect_predictions(named, ds)
         preds = add_statistical_baselines(preds, aux, r_damped=r_damped)
 
-    y, w, muc = aux["y"], aux["y_mask"], aux["mu_clim"]
-    for name, p in preds.items():
+    print(BENCHMARK_NOTE)
+    evs = evaluations(preds, aux, shift=shift)
+    for name, ev in evs.items():
         print(f"\n=== {name} ===")
-        show(metric_table(y, p["mu"], p["q"], muc, w))
+        print_lead_table(ev, ci=ci, **(bootstrap if ci else {}))
 
-    j = 24 - 1
-    mu_mayak = preds["МАЯК"]["mu"]
-    for tag, mask in [("seen", aux["seen"] == 0), ("unseen", aux["seen"] == 1)]:
-        if mask.sum() == 0:
-            continue
-        sk = skill(y[mask, j], mu_mayak[mask, j], muc[mask, j], w[mask, j])
-        print(f"Skill-24ч [{tag}]: {sk:+.1%}  (окон: {int(mask.sum())})")
+    print("\n=== Общие метрики по всему горизонту ===")
+    rows = {name: ev.summary(ci=ci, **(bootstrap if ci else {})) for name, ev in evs.items()}
+    print_rows(rows, label="модель", ci=ci)
+
+    print("\n=== Разрезы (МАЯК, лид 24 ч) ===")
+    print_breakdowns(evs["МАЯК"], aux["meta"], leads=[24], ci=False)
+
+    print("\n=== Надёжность (МАЯК) ===")
+    print_reliability(evs["МАЯК"])
     return preds, aux, ds
 
 
@@ -559,28 +766,33 @@ def main():
     import argparse
     from mayak.lit import LitMayak, load_model
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ckpt", required=True, help="чекпойнт МАЯК (runs/mayak/stageB/best.ckpt)")
+    ap.add_argument("--ckpt", required=True, nargs="+",
+                    help="чекпойнты МАЯК; несколько = прогоны с разными сидами")
     ap.add_argument("--manifest", default="data/manifest.csv")
     ap.add_argument("--gru-ckpt", default=None)
     ap.add_argument("--dlinear-ckpt", default=None)
     ap.add_argument("--conformal", default=None, help="runs/conformal.npy (если есть)")
     ap.add_argument("--out-dir", default="runs/plots")
     ap.add_argument("--n-examples", type=int, default=10, help="число примеров прогноз vs факт")
+    ap.add_argument("--bootstrap", type=int, default=BOOTSTRAP["n_boot"],
+                    help="итераций блочного бутстрапа по станциям; 0 — без интервалов")
+    ap.add_argument("--ci-level", type=float, default=BOOTSTRAP["level"])
     args = ap.parse_args()
 
-    from mayak.data.splits import ROLE_TRAIN
     from mayak.data.store import get_store
+    from mayak.data.splits import ROLE_TRAIN
     from mayak.leakage import run_checklist
     store = get_store(args.manifest)
     clims = store.clims()
     ds = EvalSet(clims, manifest=args.manifest, time_key="test")
     run_checklist(store, datasets=[ds], conformal=args.conformal,
-                  checkpoints=[c for c in (args.ckpt, args.gru_ckpt, args.dlinear_ckpt) if c])
+                  checkpoints=[c for c in (*args.ckpt, args.gru_ckpt, args.dlinear_ckpt) if c])
 
     r = BL.fit_damped_persistence({k: s for k, s in clims.items() if s["role"] == ROLE_TRAIN},
                                   n_windows=20000)
 
-    mayak = LitMayak.load_from_checkpoint(args.ckpt, map_location="cpu").model
+    seeds = [LitMayak.load_from_checkpoint(c, map_location="cpu").model for c in args.ckpt]
+    mayak = seeds[0]
     named_extra = {}
     if args.gru_ckpt:
         named_extra["GRU seq2seq"] = load_model(args.gru_ckpt)
@@ -591,9 +803,18 @@ def main():
     preds, aux = collect_predictions(named_all, ds)
     preds = add_statistical_baselines(preds, aux, r_damped=r)
 
+    shift = np.load(args.conformal) if args.conformal else None
+    boot = dict(n_boot=args.bootstrap, seed=0, level=args.ci_level)
+
     print("\n=== Таблицы метрик ===")
     evaluate_all(mayak, clims, args.manifest, r_damped=r,
-                 named_extra=named_extra, ds=ds, preds=preds, aux=aux)
+                 named_extra=named_extra, ds=ds, preds=preds, aux=aux,
+                 shift=shift, ci=args.bootstrap > 0, bootstrap=boot)
+
+    if len(seeds) > 1:
+        evs = [evaluation_for(dict(zip(("mu", "q"), _mu_q(m, ds))), aux, shift) for m in seeds[1:]]
+        evs = [evaluation_for(preds["МАЯК"], aux, shift)] + evs
+        print_seed_spread(evs)
 
     coldstart_curve(mayak, clims, args.manifest)
 
@@ -602,10 +823,13 @@ def main():
     for p in plot_metric_curves(tables, args.out_dir):
         print("  ", p)
 
-    print("\n=== Разрез по зонам Кёппена (МАЯК) ===")
-    print_zone_breakdown(zone_breakdown(preds, aux, koppen_per_window(ds)))
+    ev_mayak = evaluation_for(preds["МАЯК"], aux, shift)
+    print("  ", plot_reliability(ev_mayak, args.out_dir))
+    print("  ", plot_pit(ev_mayak, args.out_dir))
 
-    shift = np.load(args.conformal) if args.conformal else None
+    print("\n=== Разрез по зонам Кёппена (МАЯК) ===")
+    print_zone_breakdown(zone_breakdown(preds, aux))
+
     print("\n=== Холодный старт L=0 (пункт 3) ===")
     coldstart_L0_check(mayak, clims, args.manifest, shift=shift)
 
@@ -626,6 +850,11 @@ def main():
                            out_dir=args.out_dir + "/unseen", shift=shift)
     print("\n=== Суточные амплитуды ===")
     plot_amplitude_scatter(mayak, clims, manifest=args.manifest, out_dir=args.out_dir)
+
+
+def _mu_q(model, ds):
+    D = gather(model, ds)
+    return D["mu"], D["q"]
 
 
 if __name__ == "__main__":

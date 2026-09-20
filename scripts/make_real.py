@@ -8,39 +8,9 @@ import pandas as pd
 import rasterio
 
 from mayak.timeaxis import to_hourly_grid
+from mayak.zones import KG_TIF_CODE, UNKNOWN_ZONE
 
-KG_MAP = {
-     1: "Af",
-     2: "Am",
-     3: "Aw",
-     4: "BWh",
-     5: "BWk",
-     6: "BSh",
-     7: "BSk",
-     8: "Csa",
-     9: "Csb",
-    10: "Csc",
-    11: "Cwa",
-    12: "Cwb",
-    13: "Cwc",
-    14: "Cfa",
-    15: "Cfb",
-    16: "Cfc",
-    17: "Dsa",
-    18: "Dsb",
-    19: "Dsc",
-    20: "Dsd",
-    21: "Dwa",
-    22: "Dwb",
-    23: "Dwc",
-    24: "Dwd",
-    25: "Dfa",
-    26: "Dfb",
-    27: "Dfc",
-    28: "Dfd",
-    29: "ET",
-    30: "EF",
-}
+KG_MAP = KG_TIF_CODE
 
 
 def get_koppen_reader(tif_path):
@@ -57,17 +27,17 @@ def get_koppen_reader(tif_path):
                 or col < 0
                 or col >= band.shape[1]
             ):
-                return "UNK"
+                return UNKNOWN_ZONE
 
             code = int(band[row, col])
 
             if code <= 0:
-                return "UNK"
+                return UNKNOWN_ZONE
 
-            return KG_MAP.get(code, "UNK")
+            return KG_MAP.get(code, UNKNOWN_ZONE)
 
         except Exception:
-            return "UNK"
+            return UNKNOWN_ZONE
 
     return get_koppen
 
@@ -164,7 +134,7 @@ def main():
                 "lat": round(lat, 4),
                 "lon": round(lon, 4),
                 "elev": round(elev, 1),
-                "koppen": koppen[0] if koppen != "UNK" else "UNK",
+                "koppen": koppen,
             }
         )
 

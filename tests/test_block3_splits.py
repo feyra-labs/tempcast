@@ -314,7 +314,7 @@ def _load_calibrate():
 def test_calibration_set_is_val_stations_in_calib_window(store, manifest):
     ds = _load_calibrate().calibration_set(store.clims(), manifest)
     assert ds.station_splits == (ROLE_VAL,) and ds.time_key == "calib"
-    assert {sid for sid, _t, _s in ds.items} == {"v0", "v1"}
+    assert {sid for sid, _t in ds.items} == {"v0", "v1"}
 
 
 def test_conformal_check(store, manifest, tmp_path):

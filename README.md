@@ -188,14 +188,30 @@ python scripts/train.py --arch dlinear --manifest data/manifest.csv --accelerato
 # конформная таблица (калибровка интервалов)
 python scripts/calibrate.py --ckpt runs/mayak/stageB/best.ckpt --out runs/conformal.npy
 
-# полный отчёт: таблицы метрик, графики по горизонту, примеры прогнозов,
-# разрез по климатическим зонам, холодный старт, влияние калибровки
+# полный отчёт: таблицы метрик в двух агрегациях (пуловой и макро) с
+# доверительными интервалами блочного бутстрапа по станциям, разрезы по лидам /
+# ролям станций / зонам Кёппена / сезонам / длине и качеству истории, метрики
+# надёжности (PIT, диаграмма надёжности, острота против покрытия), графики по
+# горизонту, примеры прогнозов, холодный старт, влияние калибровки
 python -m mayak.evaluate --ckpt runs/mayak/stageB/best.ckpt \
     --gru-ckpt runs/gru/stageB/best.ckpt \
     --dlinear-ckpt runs/dlinear/stageB/best.ckpt \
     --conformal runs/conformal.npy --out-dir runs/plots \
-    --n-examples 10
+    --n-examples 10 --bootstrap 1000
+
+# три сида основной модели: к интервалу по станциям добавляется разброс по сидам
+python -m mayak.evaluate --conformal runs/conformal.npy \
+    --ckpt runs/mayak_s0/stageB/best.ckpt \
+           runs/mayak_s1/stageB/best.ckpt \
+           runs/mayak_s2/stageB/best.ckpt
 ```
+
+Скилл считается относительно эмпирической климатологии **самой станции**,
+подогнанной по её многолетнему обучающему окну: при короткой истории эталон
+знает о станции больше, чем модель, — оценка строгая в пользу эталона. Любой
+разрез пересчитывает климатологический знаменатель на том же срезе, что и
+числитель.
+
 
 <details>
 <summary><b>Диагностика модели (knockout-абляции)</b></summary>
@@ -238,7 +254,9 @@ mayak/
   lit.py          LightningModule (одна на все архитектуры), EMA
   baselines.py    климатология / damped / seasonal / GRU / DLinear
   data/           загрузчик, окна, суточные сводки, сплиты
-  evaluate.py     метрики, графики, разрез по зонам, холодный старт
+  metrics.py      единый модуль метрик: агрегации, надёжность, бутстрап, конформная поправка
+  zones.py        фиксированные таблицы зон Кёппена и сезонов (без встроенного hash)
+  evaluate.py     сбор окон и предсказаний, таблицы, разрезы, графики, холодный старт
   knockout.py     абляции обученной модели (без переобучения)
   runtime/        treaming.py (потоковый рантайм), run_inference.py
 scripts/          make_synth, make_real, make_splits, build_cache, train, train_neurobaselines, calibrate, export_onnx, plot_loss

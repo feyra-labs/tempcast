@@ -12,21 +12,11 @@ import argparse
 
 import numpy as np
 
-from mayak.constants import H
 from mayak.data.splits import ROLE_VAL
 from mayak.data.store import get_store
 from mayak.evaluate import EvalSet, gather
 from mayak.leakage import CONFORMAL_TIME_KEY, conformal_record, run_checklist, save_conformal
-from mayak.metrics import coverage, fit_conformal_shift
-
-LEAD_BINS = [(1, 6), (7, 24), (25, 72), (73, 168)]
-
-
-def lead_bin_index(h1):
-    for i, (a, b) in enumerate(LEAD_BINS):
-        if a <= h1 <= b:
-            return i
-    return len(LEAD_BINS) - 1
+from mayak.metrics import LEAD_BINS, apply_conformal, coverage, fit_conformal_shift
 
 
 def calibration_set(clims, manifest="data/manifest.csv"):
@@ -37,15 +27,6 @@ def calibration_set(clims, manifest="data/manifest.csv"):
 def fit_conformal(model, clims, manifest="data/manifest.csv"):
     D = gather(model, calibration_set(clims, manifest))
     return fit_conformal_shift(D["y"], D["q"], D["y_mask"], LEAD_BINS)
-
-
-def apply_conformal(q, shift):
-    q = np.array(q, np.float32, copy=True)
-    for h in range(H):
-        bi = lead_bin_index(h + 1)
-        q[..., h, :] += shift[bi]
-    q = np.maximum.accumulate(q, axis=-1)
-    return q
 
 
 def main():

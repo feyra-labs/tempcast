@@ -203,7 +203,7 @@ def test_holdout_and_eval_sets_emit_same_norm_scale(manifest, store):
     ev = EvalSet(store.clims(), station_splits=(ROLE_VAL,), manifest=manifest, time_key="val")
     by_key = {(m["id"], m["t"]): hd[i]["norm_scale"] for i, m in enumerate(hd.meta)}
     n = 0
-    for i, (sid, t, _seen) in enumerate(ev.items):
+    for i, (sid, t) in enumerate(ev.items):
         if (sid, t) in by_key:
             assert torch.equal(ev[i]["norm_scale"], by_key[(sid, t)])
             n += 1

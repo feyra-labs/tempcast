@@ -43,6 +43,17 @@ def doy_hour(ts):
     return sec / 86400.0, (sec % 86400) / 3600.0
 
 
+def month_of(ts):
+    """Момент(ы) UTC → календарный месяц 1..12 (int64). Векторизовано."""
+    t = _as_datetime64_s(ts)
+    return t.astype("datetime64[M]").astype(np.int64) % 12 + 1
+
+
+def window_month(t0_utc_h: int, idx):
+    """Часы ряда станции (индексы от ``t0_utc_h``) → календарные месяцы UTC."""
+    return month_of(from_utc_hour(int(t0_utc_h) + np.asarray(idx, dtype=np.int64)))
+
+
 def to_utc_hour(ts) -> int:
     """Момент UTC → целое число часов от эпохи. Падает, если момент не на целом часе."""
     t = _as_datetime64_s(ts)

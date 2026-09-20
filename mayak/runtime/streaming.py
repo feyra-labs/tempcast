@@ -5,16 +5,9 @@ import torch
 from mayak.constants import H, M, DZ
 from mayak.astro import astro_features
 from mayak.data.qc import PHYS
+from mayak.metrics import I_MED, apply_conformal
 
 RF = 256
-LEAD_BINS = [(1, 6), (7, 24), (25, 72), (73, 168)]
-
-
-def _lead_bin(h1):
-    for i, (a, b) in enumerate(LEAD_BINS):
-        if a <= h1 <= b:
-            return i
-    return len(LEAD_BINS) - 1
 
 
 class StreamingMayak:
@@ -160,10 +153,9 @@ class StreamingMayak:
         q = q[0].numpy()
         mu = mu[0].numpy()
         if self.conformal is not None:
-            for h in range(H):
-                q[h] += self.conformal[_lead_bin(h + 1)]
-            q = np.maximum.accumulate(q, axis=-1)
-            mu = q[:, 3]
+            # одна и та же реализация, что в оценке и в скрипте калибровки
+            q = apply_conformal(q, self.conformal)
+            mu = q[:, I_MED]
         return q, mu
 
     def serialize(self):
