@@ -25,7 +25,7 @@ from mayak.constants import H, L_MAX
 
 log = logging.getLogger(__name__)
 
-SPLITS_VERSION = "2"   # Увеличивать при изменении; входит в ключ кэша; входит в ключ кэша
+SPLITS_VERSION = "2"   # Увеличивать при изменении; входит в ключ кэша.
 MIN_GAP_HOURS = H + L_MAX
 TIME_BOUNDS = dict(hours_per_year=8766, test_frac=0.3, val_days=60, calib_days=60,
                    gap_hours=MIN_GAP_HOURS)

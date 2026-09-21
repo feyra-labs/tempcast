@@ -267,7 +267,7 @@ def manifest(tmp_path_factory):
     for i, (split, lat) in enumerate([("train", 50.0), ("train", 10.0),
                                       ("unseen_val", 45.0), ("unseen_test", 30.0)]):
         h = np.arange(N_HOURS)
-        T = 10 + 6 * np.sin(2 * np.pi * h / 24) + 0.3 * rng.standard_normal(N_HOURS)
+        T = 10 + 6 * np.sin(2 * np.pi * (h - 8) / 24) + 0.3 * rng.standard_normal(N_HOURS)
         P = 1000 + 2 * np.sin(2 * np.pi * h / 100) + 0.2 * rng.standard_normal(N_HOURS)
         RH = 60 + 10 * np.cos(2 * np.pi * h / 24) + rng.standard_normal(N_HOURS)
         valid = np.ones(N_HOURS, np.uint8)

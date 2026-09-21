@@ -21,3 +21,4 @@ augment:
   noise_sd: [0.2, 0.5, 2.0]
   offset_max: 0.7
   coord_jitter_deg: 0.4
+window_qc: true

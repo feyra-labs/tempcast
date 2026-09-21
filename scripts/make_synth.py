@@ -23,6 +23,9 @@ def koppen_for(lat):
     return "ET"
 
 
+THERMAL_LAG_H = 2.5
+
+
 def make_station(rng, lat, lon, elev, n_hours, t0_utc_h):
     doy, hour = window_calendar(t0_utc_h, np.arange(n_hours))
     doy, hour = doy.astype(np.float64), hour.astype(np.float64)
@@ -34,8 +37,9 @@ def make_station(rng, lat, lon, elev, n_hours, t0_utc_h):
     seasonal = annual_amp * np.cos(2 * math.pi * (doy - 200) / 365.24 + season_phase)
 
     decl = -23.44 * np.cos(2 * math.pi * (doy + 10) / 365.24)
+    t_sol = hour + lon / 15.0 - THERMAL_LAG_H
     cos_zen = (np.sin(phi) * np.sin(np.radians(decl))
-               + np.cos(phi) * np.cos(np.radians(decl)) * np.cos(np.radians(15 * (hour - 12))))
+               + np.cos(phi) * np.cos(np.radians(decl)) * np.cos(np.radians(15 * (t_sol - 12))))
     daily_amp = 3.5 + 4.0 * np.clip(np.cos(phi), 0.1, 1.0)
     diurnal = daily_amp * np.clip(cos_zen, -0.3, 1.0)
 
@@ -56,7 +60,7 @@ def make_station(rng, lat, lon, elev, n_hours, t0_utc_h):
     RH = RH_base - 1.8 * diurnal + rng.standard_normal(n_hours) * 4.0
     RH = np.clip(RH, 3, 100)
 
-    valid = np.ones((n_hours, 3), dtype=np.uint8)                # 2.9: по-канальная маска
+    valid = np.ones((n_hours, 3), dtype=np.uint8)
     return (T.astype(np.float32), P.astype(np.float32), RH.astype(np.float32), valid)
 
 

@@ -1,7 +1,9 @@
-"""Офлайн-сборка кэша станций: QC + климатология.
+"""Офлайн-сборка кэша станций: QC + станционные проверки + отбор + климатология.
 
 Все остальные шаги читают готовый кэш и никогда не пересчитывают QC.
 Повторный запуск при неизменных источниках и правилах = только хеширование.
+Отчёт QC - артефакт сборки: <кэш>/qc_report.csv (по станциям, включая исключённые)
+и раздел "qc" в <кэш>/meta.json (по набору).
 
 Запуск:
     python scripts/build_cache.py --manifest data/manifest.csv --jobs 8
@@ -29,9 +31,20 @@ def main():
     with open(os.path.join(path, "meta.json")) as f:
         meta = json.load(f)
     print(("собран" if built else "уже актуален"), f"за {time.perf_counter() - t:.1f} с:", path)
-    print("исключено станций:", len(meta["excluded"]))
+    qc = meta["qc"]
+    print(f"QC {qc['version']} ({qc['fingerprint']}): станций {qc['stations_included']} "
+          f"из {qc['stations_total']}")
+    for rule, cnt in qc["excluded_by_rule"].items():
+        print(f"  исключено по правилу {rule}: {cnt}")
+    for sid, why in list(meta["excluded"].items())[:20]:
+        print(f"  {sid}: {why}")
+    if len(meta["excluded"]) > 20:
+        print(f"  … и ещё {len(meta['excluded']) - 20}, см. qc_report.csv")
+    print("станционные проверки (pass/fail/skip):",
+          {k: f"{v['pass']}/{v['fail']}/{v['skip']}" for k, v in qc["station_checks"].items()})
     bad = {k: round(v, 5) for k, v in meta["qc_total"].items() if v > 0}
-    print("доли кодов QC по набору:", bad or "нет отбраковки")
+    print("доли кодов QC по включённым станциям:", bad or "нет отбраковки")
+    print("отчёт:", os.path.join(path, "qc_report.csv"))
 
 
 if __name__ == "__main__":

@@ -55,7 +55,7 @@ def _model(cfg=None, seed=0):
 def _write_station(root, sid, seed, n=12_000):
     rng = np.random.default_rng(seed)
     h = np.arange(n)
-    T = 10 + 6 * np.sin(2 * np.pi * h / 24) + rng.standard_normal(n)
+    T = 10 + 6 * np.sin(2 * np.pi * (h - 8) / 24) + rng.standard_normal(n)
     P = 1000 + 2 * np.sin(2 * np.pi * h / 100) + 0.2 * rng.standard_normal(n)
     RH = 60 + 10 * np.cos(2 * np.pi * h / 24) + rng.standard_normal(n)
     np.savez(root / "stations" / f"{sid}.npz", T=T.astype(np.float32), P=P.astype(np.float32),

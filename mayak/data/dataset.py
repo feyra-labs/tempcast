@@ -7,6 +7,7 @@ from mayak.config import AugmentConfig
 from mayak.constants import L_MAX, H
 from mayak.data.masking import (DEFAULT_TARGET_MASK, FilterStats, enforce_invariant,
                                 target_window_ok)
+from mayak.data.qc import qc_window
 from mayak.data.splits import ROLE_TRAIN, ROLE_VAL, time_bounds
 from mayak.data.store import get_store
 from mayak.timeaxis import window_calendar
@@ -81,7 +82,7 @@ def footprint(t, L, lo):
 class WindowDataset(Dataset):
     def __init__(self, manifest, split="train", curriculum="full",
                  windows_per_epoch=200_000, seed=0, target_mask=DEFAULT_TARGET_MASK,
-                 store=None, aug_seed=None, augment=None, cache_root=None):
+                 store=None, aug_seed=None, augment=None, cache_root=None, window_qc=True):
         assert split in ("train",)
         assert curriculum in ("full", "L0")
         self.curriculum = curriculum
@@ -90,6 +91,7 @@ class WindowDataset(Dataset):
         self.aug_seed = None if aug_seed is None else int(aug_seed)
         self.augment = augment if isinstance(augment, AugmentConfig) else \
             AugmentConfig(**(augment or {}))
+        self.window_qc = bool(window_qc)
         self.seed_streams(worker_id=0, salt=0)
 
         store = store or get_store(manifest, cache_root=cache_root)
@@ -110,6 +112,7 @@ class WindowDataset(Dataset):
             self.st.append(dict(
                 id=r["id"], lat=float(r["lat"]), lon=float(r["lon"]), elev=float(r["elev"]),
                 koppen=r["koppen"], x=x, mask=mask, N=N, t0=r["t0"], clim=r["clim"],
+                qc_elev=r.get("dem_elev") if r.get("dem_elev") is not None else float(r["elev"]),
                 tr=(lo, hi), starts=ok))
             zone_count[r["koppen"]] = zone_count.get(r["koppen"], 0) + 1
         self.filter_stats.report("train")
@@ -156,7 +159,7 @@ class WindowDataset(Dataset):
         return self.build(s, t, L)
 
     def build(self, s, t, L):
-        """Окно станции s с началом горизонта t и историей L, с аугментациями."""
+        """Окно станции s с началом горизонта t и историей L, с аугментациями. """
         k = np.arange(L_MAX)
         abs_h = t - L_MAX + k
         doy_h, hour_h = window_calendar(s["t0"], abs_h)
@@ -193,6 +196,9 @@ class WindowDataset(Dataset):
 
         x_hist[:, 2] = np.clip(x_hist[:, 2], 0, 100)
         x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
+        if self.window_qc and L > 0:
+            mask_hist, _ = qc_window(x_hist, mask_hist, elev=s["qc_elev"])
+            x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
 
         return {
             "lat": torch.tensor(lat, dtype=torch.float32),

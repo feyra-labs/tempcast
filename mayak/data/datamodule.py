@@ -32,7 +32,8 @@ class MayakData(L.LightningDataModule):
                                       curriculum=h.curriculum,
                                       windows_per_epoch=h.windows_per_epoch,
                                       seed=h.seed, aug_seed=h.aug_seed, store=store,
-                                      target_mask=c.target_mask, augment=c.augment)
+                                      target_mask=c.target_mask, augment=c.augment,
+                                      window_qc=c.window_qc)
         self.store = store
         self.val_ds = HoldoutDataset(h.manifest, station_split=ROLE_VAL,
                                      time_key="val", every_hours=c.val_every_hours, L=h.val_L,

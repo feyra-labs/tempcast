@@ -4,7 +4,7 @@
 
 * ``ModelConfig`` (МАЯК), ``GRUConfig``, ``DLinearConfig`` - архитектура. Всё, что
   раньше лежало глобальными константами и числами в конструкторах модулей;
-* ``DataConfig`` - пути, временные окна, пороги масок, параметры аугментаций;
+* ``DataConfig`` - пути, временные окна, пороги масок, параметры аугментаций, QC окна;
 * ``TrainConfig`` - это ``mayak.protocol.Protocol`` (единый протокол
   обучения): шаги, батч, оптимизатор, расписание, ранняя остановка, сиды.
 
@@ -442,6 +442,7 @@ class DataConfig:
     val_every_hours: int = 72
     val_max_windows: int = 8000
     augment: AugmentConfig = AugmentConfig()
+    window_qc: bool = True
 
     def __post_init__(self):
         if not isinstance(self.target_mask, TargetMaskConfig):
@@ -457,6 +458,8 @@ class DataConfig:
         object.__setattr__(self, "time_bounds", tb)
         if self.val_every_hours < 1 or self.val_max_windows < 1:
             raise ConfigError("val_every_hours и val_max_windows ≥ 1")
+        if not isinstance(self.window_qc, bool):
+            raise ConfigError(f"window_qc должен быть bool, получено {self.window_qc!r}")
 
     def to_dict(self):
         return to_jsonable(self)

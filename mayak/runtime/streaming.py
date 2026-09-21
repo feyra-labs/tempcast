@@ -27,7 +27,7 @@ import torch
 
 from mayak.astro import astro_features
 from mayak.config import CHANNEL_MAX_LAG
-from mayak.data.qc import PHYS
+from mayak.data.qc import PHYS, point_qc
 from mayak.metrics import I_MED, apply_conformal
 
 log = logging.getLogger(__name__)
@@ -147,14 +147,8 @@ class StreamingMayak:
 
     @staticmethod
     def _qc_point(T, P, RH):
-        out = np.zeros(3, np.float32)
-        mask = np.zeros(3, np.float32)
-        for j, (name, val) in enumerate([("T", T), ("P", P), ("RH", RH)]):
-            lo, hi = PHYS[name]
-            if val is not None and np.isfinite(val) and lo <= val <= hi:
-                out[j] = val
-                mask[j] = 1.0
-        return out, mask
+        """Поточечный QC часа - та же функция и те же пределы, что в mayak.data.qc."""
+        return point_qc(T, P, RH)
 
     @torch.no_grad()
     def _ingest(self, x, m, doy, hour):
