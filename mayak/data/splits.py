@@ -13,6 +13,11 @@
 
 Роли станций: train (обучение), unseen_val (валидация и калибровка),
 unseen_test (финальная оценка). Разбиение — assign_roles.
+
+Четвёртая роль — external_test: станции реальной сети наблюдений (GHCNh), внешний
+тест. Они не участвуют ни в обучении, ни в выборе чекпойнта, ни в конформной
+калибровке; из их временных окон читается только test, а train служит одной цели —
+подгонке климатологии самой станции (эталон скилла). assign_roles их не трогает.
 """
 from __future__ import annotations
 
@@ -33,6 +38,11 @@ TIME_KEYS = ("train", "val", "calib", "test")
 
 ROLE_TRAIN, ROLE_VAL, ROLE_TEST = "train", "unseen_val", "unseen_test"
 ROLES = (ROLE_TRAIN, ROLE_VAL, ROLE_TEST)
+ROLE_EXTERNAL = "external_test"
+ALL_ROLES = ROLES + (ROLE_EXTERNAL,)
+
+EXTERNAL_MIN_TRAIN_YEARS = 3
+FULL_YEAR_MIN_MONTH_FRAC = 0.3
 
 
 def time_bounds(n_hours, **overrides):
@@ -64,6 +74,49 @@ def time_bounds(n_hours, **overrides):
     return out
 
 
+def full_years(mask_T, t0_utc_h, lo, hi, min_month_frac=FULL_YEAR_MIN_MONTH_FRAC,
+               hours_per_year=None):
+    """Число полных лет в окне [lo, hi) ряда станции.
+
+    Окно режется на годовые блоки по hours_per_year часов, отсчитывая от hi назад
+    (неполный остаток в начале отбрасывается). Блок - полный год, если в каждом из
+    12 календарных месяцев валидна не меньше min_month_frac часов этого месяца:
+    гармоникам годового хода нужен весь сезонный цикл, а не только много часов.
+    """
+    from mayak.timeaxis import window_month
+    hpy = int(hours_per_year or TIME_BOUNDS["hours_per_year"])
+    n_blocks = max(0, (int(hi) - int(lo)) // hpy)
+    if n_blocks == 0:
+        return 0
+    a = int(hi) - n_blocks * hpy
+    k = np.arange(a, int(hi))
+    block = (k - a) // hpy
+    month = np.asarray(window_month(t0_utc_h, k), np.int64) - 1
+    key = block * 12 + month
+    total = np.bincount(key, minlength=n_blocks * 12).reshape(n_blocks, 12)
+    valid = np.bincount(key, weights=(np.asarray(mask_T)[a:int(hi)] > 0).astype(np.float64),
+                        minlength=n_blocks * 12).reshape(n_blocks, 12)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        frac = np.where(total > 0, valid / np.maximum(total, 1), 0.0)
+    return int(np.sum(np.all((total > 0) & (frac >= min_month_frac), axis=1)))
+
+
+def min_hours_for_train_years(years, **overrides):
+    """Минимальная длина ряда, при которой в обучающем окне ≥ years лет."""
+    cfg = {**TIME_BOUNDS, **overrides}
+    hpy, gap = int(cfg["hours_per_year"]), int(cfg["gap_hours"])
+    rest = 3 * gap + (int(cfg["val_days"]) + int(cfg["calib_days"])) * 24
+    n = max(1, int(years)) * hpy + rest
+    while True:
+        try:
+            b = time_bounds(n, **overrides)
+            if b["train"][1] - b["train"][0] >= int(years) * hpy:
+                return n
+        except ValueError:
+            pass
+        n += 24
+
+
 def lat_band(lat):
     a = abs(float(lat))
     return "eq" if a < 23.5 else ("mid" if a < 50 else "pol")
@@ -92,11 +145,14 @@ def _allocate(total, sizes, floor, cap, rng):
 def assign_roles(rows, n_test=8, val_frac=0.1, n_val=None, seed=0, min_stratum=3):
     """Стратифицированное разбиение станций на три роли.
 
-    Возвращает {id станции: роль}.
+    Станции с ролью external_test в манифесте в разбиении не участвуют и сохраняют
+    роль. Возвращает {id станции: роль}.
     """
     if min_stratum < 3:
         raise ValueError("min_stratum < 3: в страте не хватит станций на три роли")
     rng = np.random.default_rng(seed)
+    external = sorted(str(r["id"]) for r in rows if str(r.get("split") or "") == ROLE_EXTERNAL)
+    rows = [r for r in rows if str(r.get("split") or "") != ROLE_EXTERNAL]
     strata = {}
     for r in sorted(rows, key=lambda r: str(r["id"])):
         strata.setdefault(stratum_of(r), []).append(str(r["id"]))
@@ -115,7 +171,7 @@ def assign_roles(rows, n_test=8, val_frac=0.1, n_val=None, seed=0, min_stratum=3
             log.warning("роль %s: запрошено %d станций, назначено %d "
                         "(гарантии представительства страт / нехватка станций)", name, want, got)
 
-    roles = {}
+    roles = {sid: ROLE_EXTERNAL for sid in external}
     for g, kt, kv in zip(groups, k_test, k_val):
         for i, sid in enumerate(g):
             roles[sid] = ROLE_TEST if i < kt else (ROLE_VAL if i < kt + kv else ROLE_TRAIN)
@@ -126,5 +182,7 @@ def strata_report(rows, roles):
     """{страта: {роль: число станций}} — для печати и тестов."""
     rep = {}
     for r in rows:
+        if roles[str(r["id"])] == ROLE_EXTERNAL:
+            continue
         rep.setdefault(stratum_of(r), Counter())[roles[str(r["id"])]] += 1
     return {k: dict(v) for k, v in sorted(rep.items())}

@@ -7,7 +7,10 @@
 Исходный файл станции (``stations/<id>.npz``): T, P, RH, valid, t0_utc_h и
 необязательные ``flag`` — штатные флаги источника «подозрительно» формы (N,) или
 (N, 3), и ``Td`` - точка росы (N,), если источник даёт её отдельно.
-Необязательная колонка манифеста ``dem_elev`` — высота из цифровой модели рельефа.
+Необязательные колонки манифеста: ``dem_elev`` — высота из цифровой модели рельефа,
+``station_elev`` — высота из метаданных станции (реальная сеть: ``elev`` там — высота
+из ЦМР, её видит модель, а для станционной проверки высоты нужна заявленная),
+``report_every`` — типичный шаг отчётности, ч.
 """
 from __future__ import annotations
 
@@ -26,7 +29,8 @@ import numpy as np
 from mayak.data.climatology import CLIM_VERSION, Climatology
 from mayak.data.qc import (DEFAULT_QC, QC_CODE_DOC, QC_VERSION, STATION_CHECKS,
                            code_fractions, qc_station, station_checks, station_selection)
-from mayak.data.splits import SPLITS_VERSION, TIME_BOUNDS, time_bounds
+from mayak.data.splits import (EXTERNAL_MIN_TRAIN_YEARS, ROLE_EXTERNAL, SPLITS_VERSION,
+                               TIME_BOUNDS, full_years, time_bounds)
 from mayak.timeaxis import CALENDAR_VERSION, legacy_t0, window_calendar
 
 log = logging.getLogger(__name__)
@@ -85,13 +89,14 @@ def _opt_float(v):
 
 
 def qc_meta(row):
-    """Метаданные станции, которые читает QC: долгота, высота, высота из ЦМР.
-
-    Ровно эти поля входят в ключ кэша: от них зависят станционные проверки и
-    проверка давления. Широта, зона и роль в QC не участвуют и в ключ не входят.
-    """
-    return dict(lon=_opt_float(row.get("lon")), elev=_opt_float(row.get("elev")),
+    """Метаданные станции, которые читает QC: долгота, заявленная высота, высота из ЦМР."""
+    declared = _opt_float(row.get("station_elev"))
+    meta = dict(lon=_opt_float(row.get("lon")),
+                elev=declared if declared is not None else _opt_float(row.get("elev")),
                 dem_elev=_opt_float(row.get("dem_elev")))
+    if str(row.get("split") or "") == ROLE_EXTERNAL:
+        meta["min_train_years"] = EXTERNAL_MIN_TRAIN_YEARS
+    return meta
 
 
 def qc_elev(meta):
@@ -143,6 +148,13 @@ def process_station(path, meta=None, qc_cfg=DEFAULT_QC):
         lo, hi = time_bounds(n)["train"]
     except ValueError as e:
         reasons.append(("splits", f"сплиты: {e}"))
+    need_years = int(meta.get("min_train_years") or 0)
+    if need_years and not reasons:
+        ny = full_years(mask[:, 0], src["t0"], lo, hi)
+        report["train_full_years"] = ny
+        if ny < need_years:
+            reasons.append(("clim_years", f"в обучающем окне {ny} полных лет < {need_years}: "
+                                          f"климатология станции неустойчива"))
     if not reasons:
         k = np.arange(lo, hi)
         doy, hour = window_calendar(src["t0"], k)
@@ -293,7 +305,9 @@ def load_cache(path, rows, mmap=False):
         a, n = it["offset"], it["n"]
         store.stations[it["id"]] = dict(
             id=it["id"], lat=float(r["lat"]), lon=float(r["lon"]), elev=float(r["elev"]),
-            dem_elev=_opt_float(r.get("dem_elev")), koppen=r["koppen"], role=r.get("split"),
+            dem_elev=_opt_float(r.get("dem_elev")), station_elev=_opt_float(r.get("station_elev")),
+            report_every=_opt_float(r.get("report_every")),
+            koppen=r["koppen"], role=r.get("split"),
             qc_checks=it.get("qc_checks", {}),
             x=x[a:a + n], mask=mask[a:a + n], qc=qc[a:a + n], N=n, t0=int(it["t0_utc_h"]),
             clim_fit=tuple(it["clim_fit"]),

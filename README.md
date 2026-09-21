@@ -246,6 +246,34 @@ python -m mayak.evaluate --conformal runs/conformal.npy \
 числитель.
 
 
+### Внешний тест на наблюдениях реальной сети (GHCNh)
+
+Обучение идёт только на реанализе; наблюдения реальной сети NOAA/NCEI GHCNh - строго
+внешний тест (роль `external_test`): эти станции не участвуют ни в обучении, ни в
+выборе чекпойнта, ни в конформной калибровке, и из их ряда читается только тестовое
+окно (обучающее окно станции служит одному - её собственной климатологии-эталону,
+поэтому нужно ≥ 3 полных лет в нём). Чек-лист антиутечек это проверяет.
+
+```bash
+# 1. скачивание (докачка, повторы, кэш; 404 запоминается)
+python scripts/fetch_ghcnh.py --out data/ghcnh/raw --years 2015-2024 \
+    --bbox 35 60 -10 40 --max-stations 300 --jobs 8
+# 2. разбор T, Td, станционного давления и штатных кодов качества → почасовая сетка
+#    без интерполяции; влажность из T и Td формулой модели; высота - из ЦМР
+python scripts/make_ghcnh.py --raw data/ghcnh/raw --out data/ghcnh \
+    --koppen Beck_KG_V1_present_0p0083.tif --dem open-meteo
+# 3. тот же QC и кэш, что для обучения (+ правило «≥ 3 полных лет в обучающем окне»)
+python scripts/build_cache.py --manifest data/ghcnh/manifest.csv
+# 4. отдельные таблицы внешнего теста со всеми разрезами и сопоставление
+#    «внутренний против внешнего» на общих зонах
+python -m mayak.evaluate --ckpt runs/mayak/stageB/best.ckpt --conformal runs/conformal.npy \
+    --external-manifest data/ghcnh/manifest.csv
+```
+
+Разрезы внешнего теста: доля валидных часов в истории, шаг отчётности станции
+(1/3/6 ч), разность заявленной высоты станции и высоты из ЦМР, наличие канала
+давления. Падение качества при переносе - измеряемый результат, а не дефект.
+
 <details>
 <summary><b>Диагностика модели (knockout-абляции)</b></summary>
 
@@ -288,14 +316,16 @@ mayak/
   protocol.py     единый протокол обучения и функция запуска
   lit.py          LightningModule (одна на все архитектуры), EMA
   baselines.py    климатология / damped / seasonal / GRU / DLinear
-  data/           загрузчик, окна, суточные сводки, сплиты
+  data/           загрузчик, окна, суточные сводки, сплиты; ghcnh.py (разбор GHCNh),
+                  rasters.py (зона Кёппена и высота из ЦМР)
   metrics.py      единый модуль метрик: агрегации, надёжность, бутстрап, конформная поправка
+  external.py     внешний тест: атрибуты станций, сопоставление «внутренний против внешнего»
   zones.py        фиксированные таблицы зон Кёппена и сезонов (без встроенного hash)
   evaluate.py     сбор окон и предсказаний, таблицы, разрезы, графики, холодный старт
   knockout.py     абляции обученной модели (без переобучения)
   runtime/        streaming.py (потоковый рантайм), equivalence.py (замер пакет ↔ поток), run_inference.py
 conf/             конфиги Hydra: model/, ablation/, data/, train/
-scripts/          make_synth, make_real, make_splits, build_cache, train, run (Hydra), train_neurobaselines, calibrate, export_onnx, plot_loss
+scripts/          make_synth, make_real, fetch_ghcnh, make_ghcnh, make_splits, build_cache, train, run (Hydra), train_neurobaselines, calibrate, export_onnx, plot_loss
 
 ```
 </details>

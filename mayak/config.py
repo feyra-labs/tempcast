@@ -58,6 +58,7 @@ def to_jsonable(obj):
     return json.loads(json.dumps(dataclasses.asdict(obj) if dataclasses.is_dataclass(obj) else obj,
                                  default=lambda o: dataclasses.asdict(o)))
 
+
 @dataclass(frozen=True)
 class ModeGroup:
     """Группа затухающих мод.
@@ -398,7 +399,7 @@ def check_pipeline_compat(cfg):
     if errs:
         raise ConfigError("конфиг модели несовместим с контрактом данных (mayak/constants.py): "
                           + "; ".join(errs) + ". Модель это поддерживает, но сплиты, кэш и "
-                          "метрики построены под контракт - меняйте его там.")
+                                              "метрики построены под контракт - меняйте его там.")
     return cfg
 
 
@@ -601,6 +602,8 @@ AUGMENT_PROFILES = {
     "none": {f: 0.0 for f in AUGMENT_PROB_FIELDS.values()},
 }
 
+ZONE_WEIGHTINGS = {"uniform": 0.0, "inv_sqrt": 0.5, "inv": 1.0}
+
 
 @dataclass(frozen=True)
 class DataConfig:
@@ -612,8 +615,17 @@ class DataConfig:
     val_max_windows: int = 8000
     augment: AugmentConfig = AugmentConfig()
     window_qc: bool = True
+    zone_weighting: str = "inv_sqrt"
+    zone_weight_cap: float = 0.0
 
     def __post_init__(self):
+        if self.zone_weighting not in ZONE_WEIGHTINGS:
+            raise ConfigError(f"zone_weighting = {self.zone_weighting!r}; "
+                              f"допустимо {sorted(ZONE_WEIGHTINGS)}")
+        cap = float(self.zone_weight_cap)
+        if cap != 0.0 and cap < 1.0:
+            raise ConfigError(f"zone_weight_cap = {cap}: 0 (выкл.) или ≥ 1")
+        object.__setattr__(self, "zone_weight_cap", cap)
         if not isinstance(self.target_mask, TargetMaskConfig):
             object.__setattr__(self, "target_mask", TargetMaskConfig(**_strict_kwargs(
                 TargetMaskConfig, self.target_mask, "data.target_mask")))

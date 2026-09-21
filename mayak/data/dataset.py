@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, get_worker_info
 
-from mayak.config import AugmentConfig
+from mayak.config import ZONE_WEIGHTINGS, AugmentConfig
 from mayak.constants import L_MAX, H
 from mayak.data.augment import AugWindow, augment_window
 from mayak.data.masking import (DEFAULT_TARGET_MASK, FilterStats, enforce_invariant,
@@ -14,6 +14,7 @@ from mayak.data.qc import qc_window
 from mayak.data.splits import ROLE_TRAIN, ROLE_VAL, time_bounds
 from mayak.data.store import get_store
 from mayak.timeaxis import window_calendar
+from mayak.zones import normalize_zone
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +80,37 @@ def history_len(L, t, lo):
     return int(max(0, min(L_MAX if L is None else L, L_MAX, t - lo)))
 
 
+def zone_weights(zones, mode="inv_sqrt", cap=0.0):
+    """Вероятности выбора станций по их полным зонам Кёппена.
+
+    Вес станции n_зоны ** (−a), a = ZONE_WEIGHTINGS[mode]; при cap > 0 вес станции
+    ограничен сверху cap · средний вес (итеративно, до сходимости). Сумма = 1.
+    """
+    if mode not in ZONE_WEIGHTINGS:
+        raise ValueError(f"zone_weighting {mode!r}; допустимо {sorted(ZONE_WEIGHTINGS)}")
+    zones = [normalize_zone(z) for z in zones]
+    count = {}
+    for z in zones:
+        count[z] = count.get(z, 0) + 1
+    w = np.array([count[z] ** -ZONE_WEIGHTINGS[mode] for z in zones], np.float64)
+    if cap and cap > 0 and len(w):
+        for _ in range(100):
+            lim = cap * w.mean()
+            if (w <= lim * (1 + 1e-12)).all():
+                break
+            w = np.minimum(w, lim)
+    return w / w.sum()
+
+
+def zone_distribution(zones, p):
+    """{зона: (число станций, суммарная вероятность)} по убыванию вероятности."""
+    out = {}
+    for z, pi in zip((normalize_zone(z) for z in zones), p):
+        n, s = out.get(z, (0, 0.0))
+        out[z] = (n + 1, s + float(pi))
+    return dict(sorted(out.items(), key=lambda kv: -kv[1][1]))
+
+
 def footprint(t, L, lo):
     """Часы, которые читает сэмпл: [t − фактическая история, t + H)."""
     return t - history_len(L, t, lo), t + H
@@ -87,7 +119,8 @@ def footprint(t, L, lo):
 class WindowDataset(Dataset):
     def __init__(self, manifest, split="train", curriculum="full",
                  windows_per_epoch=200_000, seed=0, target_mask=DEFAULT_TARGET_MASK,
-                 store=None, aug_seed=None, augment=None, cache_root=None, window_qc=True):
+                 store=None, aug_seed=None, augment=None, cache_root=None, window_qc=True,
+                 zone_weighting="inv_sqrt", zone_weight_cap=0.0):
         assert split in ("train",)
         assert curriculum in ("full", "L0")
         self.curriculum = curriculum
@@ -107,7 +140,6 @@ class WindowDataset(Dataset):
         assert rows, "нет train-станций — запустите make_splits.py"
 
         self.st = []
-        zone_count = {}
         self.filter_stats = FilterStats()
         for r in rows:
             x, mask, N = r["x"], r["mask"], r["N"]
@@ -121,12 +153,16 @@ class WindowDataset(Dataset):
                 koppen=r["koppen"], x=x, mask=mask, N=N, t0=r["t0"], clim=r["clim"],
                 qc_elev=r.get("dem_elev") if r.get("dem_elev") is not None else float(r["elev"]),
                 tr=(lo, hi), starts=ok))
-            zone_count[r["koppen"]] = zone_count.get(r["koppen"], 0) + 1
         self.filter_stats.report("train")
         assert self.st, "ни у одной train-станции нет окон, прошедших маску цели"
 
-        w = np.array([1.0 / zone_count[s["koppen"]] for s in self.st])
-        self.w = w / w.sum()
+        zones = [s["koppen"] for s in self.st]
+        self.w = zone_weights(zones, zone_weighting, zone_weight_cap)
+        self.zone_report = zone_distribution(zones, self.w)
+        log.info("сэмплирование станций: взвешивание %s (cap %s), %d станций в %d зонах; "
+                 "доли зон: %s", zone_weighting, zone_weight_cap or "нет", len(zones),
+                 len(self.zone_report),
+                 ", ".join(f"{z}:{n}ст/{p:.1%}" for z, (n, p) in self.zone_report.items()))
 
     def seed_streams(self, worker_id=0, salt=0):
         self.rng_sample, self.rng_aug = make_streams(self.base_seed, worker_id, salt,

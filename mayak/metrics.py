@@ -161,6 +161,18 @@ def fit_conformal_shift(y, q, w, lead_bins=LEAD_BINS):
     return shift
 
 
+def quantile_ci(samples, level=0.90):
+    """{метрика: выборка} → {метрика: (нижняя, верхняя)} центральный интервал уровня level."""
+    lo, hi = (1.0 - level) / 2.0, 1.0 - (1.0 - level) / 2.0
+    out = {}
+    for k, v in samples.items():
+        v = np.asarray(v, np.float64)
+        v = v[np.isfinite(v)]
+        out[k] = ((float(np.quantile(v, lo)), float(np.quantile(v, hi)))
+                  if v.size else (float("nan"), float("nan")))
+    return out
+
+
 @dataclass(frozen=True)
 class Evaluation:
     """Предсказания одной модели на наборе окон плюс веса и привязка к станциям."""
@@ -248,17 +260,15 @@ class Evaluation:
             return {k: (float(np.nanmean(v)) if np.isfinite(v).any() else float("nan"))
                     for k, v in per.items()}
 
-    def bootstrap_ci(self, n_boot=1000, seed=0, level=0.90):
-        """Блочный бутстрап по станциям: станции ресэмплируются с возвращением."""
+    def bootstrap_samples(self, n_boot=1000, seed=0):
+        """Выборки блочного бутстрапа по станциям: (пуловые, макро) {метрика: (n_boot,)}. """
         st, sums, den = self.station_sums()
         keep = den > 0
         st, den = st[keep], den[keep]
         sums = {k: v[keep] for k, v in sums.items()}
         n = len(st)
-        empty = {k: (float("nan"), float("nan")) for k in METRICS}
         if n == 0:
-            return dict(pooled=empty, macro=empty, n_boot=0, level=level, n_stations=0)
-
+            return None
         rng = np.random.default_rng(seed)
         counts = rng.multinomial(n, np.full(n, 1.0 / n), size=int(n_boot)).astype(np.float64)
 
@@ -272,19 +282,16 @@ class Evaluation:
             cnt = counts @ good.astype(np.float64)
             with np.errstate(invalid="ignore", divide="ignore"):
                 boot_macro[k] = np.where(cnt > 0, num / np.where(cnt > 0, cnt, 1.0), np.nan)
+        return ({k: np.asarray(boot_pooled[k], np.float64) for k in METRICS}, boot_macro)
 
-        lo, hi = (1.0 - level) / 2.0, 1.0 - (1.0 - level) / 2.0
-
-        def _ci(samples):
-            out = {}
-            for k in METRICS:
-                v = np.asarray(samples[k], np.float64)
-                v = v[np.isfinite(v)]
-                out[k] = ((float(np.quantile(v, lo)), float(np.quantile(v, hi)))
-                          if v.size else (float("nan"), float("nan")))
-            return out
-
-        return dict(pooled=_ci(boot_pooled), macro=_ci(boot_macro),
+    def bootstrap_ci(self, n_boot=1000, seed=0, level=0.90):
+        samples = self.bootstrap_samples(n_boot=n_boot, seed=seed)
+        empty = {k: (float("nan"), float("nan")) for k in METRICS}
+        if samples is None:
+            return dict(pooled=empty, macro=empty, n_boot=0, level=level, n_stations=0)
+        boot_pooled, boot_macro = samples
+        n = int((self.station_sums()[2] > 0).sum())
+        return dict(pooled=quantile_ci(boot_pooled, level), macro=quantile_ci(boot_macro, level),
                     n_boot=int(n_boot), level=float(level), n_stations=n)
 
     def summary(self, ci=False, n_boot=1000, seed=0, level=0.90):

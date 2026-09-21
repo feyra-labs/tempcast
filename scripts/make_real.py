@@ -5,41 +5,8 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import rasterio
-
+from mayak.data.rasters import koppen_reader as get_koppen_reader
 from mayak.timeaxis import to_hourly_grid
-from mayak.zones import KG_TIF_CODE, UNKNOWN_ZONE
-
-KG_MAP = KG_TIF_CODE
-
-
-def get_koppen_reader(tif_path):
-    ds = rasterio.open(tif_path)
-    band = ds.read(1)
-
-    def get_koppen(lat, lon):
-        try:
-            row, col = ds.index(lon, lat)
-
-            if (
-                row < 0
-                or row >= band.shape[0]
-                or col < 0
-                or col >= band.shape[1]
-            ):
-                return UNKNOWN_ZONE
-
-            code = int(band[row, col])
-
-            if code <= 0:
-                return UNKNOWN_ZONE
-
-            return KG_MAP.get(code, UNKNOWN_ZONE)
-
-        except Exception:
-            return UNKNOWN_ZONE
-
-    return get_koppen
 
 
 def main():

@@ -50,3 +50,5 @@ augment:
   coord_jitter_deg: 0.4
   elev_jitter_m: 50.0
 window_qc: true
+zone_weighting: inv_sqrt    # вес станции при сэмплировании: uniform | inv_sqrt | inv (по полной зоне)
+zone_weight_cap: 0.0

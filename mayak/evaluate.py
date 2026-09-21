@@ -14,6 +14,9 @@
     покрытия;
   * графики по каждой метрике, кривую холодного старта и проверку L=0;
   * отчёт о влиянии конформной калибровки (PICP/CRPS/MAE до и после);
+  * внешний тест на наблюдениях реальной сети (``--external-manifest``): те же
+    таблицы и разрезы, разрезы внешнего теста (шаг отчётности, Δ высоты станции и
+    ЦМР, канал давления) и сопоставление «внутренний тест против внешнего»;
   * проверки этапа A (поле), декомпозицию L=0, суточные амплитуды, ablation.
 """
 import os
@@ -40,6 +43,7 @@ HISTORY_BINS = ((0, 0, "L=0"), (1, 24, "L 1-24ч"), (25, 168, "L 25-168ч"),
 HIST_VALID_BINS = ((-0.01, 0.5, "<50%"), (0.5, 0.8, "50-80%"),
                    (0.8, 0.95, "80-95%"), (0.95, 1.01, "95-100%"))
 MIN_WINDOWS, MIN_STATIONS = 20, 2
+PRESSURE_YES, PRESSURE_NO = "есть давление", "нет давления"
 BOOTSTRAP = dict(n_boot=1000, seed=0, level=0.90)
 
 BENCHMARK_NOTE = (
@@ -112,8 +116,17 @@ class EvalSet(Dataset):
             yield dict(sid=sid, N=self.clims[sid]["N"], time_key=self.time_key,
                        lo=np.array([lo]), hi=np.array([hi]))
 
+    def station_attrs(self):
+        if getattr(self, "_attrs", None) is None:
+            from mayak.external import station_attributes
+            sids = {sid for sid, _t in self.items}
+            self._attrs = station_attributes({sid: self.clims[sid] for sid in sids})
+        return self._attrs
+
     def window_meta(self):
         sid_a, role, zone, season, hist, hvalid = [], [], [], [], [], []
+        has_p, rep, egap = [], [], []
+        attrs = self.station_attrs()
         for sid, t in self.items:
             s = self.clims[sid]
             L = history_len(self.L, t, self.bounds[sid][0])
@@ -125,9 +138,15 @@ class EvalSet(Dataset):
             season.append(SEASON_RU[season_of(month, s["lat"])])
             hist.append(L)
             hvalid.append(float((m > 0).mean()) if L > 0 else 0.0)
+            mp = s["mask"][t - L:t, 1] if L > 0 else np.zeros(0, np.float32)
+            has_p.append(PRESSURE_YES if (mp > 0).any() else PRESSURE_NO)
+            rep.append(attrs[sid]["report_class"])
+            egap.append(attrs[sid]["elev_gap_label"])
         return dict(station=np.array(sid_a, object), role=np.array(role, object),
                     zone=np.array(zone, object), season=np.array(season, object),
-                    history=np.array(hist, np.int64), hist_valid=np.array(hvalid, np.float64))
+                    history=np.array(hist, np.int64), hist_valid=np.array(hvalid, np.float64),
+                    has_pressure=np.array(has_p, object), report_class=np.array(rep, object),
+                    elev_gap=np.array(egap, object))
 
     def __getitem__(self, i):
         sid, t = self.items[i]
@@ -315,8 +334,21 @@ def all_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS, min_stations=M
     }
 
 
-def print_breakdowns(ev, meta, leads=None, ci=False, **kw):
-    for name, rows in all_breakdowns(ev, meta, leads=leads, ci=ci, **kw).items():
+def external_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS,
+                        min_stations=MIN_STATIONS, ci=False, **kw):
+    hvalid = np.array([bin_label(float(v), HIST_VALID_BINS) for v in meta["hist_valid"]], object)
+    kwargs = dict(leads=leads, min_windows=min_windows, min_stations=min_stations, ci=ci, **kw)
+    return {
+        "валидность истории": breakdown(ev, hvalid, **kwargs),
+        "частота отчётности": breakdown(ev, meta["report_class"], **kwargs),
+        "Δ высоты станция−ЦМР": breakdown(ev, meta["elev_gap"], **kwargs),
+        "канал давления": breakdown(ev, meta["has_pressure"], **kwargs),
+    }
+
+
+def print_breakdowns(ev, meta, leads=None, ci=False, fn=None, **kw):
+    fn = fn or all_breakdowns
+    for name, rows in fn(ev, meta, leads=leads, ci=ci, **kw).items():
         print(f"\n--- разрез: {name} ---")
         if not rows:
             print("  (все страты меньше порога по числу окон или станций)")
@@ -760,6 +792,68 @@ def compare_ablation(model_full, model_ablated, clims, manifest="data/manifest.c
     return out
 
 
+def evaluate_external(named, external_manifest, store, r_damped=None, shift=None,
+                      ci=True, bootstrap=BOOTSTRAP, checkpoints=(), conformal=None,
+                      internal=None, transfer_level="group"):
+    """Внешний тест: станции реальной сети (роль external_test), только их тестовое окно.
+
+    named    - {имя: модель}, те же модели и чекпойнты, что во внутренней оценке;
+    store    - основной набор (для чек-листа изоляции внешнего теста);
+    internal - (preds, aux) внутренней оценки для сопоставления «внутренний против
+               внешнего»; None - без сопоставления.
+    Эталон для всех моделей один - климатология каждой внешней станции по её
+    собственному обучающему окну (строится при сборке кэша внешнего набора).
+    """
+    from mayak.data.splits import ROLE_EXTERNAL, ROLE_TEST
+    from mayak.data.store import get_store
+    from mayak.external import print_transfer, transfer_table
+    from mayak.leakage import check_external, run_checklist
+    ext_store = get_store(external_manifest)
+    ds = EvalSet(ext_store.clims(), station_splits=(ROLE_EXTERNAL,), manifest=external_manifest,
+                 time_key="test")
+    run_checklist(ext_store, datasets=[ds])
+    check_external(store, ext_store, checkpoints=checkpoints, conformal=conformal)
+    preds, aux = collect_predictions(named, ds)
+    preds = add_statistical_baselines(preds, aux, r_damped=r_damped)
+    kw = bootstrap if ci else {}
+
+    print(f"\n########## ВНЕШНИЙ ТЕСТ: {len(ext_store.stations)} станций, окон {len(ds)} ##########")
+    print(BENCHMARK_NOTE)
+    evs = evaluations(preds, aux, shift=shift)
+    for name, ev in evs.items():
+        print(f"\n=== [внешний] {name} ===")
+        print_lead_table(ev, ci=ci, **kw)
+    print("\n=== [внешний] Общие метрики по всему горизонту ===")
+    print_rows({n: ev.summary(ci=ci, **kw) for n, ev in evs.items()}, label="модель", ci=ci)
+    print("\n=== [внешний] Разрезы блока 5 (МАЯК, лид 24 ч) ===")
+    print_breakdowns(evs["МАЯК"], aux["meta"], leads=[24])
+    print("\n=== [внешний] Разрезы внешнего теста (МАЯК, лид 24 ч) ===")
+    print_breakdowns(evs["МАЯК"], aux["meta"], leads=[24], fn=external_breakdowns)
+    print("\n=== [внешний] Надёжность (МАЯК) ===")
+    print_reliability(evs["МАЯК"])
+
+    transfer = {}
+    if internal is not None:
+        p_int, a_int = internal
+        for name in ("МАЯК", "Климатология"):
+            if name not in p_int or name not in preds:
+                continue
+            ev_i = evaluation_for(p_int[name], a_int, shift)
+            ev_e = evs[name]
+            for tag, roles in (("все станции внутреннего теста", None),
+                               ("только невиденные (unseen_test)", (ROLE_TEST,))):
+                sel = (np.ones(len(ev_i.y), bool) if roles is None
+                       else np.isin(a_int["meta"]["role"], roles))
+                tbl = transfer_table(ev_i.restrict(windows=sel), a_int["meta"]["zone"],
+                                     ev_e, aux["meta"]["zone"], level=transfer_level,
+                                     n_boot=kw.get("n_boot", 0), seed=kw.get("seed", 0),
+                                     ci_level=kw.get("level", 0.90))
+                transfer[(name, tag)] = tbl
+                print_transfer(tbl, title=f"\n=== Перенос: {name}, внешний против внутреннего "
+                                          f"({tag}); Δ = внешний − внутренний ===")
+    return preds, aux, ds, transfer
+
+
 def main():
     import logging
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -784,6 +878,11 @@ def main():
     ap.add_argument("--bootstrap", type=int, default=BOOTSTRAP["n_boot"],
                     help="итераций блочного бутстрапа по станциям; 0 — без интервалов")
     ap.add_argument("--ci-level", type=float, default=BOOTSTRAP["level"])
+    ap.add_argument("--external-manifest", default=None,
+                    help="манифест внешнего теста (реальная сеть, роль external_test), "
+                         "например data/ghcnh/manifest.csv; собирается scripts/make_ghcnh.py")
+    ap.add_argument("--transfer-zones", choices=("group", "full"), default="group",
+                    help="уровень зон для сопоставления внутреннего и внешнего теста")
     args = ap.parse_args()
 
     from mayak.data.store import get_store
@@ -866,6 +965,14 @@ def main():
                            out_dir=args.out_dir + "/unseen", shift=shift, seed=eval_seed)
     print("\n=== Суточные амплитуды ===")
     plot_amplitude_scatter(mayak, clims, manifest=args.manifest, out_dir=args.out_dir)
+
+    if args.external_manifest:
+        evaluate_external(named_all, args.external_manifest, store, r_damped=r, shift=shift,
+                          ci=args.bootstrap > 0, bootstrap=boot,
+                          checkpoints=[c for c in (*args.ckpt, args.gru_ckpt, args.dlinear_ckpt,
+                                                   *args.ablation_ckpt) if c],
+                          conformal=args.conformal, internal=(preds, aux),
+                          transfer_level=args.transfer_zones)
 
 
 def _mu_q(model, ds):
