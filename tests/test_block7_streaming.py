@@ -24,7 +24,8 @@ from mayak.runtime.streaming import (RAW_STEP, STATE_HEADER, StreamingMayak, dec
                                      encode_raw)
 
 LAT, LON, ELEV = 52.37, 4.9, 0.0
-ATOL_STEP = 1e-5
+RTOL_STEP = 1e-5
+EXACT_F64 = 1e-10
 ATOL_FORECAST = 1e-4
 ATOL_RESTART = 2e-3
 DEFAULT_STATE_BYTES = 3348
@@ -57,8 +58,20 @@ def _ring(state, encoder):
             for buf, b in zip(state.bufs, encoder.blocks)]
 
 
+def _scale(*tensors):
+    return max(1.0, *(float(t.abs().max()) for t in tensors if t.numel()))
+
+
+def _step_tol(*ref):
+    """Допуск float32 в единицах масштаба опорных значений."""
+    return RTOL_STEP * _scale(*ref)
+
+
 def _ring_diff(a, b, encoder):
-    return max((x - y).abs().max().item() for x, y in zip(_ring(a, encoder), _ring(b, encoder)))
+    """Расхождение кольцевых буферов, отнесённое к их масштабу (сравнивать с RTOL_STEP)."""
+    pairs = list(zip(_ring(a, encoder), _ring(b, encoder)))
+    err = max((x - y).abs().max().item() for x, y in pairs) if pairs else 0.0
+    return err / _scale(*(x for x, _ in pairs)) if pairs else 0.0
 
 
 def _grid(series):
@@ -99,7 +112,7 @@ def test_encoder_causal_and_window_length_independent(model):
         torch.testing.assert_close(enc(x_fut)[:, :300], full[:, :300], atol=0, rtol=0)
         rf = enc.receptive_field
         tail = enc(x[..., 400 - rf - 50:])
-        torch.testing.assert_close(tail[:, -50:], full[:, -50:], atol=ATOL_STEP, rtol=0)
+        torch.testing.assert_close(tail[:, -50:], full[:, -50:], atol=_step_tol(full), rtol=0)
 
 
 def test_old_time_axis_groupnorm_checkpoint_is_rejected(model):
@@ -128,8 +141,33 @@ def test_encoder_step_matches_batch_whole_window(kw):
         st = enc.init_state(2)
         out = torch.stack([enc.step(x[..., k], st) for k in range(L_MAX)], dim=1)
     err = (out - ref).abs().max().item()
-    assert err < ATOL_STEP, f"потактовый энкодер ≠ пакетный: max|Δ| = {err:.3g}"
+    assert err < _step_tol(ref), (f"потактовый энкодер ≠ пакетный: max|Δ| = {err:.3g} "
+                                  f"при max|ref| = {ref.abs().max():.3g}")
     assert st.t == L_MAX
+
+
+@pytest.mark.parametrize("kw", [
+    {},
+    dict(encoder_dilations=(1, 2, 4), encoder_width=16),
+    dict(encoder_kernel=2, encoder_dilations=(1, 3, 9)),
+    dict(encoder_kernel=4, encoder_dilations=(1, 2, 5), encoder_norm_groups=1),
+])
+def test_encoder_step_is_exact_in_float64(kw):
+    """Алгоритмическая эквивалентность без шума округления float32: не зависит от CPU."""
+    m = _model(ModelConfig(**kw))
+    enc = m.encoder.double()
+    x = torch.randn(2, m.cfg.n_channels, L_MAX, generator=torch.Generator().manual_seed(2),
+                    dtype=torch.float64)
+    with torch.no_grad():
+        ref = enc(x)
+        st = enc.init_state(2)
+        out = torch.stack([enc.step(x[..., k], st) for k in range(L_MAX)], dim=1)
+        pre_out, pre = enc.prefill(x[..., :300])
+        rest = torch.stack([enc.step(x[..., k], pre) for k in range(300, L_MAX)], dim=1)
+    assert out.dtype == torch.float64
+    assert (out - ref).abs().max().item() < EXACT_F64
+    assert (pre_out - ref[:, :300]).abs().max().item() < EXACT_F64
+    assert (rest - ref[:, 300:]).abs().max().item() < EXACT_F64
 
 
 @pytest.mark.parametrize("split", [0, 1, 37, 63, 64, 300, L_MAX])
@@ -143,13 +181,13 @@ def test_prefill_equals_stepping(model, split):
             enc.step(x[..., k], stepped)
         pre_out, pre = enc.prefill(x[..., :split])
         assert pre.t == stepped.t == split
-        assert _ring_diff(pre, stepped, enc) < ATOL_STEP
+        assert _ring_diff(pre, stepped, enc) < RTOL_STEP
         if split:
-            torch.testing.assert_close(pre_out, ref[:, :split], atol=ATOL_STEP, rtol=0)
+            torch.testing.assert_close(pre_out, ref[:, :split], atol=_step_tol(ref), rtol=0)
         rest = [enc.step(x[..., k], pre) for k in range(split, L_MAX)]
     if rest:
         err = (torch.stack(rest, 1) - ref[:, split:]).abs().max().item()
-        assert err < ATOL_STEP
+        assert err < _step_tol(ref)
 
 
 def test_step_cost_does_not_depend_on_receptive_field():
@@ -222,7 +260,7 @@ def test_restore_window_is_sufficient_and_minimal():
         r.filled = w
         r._rebuild_from_window()
         diffs[w] = _ring_diff(live.enc, r.enc, m.encoder)
-    assert diffs[cfg.stream_window] < ATOL_STEP and diffs[need] < ATOL_STEP, diffs
+    assert diffs[cfg.stream_window] < RTOL_STEP and diffs[need] < RTOL_STEP, diffs
     assert diffs[need - 1] > 1e-3, diffs
 
 
@@ -271,7 +309,7 @@ def test_stream_equivalence_over_long_sequence(model):
             feats, ref_state = model.encoder.prefill(ch)
             a_re, a_im, e = model.readout(feats, vt)
             s_re, s_im = model.readout.normalize(st.n_re, st.n_im, st.e)
-        assert _ring_diff(ref_state, st.enc, model.encoder) < ATOL_STEP
+        assert _ring_diff(ref_state, st.enc, model.encoder) < RTOL_STEP
         assert (s_re - a_re).abs().max() < 1e-4 and (s_im - a_im).abs().max() < 1e-4
         assert ((st.e - e).abs() / e.abs().clamp(min=1.0)).max() < 1e-4
 
@@ -284,7 +322,7 @@ def test_warm_start_equals_stepping_with_partial_day(model):
     warm.warm_start(s["x"], s["m"], s["doy"], s["hour"])
     assert warm._hours_in_day == stepped._hours_in_day == 13
     np.testing.assert_allclose(warm._day, stepped._day, atol=1e-5)
-    assert _ring_diff(warm.enc, stepped.enc, model.encoder) < ATOL_STEP
+    assert _ring_diff(warm.enc, stepped.enc, model.encoder) < RTOL_STEP
     cal = future_calendar_after(s, L, H)
     np.testing.assert_allclose(warm.forecast(*cal)[0], stepped.forecast(*cal)[0], atol=ATOL_FORECAST)
     assert warm.serialize()[:STATE_HEADER.itemsize] == stepped.serialize()[:STATE_HEADER.itemsize]
@@ -300,7 +338,7 @@ def test_restart_continues_continuous_run(model, cut):
     assert back.filled == min(cut, model.cfg.stream_window)
     assert back._hours_in_day == live._hours_in_day == cut % 24
     np.testing.assert_allclose(back._day, live._day, atol=1e-5)
-    assert _ring_diff(live.enc, back.enc, model.encoder) < ATOL_STEP
+    assert _ring_diff(live.enc, back.enc, model.encoder) < RTOL_STEP
     done = cut
     for end in (cut, cut + 7, cut + 60):
         feed(live, s, done, end)
