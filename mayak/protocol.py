@@ -299,9 +299,10 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     journal = dict(arch=arch, model_class=f"{ARCHS[arch].__module__}.{ARCHS[arch].__qualname__}",
                    protocol=protocol.to_dict(), deviations=[asdict(d) for d in protocol.deviations],
                    manifest=os.path.abspath(manifest), seeds=seeds, config_file=CONFIG_FILE,
-                   stages=[], final_ckpt=None)
+                   augment=data_cfg.augment.summary(), stages=[], final_ckpt=None)
     write_config(os.path.join(run_dir, CONFIG_FILE), cfg_dict)
     log.info("%s: сиды %s", arch, seeds)
+    log.info("%s: аугментации %s", arch, journal["augment"])
 
     prev_ckpt = None
     for i, stage in enumerate(protocol.stages):

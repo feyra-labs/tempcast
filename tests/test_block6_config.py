@@ -329,10 +329,12 @@ def test_ablation_is_bound_to_parameter_groups():
 
 def test_no_offset_aug_moves_to_data_without_shifting_other_augmentations(manifest):
     from mayak.data.dataset import WindowDataset
-    rc = RunConfig(model=ModelConfig(ablations=Ablations(no_offset_aug=True))).resolved()
+    legacy = DataConfig(augment=AugmentConfig.from_profile("base"))
+    rc = RunConfig(model=ModelConfig(ablations=Ablations(no_offset_aug=True)),
+                   data=legacy).resolved()
     assert rc.data.augment.offset_max == 0.0 and rc.resolved() == rc
     assert RunConfig().resolved().data.augment.offset_max == AugmentConfig().offset_max
-    base = WindowDataset(manifest, windows_per_epoch=16, seed=0)
+    base = WindowDataset(manifest, windows_per_epoch=16, seed=0, augment=legacy.augment)
     off = WindowDataset(manifest, windows_per_epoch=16, seed=0, augment=rc.data.augment)
     n_diff_y = 0
     for i in range(16):

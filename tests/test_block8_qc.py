@@ -662,7 +662,7 @@ def test_window_qc_sees_augmented_artifacts(train_manifest):
 
 
 def test_window_qc_does_not_eat_clean_history(train_manifest):
-    aug = dict(noise_sd=(0.2, 0.5, 2.0), gap_prob=0.0, offset_max=0.0,
+    aug = dict(profile="base", noise_sd=(0.2, 0.5, 2.0), gap_prob=0.0, offset_max=0.0,
                drop_humidity_prob=0.0, drop_pressure_prob=0.0)
     on = _items(train_manifest, augment=aug, window_qc=True)
     off = _items(train_manifest, augment=aug, window_qc=False)

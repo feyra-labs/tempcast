@@ -1,16 +1,21 @@
 """Датасет обучающих окон с куррикулумом холодного старта и аугментациями."""
+import logging
+
 import numpy as np
 import torch
 from torch.utils.data import Dataset, get_worker_info
 
 from mayak.config import AugmentConfig
 from mayak.constants import L_MAX, H
+from mayak.data.augment import AugWindow, augment_window
 from mayak.data.masking import (DEFAULT_TARGET_MASK, FilterStats, enforce_invariant,
                                 target_window_ok)
 from mayak.data.qc import qc_window
 from mayak.data.splits import ROLE_TRAIN, ROLE_VAL, time_bounds
 from mayak.data.store import get_store
 from mayak.timeaxis import window_calendar
+
+log = logging.getLogger(__name__)
 
 STREAM_SAMPLE, STREAM_AUG = 0, 1
 
@@ -90,7 +95,9 @@ class WindowDataset(Dataset):
         self.base_seed = int(seed)
         self.aug_seed = None if aug_seed is None else int(aug_seed)
         self.augment = augment if isinstance(augment, AugmentConfig) else \
-            AugmentConfig(**(augment or {}))
+            AugmentConfig.from_dict(augment)
+        log.info("аугментации: профиль %s, отклонения от профиля %s",
+                 self.augment.profile, self.augment.deviations() or "нет")
         self.window_qc = bool(window_qc)
         self.seed_streams(worker_id=0, salt=0)
 
@@ -158,8 +165,11 @@ class WindowDataset(Dataset):
         L = history_len(self._sample_L(), t, lo)
         return self.build(s, t, L)
 
-    def build(self, s, t, L):
-        """Окно станции s с началом горизонта t и историей L, с аугментациями. """
+    def build(self, s, t, L, info=None):
+        """Окно станции s с началом горизонта t и историей L, с аугментациями.
+
+        info - если передан dict, в него кладутся параметры применённых аугментаций.
+        """
         k = np.arange(L_MAX)
         abs_h = t - L_MAX + k
         doy_h, hour_h = window_calendar(s["t0"], abs_h)
@@ -170,34 +180,16 @@ class WindowDataset(Dataset):
         y, y_mask = slice_target(s["x"], s["mask"], t)
         scale = norm_scale(s["clim"], doy_f, hour_f)
 
-        lat, lon, elev = s["lat"], s["lon"], s["elev"]
-
-        a, r = self.augment, self.rng_aug
-        if L > 0 and r.random() < a.gap_prob:
-            glen = int(r.integers(1, a.gap_max_len + 1))
-            gst = int(r.integers(L_MAX - L, L_MAX))
-            mask_hist[gst:min(L_MAX, gst + glen)] = 0.0
-
-        if r.random() < a.drop_humidity_prob:
-            mask_hist[:, 2] = 0.0
-        if r.random() < a.drop_pressure_prob:
-            mask_hist[:, 1] = 0.0
-
-        noise = np.stack([r.normal(0, sd, L_MAX) for sd in a.noise_sd],
-                         axis=-1).astype(np.float32)
-        x_hist = x_hist + noise * mask_hist
-
-        if L > 0:
-            off = float(r.uniform(-a.offset_max, a.offset_max))
-            x_hist[:, 0] = x_hist[:, 0] + off * mask_hist[:, 0]
-            y = y + off * y_mask
-            lat = lat + float(r.uniform(-a.coord_jitter_deg, a.coord_jitter_deg))
-            lon = lon + float(r.uniform(-a.coord_jitter_deg, a.coord_jitter_deg))
-
-        x_hist[:, 2] = np.clip(x_hist[:, 2], 0, 100)
-        x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
+        w = augment_window(AugWindow(x=x_hist, m=mask_hist, y=y, y_mask=y_mask, L=L,
+                                     hour=hour_h, lat=s["lat"], lon=s["lon"],
+                                     elev=s["elev"], qc_elev=s["qc_elev"]),
+                           self.augment, self.rng_aug)
+        if info is not None:
+            info.update(w.applied)
+        lat, lon, elev, y = w.lat, w.lon, w.elev, w.y
+        x_hist, mask_hist = enforce_invariant(w.x, w.m)
         if self.window_qc and L > 0:
-            mask_hist, _ = qc_window(x_hist, mask_hist, elev=s["qc_elev"])
+            mask_hist, _ = qc_window(x_hist, mask_hist, elev=w.qc_elev)
             x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
 
         return {

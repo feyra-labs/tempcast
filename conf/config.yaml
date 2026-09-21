@@ -7,6 +7,7 @@ defaults:
   - model: mayak
   - ablation: none
   - data: default
+  - augment: aggressive
   - train: default
   - _self_
 
@@ -36,6 +37,7 @@ hydra:
         python scripts/run.py model.encoder_width=64 train.seed=1
         python scripts/run.py -m ablation=none,no_anchor,no_compression train.seed=0
         python scripts/run.py -m train.seed=0,1,2
+        python scripts/run.py augment=soft          # профиль аугментаций
 
       Hydra: python scripts/run.py --hydra-help
     template: |

@@ -402,35 +402,204 @@ def check_pipeline_compat(cfg):
     return cfg
 
 
+def _pair(v, name, cast=float):
+    v = tuple(cast(x) for x in v)
+    if len(v) != 2 or v[0] > v[1]:
+        raise ConfigError(f"{name} = {v}: нужна пара lo ≤ hi")
+    return v
+
+
+AUGMENT_PROB_FIELDS = {
+    "coords": "coords_prob", "scale": "scale_prob", "drift": "drift_prob",
+    "offset": "offset_prob", "noise": "noise_prob", "spike": "spike_prob",
+    "stuck": "stuck_prob", "units": "units_prob", "quantize": "quant_prob",
+    "dropout": "dropout_prob", "gap": "gap_prob", "sparse": "sparse_prob",
+    "outage": "outage_prob", "drop_pressure": "drop_pressure_prob",
+    "drop_humidity": "drop_humidity_prob",
+}
+
+
 @dataclass(frozen=True)
 class AugmentConfig:
-    """Аугментации обучающих окон. Значения по умолчанию - прежний набор (профиль base).
+    """Аугментации обучающих окон, имитирующие реальный прибор.
 
-    gap_prob / gap_max_len     - блочный пропуск в истории: вероятность и длина до, ч;
-    drop_humidity_prob         - вся история без влажности;
-    drop_pressure_prob         - вся история без давления;
-    noise_sd                   - шум по каналам T, P, RH (°C, гПа, %);
-    offset_max                 - постоянное смещение T в [−a, a] для истории и цели; 0 - нет;
-    coord_jitter_deg           - дрожание широты и долготы, градусы.
+    Значения по умолчанию - профиль ``aggressive``: профиль обучения для переноса на
+    реальные наблюдения. Именованные профили - ``AUGMENT_PROFILES`` (отличия от
+    умолчаний), собираются ``AugmentConfig.from_profile``. Каждая аугментация
+    включается с вероятностью ``*_prob`` и берёт параметры из своего диапазона.
+    Кортежи из трёх элементов - по каналам (T, P, RH); пары - диапазон [lo, hi].
+
+    Инструмент (к валидным точкам истории):
+      scale_max        - множитель 1 ± U(0, a) на канал;
+      drift_max        - дрейф за историю: к началу истории ±a, к последнему часу 0;
+      drift_rw_frac    - доля случайного блуждания (остальное - линейный дрейф);
+      offset_min/max   - постоянное смещение T, |b| log-равномерно в [min, max] (при
+                         min = 0 - равномерно в [0, max]); **и к истории, и к цели**;
+                         offset_max = 0 - выключено (абляция no_offset_aug);
+      noise_sd         - гауссов шум по каналам (°C, гПа, %);
+      quant_f_frac     - доля квантования T целыми °F (остальное - шаг 0.1 °C).
+    Грубые ошибки (к истории):
+      spike_max_count, spike_min/max - число выбросов 1..n и их величина по каналам;
+      stuck_hours      - залипание значения канала на [lo, hi] ч;
+      units_hours      - подмена единиц на участке [lo, hi] ч: T в °F либо (с долей
+                         units_p_frac) давление, приведённое к уровню моря.
+    Доступность (к маске истории):
+      dropout_max_rate - одиночные пропуски: доля часов U(0, a);
+      gap_max_count, gap_max_len - блочные пропуски: число 1..n, длина 1..len ч;
+      sparse_every     - регулярная отчётность: валиден каждый k-й час, k из набора;
+      outage_hours     - выпадение канала в середине истории на [lo, hi] ч;
+      drop_pressure/humidity - канал отсутствует на всей истории.
+    Метаданные:
+      coord_jitter_deg - дрожание широты и долготы U(±a), градусы;
+      elev_jitter_m    - дрожание высоты N(0, a), м.
     """
-    profile: str = "base"
-    gap_prob: float = 0.3
-    gap_max_len: int = 24
-    drop_humidity_prob: float = 0.1
-    drop_pressure_prob: float = 0.1
-    noise_sd: tuple = (0.2, 0.5, 2.0)
-    offset_max: float = 0.7
+    profile: str = "aggressive"
+    scale_prob: float = 0.3
+    scale_max: tuple = (0.02, 0.001, 0.05)
+    drift_prob: float = 0.3
+    drift_max: tuple = (1.5, 1.5, 6.0)
+    drift_rw_frac: float = 0.5
+    offset_prob: float = 0.8
+    offset_min: float = 0.1
+    offset_max: float = 3.0
+    noise_prob: float = 1.0
+    noise_sd: tuple = (0.2, 0.3, 2.0)
+    quant_prob: float = 0.5
+    quant_f_frac: float = 0.4
+    spike_prob: float = 0.2
+    spike_max_count: int = 3
+    spike_min: tuple = (12.0, 15.0, 40.0)
+    spike_max: tuple = (30.0, 40.0, 80.0)
+    stuck_prob: float = 0.15
+    stuck_hours: tuple = (12, 96)
+    units_prob: float = 0.05
+    units_hours: tuple = (24, 96)
+    units_p_frac: float = 0.3
+    dropout_prob: float = 0.3
+    dropout_max_rate: float = 0.2
+    gap_prob: float = 0.5
+    gap_max_count: int = 3
+    gap_max_len: int = 96
+    sparse_prob: float = 0.15
+    sparse_every: tuple = (3, 6)
+    outage_prob: float = 0.2
+    outage_hours: tuple = (24, 240)
+    drop_humidity_prob: float = 0.15
+    drop_pressure_prob: float = 0.15
+    coords_prob: float = 1.0
     coord_jitter_deg: float = 0.4
+    elev_jitter_m: float = 50.0
 
     def __post_init__(self):
-        object.__setattr__(self, "noise_sd", _floats(self.noise_sd))
-        if len(self.noise_sd) != 3:
-            raise ConfigError(f"noise_sd - по одному на канал T, P, RH: {self.noise_sd}")
-        for name in ("gap_prob", "drop_humidity_prob", "drop_pressure_prob"):
-            if not 0.0 <= float(getattr(self, name)) <= 1.0:
-                raise ConfigError(f"{name} вне [0, 1]")
-        if self.gap_max_len < 1 or self.offset_max < 0 or self.coord_jitter_deg < 0:
-            raise ConfigError("gap_max_len ≥ 1, offset_max ≥ 0, coord_jitter_deg ≥ 0")
+        s = object.__setattr__
+        if self.profile not in AUGMENT_PROFILES:
+            raise ConfigError(f"неизвестный профиль аугментаций {self.profile!r}; "
+                              f"есть {tuple(AUGMENT_PROFILES)}")
+        for name in ("scale_max", "drift_max", "noise_sd", "spike_min", "spike_max"):
+            v = _floats(getattr(self, name))
+            if len(v) != 3 or min(v) < 0:
+                raise ConfigError(f"{name} - по одному неотрицательному значению на канал "
+                                  f"T, P, RH: {v}")
+            s(self, name, v)
+        if any(a > b for a, b in zip(self.spike_min, self.spike_max)):
+            raise ConfigError(f"spike_min {self.spike_min} > spike_max {self.spike_max}")
+        for name in ("stuck_hours", "units_hours", "outage_hours"):
+            v = _pair(getattr(self, name), name, int)
+            if v[0] < 1:
+                raise ConfigError(f"{name}: длительность ≥ 1 ч")
+            s(self, name, v)
+        every = _ints(self.sparse_every)
+        if not every or min(every) < 2:
+            raise ConfigError(f"sparse_every - шаги отчётности ≥ 2 ч: {every}")
+        s(self, "sparse_every", every)
+        for name in (*AUGMENT_PROB_FIELDS.values(), "drift_rw_frac", "quant_f_frac",
+                     "units_p_frac", "dropout_max_rate"):
+            v = float(getattr(self, name))
+            if not 0.0 <= v <= 1.0:
+                raise ConfigError(f"{name} = {v} вне [0, 1]")
+            s(self, name, v)
+        for name in ("spike_max_count", "gap_max_count", "gap_max_len"):
+            v = int(getattr(self, name))
+            if v < 1:
+                raise ConfigError(f"{name} ≥ 1")
+            s(self, name, v)
+        for name in ("offset_min", "offset_max", "coord_jitter_deg", "elev_jitter_m"):
+            v = float(getattr(self, name))
+            if v < 0:
+                raise ConfigError(f"{name} ≥ 0")
+            s(self, name, v)
+        if self.offset_max == 0.0:
+            s(self, "offset_min", 0.0)
+        elif self.offset_min > self.offset_max:
+            raise ConfigError(f"offset_min {self.offset_min} > offset_max {self.offset_max}")
+
+    @classmethod
+    def from_profile(cls, name="aggressive", **overrides):
+        """Именованный профиль + явные переопределения."""
+        if name not in AUGMENT_PROFILES:
+            raise ConfigError(f"неизвестный профиль аугментаций {name!r}; "
+                              f"есть {tuple(AUGMENT_PROFILES)}")
+        kw = {**AUGMENT_PROFILES[name], **overrides}
+        kw.pop("profile", None)
+        return cls(**_strict_kwargs(cls, {"profile": name, **kw}, "data.augment"))
+
+    @classmethod
+    def from_dict(cls, d=None):
+        """Словарь → конфиг: профиль из ключа profile (по умолчанию aggressive), затем
+        остальные ключи поверх него."""
+        d = _strict_kwargs(cls, d, "data.augment")
+        return cls.from_profile(d.pop("profile", "aggressive"), **d)
+
+    @classmethod
+    def only(cls, name, profile="aggressive"):
+        if name not in AUGMENT_PROB_FIELDS:
+            raise ConfigError(f"нет аугментации {name!r}; есть {tuple(AUGMENT_PROB_FIELDS)}")
+        base = cls.from_profile(profile)
+        probs = {f: 0.0 for f in AUGMENT_PROB_FIELDS.values()}
+        probs[AUGMENT_PROB_FIELDS[name]] = 1.0
+        return replace(base, **probs)
+
+    def deviations(self):
+        """Поля, отличающиеся от объявленного профиля: {поле: (в профиле, фактически)}."""
+        ref = AugmentConfig.from_profile(self.profile)
+        return {f.name: (getattr(ref, f.name), getattr(self, f.name)) for f in fields(self)
+                if getattr(ref, f.name) != getattr(self, f.name)}
+
+    def summary(self):
+        return dict(profile=self.profile,
+                    deviations={k: [to_jsonable(a), to_jsonable(b)]
+                                for k, (a, b) in self.deviations().items()},
+                    enabled=sorted(n for n, f in AUGMENT_PROB_FIELDS.items()
+                                   if getattr(self, f) > 0))
+
+
+AUGMENT_PROFILES = {
+    "aggressive": {},
+    "soft": dict(
+        scale_prob=0.15, scale_max=(0.01, 0.0005, 0.03),
+        drift_prob=0.15, drift_max=(0.7, 1.0, 3.0),
+        offset_max=1.5,
+        noise_sd=(0.15, 0.2, 1.5),
+        quant_prob=0.3, quant_f_frac=0.2,
+        spike_prob=0.05, spike_max_count=1,
+        stuck_prob=0.05, stuck_hours=(6, 48),
+        units_prob=0.01,
+        dropout_prob=0.2, dropout_max_rate=0.1,
+        gap_prob=0.3, gap_max_count=2, gap_max_len=48,
+        sparse_prob=0.05, outage_prob=0.1, outage_hours=(24, 120),
+        drop_humidity_prob=0.1, drop_pressure_prob=0.1,
+        coord_jitter_deg=0.2, elev_jitter_m=20.0),
+    "base": dict(
+        scale_prob=0.0, drift_prob=0.0,
+        offset_prob=1.0, offset_min=0.0, offset_max=0.7,
+        noise_prob=1.0, noise_sd=(0.2, 0.5, 2.0), quant_prob=0.0,
+        spike_prob=0.0, stuck_prob=0.0, units_prob=0.0,
+        dropout_prob=0.0, gap_prob=0.3, gap_max_count=1, gap_max_len=24,
+        sparse_prob=0.0, outage_prob=0.0,
+        drop_humidity_prob=0.1, drop_pressure_prob=0.1,
+        coords_prob=1.0, coord_jitter_deg=0.4, elev_jitter_m=0.0),
+    "none": {f: 0.0 for f in AUGMENT_PROB_FIELDS.values()},
+}
 
 
 @dataclass(frozen=True)
@@ -449,8 +618,7 @@ class DataConfig:
             object.__setattr__(self, "target_mask", TargetMaskConfig(**_strict_kwargs(
                 TargetMaskConfig, self.target_mask, "data.target_mask")))
         if not isinstance(self.augment, AugmentConfig):
-            object.__setattr__(self, "augment", AugmentConfig(**_strict_kwargs(
-                AugmentConfig, self.augment, "data.augment")))
+            object.__setattr__(self, "augment", AugmentConfig.from_dict(self.augment))
         tb = dict(self.time_bounds)
         if tb != dict(TIME_BOUNDS):
             raise ConfigError(f"data.time_bounds = {tb} расходится с контрактом сплитов "
@@ -493,7 +661,7 @@ class RunConfig:
         abl = getattr(self.model, "ablations", None)
         data = self.data
         if abl is not None and abl.no_offset_aug and data.augment.offset_max != 0.0:
-            data = replace(data, augment=replace(data.augment, offset_max=0.0))
+            data = replace(data, augment=replace(data.augment, offset_min=0.0, offset_max=0.0))
         return replace(self, data=data)
 
     def to_dict(self):
@@ -513,7 +681,8 @@ def run_label(model_cfg):
     return model_cfg.arch + ("" if not act else "-" + "+".join(act))
 
 
-__all__ = ["ABLATION_NAMES", "Ablations", "AugmentConfig", "CHANNEL_MAX_LAG", "ConfigError",
+__all__ = ["ABLATION_NAMES", "AUGMENT_PROB_FIELDS", "AUGMENT_PROFILES", "Ablations",
+           "AugmentConfig", "CHANNEL_MAX_LAG", "ConfigError",
            "DEFAULT_MODE_GROUPS",
            "DLinearConfig", "DataConfig", "ENCODER_CHANNELS", "GRUConfig", "MODEL_CONFIGS",
            "ModeGroup", "ModelConfig", "RunConfig", "SOLAR_CHANNELS", "Seeds", "TrainConfig",
