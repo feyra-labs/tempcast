@@ -764,13 +764,20 @@ def main():
     import logging
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     import argparse
-    from mayak.lit import LitMayak, load_model
-    ap = argparse.ArgumentParser()
+    from mayak.config import run_label
+    from mayak.lit import load_model, load_run_record
+    ap = argparse.ArgumentParser(description="единый стенд оценки МАЯК")
     ap.add_argument("--ckpt", required=True, nargs="+",
                     help="чекпойнты МАЯК; несколько = прогоны с разными сидами")
     ap.add_argument("--manifest", default="data/manifest.csv")
     ap.add_argument("--gru-ckpt", default=None)
     ap.add_argument("--dlinear-ckpt", default=None)
+    ap.add_argument("--ablation-ckpt", nargs="*", default=[],
+                    help="чекпойнты переобученных абляций МАЯК (тот же сид и протокол); "
+                         "имя строки таблицы берётся из конфига в чекпойнте")
+    ap.add_argument("--eval-seed", type=int, default=None,
+                    help="сид оценки (бутстрап, примеры); по умолчанию - seeds.eval "
+                         "из первого чекпойнта, иначе 0")
     ap.add_argument("--conformal", default=None, help="runs/conformal.npy (если есть)")
     ap.add_argument("--out-dir", default="runs/plots")
     ap.add_argument("--n-examples", type=int, default=10, help="число примеров прогноз vs факт")
@@ -786,14 +793,23 @@ def main():
     clims = store.clims()
     ds = EvalSet(clims, manifest=args.manifest, time_key="test")
     run_checklist(store, datasets=[ds], conformal=args.conformal,
-                  checkpoints=[c for c in (*args.ckpt, args.gru_ckpt, args.dlinear_ckpt) if c])
+                  checkpoints=[c for c in (*args.ckpt, args.gru_ckpt, args.dlinear_ckpt,
+                                           *args.ablation_ckpt) if c])
+    rec = load_run_record(args.ckpt[0])
+    eval_seed = args.eval_seed
+    if eval_seed is None:
+        eval_seed = int(rec["seeds"]["eval"]) if rec else 0
+    print(f"Сид оценки: {eval_seed}")
 
     r = BL.fit_damped_persistence({k: s for k, s in clims.items() if s["role"] == ROLE_TRAIN},
                                   n_windows=20000)
 
-    seeds = [LitMayak.load_from_checkpoint(c, map_location="cpu").model for c in args.ckpt]
+    seeds = [load_model(c) for c in args.ckpt]
     mayak = seeds[0]
     named_extra = {}
+    for c in args.ablation_ckpt:
+        m = load_model(c)
+        named_extra[f"МАЯК [{run_label(m.cfg)}]"] = m
     if args.gru_ckpt:
         named_extra["GRU seq2seq"] = load_model(args.gru_ckpt)
     if args.dlinear_ckpt:
@@ -804,7 +820,7 @@ def main():
     preds = add_statistical_baselines(preds, aux, r_damped=r)
 
     shift = np.load(args.conformal) if args.conformal else None
-    boot = dict(n_boot=args.bootstrap, seed=0, level=args.ci_level)
+    boot = dict(n_boot=args.bootstrap, seed=eval_seed, level=args.ci_level)
 
     print("\n=== Таблицы метрик ===")
     evaluate_all(mayak, clims, args.manifest, r_damped=r,
@@ -839,15 +855,15 @@ def main():
 
     print("\n=== Графики прогноз vs факт (примеры МАЯК) ===")
     plot_forecast_examples(mayak, clims, manifest=args.manifest,
-                           n=args.n_examples, out_dir=args.out_dir, shift=shift)
+                           n=args.n_examples, out_dir=args.out_dir, shift=shift, seed=eval_seed)
     plot_forecast_examples(mayak, clims, manifest=args.manifest, n=args.n_examples,
                            out_dir=args.out_dir + "/unseen",
-                           station_splits=("unseen_test",), shift=shift)
+                           station_splits=("unseen_test",), shift=shift, seed=eval_seed)
     plot_forecast_examples(mayak, clims, manifest=args.manifest, n=args.n_examples, L=0,
-                           out_dir=args.out_dir, shift=shift)
+                           out_dir=args.out_dir, shift=shift, seed=eval_seed)
     plot_forecast_examples(mayak, clims, manifest=args.manifest, n=args.n_examples, L=0,
                            station_splits=("unseen_test",),
-                           out_dir=args.out_dir + "/unseen", shift=shift)
+                           out_dir=args.out_dir + "/unseen", shift=shift, seed=eval_seed)
     print("\n=== Суточные амплитуды ===")
     plot_amplitude_scatter(mayak, clims, manifest=args.manifest, out_dir=args.out_dir)
 

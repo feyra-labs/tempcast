@@ -117,7 +117,7 @@ flowchart LR
 | **LocEncoder** | `mayak/modules/loc.py` | Случайные Фурье-признаки точки на сфере (полосо-ограниченные) + широта/высота → гладкий координатный вход. |
 | **ClimateField** | `mayak/modules/field.py` | Координаты → коэффициенты годового×суточного гармонического базиса → климат `C, σ, ΔТ_сут`. Модулируется паспортом через FiLM (ограниченный, ±30%). |
 | **Fingerprint (паспорт)** | `mayak/modules/passport.py` | Латент станции `z ~ N(m,v)`. Глобальный прайор + байесовское обновление по суточным сводкам (GRU). При нулевой истории `z = m₀` (нейтрально), с данными — добирает локальный сдвиг. |
-| **SynopticEncoder** | `mayak/modules/encoder.py` | Каузальный TCN (12 depthwise-separable блоков с растущей дилатацией). |
+| **SynopticEncoder** | `mayak/modules/encoder.py` | Каузальный TCN (12 depthwise-separable блоков с растущей дилатацией, рецептивное поле 253 ч). |
 | **LaplaceReadout** | `mayak/modules/readout.py` | 24 затухающие моды (релакс./суточные/полусуточные/синоптические) с полюсами `λ = −1/τ + iω`. Замкнутая форма + точный потоковый шаг `O(M)`. Деление на `e + κ` = «доказательное сжатие» к нулю при короткой истории. |
 | **ModalPropagator** | `mayak/modules/propagator.py` | Разворачивает состояние мод на 168 ч (затухание + поворот фазы), с подстройкой `τ, ω` под станцию. |
 | **Heads** | `mayak/modules/heads.py` | Ограниченная поправка `r = 0.6·tanh(...)`, масштаб интервала и монотонные квантильные смещения. |
@@ -182,6 +182,22 @@ python scripts/train.py --arch dlinear --manifest data/manifest.csv --accelerato
 ```
 Лучшие чекпойнты сохраняются в `runs/<arch>/stageB/best.ckpt`, журнал прогона — в `runs/<arch>/protocol.json`.
 
+### Конфигурация, абляции, сиды
+
+Архитектура, данные и протокол описаны датаклассами в `mayak/config.py` (`ModelConfig`, `DataConfig`, `Protocol`) — их можно создавать прямо из кода. Поверх них — слой композиции Hydra (`conf/`, `scripts/run.py`): переопределения из командной строки, именованные варианты и групповые запуски.
+
+```bash
+python scripts/run.py                                          # = scripts/train.py --arch mayak
+python scripts/run.py model=gru                                # бейзлайн
+python scripts/run.py model=mayak_wide model.encoder_width=64  # вариант + переопределение
+python scripts/run.py train=debug run.accelerator=cpu          # отладка на CPU
+python scripts/run.py -m ablation=none,no_anchor,no_compression train.seed=0   # абляции
+python scripts/run.py -m train.seed=0,1,2                      # три сида
+```
+Прогон пишется в `runs/<arch>-<абляция>-s<сид>/` (при `-m` — в `runs/sweeps/<время>/<тег>/`); рабочий каталог не меняется. Полностью разрешённый конфиг лежит в `config.json` рядом с чекпойнтами и внутри каждого чекпойнта (ключ `mayak_run`, там же сиды, хеш коммита и версии библиотек). Модель загружается из чекпойнта с той архитектурой, с которой обучалась.
+
+Флаги абляций (`model.ablations`, группа `ablation=`): `no_anchor` (без климат-поля), `no_compression` (без доказательного сжатия), `no_passport`, `no_solar`, `no_mode_groups`, `no_offset_aug`. Сиды раздельные: `train.seeds.{init,data,augment,eval}`, по умолчанию равны `train.seed`.
+
 ### Оценка и воспроизведение графиков
 
 ```bash
@@ -198,6 +214,11 @@ python -m mayak.evaluate --ckpt runs/mayak/stageB/best.ckpt \
     --dlinear-ckpt runs/dlinear/stageB/best.ckpt \
     --conformal runs/conformal.npy --out-dir runs/plots \
     --n-examples 10 --bootstrap 1000
+
+# переобученные абляции - отдельными строками тех же таблиц
+python -m mayak.evaluate --ckpt runs/mayak-none-s0/stageB/best.ckpt \
+    --ablation-ckpt runs/mayak-no_anchor-s0/stageB/best.ckpt \
+                    runs/mayak-no_compression-s0/stageB/best.ckpt
 
 # три сида основной модели: к интервалу по станциям добавляется разброс по сидам
 python -m mayak.evaluate --conformal runs/conformal.npy \
@@ -222,7 +243,7 @@ python -m mayak.evaluate --conformal runs/conformal.npy \
 ```bash
 python -m mayak.knockout --ckpt runs/mayak/stageB/best.ckpt
 ```
-Выключает по очереди солнечные каналы, группы мод, паспорт и т.д. через forward-hooks и печатает падение Skill по лидам.
+Выключает по очереди солнечные каналы, группы мод, паспорт и т.д. через forward-hooks и печатает падение Skill по лидам. Это диагностика; вклад компонента меряется переобучением с флагом абляции (см. «Конфигурация, абляции, сиды»).
 </details>
 
 ### Инференс на устройстве
@@ -247,6 +268,8 @@ python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt \
 ```
 mayak/
   modules/        loc, field, passport, encoder, readout, propagator, heads
+  config.py       датаклассы конфигурации: модель, данные, прогон; флаги абляций
+  provenance.py   хеш коммита и версии библиотек для чекпойнта
   model.py        сборка MAYAK
   astro.py        солнечно-календарные признаки, точка росы
   loss.py         общая функция потерь (pinball / климатологический масштаб)
@@ -259,7 +282,8 @@ mayak/
   evaluate.py     сбор окон и предсказаний, таблицы, разрезы, графики, холодный старт
   knockout.py     абляции обученной модели (без переобучения)
   runtime/        treaming.py (потоковый рантайм), run_inference.py
-scripts/          make_synth, make_real, make_splits, build_cache, train, train_neurobaselines, calibrate, export_onnx, plot_loss
+conf/             конфиги Hydra: model/, ablation/, data/, train/
+scripts/          make_synth, make_real, make_splits, build_cache, train, run (Hydra), train_neurobaselines, calibrate, export_onnx, plot_loss
 
 ```
 </details>

@@ -5,6 +5,7 @@ from scipy.stats import norm
 import torch
 import torch.nn as nn
 
+from mayak.config import DLinearConfig, GRUConfig
 from mayak.constants import H, QUANTILES
 from mayak.data.splits import time_bounds
 from mayak.data.store import get_store
@@ -95,19 +96,32 @@ def seasonal_naive_forecast(x_hist, mask_hist, mu_clim_fut, sigma_clim, period=2
     return mu, quantiles_from_normal(mu, sig)
 
 
-class GRUSeq2Seq(nn.Module):
-    """GRU-кодировщик с прямой головой на весь горизонт."""
+def _median_centered_offsets(gaps_param, nq, device):
+    """Монотонные смещения квантилей (H, nq) с нулём на медиане."""
+    gaps = torch.nn.functional.softplus(gaps_param)
+    offs = torch.cat([torch.zeros(gaps.shape[0], 1, device=device), torch.cumsum(gaps, -1)], -1)
+    return offs - offs[:, nq // 2:nq // 2 + 1]
 
-    def __init__(self, hidden=96, nq=len(QUANTILES)):
+
+class GRUSeq2Seq(nn.Module):
+    """GRU-кодировщик с прямой головой на весь горизонт (конфиг - GRUConfig)."""
+    N_INPUT = 3 + 3 + 3
+
+    def __init__(self, cfg=None):
         super().__init__()
-        self.nq = nq
-        self.gru = nn.GRU(input_size=3 + 3 + 3, hidden_size=hidden,
-                          num_layers=2, batch_first=True)
-        self.head_mu = nn.Sequential(nn.Linear(hidden + 3, 256), nn.GELU(),
-                                     nn.Linear(256, H))
-        self.head_sig = nn.Sequential(nn.Linear(hidden + 3, 128), nn.GELU(),
-                                      nn.Linear(128, H))
-        self.gaps = nn.Parameter(torch.zeros(H, nq - 1))
+        cfg = GRUConfig() if cfg is None else cfg
+        if not isinstance(cfg, GRUConfig):
+            cfg = GRUConfig.from_dict(cfg)
+        self.cfg = cfg
+        self.nq = cfg.n_quantiles
+        self.horizon = cfg.horizon
+        self.gru = nn.GRU(input_size=self.N_INPUT, hidden_size=cfg.hidden,
+                          num_layers=cfg.layers, batch_first=True)
+        self.head_mu = nn.Sequential(nn.Linear(cfg.hidden + 3, cfg.mu_hidden), nn.GELU(),
+                                     nn.Linear(cfg.mu_hidden, cfg.horizon))
+        self.head_sig = nn.Sequential(nn.Linear(cfg.hidden + 3, cfg.sigma_hidden), nn.GELU(),
+                                      nn.Linear(cfg.sigma_hidden, cfg.horizon))
+        self.gaps = nn.Parameter(torch.zeros(cfg.horizon, self.nq - 1))
 
     def forward(self, batch):
         x = batch["x_hist"]; m = batch["mask_hist"]
@@ -119,7 +133,6 @@ class GRUSeq2Seq(nn.Module):
             torch.tensor([90.0, 180.0, 1000.0], device=x.device)
         coord_seq = coord[:, None, :].expand(-1, x.shape[1], -1)
 
-        # inp = torch.cat([x * m, m, coord_seq], dim=-1)
         inp = torch.cat([xn * m, m, coord_seq], dim=-1)
 
         h, _ = self.gru(inp)
@@ -128,28 +141,31 @@ class GRUSeq2Seq(nn.Module):
         mu = self.head_mu(feat)
         log_sig = self.head_sig(feat).clamp(-2, 4)
         sig = torch.exp(log_sig)
-        gaps = torch.nn.functional.softplus(self.gaps)
-        cum = torch.cumsum(gaps, dim=-1)
-        offs = torch.cat([torch.zeros(H, 1, device=x.device), cum], dim=-1)
-        offs = offs - offs[:, self.nq // 2:self.nq // 2 + 1]
+        offs = _median_centered_offsets(self.gaps, self.nq, x.device)
         q = mu[..., None] + sig[..., None] * offs[None]
         return {"q": q, "mu": mu, "sigma": sig}
 
 
 class DLinear(nn.Module):
-    """DLinear: разложение скользящим средним и два линейных отображения по времени."""
+    """DLinear: разложение скользящим средним и два линейных отображения по времени
+    (конфиг - DLinearConfig: длина входа и ядро скользящего среднего)."""
 
-    def __init__(self, L_in=672, kernel=25, nq=len(QUANTILES)):
+    def __init__(self, cfg=None):
         super().__init__()
-        self.k = kernel
-        self.lin_trend = nn.Linear(L_in, H)
-        self.lin_resid = nn.Linear(L_in, H)
-        self.log_sig = nn.Parameter(torch.zeros(H))
-        self.gaps = nn.Parameter(torch.zeros(H, nq - 1))
-        self.nq = nq
+        cfg = DLinearConfig() if cfg is None else cfg
+        if not isinstance(cfg, DLinearConfig):
+            cfg = DLinearConfig.from_dict(cfg)
+        self.cfg = cfg
+        self.k = cfg.kernel
+        self.nq = cfg.n_quantiles
+        self.input_len = cfg.input_len
+        self.lin_trend = nn.Linear(cfg.input_len, cfg.horizon)
+        self.lin_resid = nn.Linear(cfg.input_len, cfg.horizon)
+        self.log_sig = nn.Parameter(torch.zeros(cfg.horizon))
+        self.gaps = nn.Parameter(torch.zeros(cfg.horizon, self.nq - 1))
 
     def forward(self, batch):
-        T = (batch["x_hist"][..., 0] * batch["mask_hist"][..., 0])
+        T = (batch["x_hist"][..., 0] * batch["mask_hist"][..., 0])[:, -self.input_len:]
         pad = self.k // 2
         trend = torch.nn.functional.avg_pool1d(
             torch.nn.functional.pad(T[:, None], (pad, pad), mode="replicate"),
@@ -157,8 +173,6 @@ class DLinear(nn.Module):
         resid = T - trend
         mu = self.lin_trend(trend) + self.lin_resid(resid)
         sig = torch.exp(self.log_sig).clamp(0.3, 12)[None].expand_as(mu)
-        gaps = torch.nn.functional.softplus(self.gaps)
-        offs = torch.cat([torch.zeros(H, 1, device=T.device), torch.cumsum(gaps, -1)], dim=-1)
-        offs = offs - offs[:, self.nq // 2:self.nq // 2 + 1]
+        offs = _median_centered_offsets(self.gaps, self.nq, T.device)
         q = mu[..., None] + sig[..., None] * offs[None]
         return {"q": q, "mu": mu, "sigma": sig}

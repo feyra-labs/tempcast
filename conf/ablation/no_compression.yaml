@@ -1,0 +1,2 @@
+# Абляция «no_compression» (mayak.config.Ablations). Только для model=mayak*.
+no_compression: true

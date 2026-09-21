@@ -1,0 +1,2 @@
+# Абляция «no_passport» (mayak.config.Ablations). Только для model=mayak*.
+no_passport: true

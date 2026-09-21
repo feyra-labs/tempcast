@@ -1,33 +1,42 @@
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mayak.constants import N_CH, C_ENC
-
 
 class DSBlock(nn.Module):
-    """Depthwise-separable блок с residual-связью."""
+    """Depthwise-separable причинный блок с residual-связью.
 
-    def __init__(self, c, dilation):
+    Ядро k с дилатацией d видит моменты t, t − d, …, t − (k − 1)·d: слева
+    дополняется (k − 1)·d нулями, выход в момент t не зависит от будущего входа.
+    """
+
+    def __init__(self, c, dilation, kernel=3, norm_groups=4):
         super().__init__()
         self.d = dilation
-        self.dw = nn.Conv1d(c, c, 3, dilation=dilation, groups=c)
+        self.pad = (kernel - 1) * dilation
+        self.dw = nn.Conv1d(c, c, kernel, dilation=dilation, groups=c)
         self.pw = nn.Conv1d(c, c, 1)
-        self.gn = nn.GroupNorm(4, c)
+        self.gn = nn.GroupNorm(norm_groups, c)
 
     def forward(self, x):
-        h = self.dw(F.pad(x, (2 * self.d, 0)))
+        h = self.dw(F.pad(x, (self.pad, 0)))
         h = F.gelu(self.gn(self.pw(h)))
         return x + h
 
 
 class SynopticEncoder(nn.Module):
-    """Каузальный TCN: 12 depthwise-separable блоков, рецептивное поле ≈127 ч."""
+    """Каузальный TCN из depthwise-separable блоков.
 
-    def __init__(self):
+    Вход (B, n_ch, L) → выход (B, L, width). Рецептивное поле (k − 1)·Σd + 1 ч:
+    для ядра 3 и дилатаций (1, 1, 2, 2, …, 32, 32) это 2·126 + 1 = 253 ч
+    (ModelConfig.receptive_field).
+    """
+
+    def __init__(self, n_ch=13, width=48, dilations=(1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 32, 32),
+                 kernel=3, norm_groups=4):
         super().__init__()
-        self.stem = nn.Conv1d(N_CH, C_ENC, 1)
-        dil = [1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 32, 32]
-        self.blocks = nn.ModuleList(DSBlock(C_ENC, d) for d in dil)
+        self.receptive_field = (kernel - 1) * sum(dilations) + 1
+        self.stem = nn.Conv1d(n_ch, width, 1)
+        self.blocks = nn.ModuleList(DSBlock(width, d, kernel, norm_groups) for d in dilations)
 
     def forward(self, x):
         h = self.stem(x)

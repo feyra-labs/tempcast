@@ -1,0 +1,13 @@
+# Отладочный прогон на CPU за минуты.
+defaults:
+  - default
+  - _self_
+
+stages:
+  - {name: A, curriculum: L0, steps: 200, val_L: 0}
+  - {name: B, curriculum: full, steps: 1000, val_L: 672}
+batch_size: 32
+windows_per_epoch: 2000
+num_workers: 0
+precision: "32"
+val_every: 200

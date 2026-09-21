@@ -1,0 +1,2 @@
+# Абляция «no_solar» (mayak.config.Ablations). Только для model=mayak*.
+no_solar: true

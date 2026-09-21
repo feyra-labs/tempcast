@@ -52,9 +52,9 @@ def main():
                     help="климат-средняя T (°C) для watchdog-фолбэка")
     ap.add_argument("--sigma-fallback", type=float, default=4.0)
     args = ap.parse_args()
-    from mayak.lit import LitMayak                     # тяжёлый импорт — после разбора аргументов
+    from mayak.lit import load_model                     # тяжёлый импорт — после разбора аргументов
 
-    model = LitMayak.load_from_checkpoint(args.ckpt, map_location="cpu").model.eval()
+    model = load_model(args.ckpt).eval()
     conf = args.conformal if (args.conformal and os.path.exists(args.conformal)) else None
     stream = StreamingMayak(model, args.lat, args.lon, args.elev, conformal=conf)
     print("Конформная калибровка:", "включена" if conf else "ОТКЛЮЧЕНА (таблица не передана)")

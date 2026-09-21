@@ -32,7 +32,7 @@ def fit_conformal(model, clims, manifest="data/manifest.csv"):
 def main():
     import logging
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    from mayak.lit import LitMayak
+    from mayak.lit import load_model
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--manifest", default="data/manifest.csv")
@@ -44,8 +44,8 @@ def main():
     ds = calibration_set(clims, args.manifest)
     run_checklist(store, datasets=[ds], checkpoints=[args.ckpt])
 
-    lit = LitMayak.load_from_checkpoint(args.ckpt, map_location="cpu")
-    D = gather(lit.model, ds)
+    model = load_model(args.ckpt)
+    D = gather(model, ds)
     shift = fit_conformal_shift(D["y"], D["q"], D["y_mask"], LEAD_BINS)
     save_conformal(args.out, shift, conformal_record(ds, checkpoint=args.ckpt))
     print("Таблица поправок (бины лидов × квантили), °C:")

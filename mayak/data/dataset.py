@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, get_worker_info
 
+from mayak.config import AugmentConfig
 from mayak.constants import L_MAX, H
 from mayak.data.masking import (DEFAULT_TARGET_MASK, FilterStats, enforce_invariant,
                                 target_window_ok)
@@ -13,14 +14,20 @@ from mayak.timeaxis import window_calendar
 STREAM_SAMPLE, STREAM_AUG = 0, 1
 
 
-def make_streams(base_seed, worker_id=0, salt=0):
+def make_streams(base_seed, worker_id=0, salt=0, aug_seed=None):
     """Два независимых генератора от тройки (сид, воркер, поток).
 
-    salt — база итератора DataLoader: при непостоянных воркерах она своя на каждую
-    эпоху, иначе каждая эпоха повторяла бы предыдущую окно в окно.
+    salt     — база итератора DataLoader: при непостоянных воркерах она своя на каждую
+               эпоху, иначе каждая эпоха повторяла бы предыдущую окно в окно;
+    aug_seed — отдельный сид аугментаций (None - тот же, что у потока окон). Поток
+               окон зависит только от base_seed: смена aug_seed его не сдвигает.
     """
-    ss = np.random.SeedSequence(entropy=[int(base_seed), int(salt)], spawn_key=(int(worker_id),))
-    sample, aug = ss.spawn(2)
+    def children(seed):
+        ss = np.random.SeedSequence(entropy=[int(seed), int(salt)], spawn_key=(int(worker_id),))
+        return ss.spawn(2)
+    sample, aug = children(base_seed)
+    if aug_seed is not None:
+        aug = children(aug_seed)[1]
     return np.random.default_rng(sample), np.random.default_rng(aug)
 
 
@@ -74,15 +81,18 @@ def footprint(t, L, lo):
 class WindowDataset(Dataset):
     def __init__(self, manifest, split="train", curriculum="full",
                  windows_per_epoch=200_000, seed=0, target_mask=DEFAULT_TARGET_MASK,
-                 store=None):
+                 store=None, aug_seed=None, augment=None, cache_root=None):
         assert split in ("train",)
         assert curriculum in ("full", "L0")
         self.curriculum = curriculum
         self.n = windows_per_epoch
         self.base_seed = int(seed)
+        self.aug_seed = None if aug_seed is None else int(aug_seed)
+        self.augment = augment if isinstance(augment, AugmentConfig) else \
+            AugmentConfig(**(augment or {}))
         self.seed_streams(worker_id=0, salt=0)
 
-        store = store or get_store(manifest)
+        store = store or get_store(manifest, cache_root=cache_root)
         self.station_role, self.time_key = ROLE_TRAIN, "train"
         rows = store.by_role(ROLE_TRAIN)
         assert rows, "нет train-станций — запустите make_splits.py"
@@ -109,7 +119,8 @@ class WindowDataset(Dataset):
         self.w = w / w.sum()
 
     def seed_streams(self, worker_id=0, salt=0):
-        self.rng_sample, self.rng_aug = make_streams(self.base_seed, worker_id, salt)
+        self.rng_sample, self.rng_aug = make_streams(self.base_seed, worker_id, salt,
+                                                     aug_seed=self.aug_seed)
 
     def footprints(self):
         for s in self.st:
@@ -158,28 +169,27 @@ class WindowDataset(Dataset):
 
         lat, lon, elev = s["lat"], s["lon"], s["elev"]
 
-        r = self.rng_aug
-        if L > 0 and r.random() < 0.3:
-            glen = int(r.integers(1, 25))
+        a, r = self.augment, self.rng_aug
+        if L > 0 and r.random() < a.gap_prob:
+            glen = int(r.integers(1, a.gap_max_len + 1))
             gst = int(r.integers(L_MAX - L, L_MAX))
             mask_hist[gst:min(L_MAX, gst + glen)] = 0.0
 
-        if r.random() < 0.1:
+        if r.random() < a.drop_humidity_prob:
             mask_hist[:, 2] = 0.0
-        if r.random() < 0.1:
+        if r.random() < a.drop_pressure_prob:
             mask_hist[:, 1] = 0.0
 
-        noise = np.stack([r.normal(0, 0.2, L_MAX),
-                          r.normal(0, 0.5, L_MAX),
-                          r.normal(0, 2.0, L_MAX)], axis=-1).astype(np.float32)
+        noise = np.stack([r.normal(0, sd, L_MAX) for sd in a.noise_sd],
+                         axis=-1).astype(np.float32)
         x_hist = x_hist + noise * mask_hist
 
         if L > 0:
-            off = float(r.uniform(-0.7, 0.7))
+            off = float(r.uniform(-a.offset_max, a.offset_max))
             x_hist[:, 0] = x_hist[:, 0] + off * mask_hist[:, 0]
             y = y + off * y_mask
-            lat = lat + float(r.uniform(-0.40, 0.40))
-            lon = lon + float(r.uniform(-0.40, 0.40))
+            lat = lat + float(r.uniform(-a.coord_jitter_deg, a.coord_jitter_deg))
+            lon = lon + float(r.uniform(-a.coord_jitter_deg, a.coord_jitter_deg))
 
         x_hist[:, 2] = np.clip(x_hist[:, 2], 0, 100)
         x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)

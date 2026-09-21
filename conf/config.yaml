@@ -1,0 +1,45 @@
+# Корневой конфиг Hydra: python scripts/run.py [группа=вариант ...] [ключ=значение ...]
+#
+# Значения в группах model/, data/, train/ совпадают с датаклассами mayak/config.py
+# (ModelConfig, DataConfig, Protocol) - это проверяет tests/test_block6_config.py.
+defaults:
+  - model: mayak
+  - ablation: none
+  - data: default
+  - train: default
+  - _self_
+
+run:
+  out_root: runs
+  tag: ${model.arch}-${hydra:runtime.choices.ablation}-s${train.seed}
+  accelerator: gpu
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: ${run.out_root}/${run.tag}
+  sweep:
+    dir: ${run.out_root}/sweeps/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${run.tag}
+  help:
+    app_name: mayak-run
+    header: |
+      usage: python scripts/run.py [ГРУППА=ВАРИАНТ ...] [КЛЮЧ=ЗНАЧЕНИЕ ...] [--multirun]
+
+      Обучение по единому протоколу с композицией конфигов (Hydra).
+    footer: |
+      Примеры:
+        python scripts/run.py model=gru run.accelerator=cpu train=debug
+        python scripts/run.py model.encoder_width=64 train.seed=1
+        python scripts/run.py -m ablation=none,no_anchor,no_compression train.seed=0
+        python scripts/run.py -m train.seed=0,1,2
+
+      Hydra: python scripts/run.py --hydra-help
+    template: |
+      ${hydra.help.header}
+      == Группы конфигов ==
+      $APP_CONFIG_GROUPS
+      == Конфиг ==
+      $CONFIG
+      ${hydra.help.footer}

@@ -4,12 +4,13 @@ import torch.nn as nn
 
 
 class LocEncoder(nn.Module):
-    """Случайные Фурье-признаки точки на сфере"""
-    OUT = 48 + 2
+    """Случайные Фурье-признаки точки на сфере."""
 
-    def __init__(self, n_freq: int = 24, f_scale: float = 12.0, f_max: float = 30.0):
+    def __init__(self, n_freq: int = 24, f_scale: float = 12.0, f_max: float = 30.0,
+                 seed: int = 7):
         super().__init__()
-        g = torch.Generator().manual_seed(7)
+        self.out_dim = 2 * n_freq + 2
+        g = torch.Generator().manual_seed(seed)
         W = torch.randn(3, n_freq, generator=g) * f_scale
         nrm = W.norm(dim=0, keepdim=True)
         W = W * torch.clamp(f_max / nrm, max=1.0)

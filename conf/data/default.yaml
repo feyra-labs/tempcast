@@ -1,0 +1,23 @@
+# Данные: значения по умолчанию = mayak.config.DataConfig().
+manifest: data/manifest.csv
+cache_root: null
+time_bounds:
+  hours_per_year: 8766
+  test_frac: 0.3
+  val_days: 60
+  calib_days: 60
+  gap_hours: 840
+target_mask:
+  min_valid_frac: 0.5
+  first_day_hours: 24
+val_every_hours: 72
+val_max_windows: 8000
+augment:
+  profile: base
+  gap_prob: 0.3
+  gap_max_len: 24
+  drop_humidity_prob: 0.1
+  drop_pressure_prob: 0.1
+  noise_sd: [0.2, 0.5, 2.0]
+  offset_max: 0.7
+  coord_jitter_deg: 0.4

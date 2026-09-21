@@ -1,18 +1,24 @@
-"""Потоковый рантайм МАЯК для устройства"""
+"""Потоковый рантайм МАЯК для устройства.
+
+Все размеры (число мод, размер паспорта, число суток сводок, длина буфера)
+берутся из конфига модели (model.cfg), а не из глобальных констант: рантайм
+работает с любой конфигурацией и любой абляцией, с которой обучена модель.
+"""
 import numpy as np
 import torch
 
-from mayak.constants import H, M, DZ
 from mayak.astro import astro_features
 from mayak.data.qc import PHYS
 from mayak.metrics import I_MED, apply_conformal
-
-RF = 256
 
 
 class StreamingMayak:
     def __init__(self, model, lat, lon, elev, conformal=None):
         self.m = model.eval()
+        cfg = model.cfg
+        self.rf = cfg.stream_buffer
+        self.n_modes, self.dz, self.n_days = cfg.n_modes, cfg.passport_dim, cfg.history_days
+        RF, M = self.rf, self.n_modes
         self.lat = float(lat)
         self.lon = float(lon)
         self.elev = float(elev)
@@ -38,8 +44,8 @@ class StreamingMayak:
         self.buf_doy = np.zeros(RF, np.float32)
         self.buf_hour = np.zeros(RF, np.float32)
         self.filled = 0
-        self.day_summ = torch.zeros(1, 28, 6)
-        self.day_mask = torch.zeros(1, 28)
+        self.day_summ = torch.zeros(1, self.n_days, 6)
+        self.day_mask = torch.zeros(1, self.n_days)
         self._reset_day()
         self.z = self._recompute_passport()
 
@@ -54,7 +60,6 @@ class StreamingMayak:
         return z
 
     def _features_over_buffer(self):
-        n = RF
         x = torch.from_numpy(self.buf_x)[None]
         mk = torch.from_numpy(self.buf_m)[None]
         doy = torch.from_numpy(self.buf_doy)[None]
@@ -66,7 +71,8 @@ class StreamingMayak:
             ch, aT, vt = self.m.build_channels(x, mk, astro_h, mu0, sg0, df0)
             vp24 = self.m.lag_valid(mk[..., 1], 24)
             feats = self.m.encoder(ch)
-        return feats[:, -1], aT[:, -1], vt[:, -1], ch[:, 3, -1], vp24[:, -1]
+        dp24 = self.m.channel(ch, "dP24")
+        return feats[:, -1], aT[:, -1], vt[:, -1], dp24[:, -1], vp24[:, -1]
 
     @staticmethod
     def _qc_point(T, P, RH):
@@ -90,7 +96,7 @@ class StreamingMayak:
             mu0, sg0, df0 = self.m.field.evaluate(self.base_coefs, astro_h)
             ch, aT, vt = self.m.build_channels(x, mk, astro_h, mu0, sg0, df0)
             self.day_summ, self.day_mask = self.m.daily_summaries(
-                aT, ch[:, 3], vt, self.m.lag_valid(mk[..., 1], 24))
+                aT, self.m.channel(ch, "dP24"), vt, self.m.lag_valid(mk[..., 1], 24))
             self.z = self._recompute_passport()
             feats = self.m.encoder(ch)
             state = (self.n_re, self.n_im, self.e)
@@ -98,7 +104,7 @@ class StreamingMayak:
                 state = self.m.readout.step(state, feats[:, k], vt[:, k])
             self.n_re, self.n_im, self.e = state
         L = x_hist.shape[0]
-        take = min(RF, L)
+        take = min(self.rf, L)
         self.buf_x[-take:] = np.asarray(x_hist)[-take:]
         self.buf_m[-take:] = np.asarray(mask_hist)[-take:]
         self.buf_doy[-take:] = np.asarray(doy_hist)[-take:]
@@ -115,7 +121,7 @@ class StreamingMayak:
         self.buf_doy[-1] = doy
         self.buf_hour[:-1] = self.buf_hour[1:]
         self.buf_hour[-1] = hour
-        self.filled = min(RF, self.filled + 1)
+        self.filled = min(self.rf, self.filled + 1)
         feat, aT, vt, dp, vp24 = self._features_over_buffer()
         with torch.no_grad():
             self.n_re, self.n_im, self.e = self.m.readout.step(
@@ -136,19 +142,13 @@ class StreamingMayak:
 
     @torch.no_grad()
     def forecast(self, doy_fut, hour_fut):
-        a_re = self.n_re / (self.e + self.kappa)
-        a_im = self.n_im / (self.e + self.kappa)
+        a_re, a_im = self.m.readout.normalize(self.n_re, self.n_im, self.e)
         doy = torch.as_tensor(doy_fut, dtype=torch.float32)[None]
         hour = torch.as_tensor(hour_fut, dtype=torch.float32)[None]
         astro_f = astro_features(doy, hour, torch.tensor([[self.lat]]),
                                  torch.tensor([[self.lon]]))
-        coefs = self.m.field.coefficients(self.loc, self.z)
-        mu_c, sigma_c, _ = self.m.field.evaluate(coefs, astro_f)
-        o, Eg = self.m.propagator(a_re, a_im, self.z, self.tau, self.omega)
-        sun_fut = torch.stack([astro_f[0], astro_f[1], astro_f[3]], dim=-1)
-        r, ratio, off = self.m.heads(o, Eg, sun_fut, torch.log(sigma_c), self.z, self.e)
-        mu = mu_c + sigma_c * (o + r)
-        q = mu[..., None] + (sigma_c * ratio)[..., None] * off
+        out = self.m.issue(self.loc, self.z, a_re, a_im, self.e, astro_f)
+        q, mu = out["q"], out["mu"]
 
         q = q[0].numpy()
         mu = mu[0].numpy()
@@ -170,7 +170,16 @@ class StreamingMayak:
             (self.buf_m > 0).astype(np.uint8).tobytes(),
         ])
 
+    @property
+    def state_nbytes(self):
+        """Размер сериализованного состояния для конфига этой модели, байт."""
+        M, D, RF = self.n_modes, self.n_days, self.rf
+        return 4 * (3 * M + self.dz) + 2 * (D * 6 + D) + 2 * RF * 3 + RF * 3
+
     def load_state(self, raw):
+        if len(raw) != self.state_nbytes:
+            raise ValueError(f"состояние {len(raw)} Б не соответствует конфигу модели "
+                             f"(ожидалось {self.state_nbytes} Б)")
         off = 0
 
         def take(shape, dtype):
@@ -180,14 +189,16 @@ class StreamingMayak:
             off += cnt * np.dtype(dtype).itemsize
             return arr
 
+        M, D, RF = self.n_modes, self.n_days, self.rf
         self.n_re = torch.from_numpy(take((1, M), np.float32))
         self.n_im = torch.from_numpy(take((1, M), np.float32))
         self.e = torch.from_numpy(take((1, M), np.float32))
-        self.z = torch.from_numpy(take((1, DZ), np.float32))
-        self.day_summ = torch.from_numpy(take((1, 28, 6), np.float16).astype(np.float32))
-        self.day_mask = torch.from_numpy(take((1, 28), np.float16).astype(np.float32))
+        self.z = torch.from_numpy(take((1, self.dz), np.float32))
+        self.day_summ = torch.from_numpy(take((1, D, 6), np.float16).astype(np.float32))
+        self.day_mask = torch.from_numpy(take((1, D), np.float16).astype(np.float32))
         self.buf_x = take((RF, 3), np.float16).astype(np.float32)
         self.buf_m = take((RF, 3), np.uint8).astype(np.float32)
+
 
 
 def safe_forecast(stream, doy_fut, hour_fut, mu_clim_fut, sigma_clim):
@@ -196,5 +207,5 @@ def safe_forecast(stream, doy_fut, hour_fut, mu_clim_fut, sigma_clim):
     except Exception:
         from mayak.baselines import quantiles_from_normal
         mu = np.asarray(mu_clim_fut, np.float32)
-        q = quantiles_from_normal(mu, np.full(H, sigma_clim, np.float32))
+        q = quantiles_from_normal(mu, np.full(mu.shape[-1], sigma_clim, np.float32))
         return q, mu

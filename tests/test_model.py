@@ -2,8 +2,11 @@ import math
 
 import torch
 
-from mayak.constants import L_MAX, M, H
+from mayak.config import ModelConfig
+from mayak.constants import L_MAX, H
 from mayak.model import MAYAK, astro_features
+
+M = ModelConfig().n_modes
 from mayak.loss import mayak_loss
 
 

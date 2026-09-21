@@ -1,0 +1,7 @@
+# Именованный вариант: широкое климат-поле
+# в mayak/modules/field.py).
+defaults:
+  - mayak
+  - _self_
+
+field_hidden: 128

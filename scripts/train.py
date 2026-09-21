@@ -15,10 +15,16 @@
     python scripts/train.py --arch mayak --accelerator gpu
     python scripts/train.py --arch gru --accelerator gpu
     python scripts/train.py --arch dlinear --accelerator gpu
+
+Абляции переобучением (конфиг модели с флагами, прогон в runs/mayak-<флаги>):
+    python scripts/train.py --arch mayak --ablate no_anchor --accelerator gpu
+
+Композиция конфигов, переопределения и групповые запуски — scripts/run.py (Hydra).
 """
 import argparse
 import logging
 
+from mayak.config import ABLATION_NAMES, Ablations, ModelConfig, run_label
 from mayak.protocol import ARCH_NAMES, add_protocol_args, protocol_from_args, run_protocol
 
 
@@ -28,15 +34,25 @@ def make_parser():
     ap.add_argument("--manifest", default="data/manifest.csv")
     ap.add_argument("--accelerator", default="gpu")
     ap.add_argument("--out-root", default="runs")
+    ap.add_argument("--ablate", nargs="*", default=[], choices=ABLATION_NAMES,
+                    help="флаги абляций МАЯК (переобучение без компонента)")
     add_protocol_args(ap)
     return ap
 
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    args = make_parser().parse_args()
+    ap = make_parser()
+    args = ap.parse_args()
+    model_config, tag = None, args.arch
+    if args.ablate:
+        if args.arch != "mayak":
+            ap.error("--ablate применим только к --arch mayak")
+        model_config = ModelConfig(ablations=Ablations(**{n: True for n in args.ablate}))
+        tag = run_label(model_config)
     journal = run_protocol(args.arch, args.manifest, protocol_from_args(args),
-                           out_root=args.out_root, accelerator=args.accelerator)
+                           out_root=args.out_root, accelerator=args.accelerator, tag=tag,
+                           model_config=model_config)
     for st in journal["stages"]:
         print(f"Лучшая модель этапа {st['name']}:", st["best_ckpt"])
     if args.arch == "mayak":

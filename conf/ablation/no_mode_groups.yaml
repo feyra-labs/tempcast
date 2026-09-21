@@ -1,0 +1,2 @@
+# Абляция «no_mode_groups» (mayak.config.Ablations). Только для model=mayak*.
+no_mode_groups: true

@@ -1,0 +1,33 @@
+# МАЯК: значения по умолчанию = mayak.config.ModelConfig().
+# Производные размерности (число мод и групп, каналы энкодера, вход голов,
+# рецептивное поле) здесь не задаются - они вычисляются из этих полей.
+arch: mayak
+horizon: 168                # контракт данных (mayak/constants.py)
+max_history: 672            # контракт данных; кратно 24
+quantiles: [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
+mode_groups:
+  - {name: R, tau0: [3.0, 6.0, 12.0, 24.0, 48.0, 96.0, 168.0, 240.0], period: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}
+  - {name: D, tau0: [12.0, 24.0, 48.0, 96.0, 168.0, 240.0], period: [24.0, 24.0, 24.0, 24.0, 24.0, 24.0]}
+  - {name: S, tau0: [12.0, 24.0, 72.0, 168.0], period: [12.0, 12.0, 12.0, 12.0]}
+  - {name: W, tau0: [24.0, 48.0, 72.0, 120.0, 168.0, 240.0], period: [60.0, 84.0, 108.0, 132.0, 156.0, 192.0]}
+tau_bounds: [3.0, 240.0]
+passport_dim: 16
+passport_hidden: 32
+encoder_width: 48
+encoder_dilations: [1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 32, 32]
+encoder_kernel: 3
+encoder_norm_groups: 4
+loc_freqs: 24
+loc_freq_scale: 12.0
+loc_freq_max: 30.0
+loc_seed: 7
+field_hidden: 48
+heads_hidden: 48
+heads_z_proj: 4
+ablations:
+  no_anchor: false
+  no_compression: false
+  no_passport: false
+  no_solar: false
+  no_mode_groups: false
+  no_offset_aug: false

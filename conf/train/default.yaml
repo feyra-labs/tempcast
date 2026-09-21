@@ -1,0 +1,25 @@
+# Протокол обучения: значения по умолчанию = mayak.protocol.DEFAULT_PROTOCOL.
+stages:
+  - {name: A, curriculum: L0, steps: 10000, val_L: 0}
+  - {name: B, curriculum: full, steps: 200000, val_L: 672}
+batch_size: 256
+windows_per_epoch: 200000
+num_workers: 8
+seed: 0
+lr: 0.003
+weight_decay: 0.01
+betas: [0.9, 0.95]
+lr_schedule: cosine
+grad_clip: 1.0
+precision: bf16-mixed
+ema_decay: 0.999
+monitor: val/loss
+val_every: 2000
+val_batches: 20
+patience: 5
+seeds:
+  init: null
+  data: null
+  augment: null
+  eval: null
+deviations: []

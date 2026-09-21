@@ -21,7 +21,7 @@ TIME_KEY = "val"
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    from mayak.lit import LitMayak
+    from mayak.lit import load_model
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", required=True, help="чекпойнт этапа A (runs/mayak/stageA/best.ckpt)")
     ap.add_argument("--manifest", default="data/manifest.csv")
@@ -33,7 +33,7 @@ def main():
                    time_key=TIME_KEY, L=0)
     run_checklist(store, datasets=[ds_z], checkpoints=[args.ckpt])
 
-    model = LitMayak.load_from_checkpoint(args.ckpt, map_location="cpu").model
+    model = load_model(args.ckpt)
     for role in (ROLE_VAL, ROLE_TRAIN):
         stage_a_field_check(model, clims, args.manifest, station_split=role, time_key=TIME_KEY)
         pure_field_check(model, clims, args.manifest, station_split=role, time_key=TIME_KEY)

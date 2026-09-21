@@ -1,0 +1,2 @@
+# Абляция «no_offset_aug» (mayak.config.Ablations). Только для model=mayak*.
+no_offset_aug: true

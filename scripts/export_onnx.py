@@ -1,10 +1,14 @@
-"""Экспорт МАЯК в ONNX + динамическая int8-квантизация"""
+"""Экспорт МАЯК в ONNX + динамическая int8-квантизация.
+
+Архитектура и размеры входов берутся из конфига модели, сохранённого в чекпойнте;
+тот же конфиг записывается в метаданные ONNX-файла (ключ mayak_model_config).
+"""
 import argparse
+import json
+
 import numpy as np
 import torch
 import torch.nn as nn
-
-from mayak.constants import L_MAX, H
 
 
 class ExportWrapper(nn.Module):
@@ -21,23 +25,24 @@ class ExportWrapper(nn.Module):
         return o["q"], o["mu"], o["sigma_c"]
 
 
-def dummy_inputs(B=1):
+def dummy_inputs(cfg, B=1):
+    L, Hh = cfg.max_history, cfg.horizon
     return (torch.zeros(B), torch.zeros(B), torch.zeros(B),
-            torch.zeros(B, L_MAX, 3), torch.ones(B, L_MAX, 3),
-            torch.zeros(B, L_MAX), torch.zeros(B, L_MAX),
-            torch.zeros(B, H), torch.zeros(B, H))
+            torch.zeros(B, L, 3), torch.ones(B, L, 3),
+            torch.zeros(B, L), torch.zeros(B, L),
+            torch.zeros(B, Hh), torch.zeros(B, Hh))
 
 
 def main():
-    from mayak.lit import LitMayak
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="экспорт МАЯК в ONNX (+ int8)")
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out", default="runtime/mayak.onnx")
     args = ap.parse_args()
+    from mayak.lit import load_model
 
-    lit = LitMayak.load_from_checkpoint(args.ckpt, map_location="cpu")
-    wrap = ExportWrapper(lit.model)
-    args_in = dummy_inputs(1)
+    model = load_model(args.ckpt)
+    wrap = ExportWrapper(model)
+    args_in = dummy_inputs(model.cfg, 1)
 
     names_in = ["lat", "lon", "elev", "x_hist", "mask_hist",
                 "doy_hist", "hour_hist", "doy_fut", "hour_fut"]
@@ -48,6 +53,11 @@ def main():
         wrap, args_in, args.out, input_names=names_in,
         output_names=["q", "mu", "sigma_c"], dynamic_axes=dyn,
         opset_version=17, dynamo=False)
+    import onnx
+    proto = onnx.load(args.out)
+    meta = proto.metadata_props.add()
+    meta.key, meta.value = "mayak_model_config", json.dumps(model.cfg.to_dict(), ensure_ascii=False)
+    onnx.save(proto, args.out)
     print("Экспортировано:", args.out)
 
     import onnxruntime as ort

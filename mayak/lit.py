@@ -7,6 +7,11 @@
 
 Критерий выбора чекпойнта ``val/loss`` - общая часть функции потерь (нормированный
 pinball) без регуляризаторов: одно и то же число для всех моделей.
+
+Чекпойнт самодостаточен: в гиперпараметрах лежат архитектура, её конфиг, протокол
+и конфиг данных, а под ключом ``RUN_KEY`` - полностью разрешённый конфиг прогона,
+сиды, хеш коммита и версии библиотек. ``load_model`` восстанавливает архитектуру
+из чекпойнта, а не из значений по умолчанию.
 """
 import copy
 
@@ -15,21 +20,24 @@ import torch
 from pytorch_lightning.callbacks import Callback
 
 from mayak.baselines import DLinear, GRUSeq2Seq
+from mayak.config import DataConfig, RunConfig, model_config_for
 from mayak.leakage import SELECTION_KEY, selection_record
 from mayak.loss import forecast_loss
 from mayak.model import MAYAK
 from mayak.protocol import ARCH_NAMES, DEFAULT_PROTOCOL, Protocol
 
 LEADS = [1, 3, 6, 12, 24, 48, 72, 120, 168]
+RUN_KEY = "mayak_run"
 
 ARCHS = {"mayak": MAYAK, "gru": GRUSeq2Seq, "dlinear": DLinear}
 assert tuple(ARCHS) == ARCH_NAMES, "реестр архитектур расходится с mayak.protocol.ARCH_NAMES"
 
 
-def build_model(arch):
+def build_model(arch, model_config=None):
+    """Модель архитектуры arch по её конфигу (None / словарь / датакласс)."""
     if arch not in ARCHS:
         raise ValueError(f"неизвестная архитектура {arch!r}; есть {tuple(ARCHS)}")
-    return ARCHS[arch]()
+    return ARCHS[arch](model_config_for(arch, model_config))
 
 
 def regularization(model, out):
@@ -108,12 +116,15 @@ def log_val_metrics(module, out, batch, loss):
 class LitForecaster(L.LightningModule):
     """Обучение любой архитектуры из ARCHS по протоколу.
 
-    protocol    — словарь Protocol.to_dict() (хранится в гиперпараметрах чекпойнта);
-    stage       — имя этапа протокола (для журнала);
-    total_steps — длина косинусного расписания этого этапа.
+    protocol     — словарь Protocol.to_dict() (хранится в гиперпараметрах чекпойнта);
+    stage        — имя этапа протокола (для журнала);
+    total_steps  — длина косинусного расписания этого этапа;
+    model_config — конфиг архитектуры;
+    data_config  — конфиг данных, с которым шло обучение (для записи в чекпойнт).
     """
 
-    def __init__(self, arch="mayak", protocol=None, stage=None, total_steps=None):
+    def __init__(self, arch="mayak", protocol=None, stage=None, total_steps=None,
+                 model_config=None, data_config=None):
         super().__init__()
         if isinstance(protocol, Protocol):
             protocol = protocol.to_dict()
@@ -122,11 +133,20 @@ class LitForecaster(L.LightningModule):
         p = Protocol.from_dict(protocol)
         if total_steps is None:
             total_steps = p.total_steps
+        mcfg = model_config_for(arch, model_config)
+        dcfg = DataConfig() if data_config is None else (
+            data_config if isinstance(data_config, DataConfig) else DataConfig.from_dict(data_config))
         self.save_hyperparameters(dict(arch=arch, protocol=p.to_dict(), stage=stage,
-                                       total_steps=int(total_steps)))
+                                       total_steps=int(total_steps),
+                                       model_config=mcfg.to_dict(),
+                                       data_config=dcfg.to_dict()))
         self.protocol = p
-        self.model = build_model(arch)
+        self.run_config = RunConfig(model=mcfg, data=dcfg, train=p)
+        self.model = build_model(arch, mcfg)
         self.ema = None
+
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint[RUN_KEY] = run_record(self.run_config)
 
     def losses(self, batch):
         out = self.model(batch)
@@ -172,6 +192,13 @@ class LitForecaster(L.LightningModule):
         return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
 
 
+def run_record(run_config):
+    """Запись о прогоне для чекпойнта: разрешённый конфиг, сиды, коммит, версии."""
+    from mayak.provenance import provenance
+    return dict(config=run_config.to_dict(), seeds=run_config.train.resolved_seeds(),
+                provenance=provenance())
+
+
 # Обратная совместимость.
 LitMayak = LitForecaster
 
@@ -182,5 +209,16 @@ def LitBaseline(model_name="gru", **kw):
 
 
 def load_model(path, map_location="cpu"):
-    """Модель из чекпойнта любой архитектуры (архитектура берётся из гиперпараметров)."""
+    """Модель из чекпойнта любой архитектуры.
+
+    Архитектура и её конфиг берутся из гиперпараметров чекпойнта; у чекпойнтов до
+    блока 6 конфига нет - тогда значения по умолчанию, совпадающие с прежними константами.
+    """
     return LitForecaster.load_from_checkpoint(path, map_location=map_location).model
+
+
+def load_run_record(path):
+    """Запись о прогоне из чекпойнта (RUN_KEY) или None у старых чекпойнтов."""
+    import torch
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    return ck.get(RUN_KEY)
