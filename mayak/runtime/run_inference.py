@@ -1,7 +1,10 @@
 """Пример сквозного инференса МАЯК на устройстве (потоковый путь A):
 загрузка модели и конформной таблицы → восстановление состояния после ребута →
 почасовые шаги по данным датчиков → выпуск прогноза → атомарное сохранение
-состояния (<4 КБ). QC точки и watchdog-фолбэк — внутри StreamingMayak/safe_forecast.
+состояния (3348 Б для конфига по умолчанию, < 4 КБ). После загрузки кольцевые буферы
+энкодера и незавершённые сутки восстанавливаются одним проходом по сохранённому окну;
+несовместимое или повреждённое состояние - чистый старт с записью в лог.
+QC точки и watchdog-фолбэк — внутри StreamingMayak/safe_forecast.
 
 Запуск:
     python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt \
@@ -61,10 +64,15 @@ def main():
 
     st = latest_state()
     if st:
-        with open(st, "rb") as fh:
-            stream.load_state(fh.read())
-        print("Состояние восстановлено из", st, f"({os.path.getsize(st)} Б)")
-    else:
+        try:
+            with open(st, "rb") as fh:
+                stream.load_state(fh.read())
+            print("Состояние восстановлено из", st, f"({os.path.getsize(st)} Б)")
+        except ValueError as e:
+            stream.reset()
+            st = None
+            print("Состояние не принято, чистый старт:", e)
+    if not st:
         print("Чистый старт (история пуста, L=0). Первый прогноз = климат-поле + паспорт.")
         # Если есть сохранённая история первого включения — можно прогреться:
         # stream.warm_start(x_hist, mask_hist, doy_hist, hour_hist)
@@ -77,7 +85,6 @@ def main():
         stream.step(T, P, RH, doy, hour)
         save_state(stream, k)
 
-    # лид 1 — час, следующий за последним наблюдением (как в датасете: история до t−1, цель с t)
     last_obs = now - timedelta(hours=1)
     doy_f, hour_f = future_calendar(last_obs, H)
     mu_clim_fb = np.full(H, args.clim_fallback, np.float32)

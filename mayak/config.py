@@ -102,6 +102,7 @@ ENCODER_CHANNELS = ("aT", "adef", "dP3", "dP24", "rh", "sin_d", "cos_d", "czp",
 SOLAR_CHANNELS = ("sin_d", "cos_d", "czp")
 N_SOLAR_HEAD = 3
 N_DAILY_SUMMARY = 6
+CHANNEL_MAX_LAG = 24
 UNSTRUCTURED_PERIODS = (12.0, 240.0)
 
 
@@ -281,8 +282,17 @@ class ModelConfig:
 
     @property
     def stream_buffer(self):
-        """Длина буфера потокового рантайма: рецептивное поле, округлённое вверх до 16 ч."""
+        """Рецептивное поле энкодера, округлённое вверх до 16 ч.
+
+        Нижняя граница истории, которую видит выход энкодера. Сырое окно рантайма
+        длиннее на лаг входных каналов - см. stream_window.
+        """
         return 16 * math.ceil(self.receptive_field / 16)
+
+    @property
+    def stream_window(self):
+        """Длина сырого окна наблюдений в потоковом рантайме, ч (кратно 16)."""
+        return 16 * math.ceil((self.receptive_field - 1 + CHANNEL_MAX_LAG) / 16)
 
     def to_dict(self):
         return to_jsonable(self)
@@ -500,7 +510,8 @@ def run_label(model_cfg):
     return model_cfg.arch + ("" if not act else "-" + "+".join(act))
 
 
-__all__ = ["ABLATION_NAMES", "Ablations", "AugmentConfig", "ConfigError", "DEFAULT_MODE_GROUPS",
+__all__ = ["ABLATION_NAMES", "Ablations", "AugmentConfig", "CHANNEL_MAX_LAG", "ConfigError",
+           "DEFAULT_MODE_GROUPS",
            "DLinearConfig", "DataConfig", "ENCODER_CHANNELS", "GRUConfig", "MODEL_CONFIGS",
            "ModeGroup", "ModelConfig", "RunConfig", "SOLAR_CHANNELS", "Seeds", "TrainConfig",
            "check_pipeline_compat", "model_config_for", "model_config_from_dict", "run_label",
