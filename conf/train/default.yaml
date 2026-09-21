@@ -17,9 +17,9 @@ monitor: val/loss
 val_every: 2000
 val_batches: 20
 patience: 5
-seeds:
+seeds:                      # null - равен seed
   init: null
   data: null
   augment: null
   eval: null
-deviations: []
+deviations: []              # отклонения архитектур объявляются в коде (ARCH_DEVIATIONS)

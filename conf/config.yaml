@@ -2,6 +2,7 @@
 #
 # Значения в группах model/, data/, train/ совпадают с датаклассами mayak/config.py
 # (ModelConfig, DataConfig, Protocol) - это проверяет tests/test_block6_config.py.
+# Здесь только композиция; источник истины - датаклассы.
 defaults:
   - model: mayak
   - ablation: none
@@ -11,12 +12,13 @@ defaults:
 
 run:
   out_root: runs
+  # имя прогона: архитектура, вариант абляции, базовый сид
   tag: ${model.arch}-${hydra:runtime.choices.ablation}-s${train.seed}
   accelerator: gpu
 
 hydra:
   job:
-    chdir: false
+    chdir: false            # относительные пути к данным остаются относительными
   run:
     dir: ${run.out_root}/${run.tag}
   sweep:
