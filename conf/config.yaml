@@ -34,6 +34,7 @@ hydra:
     footer: |
       Примеры:
         python scripts/run.py model=gru run.accelerator=cpu train=debug
+        python scripts/run.py -m model=gru,dlinear,lru,patchtst   # бейзлайны
         python scripts/run.py model.encoder_width=64 train.seed=1
         python scripts/run.py -m ablation=none,no_anchor,no_compression train.seed=0
         python scripts/run.py -m train.seed=0,1,2

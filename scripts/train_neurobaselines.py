@@ -4,9 +4,10 @@
 та же функция запуска (mayak.protocol.run_protocol), те же флаги протокола.
 
 Запуск полный:
-    python scripts/train_neurobaselines.py --models gru dlinear --accelerator gpu
+    python scripts/train_neurobaselines.py --accelerator gpu      # все: gru dlinear lru patchtst
+    python scripts/train_neurobaselines.py --models lru patchtst --accelerator gpu
 Отладка:
-    python scripts/train_neurobaselines.py --models gru dlinear --steps-a 200 --steps-b 1000 \\
+    python scripts/train_neurobaselines.py --models lru --steps-a 200 --steps-b 1000 \\
         --batch 32 --windows 2000 --workers 0 --accelerator cpu --precision 32 --val-every 200
 """
 import argparse
@@ -18,8 +19,8 @@ from mayak.protocol import ARCH_NAMES, add_protocol_args, protocol_from_args, ru
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--models", nargs="+", default=["gru", "dlinear"],
-                    choices=[a for a in ARCH_NAMES if a != "mayak"])
+    neural = [a for a in ARCH_NAMES if a != "mayak"]
+    ap.add_argument("--models", nargs="+", default=neural, choices=neural)
     ap.add_argument("--manifest", default="data/manifest.csv")
     ap.add_argument("--accelerator", default="gpu")
     ap.add_argument("--out-root", default="runs")

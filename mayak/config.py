@@ -2,8 +2,9 @@
 
 Три датакласса верхнего уровня:
 
-* ``ModelConfig`` (МАЯК), ``GRUConfig``, ``DLinearConfig`` - архитектура. Всё, что
-  раньше лежало глобальными константами и числами в конструкторах модулей;
+* ``ModelConfig`` (МАЯК), ``GRUConfig``, ``DLinearConfig``, ``LRUConfig``,
+  ``PatchTSTConfig`` - архитектура. Всё, что раньше лежало глобальными константами
+  и числами в конструкторах модулей;
 * ``DataConfig`` - пути, временные окна, пороги масок, параметры аугментаций, QC окна;
 * ``TrainConfig`` - это ``mayak.protocol.Protocol`` (единый протокол
   обучения): шаги, батч, оптимизатор, расписание, ранняя остановка, сиды.
@@ -360,7 +361,174 @@ class DLinearConfig:
         return cls(**_strict_kwargs(cls, d, "model"))
 
 
-MODEL_CONFIGS = {"mayak": ModelConfig, "gru": GRUConfig, "dlinear": DLinearConfig}
+@dataclass(frozen=True)
+class LRUConfig:
+    """Linear Recurrent Unit - бейзлайн «линейная память без
+    разложения на якорь и аномалию».
+
+    d_model    - ширина слоя (вход/выход каждого LRU-блока);
+    d_state    - число комплексных собственных значений диагональной рекуррентности;
+    layers     - число блоков (pre-LayerNorm → LRU → GELU → GLU → остаток);
+    tau_bounds - диапазон постоянных времени при инициализации, ч:
+                 |λ| ∈ [exp(−1/τ_min), exp(−1/τ_max)] (r_min, r_max оригинала). По
+                 умолчанию - тот же диапазон, что у мод МАЯК: модели отличаются
+                 разложением, а не априорной памятью;
+    min_period - наименьший начальный период колебаний, ч: фаза arg λ ∈ [0, 2π/min_period]
+                 (max_phase оригинала);
+    head_hidden - ширина MLP-головы, общей для всех лидов;
+    scan       - развёртка рекуррентности: ``chunked`` (блочный ассоциативный скан, по
+                 умолчанию), ``associative`` (скан Хиллиса-Стила по всей длине) или
+                 ``recurrent`` (наивный цикл по часам - эталон для тестов);
+    chunk      - длина блока для ``chunked``.
+    """
+    arch: str = "lru"
+    horizon: int = H
+    quantiles: tuple = QUANTILES
+    max_history: int = L_MAX
+    d_model: int = 64
+    d_state: int = 128
+    layers: int = 4
+    dropout: float = 0.0
+    tau_bounds: tuple = (3.0, 240.0)
+    min_period: float = 12.0
+    head_hidden: int = 128
+    scan: str = "chunked"
+    chunk: int = 32
+
+    def __post_init__(self):
+        s = object.__setattr__
+        if self.arch != "lru":
+            raise ConfigError(f"LRUConfig: arch={self.arch!r}")
+        s(self, "quantiles", _floats(self.quantiles))
+        s(self, "tau_bounds", _floats(self.tau_bounds))
+        for name in ("horizon", "max_history", "d_model", "d_state", "layers", "head_hidden",
+                     "chunk"):
+            v = int(getattr(self, name))
+            if v < 1:
+                raise ConfigError(f"LRUConfig.{name} < 1")
+            s(self, name, v)
+        s(self, "dropout", float(self.dropout))
+        s(self, "min_period", float(self.min_period))
+        if len(self.tau_bounds) != 2 or not 0 < self.tau_bounds[0] < self.tau_bounds[1]:
+            raise ConfigError(f"LRUConfig.tau_bounds = {self.tau_bounds}: нужна пара "
+                              f"0 < τ_min < τ_max")
+        if self.min_period <= 2.0:
+            raise ConfigError(f"LRUConfig.min_period = {self.min_period}: период ≤ 2 ч "
+                              f"неразличим на часовой сетке")
+        if not 0.0 <= self.dropout < 1.0:
+            raise ConfigError(f"LRUConfig.dropout = {self.dropout} вне [0, 1)")
+        if self.scan not in LRU_SCANS:
+            raise ConfigError(f"LRUConfig.scan = {self.scan!r}; допустимо {LRU_SCANS}")
+
+    @property
+    def n_quantiles(self):
+        return len(self.quantiles)
+
+    @property
+    def r_min(self):
+        return math.exp(-1.0 / self.tau_bounds[0])
+
+    @property
+    def r_max(self):
+        return math.exp(-1.0 / self.tau_bounds[1])
+
+    @property
+    def max_phase(self):
+        return 2.0 * math.pi / self.min_period
+
+    def to_dict(self):
+        return to_jsonable(self)
+
+    @classmethod
+    def from_dict(cls, d=None):
+        return cls(**_strict_kwargs(cls, d, "model"))
+
+
+LRU_SCANS = ("chunked", "associative", "recurrent")
+PATCH_PADDINGS = ("end", "none")
+PATCHTST_NORMS = ("batch", "layer")
+
+
+@dataclass(frozen=True)
+class PatchTSTConfig:
+    """PatchTST. Значения по умолчанию - конфигурация авторов для
+    набора Weather (scripts/PatchTST/weather.sh): патч 16, шаг 8, паддинг «end»,
+    3 слоя, d_model 128, 16 голов, d_ff 256, dropout 0.2, head_dropout 0, RevIN без
+    аффинных параметров (affine=0 по умолчанию в run_longExp.py).
+
+    input_len       - длина входа (контракт данных: L_MAX);
+    patch_len, stride, padding_patch - разбиение на патчи;
+    revin_min_valid - сколько валидных часов нужно для статистики экземпляра; меньше -
+                      нормировка (0, 1) (история пуста или почти пуста).
+    """
+    arch: str = "patchtst"
+    horizon: int = H
+    quantiles: tuple = QUANTILES
+    input_len: int = L_MAX
+    patch_len: int = 16
+    stride: int = 8
+    padding_patch: str = "end"
+    d_model: int = 128
+    n_heads: int = 16
+    d_ff: int = 256
+    layers: int = 3
+    dropout: float = 0.2
+    attn_dropout: float = 0.0
+    head_dropout: float = 0.0
+    res_attention: bool = True
+    norm: str = "batch"
+    revin: bool = True
+    revin_min_valid: int = 2
+
+    def __post_init__(self):
+        s = object.__setattr__
+        if self.arch != "patchtst":
+            raise ConfigError(f"PatchTSTConfig: arch={self.arch!r}")
+        s(self, "quantiles", _floats(self.quantiles))
+        for name in ("horizon", "input_len", "patch_len", "stride", "d_model", "n_heads", "d_ff",
+                     "layers", "revin_min_valid"):
+            v = int(getattr(self, name))
+            if v < 1:
+                raise ConfigError(f"PatchTSTConfig.{name} < 1")
+            s(self, name, v)
+        for name in ("dropout", "attn_dropout", "head_dropout"):
+            v = float(getattr(self, name))
+            if not 0.0 <= v < 1.0:
+                raise ConfigError(f"PatchTSTConfig.{name} = {v} вне [0, 1)")
+            s(self, name, v)
+        for name in ("res_attention", "revin"):
+            if not isinstance(getattr(self, name), bool):
+                raise ConfigError(f"PatchTSTConfig.{name} должен быть bool")
+        if self.padding_patch not in PATCH_PADDINGS:
+            raise ConfigError(f"PatchTSTConfig.padding_patch = {self.padding_patch!r}; "
+                              f"допустимо {PATCH_PADDINGS}")
+        if self.norm not in PATCHTST_NORMS:
+            raise ConfigError(f"PatchTSTConfig.norm = {self.norm!r}; допустимо {PATCHTST_NORMS}")
+        if self.patch_len > self.input_len:
+            raise ConfigError(f"патч {self.patch_len} ч длиннее входа {self.input_len} ч")
+        if self.d_model % self.n_heads:
+            raise ConfigError(f"d_model {self.d_model} не делится на n_heads {self.n_heads}")
+
+    @property
+    def n_quantiles(self):
+        return len(self.quantiles)
+
+    @property
+    def n_patches(self):
+        """(L − P) // S + 1 (+1 при паддинге «end» повторением последнего значения S раз)."""
+        n = (self.input_len - self.patch_len) // self.stride + 1
+        return n + (1 if self.padding_patch == "end" else 0)
+
+    def to_dict(self):
+        return to_jsonable(self)
+
+    @classmethod
+    def from_dict(cls, d=None):
+        return cls(**_strict_kwargs(cls, d, "model"))
+
+
+MODEL_CONFIGS = {"mayak": ModelConfig, "gru": GRUConfig, "dlinear": DLinearConfig,
+                 "lru": LRUConfig, "patchtst": PatchTSTConfig}
 
 
 def model_config_for(arch, cfg=None):
@@ -696,7 +864,8 @@ def run_label(model_cfg):
 __all__ = ["ABLATION_NAMES", "AUGMENT_PROB_FIELDS", "AUGMENT_PROFILES", "Ablations",
            "AugmentConfig", "CHANNEL_MAX_LAG", "ConfigError",
            "DEFAULT_MODE_GROUPS",
-           "DLinearConfig", "DataConfig", "ENCODER_CHANNELS", "GRUConfig", "MODEL_CONFIGS",
-           "ModeGroup", "ModelConfig", "RunConfig", "SOLAR_CHANNELS", "Seeds", "TrainConfig",
+           "DLinearConfig", "DataConfig", "ENCODER_CHANNELS", "GRUConfig", "LRUConfig",
+           "LRU_SCANS", "MODEL_CONFIGS", "ModeGroup", "ModelConfig", "PatchTSTConfig",
+           "RunConfig", "SOLAR_CHANNELS", "Seeds", "TrainConfig",
            "check_pipeline_compat", "model_config_for", "model_config_from_dict", "run_label",
            "to_jsonable"]

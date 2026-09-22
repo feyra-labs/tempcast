@@ -19,17 +19,18 @@ import pytorch_lightning as L
 import torch
 from pytorch_lightning.callbacks import Callback
 
-from mayak.baselines import DLinear, GRUSeq2Seq
+from mayak.baselines import DLinear, GRUSeq2Seq, LRUForecaster, PatchTST
 from mayak.config import DataConfig, RunConfig, model_config_for
 from mayak.leakage import SELECTION_KEY, selection_record
 from mayak.loss import forecast_loss
 from mayak.model import MAYAK
-from mayak.protocol import ARCH_NAMES, DEFAULT_PROTOCOL, Protocol
+from mayak.protocol import ARCH_NAMES, DEFAULT_PROTOCOL, Protocol, ProtocolError
 
 LEADS = [1, 3, 6, 12, 24, 48, 72, 120, 168]
 RUN_KEY = "mayak_run"
 
-ARCHS = {"mayak": MAYAK, "gru": GRUSeq2Seq, "dlinear": DLinear}
+ARCHS = {"mayak": MAYAK, "gru": GRUSeq2Seq, "dlinear": DLinear, "lru": LRUForecaster,
+         "patchtst": PatchTST}
 assert tuple(ARCHS) == ARCH_NAMES, "реестр архитектур расходится с mayak.protocol.ARCH_NAMES"
 
 
@@ -215,6 +216,53 @@ def load_model(path, map_location="cpu"):
     блока 6 конфига нет - тогда значения по умолчанию, совпадающие с прежними константами.
     """
     return LitForecaster.load_from_checkpoint(path, map_location=map_location).model
+
+
+def checkpoint_protocol(path):
+    """(архитектура, Protocol) чекпойнта.
+
+    Чекпойнт без протокола в гиперпараметрах обучен до единой нормировки функции
+    потерь и единого протокола (блок 4): сравнение с ним недействительно.
+    """
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    hp = ck.get("hyper_parameters") or {}
+    if "protocol" not in hp:
+        raise ProtocolError(f"{path}: в чекпойнте нет протокола обучения — он обучен до "
+                            f"единого протокола и общей нормировки функции потерь (блок 4); "
+                            f"сравнение с ним недействительно, переобучите модель")
+    return hp.get("arch", "mayak"), Protocol.from_dict(hp["protocol"])
+
+
+SEED_FIELDS = ("seed", "seeds")
+
+
+def _comparable(protocol, ignore):
+    d = protocol.common().to_dict()
+    return {k: v for k, v in d.items() if k not in ignore}
+
+
+def check_comparable(reference, others, ignore=()):
+    """Все чекпойнты сравнения обучены по одному общему протоколу, что и ``reference``.
+
+    Сравниваются протоколы без объявленных отклонений архитектур (``Protocol.common``):
+    объявленное отклонение допустимо, необъявленная разница — нет. ``ignore`` — поля,
+    которые могут различаться (``SEED_FIELDS`` для повторов основной модели с другими
+    сидами). Возвращает {путь: архитектура}; расхождение — ProtocolError.
+    """
+    ref_arch, ref = checkpoint_protocol(reference)
+    ref_d = _comparable(ref, ignore)
+    archs, bad = {reference: ref_arch}, []
+    for path in others:
+        arch, p = checkpoint_protocol(path)
+        archs[path] = arch
+        d = _comparable(p, ignore)
+        diff = sorted(k for k in set(ref_d) | set(d) if ref_d.get(k) != d.get(k))
+        if diff:
+            bad.append(f"{path} ({arch}): отличаются {diff}")
+    if bad:
+        raise ProtocolError(f"модели сравнения обучены по разным протоколам (эталон — "
+                            f"{reference}, {ref_arch}):\n  " + "\n  ".join(bad))
+    return archs
 
 
 def load_run_record(path):

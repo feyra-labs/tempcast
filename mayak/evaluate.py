@@ -5,7 +5,9 @@
 
   * EvalSet — окна для оценки со стратифицированной подвыборкой (фиксированное
     число окон с каждой станции) и метаданными окон для разрезов;
-  * сбор предсказаний МАЯК + нейробейзлайнов (GRU/DLinear) + статистических;
+  * сбор предсказаний МАЯК + нейробейзлайнов (GRU, DLinear, LRU, PatchTST) +
+    статистических; перед сравнением проверяется, что все чекпойнты обучены по одному
+    протоколу (``mayak.lit.check_comparable``);
   * таблицы в двух видах агрегирования — пуловом и макро - с доверительными
     интервалами блочного бутстрапа по станциям;
   * разрезы: по лидам, ролям станций, полным зонам Кёппена, сезонам, длине
@@ -45,6 +47,9 @@ HIST_VALID_BINS = ((-0.01, 0.5, "<50%"), (0.5, 0.8, "50-80%"),
 MIN_WINDOWS, MIN_STATIONS = 20, 2
 PRESSURE_YES, PRESSURE_NO = "есть давление", "нет давления"
 BOOTSTRAP = dict(n_boot=1000, seed=0, level=0.90)
+
+NEURAL_BASELINES = {"gru": "GRU seq2seq", "dlinear": "DLinear", "lru": "LRU",
+                    "patchtst": "PatchTST"}
 
 BENCHMARK_NOTE = (
     "Эталон скилла — эмпирическая климатология самой станции, подогнанная по её\n"
@@ -859,13 +864,19 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     import argparse
     from mayak.config import run_label
-    from mayak.lit import load_model, load_run_record
+    from mayak.lit import SEED_FIELDS, check_comparable, load_model, load_run_record
+    from mayak.protocol import ProtocolError
     ap = argparse.ArgumentParser(description="единый стенд оценки МАЯК")
     ap.add_argument("--ckpt", required=True, nargs="+",
                     help="чекпойнты МАЯК; несколько = прогоны с разными сидами")
     ap.add_argument("--manifest", default="data/manifest.csv")
-    ap.add_argument("--gru-ckpt", default=None)
-    ap.add_argument("--dlinear-ckpt", default=None)
+    for arch, name in NEURAL_BASELINES.items():
+        ap.add_argument(f"--{arch}-ckpt", default=None,
+                        help=f"чекпойнт бейзлайна «{name}» "
+                             f"(scripts/train.py --arch {arch})")
+    ap.add_argument("--allow-protocol-mismatch", action="store_true",
+                    help="не падать, если модели обучены по разным протоколам "
+                         "(только для диагностики: такие таблицы несопоставимы)")
     ap.add_argument("--ablation-ckpt", nargs="*", default=[],
                     help="чекпойнты переобученных абляций МАЯК (тот же сид и протокол); "
                          "имя строки таблицы берётся из конфига в чекпойнте")
@@ -888,12 +899,21 @@ def main():
     from mayak.data.store import get_store
     from mayak.data.splits import ROLE_TRAIN
     from mayak.leakage import run_checklist
+    baseline_ckpts = {a: getattr(args, f"{a}_ckpt") for a in NEURAL_BASELINES
+                      if getattr(args, f"{a}_ckpt")}
+    all_ckpts = [*args.ckpt, *baseline_ckpts.values(), *args.ablation_ckpt]
+    try:
+        check_comparable(args.ckpt[0], [*baseline_ckpts.values(), *args.ablation_ckpt])
+        check_comparable(args.ckpt[0], args.ckpt[1:], ignore=SEED_FIELDS)
+    except ProtocolError as e:
+        if not args.allow_protocol_mismatch:
+            raise
+        print(f"ВНИМАНИЕ: {e}\nТаблицы ниже несопоставимы (--allow-protocol-mismatch).")
+
     store = get_store(args.manifest)
     clims = store.clims()
     ds = EvalSet(clims, manifest=args.manifest, time_key="test")
-    run_checklist(store, datasets=[ds], conformal=args.conformal,
-                  checkpoints=[c for c in (*args.ckpt, args.gru_ckpt, args.dlinear_ckpt,
-                                           *args.ablation_ckpt) if c])
+    run_checklist(store, datasets=[ds], conformal=args.conformal, checkpoints=all_ckpts)
     rec = load_run_record(args.ckpt[0])
     eval_seed = args.eval_seed
     if eval_seed is None:
@@ -909,10 +929,8 @@ def main():
     for c in args.ablation_ckpt:
         m = load_model(c)
         named_extra[f"МАЯК [{run_label(m.cfg)}]"] = m
-    if args.gru_ckpt:
-        named_extra["GRU seq2seq"] = load_model(args.gru_ckpt)
-    if args.dlinear_ckpt:
-        named_extra["DLinear"] = load_model(args.dlinear_ckpt)
+    for arch, c in baseline_ckpts.items():
+        named_extra[NEURAL_BASELINES[arch]] = load_model(c)
 
     named_all = {"МАЯК": mayak, **named_extra}
     preds, aux = collect_predictions(named_all, ds)
@@ -969,8 +987,7 @@ def main():
     if args.external_manifest:
         evaluate_external(named_all, args.external_manifest, store, r_damped=r, shift=shift,
                           ci=args.bootstrap > 0, bootstrap=boot,
-                          checkpoints=[c for c in (*args.ckpt, args.gru_ckpt, args.dlinear_ckpt,
-                                                   *args.ablation_ckpt) if c],
+                          checkpoints=all_ckpts,
                           conformal=args.conformal, internal=(preds, aux),
                           transfer_level=args.transfer_zones)
 

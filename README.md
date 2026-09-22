@@ -133,7 +133,7 @@ flowchart LR
 - **Лосс** (`mayak/loss.py`): pinball по 7 квантилям, где ошибка делится на **климатологический масштаб остатка станции** `norm_scale(doy, hour)` — он подгоняется по данным при сборке кэша и приходит в батче. Нормировка одна и та же для всех моделей и не зависит ни от одного их выхода. У МАЯК к ней добавляются регуляризаторы, не зависящие от цели: KL паспорта, энергия мод, якорь интервала и затухание поправки при «мёртвой» энергии.
 - **Единый протокол** (`mayak/protocol.py`, `scripts/train.py --arch ...`): два этапа — **A** только `L=0` (стабилизация климат-поля), **B** полный куррикулум длин истории; одинаковые шаги, батч, поток окон, оптимизатор, расписание, ранняя остановка, выбор чекпойнта по `val/loss` на валидационных станциях и EMA весов для всех архитектур. Отклонения от протокола объявляются явно и пишутся в журнал прогона `runs/<arch>/protocol.json`.
 - **Конформная доводка** (`scripts/calibrate.py`): сплит-конформная коррекция квантилей по бинам лидов на отдельном калибровочном периоде. Подтягивает покрытие к номиналу, не трогая точечный прогноз; на устройстве применяется тем же таблицей сдвигов.
-- **Бейзлайны** (`mayak/baselines.py`): климатология, damped persistence, seasonal-naive, GRU seq2seq, DLinear — нейробейзлайны обучаются по тому же протоколу и с той же функцией потерь и оцениваются на тех же окнах.
+- **Бейзлайны** (`mayak/baselines/`, описание — [`mayak/baselines/README.md`](mayak/baselines/README.md)): климатология, damped persistence, seasonal-naive, GRU seq2seq, DLinear, **LRU** и **PatchTST** — нейробейзлайны обучаются по тому же протоколу и с той же функцией потерь и оцениваются на тех же окнах. У каждого бейзлайна в коде есть карточка: источник, что взято из оригинала, отличия и их причины. LRU — главный контрольный эксперимент: обучаемая линейная память с затухающими модами, но без разложения на климатический якорь и аномалию; если она даёт ту же точность, вклад МАЯК не в разложении.
 
 </details>
 
@@ -179,6 +179,8 @@ python scripts/build_cache.py --manifest data/manifest.csv --jobs 8
 python scripts/train.py --arch mayak   --manifest data/manifest.csv --accelerator gpu
 python scripts/train.py --arch gru     --manifest data/manifest.csv --accelerator gpu
 python scripts/train.py --arch dlinear --manifest data/manifest.csv --accelerator gpu
+python scripts/train.py --arch lru     --manifest data/manifest.csv --accelerator gpu
+python scripts/train.py --arch patchtst --manifest data/manifest.csv --accelerator gpu
 ```
 Лучшие чекпойнты сохраняются в `runs/<arch>/stageB/best.ckpt`, журнал прогона — в `runs/<arch>/protocol.json`.
 
@@ -224,6 +226,8 @@ python scripts/calibrate.py --ckpt runs/mayak/stageB/best.ckpt --out runs/confor
 python -m mayak.evaluate --ckpt runs/mayak/stageB/best.ckpt \
     --gru-ckpt runs/gru/stageB/best.ckpt \
     --dlinear-ckpt runs/dlinear/stageB/best.ckpt \
+    --lru-ckpt runs/lru/stageB/best.ckpt \
+    --patchtst-ckpt runs/patchtst/stageB/best.ckpt \
     --conformal runs/conformal.npy --out-dir runs/plots \
     --n-examples 10 --bootstrap 1000
 
@@ -238,6 +242,10 @@ python -m mayak.evaluate --conformal runs/conformal.npy \
            runs/mayak_s1/stageB/best.ckpt \
            runs/mayak_s2/stageB/best.ckpt
 ```
+
+Перед сравнением стенд проверяет, что все чекпойнты обучены по одному и тому же
+протоколу (блок 4): чекпойнт без протокола или с необъявленной разницей в протоколе —
+ошибка (`--allow-protocol-mismatch` только для диагностики).
 
 Скилл считается относительно эмпирической климатологии **самой станции**,
 подогнанной по её многолетнему обучающему окну: при короткой истории эталон
@@ -315,7 +323,8 @@ mayak/
   loss.py         общая функция потерь (pinball / климатологический масштаб)
   protocol.py     единый протокол обучения и функция запуска
   lit.py          LightningModule (одна на все архитектуры), EMA
-  baselines.py    климатология / damped / seasonal / GRU / DLinear
+  baselines/      statistical (климатология / damped / seasonal), neural (GRU / DLinear),
+                  lru, patchtst; cards.py — карточки бейзлайнов → mayak/baselines/README.md
   data/           загрузчик, окна, суточные сводки, сплиты; ghcnh.py (разбор GHCNh),
                   rasters.py (зона Кёппена и высота из ЦМР)
   metrics.py      единый модуль метрик: агрегации, надёжность, бутстрап, конформная поправка
@@ -325,7 +334,7 @@ mayak/
   knockout.py     абляции обученной модели (без переобучения)
   runtime/        streaming.py (потоковый рантайм), equivalence.py (замер пакет ↔ поток), run_inference.py
 conf/             конфиги Hydra: model/, ablation/, data/, train/
-scripts/          make_synth, make_real, fetch_ghcnh, make_ghcnh, make_splits, build_cache, train, run (Hydra), train_neurobaselines, calibrate, export_onnx, plot_loss
+scripts/          make_synth, make_real, fetch_ghcnh, make_ghcnh, make_splits, build_cache, train, run (Hydra), train_neurobaselines, baseline_cards, calibrate, export_onnx, plot_loss
 
 ```
 </details>

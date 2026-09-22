@@ -3,6 +3,7 @@
 Примеры:
     python scripts/run.py                                   # МАЯК, протокол по умолчанию
     python scripts/run.py model=gru                         # бейзлайн - другая группа model
+    python scripts/run.py -m model=gru,dlinear,lru,patchtst # все нейробейзлайны
     python scripts/run.py train=debug run.accelerator=cpu   # отладка на CPU
     python scripts/run.py -m ablation=none,no_anchor,no_compression   # абляции (блок 6.7)
     python scripts/run.py -m train.seed=0,1,2               # три сида основной модели

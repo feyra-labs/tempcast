@@ -36,7 +36,7 @@ from mayak.constants import L_MAX
 
 log = logging.getLogger(__name__)
 
-ARCH_NAMES = ("mayak", "gru", "dlinear")
+ARCH_NAMES = ("mayak", "gru", "dlinear", "lru", "patchtst")
 CURRICULA = ("L0", "full")
 LR_SCHEDULES = ("cosine",)
 JOURNAL = "protocol.json"
