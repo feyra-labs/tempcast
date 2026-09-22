@@ -7,7 +7,10 @@
   и числами в конструкторах модулей;
 * ``DataConfig`` - пути, временные окна, пороги масок, параметры аугментаций, QC окна;
 * ``TrainConfig`` - это ``mayak.protocol.Protocol`` (единый протокол
-  обучения): шаги, батч, оптимизатор, расписание, ранняя остановка, сиды.
+  обучения): шаги, батч, оптимизатор, расписание, ранняя остановка, сиды;
+* ``RobustnessConfig`` - сценарии робастности обученной модели (блок 12): какие
+  преобразования окна, на каких уровнях деградации, на каких станциях и лидах,
+  допуск проверки скилла. Читается ``mayak.robustness``, в обучение не входит.
 
 ``RunConfig`` собирает три части в один объект - его полностью разрешённая форма
 пишется рядом с чекпойнтом и внутри него.
@@ -22,7 +25,7 @@ from typing import Any, Optional
 
 from mayak.constants import H, L_MAX, QUANTILES
 from mayak.data.masking import TargetMaskConfig
-from mayak.data.splits import TIME_BOUNDS
+from mayak.data.splits import ROLE_TEST, ROLES, TIME_BOUNDS
 from mayak.protocol import DEFAULT_PROTOCOL, Protocol, Seeds
 
 TrainConfig = Protocol
@@ -861,11 +864,261 @@ def run_label(model_cfg):
     return model_cfg.arch + ("" if not act else "-" + "+".join(act))
 
 
+SCENARIO_INSTRUMENT, SCENARIO_INPUT = "instrument", "input"
+ROBUSTNESS_QC = ("none", "point", "window")
+ROBUSTNESS_TIME_KEYS = ("val", "test")
+
+
+@dataclass(frozen=True)
+class ScenarioRule:
+    """Контракт сценария робастности; реализация - ``mayak.data.scenarios``.
+
+    kind      - ``instrument`` («свойство прибора») или ``input`` («отказ входа»);
+    target    - искажается ли и цель (для свойства прибора - да, кроме вариантов
+                «незамеченное смещение прибора», где искажён только вход);
+    max_level - верхняя граница уровня деградации (None - без границы);
+    integer   - уровень - целое число (часы, номер варианта);
+    params    - фиксированные параметры сценария и их значения по умолчанию;
+    guard     - участвует ли сценарий в проверке «скилл не ниже −допуска»;
+    variant_of - для варианта «искажён только вход» - имя основного сценария.
+    """
+    kind: str
+    target: bool
+    title: str
+    unit: str
+    max_level: Optional[float] = None
+    integer: bool = False
+    params: dict = field(default_factory=dict)
+    guard: bool = True
+    variant_of: Optional[str] = None
+
+
+SCENARIO_RULES = {
+    "dropout": ScenarioRule(SCENARIO_INPUT, False, "случайные пропуски истории",
+                            "доля потерянных часов", max_level=1.0),
+    "gap": ScenarioRule(SCENARIO_INPUT, False, "блочный пропуск последних часов",
+                        "ч без данных перед выпуском", max_level=float(L_MAX), integer=True),
+    "noise": ScenarioRule(SCENARIO_INPUT, False, "шум измерений", "σ шума T, °C",
+                          params=dict(sd_ratio=(1.0, 1.5, 10.0))),
+    "spikes": ScenarioRule(SCENARIO_INPUT, False, "одиночные выбросы",
+                           "доля часов с выбросом", max_level=1.0,
+                           params=dict(magnitude=(20.0, 25.0, 60.0))),
+    "freeze": ScenarioRule(SCENARIO_INPUT, False, "замерзание датчика",
+                           "ч повторения одного значения", max_level=float(L_MAX),
+                           integer=True, params=dict(channels=(0, 1, 2))),
+    "drop_channel": ScenarioRule(SCENARIO_INPUT, False, "отсутствие канала",
+                                 "0 - все, 1 - без P, 2 - без RH, 3 - без P и RH",
+                                 max_level=3.0, integer=True),
+    "history": ScenarioRule(SCENARIO_INPUT, False, "сокращение истории",
+                            "убрано ч истории (672 - холодный старт)",
+                            max_level=float(L_MAX), integer=True),
+    "coords": ScenarioRule(SCENARIO_INPUT, False, "ошибка координат", "градусы"),
+    "elev": ScenarioRule(SCENARIO_INPUT, False, "ошибка высоты", "м"),
+    "offset": ScenarioRule(SCENARIO_INSTRUMENT, True, "постоянное смещение T", "°C"),
+    "drift": ScenarioRule(SCENARIO_INSTRUMENT, True, "медленный дрейф T", "°C/сутки"),
+    "scale": ScenarioRule(SCENARIO_INSTRUMENT, True, "ошибка масштаба T", "|k − 1|"),
+    "offset_input": ScenarioRule(SCENARIO_INSTRUMENT, False,
+                                 "незамеченное смещение прибора (только вход)", "°C",
+                                 guard=False, variant_of="offset"),
+    "drift_input": ScenarioRule(SCENARIO_INSTRUMENT, False,
+                                "незамеченный дрейф прибора (только вход)", "°C/сутки",
+                                guard=False, variant_of="drift"),
+}
+
+DEFAULT_SCENARIOS = (
+    dict(name="dropout", levels=(0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 0.97, 1.0)),
+    dict(name="gap", levels=(0, 3, 6, 12, 24, 48, 96, 168, 336, 672)),
+    dict(name="offset", levels=(0.0, 0.5, 1.0, 2.0, 3.0, 5.0)),
+    dict(name="offset_input", levels=(0.0, 0.5, 1.0, 2.0, 3.0, 5.0)),
+    dict(name="drift", levels=(0.0, 0.02, 0.05, 0.1, 0.2)),
+    dict(name="drift_input", levels=(0.0, 0.02, 0.05, 0.1, 0.2)),
+    dict(name="scale", levels=(0.0, 0.01, 0.02, 0.05, 0.1)),
+    dict(name="noise", levels=(0.0, 0.25, 0.5, 1.0, 2.0, 4.0)),
+    dict(name="spikes", levels=(0.0, 0.005, 0.01, 0.03, 0.1)),
+    dict(name="freeze", levels=(0, 6, 24, 72, 168, 336, 672)),
+    dict(name="drop_channel", levels=(0, 1, 2, 3)),
+    dict(name="history", levels=(0, 168, 336, 504, 600, 648, 666, 672)),
+    dict(name="coords", levels=(0.0, 0.1, 0.25, 0.5, 1.0, 2.0)),
+    dict(name="elev", levels=(0.0, 50.0, 100.0, 250.0, 500.0, 1000.0)),
+)
+
+
+def _norm_param(where, key, default, value):
+    """Значение параметра сценария к типу и длине значения по умолчанию."""
+    if isinstance(default, tuple):
+        try:
+            v = tuple(value)
+        except TypeError:
+            raise ConfigError(f"{where}.{key}: ожидался список из {len(default)} значений")
+        if len(v) != len(default) and not (key == "channels" and 1 <= len(v) <= 3):
+            raise ConfigError(f"{where}.{key}: {len(v)} значений, нужно {len(default)}")
+        cast = int if all(isinstance(d, int) for d in default) else float
+        return tuple(cast(x) for x in v)
+    return type(default)(value)
+
+
+@dataclass(frozen=True)
+class ScenarioSpec:
+    """Один сценарий робастности из конфига.
+
+    name   - ключ ``SCENARIO_RULES``;
+    levels - уровни деградации по возрастанию; первый обязан быть 0 - сценарий с
+             нулевым параметром не меняет данные и служит точкой отсчёта кривой;
+    params - переопределения фиксированных параметров (остальные - по умолчанию);
+    guard  - None - по умолчанию сценария (``ScenarioRule.guard``).
+    """
+    name: str
+    levels: tuple
+    params: dict = field(default_factory=dict)
+    guard: Optional[bool] = None
+
+    def __post_init__(self):
+        s = object.__setattr__
+        where = f"robustness.scenarios[{self.name}]"
+        rule = SCENARIO_RULES.get(self.name)
+        if rule is None:
+            raise ConfigError(f"неизвестный сценарий {self.name!r}; есть {tuple(SCENARIO_RULES)}")
+        lv = tuple(float(v) for v in _floats(self.levels))
+        if not lv:
+            raise ConfigError(f"{where}: пустой список уровней")
+        if lv[0] != 0.0:
+            raise ConfigError(f"{where}: первый уровень должен быть 0 (точка отсчёта без "
+                              f"деградации), получено {lv[0]}")
+        if any(b <= a for a, b in zip(lv, lv[1:])):
+            raise ConfigError(f"{where}: уровни должны строго возрастать: {lv}")
+        if rule.max_level is not None and lv[-1] > rule.max_level:
+            raise ConfigError(f"{where}: уровень {lv[-1]} больше допустимого {rule.max_level}")
+        if rule.integer and not all(v.is_integer() for v in lv):
+            raise ConfigError(f"{where}: уровни - целые числа, получено {lv}")
+        s(self, "levels", lv)
+        params = dict(self.params or {})
+        unknown = sorted(set(params) - set(rule.params))
+        if unknown:
+            raise ConfigError(f"{where}: неизвестные параметры {unknown}; "
+                              f"допустимы {sorted(rule.params)}")
+        s(self, "params", {k: _norm_param(where, k, d, params.get(k, d))
+                           for k, d in rule.params.items()})
+        if "channels" in self.params and not set(self.params["channels"]) <= {0, 1, 2}:
+            raise ConfigError(f"{where}.channels: каналы 0 (T), 1 (P), 2 (RH)")
+        s(self, "guard", rule.guard if self.guard is None else bool(self.guard))
+
+    @property
+    def rule(self):
+        return SCENARIO_RULES[self.name]
+
+    @classmethod
+    def from_dict(cls, d):
+        return d if isinstance(d, cls) else cls(**_strict_kwargs(cls, d, "robustness.scenarios"))
+
+
+def default_scenarios():
+    return tuple(ScenarioSpec(**d) for d in DEFAULT_SCENARIOS)
+
+
+@dataclass(frozen=True)
+class RobustnessConfig:
+    """Прогон робастности обученной модели без переобучения.
+
+    roles, time_key     - станции и временное окно внутреннего набора (внешний тест
+                          всегда external_test × test);
+    every_hours, windows_per_station - шаг кандидатов и стратифицированная подвыборка
+                          окон (одинаковое число окон с каждой станции);
+    qc                  - контроль качества после сценария: ``point`` - поточечный, как
+                          в рантайме на устройстве; ``window`` - оконный, как при
+                          обучении; ``none`` - без QC;
+    leads               - лиды кривых и проверки скилла;
+    skill_tolerance     - допуск: скилл ``guard_models`` не ниже −skill_tolerance ни в
+                          одном сценарии с ``guard`` и ни на одном уровне и лиде;
+    seed                - сид случайных чисел сценариев (общие для всех уровней);
+    bootstrap, ci_level - блочный бутстрап по станциям (блок 5); 0 - без интервалов.
+    """
+    roles: tuple = (ROLE_TEST,)
+    time_key: str = "test"
+    every_hours: int = 72
+    windows_per_station: int = 20
+    qc: str = "point"
+    leads: tuple = (1, 6, 24, 72, 168)
+    skill_tolerance: float = 0.05
+    guard_models: tuple = ("МАЯК",)
+    seed: int = 0
+    bootstrap: int = 1000
+    ci_level: float = 0.90
+    scenarios: tuple = field(default_factory=default_scenarios)
+
+    def __post_init__(self):
+        s = object.__setattr__
+        roles = tuple(str(r) for r in ([self.roles] if isinstance(self.roles, str)
+                                       else self.roles))
+        if not roles or not set(roles) <= set(ROLES):
+            raise ConfigError(f"robustness.roles = {roles}; допустимы {ROLES} "
+                              f"(внешний тест - отдельным манифестом)")
+        s(self, "roles", roles)
+        if self.time_key not in ROBUSTNESS_TIME_KEYS:
+            raise ConfigError(f"robustness.time_key = {self.time_key!r}; "
+                              f"допустимо {ROBUSTNESS_TIME_KEYS}")
+        if self.qc not in ROBUSTNESS_QC:
+            raise ConfigError(f"robustness.qc = {self.qc!r}; допустимо {ROBUSTNESS_QC}")
+        leads = tuple(sorted(set(_ints(self.leads))))
+        if not leads or leads[0] < 1 or leads[-1] > H:
+            raise ConfigError(f"robustness.leads = {leads}: лиды в [1, {H}]")
+        s(self, "leads", leads)
+        for name in ("every_hours", "windows_per_station", "seed", "bootstrap"):
+            s(self, name, int(getattr(self, name)))
+        if self.every_hours < 1 or self.windows_per_station < 1 or self.bootstrap < 0:
+            raise ConfigError("every_hours, windows_per_station ≥ 1; bootstrap ≥ 0")
+        tol = float(self.skill_tolerance)
+        if not 0.0 <= tol < 1.0:
+            raise ConfigError(f"robustness.skill_tolerance = {tol} вне [0, 1)")
+        s(self, "skill_tolerance", tol)
+        lvl = float(self.ci_level)
+        if not 0.0 < lvl < 1.0:
+            raise ConfigError(f"robustness.ci_level = {lvl} вне (0, 1)")
+        s(self, "ci_level", lvl)
+        gm = tuple(str(m) for m in ([self.guard_models] if isinstance(self.guard_models, str)
+                                    else self.guard_models))
+        if not gm:
+            raise ConfigError("robustness.guard_models пуст: проверке скилла нечего проверять")
+        s(self, "guard_models", gm)
+        sc = tuple(ScenarioSpec.from_dict(d) for d in self.scenarios)
+        if not sc:
+            raise ConfigError("robustness.scenarios пуст")
+        names = [x.name for x in sc]
+        dup = sorted({n for n in names if names.count(n) > 1})
+        if dup:
+            raise ConfigError(f"robustness.scenarios: повторяются {dup}")
+        s(self, "scenarios", sc)
+
+    def scenario(self, name):
+        for sc in self.scenarios:
+            if sc.name == name:
+                return sc
+        raise KeyError(name)
+
+    def select(self, names):
+        """Подмножество сценариев по именам (порядок конфига сохраняется)."""
+        names = list(names)
+        have = {sc.name for sc in self.scenarios}
+        missing = sorted(set(names) - have)
+        if missing:
+            raise ConfigError(f"в конфиге нет сценариев {missing}; есть {sorted(have)}")
+        return replace(self, scenarios=tuple(sc for sc in self.scenarios if sc.name in names))
+
+    def to_dict(self):
+        return to_jsonable(self)
+
+    @classmethod
+    def from_dict(cls, d=None):
+        return cls(**_strict_kwargs(cls, d, "robustness"))
+
+
 __all__ = ["ABLATION_NAMES", "AUGMENT_PROB_FIELDS", "AUGMENT_PROFILES", "Ablations",
            "AugmentConfig", "CHANNEL_MAX_LAG", "ConfigError",
            "DEFAULT_MODE_GROUPS",
            "DLinearConfig", "DataConfig", "ENCODER_CHANNELS", "GRUConfig", "LRUConfig",
            "LRU_SCANS", "MODEL_CONFIGS", "ModeGroup", "ModelConfig", "PatchTSTConfig",
-           "RunConfig", "SOLAR_CHANNELS", "Seeds", "TrainConfig",
-           "check_pipeline_compat", "model_config_for", "model_config_from_dict", "run_label",
+           "DEFAULT_SCENARIOS", "ROBUSTNESS_QC", "RobustnessConfig", "RunConfig",
+           "SCENARIO_INPUT", "SCENARIO_INSTRUMENT", "SCENARIO_RULES", "SOLAR_CHANNELS",
+           "ScenarioRule", "ScenarioSpec", "Seeds", "TrainConfig",
+           "check_pipeline_compat", "default_scenarios", "model_config_for",
+           "model_config_from_dict", "run_label",
            "to_jsonable"]
