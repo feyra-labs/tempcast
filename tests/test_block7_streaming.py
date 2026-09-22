@@ -28,7 +28,7 @@ RTOL_STEP = 1e-5
 EXACT_F64 = 1e-10
 ATOL_FORECAST = 1e-4
 ATOL_RESTART = 2e-3
-DEFAULT_STATE_BYTES = 3348
+DEFAULT_STATE_BYTES = 3352
 
 
 def _model(cfg=None, seed=0, perturb=True):

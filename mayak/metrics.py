@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, replace
+from statistics import NormalDist
 
 import numpy as np
 
@@ -31,6 +33,15 @@ def _central_intervals():
 
 
 CENTRAL_INTERVALS = _central_intervals()
+
+
+def interval_indices(nominal):
+    """Номинал центрального интервала → (i_lo, i_hi) в наборе квантилей."""
+    for nom, i, j in CENTRAL_INTERVALS:
+        if abs(nom - float(nominal)) < 1e-6:
+            return i, j
+    raise ValueError(f"номинал {nominal} не является центральным интервалом набора квантилей; "
+                     f"есть {[nom for nom, _i, _j in CENTRAL_INTERVALS]}")
 
 
 def wmean(x, w, axis=None):
@@ -147,6 +158,191 @@ def apply_conformal(q, shift, lead_bins=LEAD_BINS):
     return np.maximum.accumulate(q + table, axis=-1)
 
 
+def apply_adaptive(q, theta=0.0):
+    """Адаптивная поправка: все квантили растягиваются вокруг медианы в e^θ раз.
+
+    Возвращает (q, mu), mu - медиана поправленных квантилей. Медиана поправкой не
+    меняется; при θ = 0 квантили возвращаются как есть, без арифметики (пакет и поток
+    совпадают до бита). Растяжение с положительным множителем сохраняет порядок;
+    ``maximum.accumulate`` - защита для входа, который уже был немонотонным.
+    """
+    theta = float(theta)
+    if not math.isfinite(theta):
+        raise ValueError(f"θ адаптивной поправки не конечно: {theta}")
+    q = np.asarray(q, np.float32)
+    if theta != 0.0:
+        med = q[..., I_MED:I_MED + 1]
+        q = np.maximum.accumulate(med + np.float32(math.exp(theta)) * (q - med), axis=-1)
+    return q, q[..., I_MED].copy()
+
+
+def calibrate_forecast(q, shift=None, theta=0.0, lead_bins=LEAD_BINS):
+    """Единственная точка применения калибровки в проекте → (q, mu).
+
+    Порядок фиксирован: сплит-конформная таблица по бинам лидов (подогнана офлайн на
+    калибровочном окне), затем адаптивный множитель e^θ (подстраивается онлайн на
+    устройстве). Медиана берётся из итоговых квантилей. Оценка, графики и рантайм
+    вызывают эту функцию (рантайм - те же две ступени по отдельности, потому что ему
+    нужен промежуточный результат для обратной связи).
+    """
+    if shift is not None:
+        q = apply_conformal(q, shift, lead_bins)
+    return apply_adaptive(q, theta)
+
+
+def aci_score(y, q, interval=(I_LO90, I_HI90)):
+    """Нормированный выход факта за интервал: 0 - на медиане, 1 - ровно на границе.
+
+    Для y выше медианы - (y − med) / (q_hi − med), ниже - (med − y) / (med − q_lo).
+    Факт внутри интервала, растянутого ``apply_adaptive`` в e^θ раз, тогда и только
+    тогда, когда оценка ≤ e^θ. Вырожденная половина интервала (нулевая ширина) даёт
+    +inf для любого факта, кроме самой медианы.
+    """
+    i, j = interval
+    y = np.asarray(y, np.float64)
+    q = np.asarray(q, np.float64)
+    med = q[..., I_MED]
+    u = y - med
+    d = np.where(u >= 0, q[..., j] - med, med - q[..., i])
+    au = np.abs(u)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        s = np.where(d > 0, au / np.where(d > 0, d, 1.0), np.inf)
+    s = np.where(au == 0, 0.0, s)
+    return np.where(np.isfinite(y) & np.isfinite(med), s, np.nan)
+
+
+def _f32(x):
+    """Округление до float32: θ хранится в состоянии рантайма как float32, и онлайн-путь
+    с перезапусками совпадает с непрерывным до бита."""
+    return float(np.float32(x))
+
+
+@dataclass(frozen=True)
+class ACIParams:
+    """Адаптивная конформная калибровка на устройстве.
+
+    Источник: Gibbs, Candès, «Adaptive Conformal Inference Under Distribution Shift»,
+    NeurIPS 2021, arXiv:2106.00170 - онлайн-подстройка по ошибкам покрытия
+    err_t ∈ {0, 1} с малым шагом γ: параметр сдвигается на γ·(err_t − α).
+
+    Что взято: правило обновления и его гарантия. Сумма обновлений телескопируется:
+    θ_T − θ_0 = γ·Σ(err_t − α), поэтому средняя доля промахов на любом потоке отличается
+    от α не больше чем на |θ_T − θ_0| / (γ·T) - без предположений о распределении.
+
+    Отличие от оригинала: подстраивается не номинальный уровень α_t, а логарифм
+    множителя ширины интервала θ (интервал растягивается вокруг медианы в e^θ раз;
+    ``apply_adaptive``). Это та же схема в форме отслеживания квантиля оценки
+    (quantile tracking; Angelopoulos, Candès, Tibshirani, «Conformal PID Control for
+    Time Series Prediction», NeurIPS 2023, arXiv:2307.16895). Причина: у модели семь
+    квантилей, уровни вне [5 %, 95 %] ей недоступны, и при α_t ≤ 0 оригинал требует
+    бесконечного интервала. В θ-форме каждый промах расширяет интервал на один и тот же
+    относительный шаг независимо от текущего уровня, а само состояние - одно число.
+
+    Границы: θ ∈ [−ln f, ln f], f = ``max_factor``. Нужны, чтобы поток сплошных
+    промахов (отказ прибора, подмена единиц) не разгонял θ без предела. Пока граница не
+    достигнута, гарантия выше выполняется точно; упоры в границу считаются и
+    показываются в отчётах.
+
+    target - α, целевая доля промахов центрального интервала уровня 1 − α (он должен
+    быть в наборе квантилей); gamma - шаг γ (0.005 - значение из статьи Gibbs, Candès).
+    """
+    target: float = 0.10
+    gamma: float = 0.005
+    max_factor: float = 4.0
+
+    def __post_init__(self):
+        object.__setattr__(self, "target", float(self.target))
+        object.__setattr__(self, "gamma", float(self.gamma))
+        object.__setattr__(self, "max_factor", float(self.max_factor))
+        interval_indices(1.0 - self.target)
+        if not 0.0 < self.gamma < 1.0:
+            raise ValueError(f"шаг ACI γ = {self.gamma} вне (0, 1)")
+        if not (math.isfinite(self.max_factor) and self.max_factor > 1.0):
+            raise ValueError(f"max_factor = {self.max_factor}: нужен конечный множитель > 1")
+
+    @property
+    def interval(self):
+        return interval_indices(1.0 - self.target)
+
+    @property
+    def theta_min(self):
+        return _f32(-math.log(self.max_factor))
+
+    @property
+    def theta_max(self):
+        return _f32(math.log(self.max_factor))
+
+    def clip(self, theta):
+        return min(max(_f32(theta), self.theta_min), self.theta_max)
+
+    def update(self, theta, miss):
+        """θ после одного наблюдения: θ + γ·(err − α), с упором в границы."""
+        return self.clip(float(theta) + self.gamma * (float(miss) - self.target))
+
+    def step(self, theta, score):
+        """Одна обратная связь: (новое θ, был ли промах) по оценке ``aci_score``."""
+        miss = bool(score > math.exp(theta))
+        return self.update(theta, miss), miss
+
+
+def aci_run(scores, params, theta0=0.0):
+    """Прогон ACI по одному потоку оценок в порядке времени.
+
+    NaN - обратной связи нет (факт невалиден): θ не меняется. Возвращает θ до каждого
+    наблюдения (им и выпущен интервал), промахи (NaN там, где связи нет), итоговое θ и
+    число упоров в границы.
+    """
+    scores = np.asarray(scores, np.float64).ravel()
+    theta = params.clip(theta0)
+    before = np.empty(len(scores), np.float64)
+    miss = np.full(len(scores), np.nan)
+    clipped = 0
+    lo, hi = params.theta_min, params.theta_max
+    for k, s in enumerate(scores.tolist()):
+        before[k] = theta
+        if s != s:
+            continue
+        theta, m = params.step(theta, s)
+        miss[k] = m
+        clipped += theta in (lo, hi)
+    return dict(theta=before, miss=miss, theta_end=theta, clipped=int(clipped))
+
+
+def aci_effective_level(theta, target=0.10):
+    """Номинал, которому соответствует растянутый интервал при нормальной форме прогноза:
+    интервал уровня 1 − α, растянутый в e^θ раз, - это уровень 2Φ(z·e^θ) − 1."""
+    nd = NormalDist()
+    z = nd.inv_cdf(1.0 - float(target) / 2.0)
+    return 2.0 * nd.cdf(z * math.exp(float(theta))) - 1.0
+
+
+SHARPNESS_RANGE = (0.25, 4.0)
+SHARPNESS_POINTS = 33
+
+
+def sharpness_scales(lo=SHARPNESS_RANGE[0], hi=SHARPNESS_RANGE[1], n=SHARPNESS_POINTS):
+    """Логарифмическая сетка множителей ширины, всегда содержит 1 (выход модели)."""
+    s = np.exp(np.linspace(math.log(lo), math.log(hi), int(n)))
+    return np.unique(np.concatenate([s, [1.0]]))
+
+
+def width_at_coverage(coverage, width, target):
+    """Ширина, при которой фактическое покрытие достигает target (линейная интерполяция
+    по кривой, упорядоченной по множителю). NaN, если кривая target не достигает."""
+    coverage = np.asarray(coverage, np.float64)
+    width = np.asarray(width, np.float64)
+    ok = np.isfinite(coverage) & np.isfinite(width)
+    coverage, width = coverage[ok], width[ok]
+    idx = np.flatnonzero(coverage >= target)
+    if coverage.size == 0 or idx.size == 0 or coverage[0] > target:
+        return float("nan")
+    k = int(idx[0])
+    if k == 0 or coverage[k] == coverage[k - 1]:
+        return float(width[k])
+    f = (target - coverage[k - 1]) / (coverage[k] - coverage[k - 1])
+    return float(width[k - 1] + f * (width[k] - width[k - 1]))
+
+
 def fit_conformal_shift(y, q, w, lead_bins=LEAD_BINS):
     """Сплит-конформные поправки по бинам лидов: квантиль остатка на валидных часах."""
     shift = np.zeros((len(lead_bins), q.shape[-1]), np.float32)
@@ -215,13 +411,17 @@ class Evaluation:
             w = w * lm[None, :]
         return replace(self, w=w)
 
+    def with_calibration(self, shift=None, theta=0.0, lead_bins=LEAD_BINS):
+        """Оценка после калибровки ``calibrate_forecast``: медиана берётся из квантилей."""
+        if shift is None and float(theta) == 0.0:
+            return self
+        q, mu = calibrate_forecast(self.q, shift, theta, lead_bins)
+        return Evaluation(y=self.y, mu=mu, q=q, mu_clim=self.mu_clim,
+                          w=self.w, station=self.station)
+
     def with_conformal(self, shift, lead_bins=LEAD_BINS):
         """Оценка с применённой конформной поправкой: медиана берётся из квантилей."""
-        if shift is None:
-            return self
-        q = apply_conformal(self.q, shift, lead_bins)
-        return Evaluation(y=self.y, mu=q[..., I_MED], q=q, mu_clim=self.mu_clim,
-                          w=self.w, station=self.station)
+        return self.with_calibration(shift, 0.0, lead_bins)
 
 
     def counts(self):
@@ -322,14 +522,47 @@ class Evaluation:
         return dict(nominal=np.asarray(Q, np.float64), empirical=emp)
 
     def sharpness_coverage(self):
-        """Острота против покрытия: средняя ширина интервала и фактическое покрытие."""
+        """Острота против покрытия: средняя ширина интервала и фактическое покрытие.
+
+        below / above - доли факта ниже нижней и выше верхней границы: при одинаковом
+        покрытии они различают «узкий интервал» (промахи с обеих сторон) и «сдвиг»
+        (промахи с одной стороны).
+        """
         rows = []
         for nominal, i, j in CENTRAL_INTERVALS:
             lo, hi = self.q[..., i], self.q[..., j]
             rows.append(dict(nominal=float(nominal),
                              coverage=float(wmean(inside(self.y, lo, hi), self.w)),
-                             width=float(wmean(hi - lo, self.w))))
+                             width=float(wmean(hi - lo, self.w)),
+                             below=float(wmean((self.y < lo).astype(np.float64), self.w)),
+                             above=float(wmean((self.y > hi).astype(np.float64), self.w))))
         return rows
+
+    def sharpness_curve(self, scales=None, nominal=0.9, lead_bins=LEAD_BINS):
+        """Кривая «острота против покрытия» по уже собранным предсказаниям.
+
+        Интервал уровня ``nominal`` растягивается вокруг медианы в s раз для каждого s из
+        ``scales`` (та же операция, что ``apply_adaptive``) - получается непрерывная кривая
+        «фактическое покрытие → средняя ширина». s = 1 - выход модели как есть. Кривые
+        разных моделей сравниваются при одинаковом фактическом покрытии
+        (``width_at_coverage``), а не при одинаковом номинале. Возвращает
+        {"весь горизонт" | "a-b": dict(scale, coverage, width)}.
+        """
+        scales = sharpness_scales() if scales is None else np.asarray(scales, np.float64)
+        i, j = interval_indices(nominal)
+        panels = {"весь горизонт": self.w}
+        for a, b in lead_bins:
+            panels[f"{a}-{b}"] = self.w * lead_mask(np.arange(a, b + 1), self.horizon)[None, :]
+        out = {k: dict(scale=scales.copy(), coverage=np.full(len(scales), np.nan),
+                       width=np.full(len(scales), np.nan)) for k in panels}
+        for n, sc in enumerate(scales):
+            qs, _ = apply_adaptive(self.q, math.log(sc))
+            lo, hi = qs[..., i].astype(np.float64), qs[..., j].astype(np.float64)
+            cov, wid = inside(self.y, lo, hi), hi - lo
+            for k, w in panels.items():
+                out[k]["coverage"][n] = float(wmean(cov, w))
+                out[k]["width"][n] = float(wmean(wid, w))
+        return out
 
 
 def by_lead(ev, leads=FINE_LEADS, ci=False, **kw):
@@ -416,8 +649,11 @@ def metric_table(y, mu, q, mu_clim, w, leads=(1, 3, 6, 12, 24, 48, 72, 120, 168)
     return out
 
 
-__all__ = ["CENTRAL_INTERVALS", "Evaluation", "FINE_LEADS", "LEAD_BINS", "METRICS", "NQ", "Q",
-           "apply_conformal", "breakdown", "by_lead", "by_lead_bin", "conformal_table",
-           "coverage", "fit_conformal_shift", "inside", "lead_bin_index", "lead_bin_of",
-           "lead_mask", "metric_table", "pair_terms", "pinball_crps", "seed_spread", "skill",
-           "skill_per_lead", "spread", "winkler", "wmean"]
+__all__ = ["ACIParams", "CENTRAL_INTERVALS", "Evaluation", "FINE_LEADS", "LEAD_BINS", "METRICS",
+           "NQ", "Q", "SHARPNESS_POINTS", "SHARPNESS_RANGE", "aci_effective_level", "aci_run",
+           "aci_score", "apply_adaptive", "apply_conformal", "breakdown", "by_lead",
+           "by_lead_bin", "calibrate_forecast", "conformal_table", "coverage",
+           "fit_conformal_shift", "inside", "interval_indices", "lead_bin_index", "lead_bin_of",
+           "lead_mask", "metric_table", "pair_terms", "pinball_crps", "seed_spread",
+           "sharpness_scales", "skill", "skill_per_lead", "spread", "width_at_coverage",
+           "winkler", "wmean"]

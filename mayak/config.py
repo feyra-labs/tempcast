@@ -8,9 +8,13 @@
 * ``DataConfig`` - пути, временные окна, пороги масок, параметры аугментаций, QC окна;
 * ``TrainConfig`` - это ``mayak.protocol.Protocol`` (единый протокол
   обучения): шаги, батч, оптимизатор, расписание, ранняя остановка, сиды;
-* ``RobustnessConfig`` - сценарии робастности обученной модели (блок 12): какие
+* ``RobustnessConfig`` - сценарии робастности обученной модели: какие
   преобразования окна, на каких уровнях деградации, на каких станциях и лидах,
   допуск проверки скилла. Читается ``mayak.robustness``, в обучение не входит.
+* ``CalibrationConfig`` - анализ калибровки: номинал и допуск покрытия,
+  пороги страт, бутстрап, критерий условной поправки, сетка кривой «острота против
+  покрытия», параметры адаптивной калибровки на устройстве. Читается
+  ``mayak.calibration`` и рантаймом, в обучение не входит.
 
 ``RunConfig`` собирает три части в один объект - его полностью разрешённая форма
 пишется рядом с чекпойнтом и внутри него.
@@ -26,6 +30,7 @@ from typing import Any, Optional
 from mayak.constants import H, L_MAX, QUANTILES
 from mayak.data.masking import TargetMaskConfig
 from mayak.data.splits import ROLE_TEST, ROLES, TIME_BOUNDS
+from mayak.metrics import ACIParams, interval_indices
 from mayak.protocol import DEFAULT_PROTOCOL, Protocol, Seeds
 
 TrainConfig = Protocol
@@ -1111,8 +1116,99 @@ class RobustnessConfig:
         return cls(**_strict_kwargs(cls, d, "robustness"))
 
 
+COVERAGE_DIMS_INTERNAL = ("роль станции", "зона Кёппена", "длина истории", "валидность истории")
+COVERAGE_DIMS_EXTERNAL = ("зона Кёппена", "длина истории", "валидность истории",
+                          "частота отчётности", "Δ высоты станция−ЦМР", "канал давления")
+COVERAGE_DIMS = tuple(dict.fromkeys(COVERAGE_DIMS_INTERNAL + COVERAGE_DIMS_EXTERNAL))
+CALIBRATION_NOMINALS = (0.8, 0.9)
+
+
+@dataclass(frozen=True)
+class CalibrationConfig:
+    """Анализ калибровки обученной модели и адаптивная калибровка на устройстве.
+
+    nominal            - номинал центрального интервала, покрытие которого разбирается;
+    tolerance          - существенное отклонение покрытия, доля (0.04 → полоса 86–94 %);
+    min_windows, min_stations - страты меньше порога не показываются;
+    bootstrap, ci_level, seed - блочный бутстрап по станциям; 0 - без интервалов, тогда
+                         вердикты опираются только на допуск;
+    conditional_dims   - разрезы, по которым допустима условная конформная поправка:
+                         она рекомендуется, только если страты этих разрезов
+                         систематически отличаются от покрытия набора в целом;
+    sharpness_range, sharpness_points - сетка множителей ширины для кривой «острота
+                         против покрытия»;
+    aci_gamma, aci_max_factor - шаг и граница множителя адаптивной калибровки
+                         (``mayak.metrics.ACIParams``); целевая доля промахов = 1 − nominal.
+    """
+    nominal: float = 0.90
+    tolerance: float = 0.04
+    min_windows: int = 20
+    min_stations: int = 2
+    bootstrap: int = 1000
+    ci_level: float = 0.90
+    seed: int = 0
+    conditional_dims: tuple = ("зона Кёппена", "длина истории")
+    sharpness_range: tuple = (0.25, 4.0)
+    sharpness_points: int = 33
+    aci_gamma: float = 0.005
+    aci_max_factor: float = 4.0
+
+    def __post_init__(self):
+        s = object.__setattr__
+        nominal = float(self.nominal)
+        if not any(abs(nominal - n) < 1e-9 for n in CALIBRATION_NOMINALS):
+            raise ConfigError(f"calibration.nominal = {nominal}; допустимо {CALIBRATION_NOMINALS}")
+        interval_indices(nominal)
+        s(self, "nominal", nominal)
+        tol = float(self.tolerance)
+        if not 0.0 < tol < 0.5:
+            raise ConfigError(f"calibration.tolerance = {tol} вне (0, 0.5)")
+        s(self, "tolerance", tol)
+        for name in ("min_windows", "min_stations", "bootstrap", "seed", "sharpness_points"):
+            s(self, name, int(getattr(self, name)))
+        if self.min_windows < 1 or self.min_stations < 1 or self.bootstrap < 0:
+            raise ConfigError("min_windows, min_stations ≥ 1; bootstrap ≥ 0")
+        lvl = float(self.ci_level)
+        if not 0.0 < lvl < 1.0:
+            raise ConfigError(f"calibration.ci_level = {lvl} вне (0, 1)")
+        s(self, "ci_level", lvl)
+        dims = tuple(str(d) for d in ([self.conditional_dims]
+                                      if isinstance(self.conditional_dims, str)
+                                      else self.conditional_dims))
+        unknown = sorted(set(dims) - set(COVERAGE_DIMS))
+        if unknown:
+            raise ConfigError(f"calibration.conditional_dims: неизвестные разрезы {unknown}; "
+                              f"есть {list(COVERAGE_DIMS)}")
+        s(self, "conditional_dims", dims)
+        rng = _floats(self.sharpness_range)
+        if len(rng) != 2 or not 0.0 < rng[0] < 1.0 < rng[1]:
+            raise ConfigError(f"calibration.sharpness_range = {rng}: нужно (a, b), 0 < a < 1 < b")
+        s(self, "sharpness_range", rng)
+        if self.sharpness_points < 3:
+            raise ConfigError("calibration.sharpness_points ≥ 3")
+        s(self, "aci_gamma", float(self.aci_gamma))
+        s(self, "aci_max_factor", float(self.aci_max_factor))
+        try:
+            self.aci()
+        except ValueError as e:
+            raise ConfigError(f"calibration.aci_*: {e}") from None
+
+    def aci(self):
+        """Параметры адаптивной калибровки на устройстве."""
+        return ACIParams(target=round(1.0 - self.nominal, 10), gamma=self.aci_gamma,
+                         max_factor=self.aci_max_factor)
+
+    def to_dict(self):
+        return to_jsonable(self)
+
+    @classmethod
+    def from_dict(cls, d=None):
+        return cls(**_strict_kwargs(cls, d, "calibration"))
+
+
 __all__ = ["ABLATION_NAMES", "AUGMENT_PROB_FIELDS", "AUGMENT_PROFILES", "Ablations",
-           "AugmentConfig", "CHANNEL_MAX_LAG", "ConfigError",
+           "AugmentConfig", "CALIBRATION_NOMINALS", "CHANNEL_MAX_LAG", "COVERAGE_DIMS",
+           "COVERAGE_DIMS_EXTERNAL", "COVERAGE_DIMS_INTERNAL", "CalibrationConfig", "ConfigError",
            "DEFAULT_MODE_GROUPS",
            "DLinearConfig", "DataConfig", "ENCODER_CHANNELS", "GRUConfig", "LRUConfig",
            "LRU_SCANS", "MODEL_CONFIGS", "ModeGroup", "ModelConfig", "PatchTSTConfig",

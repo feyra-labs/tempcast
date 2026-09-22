@@ -1,0 +1,14 @@
+# Калибровка интервалов: python -m mayak.calibration --preds ...
+# Значения = mayak.config.CalibrationConfig().
+nominal: 0.9
+tolerance: 0.04
+min_windows: 20
+min_stations: 2
+bootstrap: 1000
+ci_level: 0.9
+seed: 0
+conditional_dims: [зона Кёппена, длина истории]
+sharpness_range: [0.25, 4.0]
+sharpness_points: 33
+aci_gamma: 0.005
+aci_max_factor: 4.0

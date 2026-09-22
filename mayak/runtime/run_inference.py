@@ -1,14 +1,17 @@
 """Пример сквозного инференса МАЯК на устройстве (потоковый путь A):
 загрузка модели и конформной таблицы → восстановление состояния после ребута →
 почасовые шаги по данным датчиков → выпуск прогноза → атомарное сохранение
-состояния (3348 Б для конфига по умолчанию, < 4 КБ). После загрузки кольцевые буферы
+состояния (3352 Б для конфига по умолчанию, < 4 КБ). После загрузки кольцевые буферы
 энкодера и незавершённые сутки восстанавливаются одним проходом по сохранённому окну;
 несовместимое или повреждённое состояние - чистый старт с записью в лог.
 QC точки и watchdog-фолбэк — внутри StreamingMayak/safe_forecast.
 
+С ``--aci`` прибор подстраивает ширину интервалов по своим промахам: каждый
+валидный час T сверяется с последним выпущенным прогнозом; θ хранится в состоянии.
+
 Запуск:
     python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt \
-        --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2
+        --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2 --aci
 """
 import argparse, os
 from datetime import datetime, timezone, timedelta
@@ -54,13 +57,22 @@ def main():
     ap.add_argument("--clim-fallback", type=float, default=10.0,
                     help="климат-средняя T (°C) для watchdog-фолбэка")
     ap.add_argument("--sigma-fallback", type=float, default=4.0)
+    ap.add_argument("--aci", action="store_true",
+                    help="адаптивная калибровка интервалов по собственным промахам прибора")
+    ap.add_argument("--calibration-config", default=None,
+                    help="YAML с параметрами ACI (по умолчанию conf/calibration/default.yaml)")
     args = ap.parse_args()
-    from mayak.lit import load_model                     # тяжёлый импорт — после разбора аргументов
+    from mayak.lit import load_model
 
     model = load_model(args.ckpt).eval()
     conf = args.conformal if (args.conformal and os.path.exists(args.conformal)) else None
-    stream = StreamingMayak(model, args.lat, args.lon, args.elev, conformal=conf)
+    aci = None
+    if args.aci:
+        from mayak.calibration import load_config
+        aci = load_config(args.calibration_config).aci()
+    stream = StreamingMayak(model, args.lat, args.lon, args.elev, conformal=conf, aci=aci)
     print("Конформная калибровка:", "включена" if conf else "ОТКЛЮЧЕНА (таблица не передана)")
+    print("Адаптивная калибровка:", f"включена ({aci})" if aci else "выключена")
 
     st = latest_state()
     if st:
@@ -83,6 +95,8 @@ def main():
         doy, hour = utc_to_doy_hour(ts)
         T, P, RH = read_sensors(ts)
         stream.step(T, P, RH, doy, hour)
+        if aci is not None:
+            stream.forecast(*future_calendar(ts, H))
         save_state(stream, k)
 
     last_obs = now - timedelta(hours=1)
@@ -94,6 +108,11 @@ def main():
         j = h - 1
         print(f"  +{h:>3} ч:  T̂ = {mu[j]:5.1f} °C   "
               f"90%-интервал [{q[j,0]:5.1f}, {q[j,6]:5.1f}]")
+    if aci is not None:
+        from mayak.metrics import aci_effective_level
+        print(f"  θ = {stream.theta:+.4f} (номинал модели "
+              f"{aci_effective_level(stream.theta, aci.target):.1%}), обратных связей "
+              f"{stream.aci_updates}, фактическое покрытие {stream.aci_coverage:.1%}")
 
 
 if __name__ == "__main__":

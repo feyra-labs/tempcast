@@ -15,10 +15,21 @@
   (n_re, n_im, e), паспорт z, суточные сводки и их маска, сырое окно наблюдений
   (``stream_window`` часов, фиксированная точка uint16 на канал) и его маска, курсор
   (сколько часов окна заполнено, сколько часов накоплено в текущих сутках, час года
-  первой и последней позиции окна).
-* Эфемерное: кольцевые буферы энкодера, календарь окна, накопители текущих суток.
+  первой и последней позиции окна) и θ адаптивной калибровки (float32 в заголовке).
+* Эфемерное: кольцевые буферы энкодера, календарь окна, накопители текущих суток,
+  последний выпущенный прогноз для обратной связи калибровки.
   На диск не пишется; ``load_state`` восстанавливает его одним пакетным проходом
   энкодера по сохранённому окну (цена платится один раз при старте).
+
+Калибровка интервалов. Выпуск = квантили модели → сплит-конформная таблица →
+адаптивный множитель e^θ (``mayak.metrics``: та же реализация, что в оценке). θ
+подстраивается онлайн (``ACIParams``; Gibbs, Candès 2021), если рантайм создан с
+``aci``: каждый валидный час T сверяется с последним выпущенным прогнозом на том лиде,
+который приходится на этот час, - прибор учится на тех интервалах, которые он
+действительно выдал. Нет прогноза, нет валидного T или лид уже проверен - нет обратной
+связи, θ не меняется: длинная серия пропусков не сдвигает и не разгоняет θ. Стоимость
+обратной связи - O(1) на час. θ относится к прибору, а не к истории: ``reset`` (холодный
+старт) его не трогает, обнуляет только ``reset_calibration``.
 """
 import logging
 
@@ -28,15 +39,17 @@ import torch
 from mayak.astro import astro_features
 from mayak.config import CHANNEL_MAX_LAG
 from mayak.data.qc import PHYS, point_qc
-from mayak.metrics import I_MED, apply_conformal
+from mayak.metrics import ACIParams, aci_score, apply_adaptive, apply_conformal
 
 log = logging.getLogger(__name__)
 
 STATE_MAGIC = b"MYK"
-STATE_VERSION = 2
-STATE_HEADER = np.dtype([("magic", "S3"), ("version", "u1"), ("filled", "<u2"),
-                         ("hours_in_day", "u1"), ("reserved", "u1"),
-                         ("hoy_first", "<u2"), ("hoy_last", "<u2")])
+STATE_VERSION = 3
+_HEADER_V2 = [("magic", "S3"), ("version", "u1"), ("filled", "<u2"),
+              ("hours_in_day", "u1"), ("reserved", "u1"),
+              ("hoy_first", "<u2"), ("hoy_last", "<u2")]
+STATE_HEADER = np.dtype(_HEADER_V2 + [("aci_theta", "<f4")])
+STATE_HEADERS = {2: np.dtype(_HEADER_V2), STATE_VERSION: STATE_HEADER}
 YEAR_HOURS = (365 * 24, 366 * 24)
 
 RAW_CHANNELS = ("T", "P", "RH")
@@ -60,7 +73,9 @@ def hour_of_year(doy):
 
 
 class StreamingMayak:
-    def __init__(self, model, lat, lon, elev, conformal=None):
+    def __init__(self, model, lat, lon, elev, conformal=None, aci=None):
+        """aci - ``ACIParams`` (или True - параметры по умолчанию) включает онлайн-подстройку
+        θ; None - θ фиксировано (по умолчанию 0, либо из загруженного состояния)."""
         self.m = model.eval()
         cfg = model.cfg
         self.window = cfg.stream_window
@@ -76,6 +91,8 @@ class StreamingMayak:
             self.conformal = np.load(conformal).astype(np.float32)
         else:
             self.conformal = np.asarray(conformal, np.float32)
+        self.aci = ACIParams() if aci is True else aci
+        self.reset_calibration()
 
         with torch.no_grad():
             self.loc = self.m.loc(torch.tensor([lat]), torch.tensor([lon]),
@@ -85,8 +102,16 @@ class StreamingMayak:
         self.tau, self.omega, self.kappa = tau, omega, kappa
         self.reset()
 
+    def reset_calibration(self, theta=0.0):
+        """Сброс адаптивной калибровки прибора (θ и счётчики обратной связи)."""
+        self.theta = float(np.float32(theta)) if self.aci is None else self.aci.clip(theta)
+        self.aci_updates = 0
+        self.aci_misses = 0
+        self._pending = None
+
     def reset(self):
-        """Холодный старт: история пуста (L = 0)."""
+        """Холодный старт: история пуста (L = 0). θ калибровки сохраняется."""
+        self._pending = None
         M, W = self.n_modes, self.window
         self.n_re = torch.zeros(1, M)
         self.n_im = torch.zeros(1, M)
@@ -182,7 +207,31 @@ class StreamingMayak:
     def step(self, T, P, RH, doy, hour):
         """Новый час наблюдений. None или значение вне физического диапазона - пропуск."""
         xj, mj = self._qc_point(T, P, RH)
+        if self.aci is not None and mj[0] > 0:
+            self._aci_feedback(float(xj[0]), doy)
         self._ingest(xj, mj, doy, hour)
+
+    def _aci_feedback(self, y, doy):
+        """Сверка валидного T часа с последним выпущенным прогнозом на его лиде → θ."""
+        p = self._pending
+        if p is None:
+            return
+        hit = np.flatnonzero(p["hoy"] == hour_of_year(doy))
+        if hit.size == 0 or int(hit[0]) <= p["last"]:
+            return
+        k = int(hit[0])
+        p["last"] = k
+        score = float(aci_score(y, p["q"][k], self.aci.interval))
+        self.theta, miss = self.aci.step(self.theta, score)
+        self.aci_updates += 1
+        self.aci_misses += int(miss)
+
+    @property
+    def aci_coverage(self):
+        """Фактическое покрытие по обратной связи с момента последнего сброса калибровки."""
+        if not self.aci_updates:
+            return float("nan")
+        return 1.0 - self.aci_misses / self.aci_updates
 
     @torch.no_grad()
     def warm_start(self, x_hist, mask_hist, doy_hist, hour_hist):
@@ -238,14 +287,13 @@ class StreamingMayak:
         hour = torch.as_tensor(hour_fut, dtype=torch.float32)[None]
         astro_f = astro_features(doy, hour, self._lat_t, self._lon_t)
         out = self.m.issue(self.loc, self.z, a_re, a_im, self.e, astro_f)
-        q, mu = out["q"], out["mu"]
-
-        q = q[0].numpy()
-        mu = mu[0].numpy()
+        q = out["q"][0].numpy()
         if self.conformal is not None:
             q = apply_conformal(q, self.conformal)
-            mu = q[:, I_MED]
-        return q, mu
+        if self.aci is not None:
+            hoy = np.rint(np.asarray(doy_fut, np.float64).ravel() * 24.0).astype(np.int64)
+            self._pending = dict(hoy=hoy, q=np.array(q, np.float32), last=-1)
+        return apply_adaptive(q, self.theta)
 
     def serialize(self):
         idx = self._ordered()
@@ -253,6 +301,7 @@ class StreamingMayak:
         hdr = np.zeros((), STATE_HEADER)
         hdr["magic"], hdr["version"] = STATE_MAGIC, STATE_VERSION
         hdr["filled"], hdr["hours_in_day"] = n, self._hours_in_day
+        hdr["aci_theta"] = self.theta
         if n:
             hdr["hoy_first"] = hour_of_year(self.raw_doy[idx[-n]]) % 65536
             hdr["hoy_last"] = hour_of_year(self.raw_doy[idx[-1]]) % 65536
@@ -275,25 +324,36 @@ class StreamingMayak:
         return STATE_HEADER.itemsize + 4 * (3 * M + self.dz) + 2 * (D * 6 + D) + 2 * W * 3 + W * 3
 
     def load_state(self, raw):
-        """Состояние с диска + восстановление эфемерной части одним проходом по окну."""
+        """Состояние с диска + восстановление эфемерной части одним проходом по окну.
+
+        Читаются версии 3 (текущая) и 2 (до блока 13, без θ): для v2 θ = 0.
+        """
         raw = bytes(raw)
-        if len(raw) < STATE_HEADER.itemsize or raw[:len(STATE_MAGIC)] != STATE_MAGIC:
-            raise ValueError("не состояние МАЯК формата v2 (нет заголовка); состояния, "
+        if len(raw) < len(STATE_MAGIC) + 1 or raw[:len(STATE_MAGIC)] != STATE_MAGIC:
+            raise ValueError("не состояние МАЯК формата v2+ (нет заголовка); состояния, "
                              "записанные до блока 7, не поддерживаются - нужен чистый старт")
-        hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0]
-        if int(hdr["version"]) != STATE_VERSION:
-            raise ValueError(f"версия состояния {int(hdr['version'])}, рантайм читает "
-                             f"{STATE_VERSION}")
-        if len(raw) != self.state_nbytes:
+        version = raw[len(STATE_MAGIC)]
+        hdr_t = STATE_HEADERS.get(version)
+        if hdr_t is None:
+            raise ValueError(f"версия состояния {version}, рантайм читает "
+                             f"{sorted(STATE_HEADERS)}")
+        expected = self.state_nbytes - STATE_HEADER.itemsize + hdr_t.itemsize
+        if len(raw) != expected:
             raise ValueError(f"состояние {len(raw)} Б не соответствует конфигу модели "
-                             f"(ожидалось {self.state_nbytes} Б)")
+                             f"(ожидалось {expected} Б для версии {version})")
+        hdr = np.frombuffer(raw, hdr_t, count=1)[0]
+        theta = float(hdr["aci_theta"]) if "aci_theta" in hdr_t.names else 0.0
+        if not np.isfinite(theta):
+            raise ValueError(f"повреждённое θ калибровки в состоянии: {theta}")
+        if version != STATE_VERSION:
+            log.info("состояние версии %d без θ калибровки: θ = 0", version)
         filled, hid = int(hdr["filled"]), int(hdr["hours_in_day"])
         if filled > self.window or hid > 23 or hid > filled:
             raise ValueError(f"повреждённый курсор состояния: filled={filled}, "
                              f"часов в сутках {hid}, окно {self.window}")
         doy, hour = self._window_calendar(filled, int(hdr["hoy_first"]), int(hdr["hoy_last"]))
 
-        off = STATE_HEADER.itemsize
+        off = hdr_t.itemsize
 
         def take(shape, dtype):
             nonlocal off
@@ -317,6 +377,7 @@ class StreamingMayak:
         self.head, self.filled = 0, filled
         self._hours_in_day = hid
         self._last_hoy = int(hdr["hoy_last"]) if filled else None
+        self.reset_calibration(theta)
         self._rebuild_from_window()
 
     @staticmethod

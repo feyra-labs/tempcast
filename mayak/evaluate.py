@@ -16,6 +16,8 @@
     покрытия;
   * графики по каждой метрике, кривую холодного старта и проверку L=0;
   * отчёт о влиянии конформной калибровки (PICP/CRPS/MAE до и после);
+  * покрытие по разрезам с вердиктами и критерий условной поправки; ``--save-preds`` сохраняет предсказания всех моделей,
+    чтобы анализ калибровки шёл без повторного запуска моделей;
   * внешний тест на наблюдениях реальной сети (``--external-manifest``): те же
     таблицы и разрезы, разрезы внешнего теста (шаг отчётности, Δ высоты станции и
     ЦМР, канал давления) и сопоставление «внутренний тест против внешнего»;
@@ -33,8 +35,8 @@ from mayak.data.dataset import (footprint, history_len, norm_scale, slice_histor
                                 valid_starts)
 from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats
 from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, apply_conformal, breakdown,
-                           by_lead, coverage, metric_table, pinball_crps, seed_spread, skill,
-                           wmean)
+                           by_lead, calibrate_forecast, coverage, metric_table, pinball_crps,
+                           seed_spread, skill, wmean)
 from mayak.timeaxis import window_calendar, window_month
 from mayak.zones import SEASON_RU, normalize_zone, season_of
 
@@ -129,6 +131,8 @@ class EvalSet(Dataset):
         return self._attrs
 
     def window_meta(self):
+        """Метки окон для разрезов; ``t`` - час начала горизонта (порядок окон во времени
+        нужен офлайн-прогону адаптивной калибровки)."""
         sid_a, role, zone, season, hist, hvalid = [], [], [], [], [], []
         has_p, rep, egap = [], [], []
         attrs = self.station_attrs()
@@ -151,7 +155,8 @@ class EvalSet(Dataset):
                     zone=np.array(zone, object), season=np.array(season, object),
                     history=np.array(hist, np.int64), hist_valid=np.array(hvalid, np.float64),
                     has_pressure=np.array(has_p, object), report_class=np.array(rep, object),
-                    elev_gap=np.array(egap, object))
+                    elev_gap=np.array(egap, object),
+                    t=np.array([t for _sid, t in self.items], np.int64))
 
     def __getitem__(self, i):
         sid, t = self.items[i]
@@ -541,8 +546,7 @@ def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
         mu = out["mu"][0].cpu().numpy()
         q = out["q"][0].cpu().numpy()
         if shift is not None:
-            q = apply_conformal(q, shift)
-            mu = q[:, 3]
+            q, mu = calibrate_forecast(q, shift)
         y = np.where(item["y_mask"].numpy() > 0, item["y"].numpy(), np.nan)  # дыры видны
         muc = item["mu_clim_fut"].numpy()
         sid, _t = ds.items[int(i)]
@@ -648,7 +652,25 @@ def evaluate_all(model, clims, manifest="data/manifest.csv", r_damped=None,
 
     print("\n=== Надёжность (МАЯК) ===")
     print_reliability(evs["МАЯК"])
+    print_calibration(evs["МАЯК"], aux["meta"], bootstrap=bootstrap if ci else None)
     return preds, aux, ds
+
+
+def print_calibration(ev, meta, bootstrap=None, external=False):
+    from dataclasses import replace
+    from mayak.calibration import (conditional_gate, coverage_report, load_config,
+                                   print_coverage_report)
+    cfg = load_config()
+    if bootstrap:
+        cfg = replace(cfg, bootstrap=int(bootstrap["n_boot"]), seed=int(bootstrap["seed"]),
+                      ci_level=float(bootstrap["level"]))
+    else:
+        cfg = replace(cfg, bootstrap=0)
+    rep = coverage_report(ev, meta, cfg, external=external)
+    print_coverage_report(rep, conditional_gate(rep, cfg),
+                          title=f"\n=== {'[внешний] ' if external else ''}Покрытие по разрезам "
+                                f"(МАЯК, весь горизонт) ===")
+    return rep
 
 
 def coldstart_curve(model, clims, manifest="data/manifest.csv",
@@ -836,6 +858,7 @@ def evaluate_external(named, external_manifest, store, r_damped=None, shift=None
     print_breakdowns(evs["МАЯК"], aux["meta"], leads=[24], fn=external_breakdowns)
     print("\n=== [внешний] Надёжность (МАЯК) ===")
     print_reliability(evs["МАЯК"])
+    print_calibration(evs["МАЯК"], aux["meta"], bootstrap=kw or None, external=True)
 
     transfer = {}
     if internal is not None:
@@ -894,6 +917,9 @@ def main():
                          "например data/ghcnh/manifest.csv; собирается scripts/make_ghcnh.py")
     ap.add_argument("--transfer-zones", choices=("group", "full"), default="group",
                     help="уровень зон для сопоставления внутреннего и внешнего теста")
+    ap.add_argument("--save-preds", default=None, metavar="DIR",
+                    help="сохранить предсказания всех моделей (до калибровки) в DIR/internal.npz "
+                         "и DIR/external.npz - для python -m mayak.calibration")
     args = ap.parse_args()
 
     from mayak.data.store import get_store
@@ -938,6 +964,12 @@ def main():
 
     shift = np.load(args.conformal) if args.conformal else None
     boot = dict(n_boot=args.bootstrap, seed=eval_seed, level=args.ci_level)
+    info = dict(ckpt=args.ckpt, conformal=args.conformal, manifest=args.manifest,
+                eval_seed=eval_seed)
+    if args.save_preds:
+        from mayak.calibration import save_predictions
+        print("Предсказания:", save_predictions(os.path.join(args.save_preds, "internal.npz"),
+                                                preds, aux, shift=shift, info=info))
 
     print("\n=== Таблицы метрик ===")
     evaluate_all(mayak, clims, args.manifest, r_damped=r,
@@ -963,11 +995,11 @@ def main():
     print("\n=== Разрез по зонам Кёппена (МАЯК) ===")
     print_zone_breakdown(zone_breakdown(preds, aux))
 
-    print("\n=== Холодный старт L=0 (пункт 3) ===")
+    print("\n=== Холодный старт L=0 ===")
     coldstart_L0_check(mayak, clims, args.manifest, shift=shift)
 
     if shift is not None:
-        print("\n=== Влияние конформной калибровки (пункт 4) ===")
+        print("\n=== Влияние конформной калибровки ===")
         calibration_quality_report(mayak, clims, shift, args.manifest)
 
     print("\n=== Графики прогноз vs факт (примеры МАЯК) ===")
@@ -985,11 +1017,15 @@ def main():
     plot_amplitude_scatter(mayak, clims, manifest=args.manifest, out_dir=args.out_dir)
 
     if args.external_manifest:
-        evaluate_external(named_all, args.external_manifest, store, r_damped=r, shift=shift,
-                          ci=args.bootstrap > 0, bootstrap=boot,
-                          checkpoints=all_ckpts,
-                          conformal=args.conformal, internal=(preds, aux),
-                          transfer_level=args.transfer_zones)
+        p_ext, a_ext, _ds, _tr = evaluate_external(
+            named_all, args.external_manifest, store, r_damped=r, shift=shift,
+            ci=args.bootstrap > 0, bootstrap=boot, checkpoints=all_ckpts,
+            conformal=args.conformal, internal=(preds, aux), transfer_level=args.transfer_zones)
+        if args.save_preds:
+            from mayak.calibration import save_predictions
+            print("Предсказания:", save_predictions(
+                os.path.join(args.save_preds, "external.npz"), p_ext, a_ext, shift=shift,
+                info=dict(info, manifest=args.external_manifest)))
 
 
 def _mu_q(model, ds):
