@@ -180,7 +180,6 @@ fn cmd_run(a: &Args) -> Result<()> {
                 }
                 let hour = sec.div_euclid(3600);
                 if last.is_none() && rt.filled() > 0 {
-
                     last = store
                         .load_last_hour()
                         .filter(|l| *l < hour && Some(hour_of_year(doy_hour(*l).0)) == rt.last_hoy());
@@ -257,7 +256,9 @@ fn cmd_bench(a: &Args) -> Result<()> {
     let startup_ms = t0.elapsed().as_secs_f64() * 1e3;
     let raw = std::fs::read(a.req("series")?)?;
     let series: Vec<f32> = raw
-        .as_chunks::<4>().0.iter()
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
     let n = series.len() / 3;

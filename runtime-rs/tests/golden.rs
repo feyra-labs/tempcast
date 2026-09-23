@@ -25,7 +25,9 @@ fn load() -> Golden {
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(dir.join("golden.json")).unwrap()).unwrap();
     let raw = std::fs::read(dir.join("golden.f32")).unwrap();
     let blob = raw
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
     Golden { doc, blob }

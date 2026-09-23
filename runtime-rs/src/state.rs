@@ -84,19 +84,25 @@ impl Reader<'_> {
     }
     fn f32s(&mut self, n: usize) -> Vec<f32> {
         self.bytes(4 * n)
-            .as_chunks::<4>().0.iter()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }
     fn f16s(&mut self, n: usize) -> Vec<f32> {
         self.bytes(2 * n)
-            .as_chunks::<2>().0.iter()
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
             .collect()
     }
     fn u16s(&mut self, n: usize) -> Vec<u16> {
         self.bytes(2 * n)
-            .as_chunks::<2>().0.iter()
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect()
     }
