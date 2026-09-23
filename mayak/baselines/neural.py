@@ -88,7 +88,8 @@ class GRUSeq2Seq(nn.Module):
         self.gaps = nn.Parameter(torch.zeros(cfg.horizon, self.nq - 1))
 
     def forward(self, batch):
-        x = batch["x_hist"]; m = batch["mask_hist"]
+        x = batch["x_hist"]
+        m = batch["mask_hist"]
         xn = normalized_obs(x)
         coord = coord_features(batch, x.device)
         coord_seq = coord[:, None, :].expand(-1, x.shape[1], -1)

@@ -166,7 +166,8 @@ def assign_roles(rows, n_test=8, val_frac=0.1, n_val=None, seed=0, min_stratum=3
     n_val = int(round(val_frac * n_rest)) if n_val is None else int(n_val)
     k_val = _allocate(n_val, sizes - k_test, big, sizes - 1 - k_test, rng)
 
-    for name, want, got in (("unseen_test", n_test, k_test.sum()), ("unseen_val", n_val, k_val.sum())):
+    for name, want, got in (("unseen_test", n_test, k_test.sum()),
+                            ("unseen_val", n_val, k_val.sum())):
         if got != want:
             log.warning("роль %s: запрошено %d станций, назначено %d "
                         "(гарантии представительства страт / нехватка станций)", name, want, got)

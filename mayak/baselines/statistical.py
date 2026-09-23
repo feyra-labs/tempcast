@@ -145,13 +145,16 @@ def fit_damped_persistence(clims, n_windows=20000, seed=0):
     """
     rng = np.random.default_rng(seed)
     sids = list(clims.keys())
-    Sxx = np.zeros(H); Sxy = np.zeros(H)
+    Sxx = np.zeros(H)
+    Sxy = np.zeros(H)
     per = max(1, n_windows // len(sids))
     for sid in sids:
-        s = clims[sid]; lo, hi = time_bounds(s["N"])["train"]
+        s = clims[sid]
+        lo, hi = time_bounds(s["N"])["train"]
         if hi - lo < 24 + H + 1:
             continue
-        clim = s["clim"]; t0 = s["t0"]
+        clim = s["clim"]
+        t0 = s["t0"]
         xT, mT = s["x"][:, 0], s["mask"][:, 0]
         for _ in range(per):
             t = int(rng.integers(lo + 24, hi - H))

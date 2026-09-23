@@ -1,6 +1,6 @@
 """Тесты: офлайн-кэш, векторный QC, сиды воркеров, календарь, точки входа."""
+import ast
 import csv
-import hashlib
 import importlib
 import json
 import os
@@ -19,7 +19,7 @@ import mayak
 from mayak.constants import H, L_MAX
 from mayak.data import store as S
 from mayak.data.qc import QCCode, _mad_ok_reference, mad_ok, qc_station, run_qc
-from mayak.timeaxis import (doy_hour, future_calendar, legacy_t0, to_hourly_grid,
+from mayak.timeaxis import (future_calendar, legacy_t0, to_hourly_grid,
                             to_utc_hour, utc_to_doy_hour, window_calendar)
 
 REPO = Path(__file__).resolve().parents[1]
@@ -141,7 +141,8 @@ def test_cache_content_equals_direct_qc(manifest):
         assert np.array_equal(s["qc"], codes) and s["t0"] == T0
         lo, hi = time_bounds(s["N"])["train"]
         d, h = window_calendar(T0, np.arange(lo, hi))
-        ref = Climatology().fit(d.astype(np.float64), h.astype(np.float64), x[lo:hi, 0], mask[lo:hi, 0])
+        ref = Climatology().fit(d.astype(np.float64), h.astype(np.float64),
+                                x[lo:hi, 0], mask[lo:hi, 0])
         assert np.allclose(s["clim"].beta, ref.beta) and s["clim"].sigma == pytest.approx(ref.sigma)
 
 
@@ -265,7 +266,8 @@ def test_all_calendar_paths_agree(manifest):
 
     last_obs = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(hours=s["t0"] + t - 1)
     rt_d, rt_h = utc_to_doy_hour(last_obs)
-    assert (rt_d, rt_h) == pytest.approx((float(item["doy_hist"][-1]), float(item["hour_hist"][-1])))
+    assert (rt_d, rt_h) == pytest.approx((float(item["doy_hist"][-1]),
+                                          float(item["hour_hist"][-1])))
     fd, fh = future_calendar(last_obs, H)
     assert np.allclose(fd, np.asarray(item["doy_fut"]), atol=1e-4)
     assert np.array_equal(fh, np.asarray(item["hour_fut"]))
@@ -363,7 +365,20 @@ def test_module_imports(mod):
 
 
 ENTRY_SCRIPTS = sorted(p.name for p in (REPO / "scripts").glob("*.py"))
-ENTRY_MODULES = ["mayak.evaluate", "mayak.knockout", "mayak.runtime.run_inference"]
+
+
+def _entry_modules():
+    out = []
+    for path in sorted((REPO / "mayak").rglob("*.py")):
+        tree = ast.parse(path.read_text("utf-8"), str(path))
+        if not any(isinstance(n, ast.If) and ast.unparse(n.test) == "__name__ == '__main__'"
+                   for n in tree.body):
+            continue
+        out.append(".".join(path.relative_to(REPO).with_suffix("").parts))
+    return out
+
+
+ENTRY_MODULES = _entry_modules()
 
 
 @pytest.mark.parametrize("script", ENTRY_SCRIPTS)

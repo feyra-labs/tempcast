@@ -551,7 +551,8 @@ def test_evaluation_from_eval_set_breakdowns_run(store, manifest):
     n = len(ds)
     y = rng.normal(10, 5, (n, H))
     mu = y + rng.normal(0, 1, (n, H))
-    ev = Ev(y=y, mu=mu, q=mu[..., None] + np.linspace(-3, 3, NQ), mu_clim=y + rng.normal(0, 3, (n, H)),
+    ev = Ev(y=y, mu=mu, q=mu[..., None] + np.linspace(-3, 3, NQ),
+            mu_clim=y + rng.normal(0, 3, (n, H)),
             w=np.ones((n, H)), station=meta["station"])
     out = all_breakdowns(ev, meta, leads=[24], min_windows=1, min_stations=1)
     assert set(out) == {"роль станции", "зона Кёппена", "сезон", "длина истории",

@@ -422,6 +422,7 @@ def test_dataset_window_qc_masks_augmented_artifacts(manifest):
         assert masked > 0, f"{name}: QC окна не снял валидность ни с одного часа"
 
 
+@pytest.mark.heavy
 def test_journal_records_augment_profile(manifest, tmp_path):
     from mayak.protocol import Protocol, Stage, run_protocol
     proto = Protocol(stages=(Stage("A", "L0", 1, 0),), batch_size=2, windows_per_epoch=4,

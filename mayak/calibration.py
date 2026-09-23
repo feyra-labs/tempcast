@@ -119,7 +119,8 @@ def load_predictions(path):
 
 def evaluation_of(pred, aux, shift=None, theta=0.0):
     return Evaluation(y=aux["y"], mu=pred["mu"], q=pred["q"], mu_clim=aux["mu_clim"],
-                      w=aux["y_mask"], station=aux["meta"]["station"]).with_calibration(shift, theta)
+                      w=aux["y_mask"],
+                      station=aux["meta"]["station"]).with_calibration(shift, theta)
 
 
 def coverage_strata(meta, external=False):

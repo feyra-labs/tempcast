@@ -136,7 +136,8 @@ class LitForecaster(L.LightningModule):
             total_steps = p.total_steps
         mcfg = model_config_for(arch, model_config)
         dcfg = DataConfig() if data_config is None else (
-            data_config if isinstance(data_config, DataConfig) else DataConfig.from_dict(data_config))
+            data_config if isinstance(data_config, DataConfig)
+            else DataConfig.from_dict(data_config))
         self.save_hyperparameters(dict(arch=arch, protocol=p.to_dict(), stage=stage,
                                        total_steps=int(total_steps),
                                        model_config=mcfg.to_dict(),

@@ -136,7 +136,8 @@ def main():
     print(f"включено станций: {len(rows)} из {len(report)}; причины исключения: {reasons}")
     print(f"манифест: {os.path.join(args.out, 'manifest.csv')}")
     print(f"отчёт:    {os.path.join(args.out, 'selection_report.csv')}")
-    print(f"далее:    python scripts/build_cache.py --manifest {os.path.join(args.out, 'manifest.csv')}")
+    print("далее:    python scripts/build_cache.py "
+          f"--manifest {os.path.join(args.out, 'manifest.csv')}")
 
 
 if __name__ == "__main__":

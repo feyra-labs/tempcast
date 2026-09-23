@@ -12,8 +12,9 @@ from mayak.baselines.cards import REGISTRY as CARDS
 from mayak.baselines.cards import BaselineCard, card_for, display_name, markdown
 from mayak.baselines.lru import (LRUForecaster, lru_recurrent, lru_scan_associative,
                                  lru_scan_chunked)
-from mayak.baselines.neural import (DLinear, GRUSeq2Seq, _median_centered_offsets,
-                                    median_centered_offsets)
+from mayak.baselines.neural import DLinear, GRUSeq2Seq
+from mayak.baselines.neural import _median_centered_offsets as _median_centered_offsets
+from mayak.baselines.neural import median_centered_offsets
 from mayak.baselines.patchtst import PatchTST
 from mayak.baselines.statistical import (DAMPED_VAR_FLOOR, RECENT_HOURS, RECENT_MIN_VALID, ZQ,
                                          climatology_forecast, damped_coefficients,

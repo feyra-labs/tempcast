@@ -18,7 +18,7 @@ from mayak.data import ghcnh as G
 from mayak.data import store as S
 from mayak.data.qc import QCCode, station_pressure_expected
 from mayak.data.splits import (EXTERNAL_MIN_TRAIN_YEARS, ROLE_EXTERNAL, ROLE_TEST, ROLE_TRAIN,
-                               ROLE_VAL, TIME_BOUNDS, assign_roles, full_years,
+                               ROLE_VAL, assign_roles, full_years,
                                min_hours_for_train_years, time_bounds)
 from mayak.leakage import (SELECTION_KEY, LeakageError, check_external, check_windows,
                            conformal_meta_path, run_checklist)
@@ -201,7 +201,8 @@ def test_humidity_flag_follows_temperature_and_dewpoint():
 def test_station_list_fixed_width_and_csv(tmp_path):
     fw = G.read_station_list(DATA / "station-list-sample.txt")
     assert list(fw["id"]) == ["TSX0000TEST", "USW00094789", "ASN00009999"]
-    assert fw.loc[1, "lat"] == pytest.approx(40.6392) and fw.loc[1, "lon"] == pytest.approx(-73.7639)
+    assert fw.loc[1, "lat"] == pytest.approx(40.6392)
+    assert fw.loc[1, "lon"] == pytest.approx(-73.7639)
     assert np.isnan(fw.loc[2, "elev"]), "−999.9 - пропуск высоты"
     assert fw.loc[1, "icao"] == "KJFK" and fw.loc[1, "wmo_id"] == "74486"
     p = tmp_path / "list.csv"
@@ -230,7 +231,8 @@ def _synthetic(n, seed, lon=LON):
         syn[i] = rho * syn[i - 1] + e[i]
     T = np.round(10 + season + diurnal + syn + 0.2 * rng.standard_normal(n), 1)
     Td = np.round(T - 4 - np.abs(rng.normal(0, 2, n)), 1)
-    P = np.round(station_pressure_expected(STATION_ELEV) + 3 * syn + 0.3 * rng.standard_normal(n), 1)
+    P = np.round(station_pressure_expected(STATION_ELEV) + 3 * syn
+                 + 0.3 * rng.standard_normal(n), 1)
     return abs_h, T, Td, P
 
 
@@ -240,7 +242,8 @@ def _write_psv(root, sid, n, seed, drop=None, flag_hours=()):
     keep = np.ones(n, bool) if drop is None else ~drop(abs_h)
     ts = pd.to_datetime(abs_h * 3600, unit="s")
     q = np.where(np.isin(np.arange(n), list(flag_hours)), "3", "5")
-    df = pd.DataFrame({"STATION": sid, "Station_name": sid, "DATE": ts.strftime("%Y-%m-%dT%H:%M:%S"),
+    df = pd.DataFrame({"STATION": sid, "Station_name": sid,
+                       "DATE": ts.strftime("%Y-%m-%dT%H:%M:%S"),
                        "LATITUDE": "50.0", "LONGITUDE": str(LON), "ELEVATION": str(STATION_ELEV),
                        "temperature": T, "temperature_Quality_Code": q,
                        "temperature_Report_Type": "FM15", "temperature_Source_Code": "343",
@@ -485,7 +488,8 @@ def test_check_external_rejects_contamination(main_store, external, tmp_path):
 def test_training_datasets_never_see_external_role(external):
     from mayak.data.dataset import HoldoutDataset, WindowDataset
     with pytest.raises(AssertionError):
-        WindowDataset(external["manifest"], windows_per_epoch=4, store=S.get_store(external["manifest"]))
+        WindowDataset(external["manifest"], windows_per_epoch=4,
+                      store=S.get_store(external["manifest"]))
     ds = HoldoutDataset(external["manifest"], store=S.get_store(external["manifest"]))
     assert len(ds) == 0, "валидация берёт только unseen_val"
 
@@ -545,7 +549,8 @@ def test_transfer_table_compares_same_leads_on_common_zones():
                               n_boot=0)
     assert tbl_full["zones"] == ["Cfb", "Dfb"]
     r = tbl["rows"][24]
-    sel_i, sel_e = np.isin(z_i, ["Cfa", "Cfb", "Dfb", "Dfc"]), np.isin(z_e, ["Cfa", "Cfb", "Dfb", "Dfc"])
+    common = ["Cfa", "Cfb", "Dfb", "Dfc"]
+    sel_i, sel_e = np.isin(z_i, common), np.isin(z_e, common)
     ref_i = ev_i.restrict(windows=sel_i, leads=[24]).pooled()
     ref_e = ev_e.restrict(windows=sel_e, leads=[24]).pooled()
     for m in ("MAE", "Skill", "CRPS"):

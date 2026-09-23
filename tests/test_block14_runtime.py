@@ -87,6 +87,7 @@ def test_torch_graphs_match_streaming(model):
     assert err <= ATOL_TORCH_GRAPHS, f"разбиение на графы расходится с эталоном: {err:.2e}"
 
 
+@pytest.mark.heavy
 def test_export_keeps_model_in_eval(model, tmp_path):
     export_graphs(model, tmp_path / "m")
     assert not model.training
@@ -96,6 +97,7 @@ def test_export_keeps_model_in_eval(model, tmp_path):
 ABLATIONS = [None, "no_anchor", "no_passport", "no_solar", "no_mode_groups", "no_compression"]
 
 
+@pytest.mark.heavy
 @pytest.mark.parametrize("ablation", ABLATIONS)
 def test_onnx_graphs_match_streaming(ablation, tmp_path):
     cfg = ModelConfig(ablations=Ablations(**{ablation: True})) if ablation else None
@@ -115,6 +117,7 @@ def test_onnx_graphs_match_streaming(ablation, tmp_path):
         assert np.isfinite(errs[1])
 
 
+@pytest.mark.heavy
 def test_manifest_contract(model, tmp_path):
     from mayak.baselines.statistical import ZQ
     from mayak.data.qc import PHYS
@@ -178,6 +181,7 @@ def test_golden_state_restores_incomplete_day(model, golden):
     assert len(raw) == 3352
 
 
+@pytest.mark.heavy
 def test_golden_onnx_matches_golden_model(model, golden):
     """Закоммиченные графы - это графы модели эталона (сценарий без калибровки)."""
     doc, blob = golden

@@ -2,7 +2,6 @@
 import dataclasses
 import importlib.util
 import math
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -11,14 +10,13 @@ import torch
 import torch.nn as nn
 
 from mayak import baselines as BL
-from mayak.baselines.cards import BaselineCard, CardError, Difference, Source
 from mayak.baselines.lru import (LRULayer, LRUForecaster, lru_recurrent, lru_scan_associative,
                                  lru_scan_chunked)
-from mayak.baselines.patchtst import PatchTST, make_patches, masked_instance_stats
+from mayak.baselines.patchtst import make_patches, masked_instance_stats
 from mayak.config import (ConfigError, DLinearConfig, LRUConfig, PatchTSTConfig,
                           check_pipeline_compat, model_config_for)
 from mayak.constants import H, L_MAX, NQ
-from mayak.protocol import ARCH_NAMES, DEFAULT_PROTOCOL, Protocol, ProtocolError
+from mayak.protocol import DEFAULT_PROTOCOL, Protocol, ProtocolError
 
 REPO = Path(__file__).resolve().parents[1]
 CONF = REPO / "conf"
@@ -141,7 +139,8 @@ def test_lru_eigenvalues_inside_unit_disk_for_any_parameters():
 
 def test_lru_init_follows_config_ranges():
     cfg = LRUConfig()
-    assert math.isclose(cfg.r_min, math.exp(-1 / 3.0)) and math.isclose(cfg.r_max, math.exp(-1 / 240.0))
+    assert math.isclose(cfg.r_min, math.exp(-1 / 3.0))
+    assert math.isclose(cfg.r_max, math.exp(-1 / 240.0))
     assert math.isclose(cfg.max_phase, 2 * math.pi / 12.0)
     torch.manual_seed(0)
     lay = LRULayer(8, 4096, cfg.r_min, cfg.r_max, cfg.max_phase)

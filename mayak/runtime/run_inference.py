@@ -13,7 +13,8 @@ QC точки и watchdog-фолбэк — внутри StreamingMayak/safe_fore
     python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt \
         --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2 --aci
 """
-import argparse, os
+import argparse
+import os
 from datetime import datetime, timezone, timedelta
 import numpy as np
 
@@ -31,7 +32,8 @@ def latest_state():
 
 def save_state(stream, toggle):
     """Атомарная запись в чередуемый файл: пишем во временный, затем os.replace."""
-    f = STATE_FILES[toggle % 2]; tmp = f + ".tmp"
+    f = STATE_FILES[toggle % 2]
+    tmp = f + ".tmp"
     os.makedirs(os.path.dirname(f), exist_ok=True)
     with open(tmp, "wb") as fh:
         fh.write(stream.serialize())

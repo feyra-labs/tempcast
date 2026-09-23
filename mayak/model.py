@@ -140,7 +140,7 @@ class MAYAK(nn.Module):
         mp = (p * vp).sum(-1) / vp.sum(-1).clamp(min=1.0)
         s = torch.stack([mean, mx, mn, mp, n / 24.0, has], dim=-1)
         return s, has
-    
+
     def forward(self, batch):
         lat, lon, elev = batch["lat"], batch["lon"], batch["elev"]
         x, mask = batch["x_hist"], batch["mask_hist"]

@@ -953,8 +953,9 @@ def _norm_param(where, key, default, value):
     if isinstance(default, tuple):
         try:
             v = tuple(value)
-        except TypeError:
-            raise ConfigError(f"{where}.{key}: ожидался список из {len(default)} значений")
+        except TypeError as err:
+            raise ConfigError(
+                f"{where}.{key}: ожидался список из {len(default)} значений") from err
         if len(v) != len(default) and not (key == "channels" and 1 <= len(v) <= 3):
             raise ConfigError(f"{where}.{key}: {len(v)} значений, нужно {len(default)}")
         cast = int if all(isinstance(d, int) for d in default) else float

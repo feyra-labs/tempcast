@@ -489,7 +489,8 @@ def test_unnoticed_offset_is_reported_but_not_asserted(base):
     specs = (ScenarioSpec("offset", (0.0, 5.0)), ScenarioSpec("offset_input", (0.0, 5.0)))
     cfg = _cfg(scenarios=specs)
     rows = robustness_sweep({"МАЯК": _Anchored("mask")}, base, cfg, statistical=False)
-    inp = [r for r in rows if r["scenario"] == "offset_input" and r["level"] == 5 and r["lead"] == 1]
+    inp = [r for r in rows
+           if r["scenario"] == "offset_input" and r["level"] == 5 and r["lead"] == 1]
     assert inp[0]["Skill"] < -cfg.skill_tolerance
     assert not skill_violations(rows, cfg.skill_tolerance)
     check_skill_guard(rows, cfg.skill_tolerance)

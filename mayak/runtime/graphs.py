@@ -248,7 +248,8 @@ def quantize_graph(path):
 def state_nbytes(cfg):
     from mayak.runtime.streaming import STATE_HEADER
     M, D, W = cfg.n_modes, cfg.history_days, cfg.stream_window
-    return STATE_HEADER.itemsize + 4 * (3 * M + cfg.passport_dim) + 2 * (D * 6 + D) + 2 * W * 3 + W * 3
+    return (STATE_HEADER.itemsize + 4 * (3 * M + cfg.passport_dim) + 2 * (D * 6 + D)
+            + 2 * W * 3 + W * 3)
 
 
 # Исполняемая спецификация хоста: та же логика, что в runtime-rs/src/runtime.rs.

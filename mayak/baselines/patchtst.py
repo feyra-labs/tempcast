@@ -83,7 +83,8 @@ class TSTEncoderLayer(nn.Module):
         self.attn = ResidualAttention(cfg.d_model, cfg.n_heads, cfg.attn_dropout, cfg.dropout)
         self.drop_attn = nn.Dropout(cfg.dropout)
         self.norm_attn = _norm(cfg.norm, cfg.d_model)
-        self.ff = nn.Sequential(nn.Linear(cfg.d_model, cfg.d_ff), nn.GELU(), nn.Dropout(cfg.dropout),
+        self.ff = nn.Sequential(nn.Linear(cfg.d_model, cfg.d_ff), nn.GELU(),
+                                nn.Dropout(cfg.dropout),
                                 nn.Linear(cfg.d_ff, cfg.d_model))
         self.drop_ffn = nn.Dropout(cfg.dropout)
         self.norm_ffn = _norm(cfg.norm, cfg.d_model)

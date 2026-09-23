@@ -324,7 +324,8 @@ def test_warm_start_equals_stepping_with_partial_day(model):
     np.testing.assert_allclose(warm._day, stepped._day, atol=1e-5)
     assert _ring_diff(warm.enc, stepped.enc, model.encoder) < RTOL_STEP
     cal = future_calendar_after(s, L, H)
-    np.testing.assert_allclose(warm.forecast(*cal)[0], stepped.forecast(*cal)[0], atol=ATOL_FORECAST)
+    np.testing.assert_allclose(warm.forecast(*cal)[0], stepped.forecast(*cal)[0],
+                               atol=ATOL_FORECAST)
     assert warm.serialize()[:STATE_HEADER.itemsize] == stepped.serialize()[:STATE_HEADER.itemsize]
 
 

@@ -13,13 +13,14 @@ def synthetic_series(n, seed=0, start_hoy=360 * 24, p_valid=0.9):
     """Почасовой ряд длины n: T, P, RH (n, 3), маска (n, 3), doy и hour (n,)."""
     rng = np.random.default_rng(seed)
     t = np.arange(n)
-    T = 8 + 6 * np.sin(2 * np.pi * t / 24) + 3 * np.sin(2 * np.pi * t / 170) + rng.standard_normal(n)
+    T = (8 + 6 * np.sin(2 * np.pi * t / 24) + 3 * np.sin(2 * np.pi * t / 170)
+         + rng.standard_normal(n))
     P = 1005 + 8 * np.sin(2 * np.pi * t / 130 + rng.uniform(0, 6)) + 0.4 * rng.standard_normal(n)
     RH = np.clip(70 - 2 * (T - 8) + 5 * rng.standard_normal(n), 5, 100)
     x = np.stack([T, P, RH], -1).astype(np.float32)
     m = (rng.random((n, 3)) < p_valid).astype(np.float32)
     gap = rng.integers(0, max(n - 30, 1))
-    m[gap:gap + 20, 0] = 0.0                                  # блочный пропуск T
+    m[gap:gap + 20, 0] = 0.0
     hoy = (start_hoy + t) % YEAR_H
     return dict(x=x * m, m=m, doy=(hoy / 24.0).astype(np.float32),
                 hour=(hoy % 24).astype(np.float32), hoy0=int(start_hoy))

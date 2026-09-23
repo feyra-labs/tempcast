@@ -251,7 +251,8 @@ def build_cache(manifest, cache_root=None, jobs=1, force=False, qc_cfg=DEFAULT_Q
     with open(os.path.join(tmp, "meta.json"), "w") as f:
         json.dump(dict(key=key, payload=payload, excluded=excluded,
                        qc_total=code_fractions(all_codes), qc=summary,
-                       build_seconds=time.perf_counter() - t_start), f, indent=1, ensure_ascii=False)
+                       build_seconds=time.perf_counter() - t_start),
+                  f, indent=1, ensure_ascii=False)
     write_qc_report(os.path.join(tmp, "qc_report.csv"), report)
 
     if force:

@@ -16,7 +16,8 @@
     покрытия;
   * графики по каждой метрике, кривую холодного старта и проверку L=0;
   * отчёт о влиянии конформной калибровки (PICP/CRPS/MAE до и после);
-  * покрытие по разрезам с вердиктами и критерий условной поправки; ``--save-preds`` сохраняет предсказания всех моделей,
+  * покрытие по разрезам с вердиктами и критерий условной поправки; ``--save-preds``
+    сохраняет предсказания всех моделей,
     чтобы анализ калибровки шёл без повторного запуска моделей;
   * внешний тест на наблюдениях реальной сети (``--external-manifest``): те же
     таблицы и разрезы, разрезы внешнего теста (шаг отчётности, Δ высоты станции и
@@ -373,7 +374,8 @@ def print_reliability(ev, lead_bins=LEAD_BINS):
                         for i in range(NQ - 1)] + [">q95"]
     print("\n--- PIT: доля факта в бинах между квантилями (ожидание в скобках) ---")
     print("  " + " ".join(f"{e:>11}" for e in edges))
-    print("  " + " ".join(f"{o:>5.1%}({e:>4.0%})" for o, e in zip(pit["observed"], pit["expected"])))
+    print("  " + " ".join(f"{o:>5.1%}({e:>4.0%})"
+                          for o, e in zip(pit["observed"], pit["expected"])))
     for name, p in ev.pit_by_lead_bin(lead_bins).items():
         print(f"  лиды {name:>7}: " + " ".join(f"{o:>6.1%}" for o in p["observed"]))
 
@@ -753,10 +755,11 @@ def stage_a_field_check(model, clims, manifest="data/manifest.csv",
     print(f"  отношение        = {ratio:7.3f}   ← цель ≤ 1.05")
     print(f"  |поле − климат|  = {bias:7.3f} °C ← цель → 0")
     if ratio <= 1.05:
-        print(f"  ИТОГ: OK — поле генерализует")
+        print("  ИТОГ: OK — поле генерализует")
     else:
         print(
-            f"  ИТОГ: НЕ ПРОЙДЕНО — поле недоучено/переобучено на train; этап B на таком поле смысла мало")
+            "  ИТОГ: НЕ ПРОЙДЕНО — поле недоучено/переобучено на train; "
+            "этап B на таком поле смысла мало")
     return dict(mse_field=mse_field, mse_clim=mse_clim, ratio=ratio, bias=bias)
 
 
@@ -844,7 +847,8 @@ def evaluate_external(named, external_manifest, store, r_damped=None, shift=None
     preds = add_statistical_baselines(preds, aux, r_damped=r_damped)
     kw = bootstrap if ci else {}
 
-    print(f"\n########## ВНЕШНИЙ ТЕСТ: {len(ext_store.stations)} станций, окон {len(ds)} ##########")
+    print(f"\n########## ВНЕШНИЙ ТЕСТ: {len(ext_store.stations)} станций, "
+          f"окон {len(ds)} ##########")
     print(BENCHMARK_NOTE)
     evs = evaluations(preds, aux, shift=shift)
     for name, ev in evs.items():

@@ -136,7 +136,7 @@ def test_sampled_train_windows_stay_in_train_window_with_gap(dm):
     del ds.build
     assert {sid for sid, *_ in seen} <= {sid for sid, r in STATIONS if r == ROLE_TRAIN}
     assert any(L == 0 for *_, L in seen) and any(L == L_MAX for *_, L in seen)
-    for sid, N, t, L in seen:
+    for _sid, N, t, L in seen:
         b = time_bounds(N)
         assert b["train"][0] <= t - L and t + H <= b["train"][1]
         assert b["val"][0] - (t + H) >= H + L_MAX, "окно ближе зазора к валидационному окну"
@@ -305,7 +305,8 @@ def test_checklist_requires_footprints():
 
 
 def _load_calibrate():
-    spec = importlib.util.spec_from_file_location("calibrate_script", REPO / "scripts" / "calibrate.py")
+    spec = importlib.util.spec_from_file_location("calibrate_script",
+                                                  REPO / "scripts" / "calibrate.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
@@ -370,6 +371,7 @@ def test_checkpoint_selection_check(store, manifest, dm, tmp_path):
             check_checkpoint(_ckpt(tmp_path, name, rec), store)
 
 
+@pytest.mark.heavy
 def test_trainer_checkpoint_carries_selection_record(dm, store, tmp_path):
     import pytorch_lightning as L
     from pytorch_lightning.callbacks import ModelCheckpoint

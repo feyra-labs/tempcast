@@ -2,7 +2,10 @@
 Запуск:
     python scripts/make_synth.py --out data --n-stations 40 --years 2 --seed 1
 """
-import argparse, csv, math, os
+import argparse
+import csv
+import math
+import os
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -80,7 +83,8 @@ def main():
     for i in range(args.n_stations):
         lat = float(rng.uniform(-70, 75))
         lon = float(rng.uniform(-180, 180))
-        elev = float(max(0.0, rng.uniform(-30, 2500) if rng.random() > 0.2 else rng.uniform(0, 200)))
+        elev = float(max(0.0, rng.uniform(-30, 2500) if rng.random() > 0.2
+                         else rng.uniform(0, 200)))
         t0_dt = datetime(2015, 1, 1) + timedelta(hours=int(rng.integers(0, 365 * 24)))
         t0 = int(to_utc_hour(t0_dt))
         sid = f"S{i:03d}"
@@ -92,9 +96,10 @@ def main():
 
     with open(os.path.join(args.out, "manifest.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["id", "lat", "lon", "elev", "koppen"])
-        w.writeheader();
+        w.writeheader()
         w.writerows(rows)
-    print(f"Готово: {args.n_stations} станций × {n_hours} ч в {args.out}/stations/, манифест {args.out}/manifest.csv")
+    print(f"Готово: {args.n_stations} станций × {n_hours} ч в {args.out}/stations/, "
+          f"манифест {args.out}/manifest.csv")
 
 
 if __name__ == "__main__":

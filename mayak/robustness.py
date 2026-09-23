@@ -498,7 +498,7 @@ def main(argv=None):
     except RobustnessError as e:
         print(f"\nНАРУШЕНИЕ: {e}")
         if not args.report_only:
-            raise SystemExit(1)
+            raise SystemExit(1) from e
 
 
 if __name__ == "__main__":

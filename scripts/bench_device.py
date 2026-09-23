@@ -212,7 +212,7 @@ def fmt(v, nd=1):
 
 
 def markdown(res):
-    L = [f"# Замеры рантайма МАЯК на устройстве", "",
+    L = ["# Замеры рантайма МАЯК на устройстве", "",
          f"Устройство: {res['device']['cpu'] or res['device']['machine']} "
          f"({res['device']['system']}); модель: {res['model']}; "
          f"{res['hours']} ч, выпуск каждые {res['forecast_every']} ч, 1 поток.", "",
@@ -299,7 +299,8 @@ def main():
         runs[name] = fn(dumps[name])
     ref = np.fromfile(dumps["Python (PyTorch, эталон)"], "<f4")
     for name, path in dumps.items():
-        runs[name]["max_abs_dq_vs_python"] = f"{float(np.abs(np.fromfile(path, '<f4') - ref).max()):.2e}"
+        dq = float(np.abs(np.fromfile(path, '<f4') - ref).max())
+        runs[name]["max_abs_dq_vs_python"] = f"{dq:.2e}"
 
     size = lambda p: os.path.getsize(os.path.join(args.model_dir, p))
     g = man["graphs"]

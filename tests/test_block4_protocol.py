@@ -462,6 +462,7 @@ def runs(manifest, store, tmp_path_factory):
     return out, res
 
 
+@pytest.mark.heavy
 def test_all_architectures_see_identical_window_stream(runs):
     _, res = runs
     ref = res[ARCH_NAMES[0]]["hashes"]
@@ -470,6 +471,7 @@ def test_all_architectures_see_identical_window_stream(runs):
         assert res[arch]["hashes"] == ref, f"{arch}: другой поток окон"
 
 
+@pytest.mark.heavy
 def test_journals_differ_only_by_architecture(runs):
     out, res = runs
     for arch in ARCH_NAMES:
@@ -486,6 +488,7 @@ def test_journals_differ_only_by_architecture(runs):
     assert varying <= {"arch", "model_class", "stages", "final_ckpt", "param_groups", "n_params"}
 
 
+@pytest.mark.heavy
 def test_checkpoints_carry_protocol_and_pass_checklist(runs, store):
     from mayak.leakage import run_checklist
     from mayak.lit import LitForecaster
@@ -504,6 +507,7 @@ def test_checkpoints_carry_protocol_and_pass_checklist(runs, store):
     run_checklist(store, checkpoints=ckpts)
 
 
+@pytest.mark.heavy
 def test_stage_b_starts_from_stage_a_weights(runs):
     _, res = runs
     j = res["dlinear"]["journal"]

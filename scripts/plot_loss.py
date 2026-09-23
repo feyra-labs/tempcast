@@ -31,11 +31,14 @@ def main():
             sub = df[["step", col]].dropna()
             ax.plot(sub["step"], sub[col], marker="." if label == "val" else None,
                     ms=6, lw=1.5, label=label)
-    ax.set_xlabel("шаг обучения"); ax.set_ylabel("pinball / климатологический масштаб")
+    ax.set_xlabel("шаг обучения")
+    ax.set_ylabel("pinball / климатологический масштаб")
     ax.set_title(f"Кривые loss — {args.tag}")
-    ax.legend(); ax.grid(alpha=0.3)
+    ax.legend()
+    ax.grid(alpha=0.3)
     out = args.out or f"runs/plots/loss_{args.tag.replace('/', '_')}.png"
-    fig.tight_layout(); fig.savefig(out, dpi=130)
+    fig.tight_layout()
+    fig.savefig(out, dpi=130)
     print("Сохранено:", out)
 
 

@@ -3,7 +3,6 @@ import csv
 import dataclasses
 import importlib.util
 import json
-import os
 import re
 from pathlib import Path
 
@@ -487,6 +486,7 @@ def test_checkpoint_carries_resolved_config_seeds_and_provenance(custom_run):
     assert load_run_record(journal["final_ckpt"])["config"]["model"]["ablations"]["no_solar"]
 
 
+@pytest.mark.heavy
 def test_resolved_config_in_checkpoint_carries_ablation_data_effect(manifest, tmp_path):
     from mayak.lit import RUN_KEY
     from mayak.protocol import run_protocol
