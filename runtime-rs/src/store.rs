@@ -72,7 +72,7 @@ impl StateStore {
             .iter()
             .filter_map(|f| fs::metadata(f).and_then(|m| m.modified()).ok().map(|t| (f.clone(), t)))
             .collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.sort_by_key(|a| std::cmp::Reverse(a.1));
         v.into_iter().map(|(f, _)| f).collect()
     }
 
