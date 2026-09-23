@@ -1,0 +1,25 @@
+[package]
+name = "mayak-rt"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Потоковый рантайм МАЯК: четыре графа ONNX + хост без логики модели (блок 14)"
+license = "MIT"
+publish = false
+
+[features]
+default = ["ort-static"]
+ort-static = ["ort/download-binaries"]
+ort-dynamic = ["ort/load-dynamic"]
+
+[dependencies]
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "api-24"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+half = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true

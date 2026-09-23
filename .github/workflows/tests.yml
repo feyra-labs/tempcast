@@ -8,3 +8,15 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --group dev
       - run: uv run pytest -q
+
+  rust-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: runtime-rs
+      - run: cargo test --release --manifest-path runtime-rs/Cargo.toml
+      - run: cargo clippy --release --manifest-path runtime-rs/Cargo.toml -- -D warnings
+      - run: cargo fmt --manifest-path runtime-rs/Cargo.toml -- --check

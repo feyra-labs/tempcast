@@ -353,6 +353,26 @@ python scripts/export_onnx.py --ckpt runs/mayak/stageB/best.ckpt --out runtime/m
 python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt \
     --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2 --aci
 ```
+
+Рабочий вариант для прибора - компилируемый рантайм `runtime-rs` (один бинарник, ONNX
+Runtime, фиксированная память):
+```bash
+# четыре графа ONNX + манифест (модель считается только внутри графов)
+python scripts/export_runtime.py --ckpt runs/mayak/stageB/best.ckpt \
+    --conformal runs/conformal.npy --aci --int8 --out runtime/model
+
+cargo build --release --manifest-path runtime-rs/Cargo.toml
+
+# наблюдения построчно на stdin, выпуск прогноза по запросу, состояние - на диск
+echo "obs $(date -u +%s -d '1 hour ago' | awk '{print int($1/3600)*3600}') 11.2 1012.4 81
+forecast" | runtime-rs/target/release/mayak-rt run --model runtime/model \
+    --lat 52.37 --lon 4.90 --elev -2 --state-dir runtime --aci
+```
+Хост на Rust держит кольцо сырого окна, буферы энкодера, суточный накопитель, QC точки,
+калибровку интервалов и формат состояния v3 - тот же, что у Python, так что состояние
+переносится между реализациями. Совпадение с эталоном закреплено векторами
+`tests/data/runtime_golden` (max|Δq| ≈ 2e-5 °C). Замеры задержек, памяти и размеров на
+целевом устройстве: `python scripts/bench_device.py --ckpt … --out-dir runs/bench_device`.
 Потоковый рантайм (`runtime/streaming.py`) на новый час делает один потактовый шаг энкодера по кольцевым буферам и один шаг мод `O(M)`; пересчёта по окну нет. Переживает перезагрузку (сериализация 3352 Б; буферы энкодера ≈ 47 КБ в памяти восстанавливаются одним проходом по сохранённому окну 288 ч), при отказе датчиков плавно деградирует к климатологии (watchdog-фолбэк). Требуются **координаты точки и часы UTC** — без них солнечная геометрия не определена.
 
 ---

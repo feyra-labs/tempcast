@@ -6,8 +6,12 @@ __pycache__/
 
 # Experiment outputs
 runs/*
+tests/data/
 lightning_logs/
 !runs/plots/
+
+# Rust
+runtime-rs/target/
 
 # IDE
 .vscode/

@@ -10,6 +10,9 @@ RF = (k − 1)·Σd + 1 - рецептивное поле. Для ядра 3 и 
 * ``step(x_t, state)`` - потактовый шаг (B, n_ch) → (B, width). Каждый блок держит
   кольцевой буфер своих (k − 1)·d последних входов; стоимость шага
   O(глубина · ширина²) и не зависит от длины рецептивного поля.
+* ``step_shift(x_t, buf)`` - тот же шаг без внутреннего состояния:
+  буферы всех блоков приходят одним тензором в хронологическом порядке и
+  возвращаются сдвинутыми на час. Кольцо и индекс t живут в хост-коде рантайма.
 """
 from dataclasses import dataclass, field
 
@@ -73,6 +76,11 @@ class DSBlock(nn.Module):
         h = F.linear(acc, self.pw.weight[:, :, 0], self.pw.bias)
         return x_t + F.gelu(self.norm(h))
 
+    def step_shift(self, x_t, buf):
+        win = torch.cat([buf, x_t[..., None]], dim=-1)
+        h = self.pw(self.dw(win))[..., 0]
+        return x_t + F.gelu(self.norm(h)), win[..., 1:]
+
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
         if prefix + "gn.weight" in state_dict:
             raise RuntimeError(
@@ -122,6 +130,26 @@ class SynopticEncoder(nn.Module):
         """Состояние до первого шага: нулевые буферы ≡ левое дополнение нулями."""
         p = self.stem.weight
         return EncoderState([p.new_zeros(batch_size, self.width, b.pad) for b in self.blocks], 0)
+
+    @property
+    def buffer_pads(self):
+        """Длины буферов блоков, ч: (k − 1)·d. Их сумма - длина буфера step_shift."""
+        return tuple(b.pad for b in self.blocks)
+
+    def ring_to_shift(self, state):
+        """EncoderState (кольца) → буфер step_shift (B, width, Σpad), старший час первым."""
+        return torch.cat([buf[:, :, torch.arange(state.t - b.pad, state.t) % b.pad]
+                          for buf, b in zip(state.bufs, self.blocks)], dim=-1)
+
+    def step_shift(self, x_t, buf):
+        """Один час без внутреннего состояния: (B, n_ch), (B, width, Σpad) →
+        (признаки (B, width), новый буфер). Эквивалентно step по кольцам."""
+        h = F.linear(x_t, self.stem.weight[:, :, 0], self.stem.bias)
+        parts = []
+        for b, bb in zip(self.blocks, buf.split(self.buffer_pads, dim=-1)):
+            h, nb = b.step_shift(h, bb)
+            parts.append(nb)
+        return h, torch.cat(parts, dim=-1)
 
     def step(self, x_t, state):
         """Один час: каналы (B, n_ch) → признаки (B, width)."""
