@@ -1,0 +1,501 @@
+{
+ "format": 1,
+ "model_config": {
+  "arch": "mayak",
+  "horizon": 168,
+  "max_history": 672,
+  "quantiles": [
+   0.05,
+   0.1,
+   0.25,
+   0.5,
+   0.75,
+   0.9,
+   0.95
+  ],
+  "mode_groups": [
+   {
+    "name": "R",
+    "tau0": [
+     3.0,
+     6.0,
+     12.0,
+     24.0,
+     48.0,
+     96.0,
+     168.0,
+     240.0
+    ],
+    "period": [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ]
+   },
+   {
+    "name": "D",
+    "tau0": [
+     12.0,
+     24.0,
+     48.0,
+     96.0,
+     168.0,
+     240.0
+    ],
+    "period": [
+     24.0,
+     24.0,
+     24.0,
+     24.0,
+     24.0,
+     24.0
+    ]
+   },
+   {
+    "name": "S",
+    "tau0": [
+     12.0,
+     24.0,
+     72.0,
+     168.0
+    ],
+    "period": [
+     12.0,
+     12.0,
+     12.0,
+     12.0
+    ]
+   },
+   {
+    "name": "W",
+    "tau0": [
+     24.0,
+     48.0,
+     72.0,
+     120.0,
+     168.0,
+     240.0
+    ],
+    "period": [
+     60.0,
+     84.0,
+     108.0,
+     132.0,
+     156.0,
+     192.0
+    ]
+   }
+  ],
+  "tau_bounds": [
+   3.0,
+   240.0
+  ],
+  "passport_dim": 16,
+  "passport_hidden": 32,
+  "encoder_width": 48,
+  "encoder_dilations": [
+   1,
+   1,
+   2,
+   2,
+   4,
+   4,
+   8,
+   8,
+   16,
+   16,
+   32,
+   32
+  ],
+  "encoder_kernel": 3,
+  "encoder_norm_groups": 4,
+  "loc_freqs": 24,
+  "loc_freq_scale": 12.0,
+  "loc_freq_max": 30.0,
+  "loc_seed": 7,
+  "field_hidden": 48,
+  "heads_hidden": 48,
+  "heads_z_proj": 4,
+  "ablations": {
+   "no_anchor": false,
+   "no_compression": false,
+   "no_passport": false,
+   "no_solar": false,
+   "no_mode_groups": false,
+   "no_offset_aug": false
+  }
+ },
+ "dims": {
+  "horizon": 168,
+  "n_quantiles": 7,
+  "n_modes": 24,
+  "passport_dim": 16,
+  "history_days": 28,
+  "n_daily_summary": 6,
+  "day_row": 4,
+  "stream_window": 288,
+  "ctx": 25,
+  "loc_dim": 50,
+  "encoder_width": 48,
+  "enc_buf_len": 252,
+  "n_coef": [
+   36,
+   21,
+   21
+  ]
+ },
+ "quantiles": [
+  0.05,
+  0.1,
+  0.25,
+  0.5,
+  0.75,
+  0.9,
+  0.95
+ ],
+ "i_med": 3,
+ "zq": [
+  -1.6448535919189453,
+  -1.2815515995025635,
+  -0.6744897365570068,
+  0.0,
+  0.6744897365570068,
+  1.2815515995025635,
+  1.6448535919189453
+ ],
+ "raw_channels": [
+  "T",
+  "P",
+  "RH"
+ ],
+ "phys": {
+  "T": [
+   -90.0,
+   60.0
+  ],
+  "P": [
+   300.0,
+   1100.0
+  ],
+  "RH": [
+   0.0,
+   100.0
+  ]
+ },
+ "state": {
+  "version": 3,
+  "header_bytes": 16,
+  "nbytes": 3352
+ },
+ "graphs": {
+  "init": {
+   "fp32": "init.onnx",
+   "inputs": [
+    "lat",
+    "lon",
+    "elev"
+   ],
+   "outputs": [
+    "loc",
+    "c_mu",
+    "c_sig",
+    "c_def",
+    "z0"
+   ],
+   "shapes_in": {
+    "lat": [
+     1,
+     1
+    ],
+    "lon": [
+     1,
+     1
+    ],
+    "elev": [
+     1,
+     1
+    ]
+   },
+   "shapes_out": {
+    "loc": [
+     1,
+     50
+    ],
+    "c_mu": [
+     1,
+     36
+    ],
+    "c_sig": [
+     1,
+     21
+    ],
+    "c_def": [
+     1,
+     21
+    ],
+    "z0": [
+     1,
+     16
+    ]
+   }
+  },
+  "step": {
+   "fp32": "step.onnx",
+   "inputs": [
+    "x_ctx",
+    "m_ctx",
+    "doy",
+    "hour",
+    "lat",
+    "lon",
+    "c_mu",
+    "c_sig",
+    "c_def",
+    "enc_buf",
+    "n_re",
+    "n_im",
+    "e"
+   ],
+   "outputs": [
+    "enc_buf_out",
+    "n_re_out",
+    "n_im_out",
+    "e_out",
+    "day_row"
+   ],
+   "shapes_in": {
+    "x_ctx": [
+     1,
+     25,
+     3
+    ],
+    "m_ctx": [
+     1,
+     25,
+     3
+    ],
+    "doy": [
+     1,
+     1
+    ],
+    "hour": [
+     1,
+     1
+    ],
+    "lat": [
+     1,
+     1
+    ],
+    "lon": [
+     1,
+     1
+    ],
+    "c_mu": [
+     1,
+     36
+    ],
+    "c_sig": [
+     1,
+     21
+    ],
+    "c_def": [
+     1,
+     21
+    ],
+    "enc_buf": [
+     1,
+     48,
+     252
+    ],
+    "n_re": [
+     1,
+     24
+    ],
+    "n_im": [
+     1,
+     24
+    ],
+    "e": [
+     1,
+     24
+    ]
+   },
+   "shapes_out": {
+    "enc_buf_out": [
+     1,
+     48,
+     252
+    ],
+    "n_re_out": [
+     1,
+     24
+    ],
+    "n_im_out": [
+     1,
+     24
+    ],
+    "e_out": [
+     1,
+     24
+    ],
+    "day_row": [
+     1,
+     4
+    ]
+   }
+  },
+  "passport": {
+   "fp32": "passport.onnx",
+   "inputs": [
+    "day_acc",
+    "day_summ",
+    "day_mask"
+   ],
+   "outputs": [
+    "day_summ_out",
+    "day_mask_out",
+    "z"
+   ],
+   "shapes_in": {
+    "loc": [
+     1,
+     50
+    ],
+    "day_acc": [
+     1,
+     4,
+     24
+    ],
+    "day_summ": [
+     1,
+     28,
+     6
+    ],
+    "day_mask": [
+     1,
+     28
+    ]
+   },
+   "shapes_out": {
+    "day_summ_out": [
+     1,
+     28,
+     6
+    ],
+    "day_mask_out": [
+     1,
+     28
+    ],
+    "z": [
+     1,
+     16
+    ]
+   }
+  },
+  "issue": {
+   "fp32": "issue.onnx",
+   "inputs": [
+    "loc",
+    "lat",
+    "lon",
+    "z",
+    "n_re",
+    "n_im",
+    "e",
+    "doy_fut",
+    "hour_fut"
+   ],
+   "outputs": [
+    "q"
+   ],
+   "shapes_in": {
+    "loc": [
+     1,
+     50
+    ],
+    "lat": [
+     1,
+     1
+    ],
+    "lon": [
+     1,
+     1
+    ],
+    "z": [
+     1,
+     16
+    ],
+    "n_re": [
+     1,
+     24
+    ],
+    "n_im": [
+     1,
+     24
+    ],
+    "e": [
+     1,
+     24
+    ],
+    "doy_fut": [
+     1,
+     168
+    ],
+    "hour_fut": [
+     1,
+     168
+    ]
+   },
+   "shapes_out": {
+    "q": [
+     1,
+     168,
+     7
+    ]
+   }
+  }
+ },
+ "calibration": {
+  "conformal": "conformal.f32",
+  "aci": {
+   "target": 0.1,
+   "gamma": 0.05,
+   "max_factor": 4.0,
+   "interval": [
+    0,
+    6
+   ]
+  }
+ },
+ "export_check_max_abs": {
+  "init": 5.960464477539063e-08,
+  "step": 1.9073486328125e-06,
+  "passport": 5.960464477539063e-08,
+  "issue": 2.86102294921875e-06
+ },
+ "opset": 17,
+ "provenance": {
+  "git": {
+   "commit": "42e025c48b198931a1f5a38fe017eedbf923a7b5",
+   "dirty": true
+  },
+  "versions": {
+   "python": "3.12.3",
+   "mayak": "0.1.0",
+   "torch": "2.14.0",
+   "pytorch-lightning": "2.6.6",
+   "numpy": "2.4.4",
+   "scipy": "1.17.1",
+   "pandas": "3.0.2",
+   "onnx": "1.23.0",
+   "onnxruntime": "1.24.4",
+   "hydra-core": "1.3.7",
+   "omegaconf": "2.3.1"
+  }
+ }
+}

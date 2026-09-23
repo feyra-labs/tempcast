@@ -9,7 +9,7 @@ publish = false
 
 [features]
 default = ["ort-static"]
-ort-static = ["ort/download-binaries"]
+ort-static = ["ort/download-binaries", "ort/tls-rustls"]
 ort-dynamic = ["ort/load-dynamic"]
 
 [dependencies]
