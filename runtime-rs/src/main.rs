@@ -257,7 +257,7 @@ fn cmd_bench(a: &Args) -> Result<()> {
     let startup_ms = t0.elapsed().as_secs_f64() * 1e3;
     let raw = std::fs::read(a.req("series")?)?;
     let series: Vec<f32> = raw
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
     let n = series.len() / 3;
