@@ -36,7 +36,6 @@ log = logging.getLogger("fetch_ghcnh")
 BASE_URL = "https://www.ncei.noaa.gov/oa/global-historical-climatology-network/hourly/access"
 STATION_LIST_URL = ("https://www.ncei.noaa.gov/oa/global-historical-climatology-network/"
                     "hourly/doc/ghcnh-station-list.csv")
-USER_AGENT = "mayak-tempcast/0.1 (+https://github.com/feyra-labs/tempcast)"
 CHUNK = 1 << 20
 
 
@@ -55,7 +54,7 @@ def file_urls(base, sid, layout, years=(), fmt="psv"):
 
 
 def _open(url, start, timeout, open_url):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    req = urllib.request.Request(url)
     if start:
         req.add_header("Range", f"bytes={start}-")
     return open_url(req, timeout=timeout)
