@@ -131,7 +131,7 @@ def test_cache_build_then_hit(manifest):
 
 def test_cache_content_equals_direct_qc(manifest):
     from mayak.data.climatology import Climatology
-    from mayak.data.splits import time_bounds
+    from mayak.data.splits import time_layout
     store = S.get_store(manifest)
     for sid, s in store.stations.items():
         src = S.read_source(S.source_path(manifest, sid))
@@ -139,7 +139,7 @@ def test_cache_content_equals_direct_qc(manifest):
         assert s["x"].dtype == np.float32 and s["mask"].dtype == np.uint8
         assert np.array_equal(s["x"], x) and np.array_equal(s["mask"], mask)
         assert np.array_equal(s["qc"], codes) and s["t0"] == T0
-        lo, hi = time_bounds(s["N"])["train"]
+        lo, hi = time_layout(s["N"]).span("train")
         d, h = window_calendar(T0, np.arange(lo, hi))
         ref = Climatology().fit(d.astype(np.float64), h.astype(np.float64),
                                 x[lo:hi, 0], mask[lo:hi, 0])
@@ -175,7 +175,7 @@ def test_cache_key_depends_on_content_not_path(manifest, tmp_path, monkeypatch):
     monkeypatch.setattr(S, "QC_VERSION", "999")
     assert _key(manifest) != k2
     monkeypatch.undo()
-    monkeypatch.setattr(S, "TIME_BOUNDS", dict(hours_per_year=8766, calib_days=30))
+    monkeypatch.setattr(S, "TIME_LAYOUT", dict(S.TIME_LAYOUT, n_blocks=6))
     assert _key(manifest) != k2
 
 

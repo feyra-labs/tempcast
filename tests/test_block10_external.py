@@ -13,13 +13,13 @@ import pandas as pd
 import pytest
 import torch
 
-from mayak.constants import H, MAGNUS_A, MAGNUS_B
+from mayak.constants import H, L_MAX, MAGNUS_A, MAGNUS_B
 from mayak.data import ghcnh as G
 from mayak.data import store as S
 from mayak.data.qc import QCCode, station_pressure_expected
 from mayak.data.splits import (EXTERNAL_MIN_TRAIN_YEARS, ROLE_EXTERNAL, ROLE_TEST, ROLE_TRAIN,
                                ROLE_VAL, assign_roles, full_years,
-                               min_hours_for_train_years, time_bounds)
+                               min_hours_for_train_years, time_layout)
 from mayak.leakage import (SELECTION_KEY, LeakageError, check_external, check_windows,
                            conformal_meta_path, run_checklist)
 from mayak.metrics import NQ, Evaluation
@@ -294,12 +294,12 @@ def external(tmp_path_factory):
     S._STORES.clear()
 
 
-def test_min_hours_for_train_years_matches_time_bounds():
+def test_min_hours_for_train_years_matches_layout():
     for years in (1, 3, 5):
         n = min_hours_for_train_years(years)
-        tr = time_bounds(n)["train"]
+        tr = time_layout(n).span("train")
         assert tr[1] - tr[0] >= years * YEAR
-        tr_prev = time_bounds(n - 24)["train"]
+        tr_prev = time_layout(n - 24).span("train")
         assert tr_prev[1] - tr_prev[0] < years * YEAR
 
 
@@ -342,7 +342,7 @@ def test_cache_requires_three_full_train_years(external):
     store = S.get_store(external["manifest"])
     assert set(store.stations) == {"EXT_LONG", "EXT_LONG2"}
     for s in store.stations.values():
-        lo, hi = time_bounds(s["N"])["train"]
+        lo, hi = time_layout(s["N"]).span("train")
         assert full_years(s["mask"][:, 0], s["t0"], lo, hi) >= EXTERNAL_MIN_TRAIN_YEARS
         assert s["role"] == ROLE_EXTERNAL and s["station_elev"] == STATION_ELEV
 
@@ -390,7 +390,8 @@ def test_make_splits_script_keeps_external_rows(tmp_path, monkeypatch):
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
-    monkeypatch.setattr(sys, "argv", ["make_splits.py", "--manifest", str(p), "--n-test", "3"])
+    monkeypatch.setattr(sys, "argv", ["make_splits.py", "--manifest", str(p), "--n-test", "3",
+                                      "--min-train-years", "0"])
     _load_script("make_splits").main()
     out = {r["id"]: r["split"] for r in S.read_manifest(str(p))}
     assert out["ext"] == ROLE_EXTERNAL
@@ -436,13 +437,16 @@ class _Fake:
 def test_external_stations_are_read_only_in_test_window(external, key):
     store = S.get_store(external["manifest"])
     s = store.stations["EXT_LONG"]
-    lo, hi = time_bounds(s["N"])[key]
-    fp = dict(sid="EXT_LONG", N=s["N"], time_key=key, lo=np.array([lo]), hi=np.array([hi]))
-    with pytest.raises(LeakageError):
+    lay = time_layout(s["N"])
+    t = lay.blocks[key][0][0]
+    fp = dict(sid="EXT_LONG", N=s["N"], time_key=key, lo=np.array([t]), t=np.array([t]),
+              hi=np.array([t + H]))
+    with pytest.raises(LeakageError, match="EXT_LONG"):
         check_windows([_Fake([fp])], store)
-    lo, hi = time_bounds(s["N"])["test"]
-    check_windows([_Fake([dict(fp, time_key="test", lo=np.array([lo]), hi=np.array([hi]))])],
-                  store)
+    t = lay.span("test")[0]
+    ok = dict(fp, time_key="test", lo=np.array([t - L_MAX]), t=np.array([t]),
+              hi=np.array([t + H]))
+    check_windows([_Fake([ok])], store)
 
 
 def test_check_external_passes_on_clean_pipeline(main_store, external):

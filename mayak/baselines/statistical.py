@@ -4,7 +4,7 @@ from scipy.stats import norm
 
 from mayak.baselines.cards import BaselineCard, Difference, Source, describe
 from mayak.constants import H, QUANTILES
-from mayak.data.splits import time_bounds
+from mayak.data.splits import time_layout
 from mayak.data.store import get_store
 from mayak.timeaxis import window_calendar
 
@@ -150,7 +150,7 @@ def fit_damped_persistence(clims, n_windows=20000, seed=0):
     per = max(1, n_windows // len(sids))
     for sid in sids:
         s = clims[sid]
-        lo, hi = time_bounds(s["N"])["train"]
+        lo, hi = time_layout(s["N"]).span("train")
         if hi - lo < 24 + H + 1:
             continue
         clim = s["clim"]

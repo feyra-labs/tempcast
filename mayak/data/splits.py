@@ -1,28 +1,19 @@
-"""Роли станций и временные окна сплитов.
+"""Роли станций и временная раскладка ряда.
 
-Временная ось каждой станции режется на четыре непересекающихся окна,
-разделённых защитными зазорами:
+Ряд каждой станции делится на обучение, год валидации и калибровки и тест:
 
-    [ train ][gap][ val ][gap][ calib ][gap][ test ]
-
-* train — обучение и подгонка всего, что подгоняется по данным станции
-  (климатология, damped persistence);
-* val   — выбор чекпойнта и любые решения по гиперпараметрам;
-* calib — только конформная поправка;
-* test  — только тестирование модели.
+    [ обучение ][ зазор ][ в | к | в | к | ... ][ зазор ][ тест ]
 
 Роли станций: train (обучение), unseen_val (валидация и калибровка),
-unseen_test (финальная оценка). Разбиение — assign_roles.
-
-Четвёртая роль — external_test: станции реальной сети наблюдений (GHCNh), внешний
-тест. Они не участвуют ни в обучении, ни в выборе чекпойнта, ни в конформной
-калибровке; из их временных окон читается только test, а train служит одной цели —
-подгонке климатологии самой станции (эталон скилла). assign_roles их не трогает.
+unseen_test (финальная оценка). Роль external_test - станции
+реальной сети наблюдений: из их ряда читается только тест, а обучение служит
+одной цели - климатологии самой станции. Разбиение на роли их не трогает.
 """
 from __future__ import annotations
 
 import logging
 from collections import Counter
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -30,47 +21,154 @@ from mayak.constants import H, L_MAX
 
 log = logging.getLogger(__name__)
 
-SPLITS_VERSION = "2"   # Увеличивать при изменении; входит в ключ кэша.
+SPLITS_VERSION = "3"   # Увеличивать при изменении; входит в ключ кэша.
 MIN_GAP_HOURS = H + L_MAX
-TIME_BOUNDS = dict(hours_per_year=8766, test_frac=0.3, val_days=60, calib_days=60,
-                   gap_hours=MIN_GAP_HOURS)
+TIME_LAYOUT = dict(hours_per_year=8766, test_frac=0.3, n_blocks=12, gap_hours=MIN_GAP_HOURS)
 TIME_KEYS = ("train", "val", "calib", "test")
+BLOCK_KEYS = ("val", "calib")
+MIN_BLOCK_HOURS = H + 1
+
+HISTORY_FORBIDDEN = {"train": ("val", "calib", "test"), "val": ("train", "test"),
+                     "calib": ("train", "test"), "test": ("train", "val", "calib")}
 
 ROLE_TRAIN, ROLE_VAL, ROLE_TEST = "train", "unseen_val", "unseen_test"
 ROLES = (ROLE_TRAIN, ROLE_VAL, ROLE_TEST)
 ROLE_EXTERNAL = "external_test"
 ALL_ROLES = ROLES + (ROLE_EXTERNAL,)
 
-EXTERNAL_MIN_TRAIN_YEARS = 3
+DEFAULT_TEST_FRAC = 0.15
+DEFAULT_VAL_FRAC = 0.1
+MIN_TRAIN_YEARS = 3
+EXTERNAL_MIN_TRAIN_YEARS = MIN_TRAIN_YEARS
 FULL_YEAR_MIN_MONTH_FRAC = 0.3
 
 
-def time_bounds(n_hours, **overrides):
-    """Четыре окна ряда длины n_hours → {ключ: (начало, конец)} в индексах часа, [начало, конец).
+@dataclass(frozen=True)
+class TimeLayout:
+    """Раскладка ряда одной станции по временным окнам.
 
-    test  — последний год, но не больше test_frac ряда (короткие ряды);
-    calib — calib_days суток перед test (через зазор);
-    val   — val_days суток перед calib (через зазор);
-    train — всё, что осталось в начале ряда до зазора перед val.
+    Attributes:
+        n_hours: длина ряда, ч.
+        blocks: блоки каждого временного окна, по ключу окна. Блок - пара индексов
+            часа ряда (начало, конец), конец не входит. У обучения и теста по одному
+            блоку, у валидации и калибровки - по половине блоков года перед тестом.
     """
-    cfg = {**TIME_BOUNDS, **overrides}
-    gap = int(cfg["gap_hours"])
-    if gap < MIN_GAP_HOURS:
-        raise ValueError(f"зазор {gap} ч меньше H + L_MAX = {MIN_GAP_HOURS} ч")
-    n = int(n_hours)
-    test_len = int(min(cfg["hours_per_year"], np.floor(cfg["test_frac"] * n)))
-    calib_len, val_len = int(cfg["calib_days"]) * 24, int(cfg["val_days"]) * 24
 
-    test = (n - test_len, n)
-    calib = (test[0] - gap - calib_len, test[0] - gap)
-    val = (calib[0] - gap - val_len, calib[0] - gap)
-    train = (0, val[0] - gap)
-    out = dict(train=train, val=val, calib=calib, test=test)
-    need = dict(train=H + 1, val=L_MAX + H + 1, calib=L_MAX + H + 1, test=L_MAX + H + 1)
-    short = {k: out[k][1] - out[k][0] for k in TIME_KEYS if out[k][1] - out[k][0] < need[k]}
+    n_hours: int
+    blocks: dict
+
+    def span(self, key):
+        """Границы временного окна от начала первого блока до конца последнего.
+
+        Args:
+            key: ключ временного окна.
+
+        Returns:
+            Пара (начало, конец), конец не входит.
+        """
+        b = self.blocks[key]
+        return b[0][0], b[-1][1]
+
+    def history_floor(self, key):
+        """Самый ранний час, который может читать история окна с этим ключом.
+
+        Args:
+            key: ключ временного окна.
+
+        Returns:
+            Индекс часа ряда.
+        """
+        first = self.blocks[key][0][0]
+        ends = [hi for k in HISTORY_FORBIDDEN[key] for _lo, hi in self.blocks[k] if hi <= first]
+        return max(ends, default=0)
+
+    def block_index(self, key, start, end):
+        """Номер блока, в котором целиком лежит отрезок часов.
+
+        Args:
+            key: ключ временного окна.
+            start: начала отрезков, массив индексов часа.
+            end: концы отрезков, конец не входит, массив той же формы.
+
+        Returns:
+            Массив номеров блоков той же формы; минус один, если отрезок не лежит
+            целиком ни в одном блоке.
+        """
+        start, end = np.asarray(start, np.int64), np.asarray(end, np.int64)
+        los = np.array([lo for lo, _hi in self.blocks[key]], np.int64)
+        his = np.array([hi for _lo, hi in self.blocks[key]], np.int64)
+        idx = np.searchsorted(los, start, side="right") - 1
+        safe = np.clip(idx, 0, len(los) - 1)
+        ok = (idx >= 0) & (start >= los[safe]) & (end <= his[safe]) & (start < end)
+        return np.where(ok, idx, -1)
+
+    def overlaps(self, keys, start, end):
+        """Пересекает ли отрезок часов хотя бы один блок перечисленных окон.
+
+        Args:
+            keys: ключи временных окон.
+            start: начала отрезков, массив индексов часа.
+            end: концы отрезков, конец не входит, массив той же формы.
+
+        Returns:
+            Булев массив той же формы. Пустой отрезок ничего не пересекает.
+        """
+        start, end = np.asarray(start, np.int64), np.asarray(end, np.int64)
+        hit = np.zeros(np.broadcast(start, end).shape, bool)
+        for k in keys:
+            for lo, hi in self.blocks[k]:
+                hit |= (start < hi) & (end > lo) & (start < end)
+        return hit
+
+    def to_dict(self):
+        """Раскладка в виде, пригодном для JSON.
+
+        Returns:
+            Словарь с длиной ряда и списками блоков по ключам.
+        """
+        return dict(n_hours=self.n_hours,
+                    blocks={k: [list(b) for b in self.blocks[k]] for k in TIME_KEYS})
+
+
+def time_layout(n_hours, **overrides):
+    """Раскладка ряда заданной длины по временным окнам.
+
+    Args:
+        n_hours: длина ряда, ч.
+        **overrides: замена параметров раскладки по умолчанию.
+
+    Returns:
+        Раскладка ряда.
+
+    Raises:
+        ValueError: зазор короче горизонта и полной истории вместе, число блоков не
+            чётное, либо ряд так короток, что обучение, тест или хотя бы один блок не
+            вмещают ни одного окна.
+    """
+    cfg = {**TIME_LAYOUT, **overrides}
+    gap, n_blocks = int(cfg["gap_hours"]), int(cfg["n_blocks"])
+    if gap < MIN_GAP_HOURS:
+        raise ValueError(f"зазор {gap} ч меньше горизонта и полной истории вместе "
+                         f"({MIN_GAP_HOURS} ч)")
+    if n_blocks < 2 or n_blocks % 2:
+        raise ValueError(f"число блоков валидации и калибровки {n_blocks}: нужно чётное, "
+                         f"не меньше двух")
+    n = int(n_hours)
+    year = int(min(int(cfg["hours_per_year"]), np.floor(float(cfg["test_frac"]) * n)))
+    test = (n - year, n)
+    vc_hi = test[0] - gap
+    vc_lo = vc_hi - year
+    edges = [vc_lo + (i * year) // n_blocks for i in range(n_blocks + 1)]
+    inner = list(zip(edges[:-1], edges[1:]))
+    train = (0, vc_lo - gap)
+    out = TimeLayout(n_hours=n, blocks=dict(train=(train,), val=tuple(inner[0::2]),
+                                            calib=tuple(inner[1::2]), test=(test,)))
+    short = {k: min(hi - lo for lo, hi in out.blocks[k]) for k in TIME_KEYS
+             if min(hi - lo for lo, hi in out.blocks[k]) < MIN_BLOCK_HOURS}
     if short:
-        raise ValueError(f"ряд из {n} ч слишком короток для четырёх окон с зазором {gap} ч: "
-                         f"длины {short} меньше минимальных {need}")
+        raise ValueError(f"ряд из {n} ч слишком короток для раскладки с зазором {gap} ч и "
+                         f"{n_blocks} блоками: самые короткие блоки {short} меньше "
+                         f"{MIN_BLOCK_HOURS} ч")
     return out
 
 
@@ -84,7 +182,7 @@ def full_years(mask_T, t0_utc_h, lo, hi, min_month_frac=FULL_YEAR_MIN_MONTH_FRAC
     гармоникам годового хода нужен весь сезонный цикл, а не только много часов.
     """
     from mayak.timeaxis import window_month
-    hpy = int(hours_per_year or TIME_BOUNDS["hours_per_year"])
+    hpy = int(hours_per_year or TIME_LAYOUT["hours_per_year"])
     n_blocks = max(0, (int(hi) - int(lo)) // hpy)
     if n_blocks == 0:
         return 0
@@ -102,15 +200,22 @@ def full_years(mask_T, t0_utc_h, lo, hi, min_month_frac=FULL_YEAR_MIN_MONTH_FRAC
 
 
 def min_hours_for_train_years(years, **overrides):
-    """Минимальная длина ряда, при которой в обучающем окне ≥ years лет."""
-    cfg = {**TIME_BOUNDS, **overrides}
-    hpy, gap = int(cfg["hours_per_year"]), int(cfg["gap_hours"])
-    rest = 3 * gap + (int(cfg["val_days"]) + int(cfg["calib_days"])) * 24
-    n = max(1, int(years)) * hpy + rest
+    """Наименьшая длина ряда, при которой обучение занимает не меньше заданного числа лет.
+
+    Args:
+        years: сколько лет должно занимать обучение.
+        **overrides: замена параметров раскладки по умолчанию.
+
+    Returns:
+        Длина ряда, ч.
+    """
+    cfg = {**TIME_LAYOUT, **overrides}
+    need = max(1, int(years)) * int(cfg["hours_per_year"])
+    n = need + 2 * int(cfg["gap_hours"])
     while True:
         try:
-            b = time_bounds(n, **overrides)
-            if b["train"][1] - b["train"][0] >= int(years) * hpy:
+            lo, hi = time_layout(n, **overrides).span("train")
+            if hi - lo >= need:
                 return n
         except ValueError:
             pass
@@ -142,11 +247,26 @@ def _allocate(total, sizes, floor, cap, rng):
     return alloc
 
 
-def assign_roles(rows, n_test=8, val_frac=0.1, n_val=None, seed=0, min_stratum=3):
+def assign_roles(rows, n_test=None, test_frac=DEFAULT_TEST_FRAC, val_frac=DEFAULT_VAL_FRAC,
+                 n_val=None, seed=0, min_stratum=3, info=None):
     """Стратифицированное разбиение станций на три роли.
 
-    Станции с ролью external_test в манифесте в разбиении не участвуют и сохраняют
-    роль. Возвращает {id станции: роль}.
+    Args:
+        rows: строки манифеста с полями id, koppen, lat и, возможно, split.
+        n_test: точное число тестовых станций; None - по доле test_frac.
+        test_frac: доля тестовых станций среди участвующих в разбиении.
+        val_frac: доля валидационных среди станций вне теста.
+        n_val: точное число валидационных станций; None - по доле val_frac.
+        seed: сид разбиения.
+        min_stratum: страты от этого размера обязаны быть во всех ролях.
+        info: если передан словарь, в него кладутся запрошенное и назначенное число
+            тестовых и валидационных станций.
+
+    Returns:
+        Словарь: id станции и её роль.
+
+    Raises:
+        ValueError: min_stratum меньше трёх.
     """
     if min_stratum < 3:
         raise ValueError("min_stratum < 3: в страте не хватит станций на три роли")
@@ -161,16 +281,22 @@ def assign_roles(rows, n_test=8, val_frac=0.1, n_val=None, seed=0, min_stratum=3
     sizes = np.array([len(g) for g in groups])
     big = (sizes >= min_stratum).astype(np.int64)
 
-    k_test = _allocate(n_test, sizes, big, sizes - 1, rng)
+    want_test = int(round(test_frac * len(rows))) if n_test is None else int(n_test)
+    k_test = _allocate(want_test, sizes, big, sizes - 1, rng)
     n_rest = int(sizes.sum() - k_test.sum())
-    n_val = int(round(val_frac * n_rest)) if n_val is None else int(n_val)
-    k_val = _allocate(n_val, sizes - k_test, big, sizes - 1 - k_test, rng)
+    want_val = int(round(val_frac * n_rest)) if n_val is None else int(n_val)
+    k_val = _allocate(want_val, sizes - k_test, big, sizes - 1 - k_test, rng)
 
-    for name, want, got in (("unseen_test", n_test, k_test.sum()),
-                            ("unseen_val", n_val, k_val.sum())):
+    for name, want, got in ((ROLE_TEST, want_test, k_test.sum()),
+                            (ROLE_VAL, want_val, k_val.sum())):
         if got != want:
             log.warning("роль %s: запрошено %d станций, назначено %d "
-                        "(гарантии представительства страт / нехватка станций)", name, want, got)
+                        "(гарантии представительства страт или нехватка станций)",
+                        name, want, got)
+    if info is not None:
+        info.update(requested={ROLE_TEST: want_test, ROLE_VAL: want_val},
+                    assigned={ROLE_TEST: int(k_test.sum()), ROLE_VAL: int(k_val.sum()),
+                              ROLE_TRAIN: int(sizes.sum() - k_test.sum() - k_val.sum())})
 
     roles = {sid: ROLE_EXTERNAL for sid in external}
     for g, kt, kv in zip(groups, k_test, k_val):

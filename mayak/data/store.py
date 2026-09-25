@@ -3,14 +3,6 @@
 Сборка:  исходные файлы станций → QC (поточечный и оконный) → станционные проверки →
          отбор станций → сплиты → климатология → кэш и отчёт QC на диске.
 Загрузка: кэш → StationStore в памяти, один объект на процесс.
-
-Исходный файл станции (``stations/<id>.npz``): T, P, RH, valid, t0_utc_h и
-необязательные ``flag`` — штатные флаги источника «подозрительно» формы (N,) или
-(N, 3), и ``Td`` - точка росы (N,), если источник даёт её отдельно.
-Необязательные колонки манифеста: ``dem_elev`` — высота из цифровой модели рельефа,
-``station_elev`` — высота из метаданных станции (реальная сеть: ``elev`` там — высота
-из ЦМР, её видит модель, а для станционной проверки высоты нужна заявленная),
-``report_every`` — типичный шаг отчётности, ч.
 """
 from __future__ import annotations
 
@@ -30,12 +22,12 @@ from mayak.data.climatology import CLIM_VERSION, Climatology
 from mayak.data.qc import (DEFAULT_QC, QC_CODE_DOC, QC_VERSION, STATION_CHECKS,
                            code_fractions, qc_station, station_checks, station_selection)
 from mayak.data.splits import (EXTERNAL_MIN_TRAIN_YEARS, ROLE_EXTERNAL, SPLITS_VERSION,
-                               TIME_BOUNDS, full_years, time_bounds)
+                               TIME_LAYOUT, full_years, time_layout)
 from mayak.timeaxis import CALENDAR_VERSION, legacy_t0, window_calendar
 
 log = logging.getLogger(__name__)
 
-CACHE_FORMAT = "4"   # Увеличивать при изменении; входит в ключ кэша.
+CACHE_FORMAT = "3"   # Увеличивать при изменении; входит в ключ кэша.
 CLIM_PARAMS = dict(n_year=3, n_day=3, scale_n_year=2, scale_n_day=2, min_valid=24 * 30)
 CLIM_BASIS = ("n_year", "n_day", "scale_n_year", "scale_n_day")
 
@@ -111,7 +103,7 @@ def key_payload(manifest, rows=None, qc_cfg=DEFAULT_QC):
     return {
         "format": CACHE_FORMAT, "qc": [QC_VERSION, qc_cfg.to_dict()],
         "calendar": CALENDAR_VERSION,
-        "clim": [CLIM_VERSION, CLIM_PARAMS], "splits": [SPLITS_VERSION, TIME_BOUNDS],
+        "clim": [CLIM_VERSION, CLIM_PARAMS], "splits": [SPLITS_VERSION, TIME_LAYOUT],
         "stations": stations,
     }
 
@@ -145,7 +137,7 @@ def process_station(path, meta=None, qc_cfg=DEFAULT_QC):
                   **{f"check/{k}": v["status"] for k, v in checks.items()},
                   **{f"check/{k}/value": v["value"] for k, v in checks.items()})
     try:
-        lo, hi = time_bounds(n)["train"]
+        lo, hi = time_layout(n).span("train")
     except ValueError as e:
         reasons.append(("splits", f"сплиты: {e}"))
     need_years = int(meta.get("min_train_years") or 0)

@@ -14,7 +14,7 @@ import torch
 from mayak.constants import H, L_MAX, QUANTILES
 from mayak.data import store as S
 from mayak.data.climatology import ABS_TO_SD, SCALE_FLOOR_FRAC, Climatology
-from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL, time_bounds
+from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL, time_layout
 from mayak.loss import NORM_SCALE_CLAMP, forecast_loss, pinball
 from mayak.protocol import (ARCH_NAMES, DEFAULT_PROTOCOL, Protocol, ProtocolError, Stage,
                             check_deviations_documented, protocol_for, read_journal,
@@ -125,7 +125,7 @@ def test_cache_stores_scale_fitted_on_train_window(store):
     cache = Path(store.path)
     assert (cache / "clim_scale_beta.npy").exists()
     for sid, s in store.stations.items():
-        lo, hi = time_bounds(s["N"])["train"]
+        lo, hi = time_layout(s["N"]).span("train")
         d, h = window_calendar(s["t0"], np.arange(lo, hi))
         ref = S.new_climatology().fit(d.astype(np.float64), h.astype(np.float64),
                                       s["x"][lo:hi, 0], s["mask"][lo:hi, 0])
@@ -150,7 +150,7 @@ def test_deep_check_catches_scale_not_from_train_window(store):
     bad = copy.copy(store)
     bad.stations = {k: dict(v) for k, v in store.stations.items()}
     s = bad.stations["t1"]
-    lo, hi = time_bounds(s["N"])["test"]
+    lo, hi = time_layout(s["N"]).span("test")
     d, h = window_calendar(s["t0"], np.arange(lo, hi))
     other = S.new_climatology().fit(d.astype(float), h.astype(float), s["x"][lo:hi, 0],
                                     s["mask"][lo:hi, 0])

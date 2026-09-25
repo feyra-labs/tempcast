@@ -11,7 +11,7 @@ from mayak.data.augment import AugWindow, augment_window
 from mayak.data.masking import (DEFAULT_TARGET_MASK, FilterStats, enforce_invariant,
                                 target_window_ok)
 from mayak.data.qc import qc_window
-from mayak.data.splits import ROLE_TRAIN, ROLE_VAL, time_bounds
+from mayak.data.splits import ROLE_TRAIN, ROLE_VAL, time_layout
 from mayak.data.store import get_store
 from mayak.timeaxis import window_calendar
 from mayak.zones import normalize_zone
@@ -69,15 +69,56 @@ def norm_scale(clim, doy_f, hour_f):
     return clim.scale(doy_f, hour_f).astype(np.float32)
 
 
-def valid_starts(mask_T, lo, hi, step=1, cfg=DEFAULT_TARGET_MASK, history=0):
-    """Кандидаты и годные старты t окна [lo, hi)."""
-    cand = np.arange(lo + history, hi - H + 1, step, dtype=np.int64)
+def valid_starts(mask_T, lo, hi, step=1, cfg=DEFAULT_TARGET_MASK):
+    """Кандидаты в начала горизонта внутри одного блока и те из них, что годны.
+
+    Args:
+        mask_T: маска температуры ряда, форма (N,).
+        lo: начало блока, индекс часа.
+        hi: конец блока, не входит.
+        step: шаг между кандидатами, ч.
+        cfg: правило годности цели.
+
+    Returns:
+        Пара массивов: все кандидаты и годные по маске цели.
+    """
+    cand = np.arange(lo, hi - H + 1, step, dtype=np.int64)
     return cand, cand[target_window_ok(mask_T, cand, H, cfg)]
 
 
-def history_len(L, t, lo):
-    """Фактическая длина истории: не больше L_MAX и не раньше начала окна сплита."""
-    return int(max(0, min(L_MAX if L is None else L, L_MAX, t - lo)))
+def block_starts(layout, key, mask_T, step=1, cfg=DEFAULT_TARGET_MASK):
+    """Кандидаты в начала горизонта во всех блоках временного окна.
+
+    Args:
+        layout: раскладка ряда станции.
+        key: ключ временного окна.
+        mask_T: маска температуры ряда, форма (N,).
+        step: шаг между кандидатами внутри блока, ч.
+        cfg: правило годности цели.
+
+    Returns:
+        Пара массивов: все кандидаты и годные по маске цели, по возрастанию.
+    """
+    cand, ok = [], []
+    for lo, hi in layout.blocks[key]:
+        c, o = valid_starts(mask_T, lo, hi, step, cfg)
+        cand.append(c)
+        ok.append(o)
+    return np.concatenate(cand), np.concatenate(ok)
+
+
+def history_len(L, t, floor):
+    """Фактическая длина истории окна.
+
+    Args:
+        L: запрошенная длина истории, ч; None - полный буфер.
+        t: начало горизонта, индекс часа.
+        floor: самый ранний час, доступный истории окна.
+
+    Returns:
+        Длина истории, ч.
+    """
+    return int(max(0, min(L_MAX if L is None else L, L_MAX, t - floor)))
 
 
 def zone_weights(zones, mode="inv_sqrt", cap=0.0):
@@ -111,9 +152,18 @@ def zone_distribution(zones, p):
     return dict(sorted(out.items(), key=lambda kv: -kv[1][1]))
 
 
-def footprint(t, L, lo):
-    """Часы, которые читает сэмпл: [t − фактическая история, t + H)."""
-    return t - history_len(L, t, lo), t + H
+def footprint(t, L, floor):
+    """Часы, которые читает окно: от начала фактической истории до конца горизонта.
+
+    Args:
+        t: начало горизонта, индекс часа.
+        L: запрошенная длина истории, ч; None - полный буфер.
+        floor: самый ранний час, доступный истории окна.
+
+    Returns:
+        Пара (начало, конец), конец не входит.
+    """
+    return t - history_len(L, t, floor), t + H
 
 
 class WindowDataset(Dataset):
@@ -143,8 +193,8 @@ class WindowDataset(Dataset):
         self.filter_stats = FilterStats()
         for r in rows:
             x, mask, N = r["x"], r["mask"], r["N"]
-            lo, hi = time_bounds(N)[self.time_key]
-            cand, ok = valid_starts(mask[:, 0], lo, hi, cfg=target_mask)
+            layout = time_layout(N)
+            cand, ok = block_starts(layout, self.time_key, mask[:, 0], cfg=target_mask)
             self.filter_stats.add(len(cand), len(ok))
             if len(ok) == 0:
                 continue
@@ -152,7 +202,7 @@ class WindowDataset(Dataset):
                 id=r["id"], lat=float(r["lat"]), lon=float(r["lon"]), elev=float(r["elev"]),
                 koppen=r["koppen"], x=x, mask=mask, N=N, t0=r["t0"], clim=r["clim"],
                 qc_elev=r.get("dem_elev") if r.get("dem_elev") is not None else float(r["elev"]),
-                tr=(lo, hi), starts=ok))
+                floor=layout.history_floor(self.time_key), starts=ok))
         self.filter_stats.report("train")
         assert self.st, "ни у одной train-станции нет окон, прошедших маску цели"
 
@@ -170,10 +220,9 @@ class WindowDataset(Dataset):
 
     def footprints(self):
         for s in self.st:
-            lo = s["tr"][0]
             t = s["starts"]
             yield dict(sid=s["id"], N=s["N"], time_key=self.time_key,
-                       lo=t - np.minimum(L_MAX, t - lo), hi=t + H)
+                       lo=t - np.minimum(L_MAX, t - s["floor"]), t=t, hi=t + H)
 
     def __len__(self):
         return self.n
@@ -195,10 +244,9 @@ class WindowDataset(Dataset):
         r = self.rng_sample
         si = int(r.choice(len(self.st), p=self.w))
         s = self.st[si]
-        lo, _hi = s["tr"]
         t = int(s["starts"][r.integers(len(s["starts"]))])
 
-        L = history_len(self._sample_L(), t, lo)
+        L = history_len(self._sample_L(), t, s["floor"])
         return self.build(s, t, L)
 
     def build(self, s, t, L, info=None):
@@ -256,12 +304,13 @@ class HoldoutDataset(Dataset):
         self.filter_stats = FilterStats()
         for r in store.by_role(station_split):
             x, mask, N = r["x"], r["mask"], r["N"]
-            lo, hi = time_bounds(N)[time_key]
-            cand, ok = valid_starts(mask[:, 0], lo, hi, every_hours, cfg=target_mask,
-                                    history=L_MAX)
+            layout = time_layout(N)
+            floor = layout.history_floor(time_key)
+            cand, ok = block_starts(layout, time_key, mask[:, 0], every_hours, cfg=target_mask)
             self.filter_stats.add(len(cand), len(ok))
             for t in ok.tolist():
-                self.meta.append(dict(id=r["id"], N=N, lo=lo, x=x, mask=mask, t=t, t0=r["t0"],
+                self.meta.append(dict(id=r["id"], N=N, floor=floor, x=x, mask=mask, t=t,
+                                      t0=r["t0"],
                                       clim=r["clim"],
                                       lat=float(r["lat"]), lon=float(r["lon"]),
                                       elev=float(r["elev"]), koppen=r["koppen"],
@@ -276,14 +325,14 @@ class HoldoutDataset(Dataset):
 
     def footprints(self):
         for m in self.meta:
-            lo, hi = footprint(m["t"], m["L"], m["lo"])
+            lo, hi = footprint(m["t"], m["L"], m["floor"])
             yield dict(sid=m["id"], N=m["N"], time_key=self.time_key,
-                       lo=np.array([lo]), hi=np.array([hi]))
+                       lo=np.array([lo]), t=np.array([m["t"]]), hi=np.array([hi]))
 
     def __getitem__(self, i):
         m = self.meta[i]
         t = m["t"]
-        L = history_len(m["L"], t, m["lo"])
+        L = history_len(m["L"], t, m["floor"])
         k = np.arange(L_MAX)
         abs_h = t - L_MAX + k
         doy_h, hour_h = window_calendar(m["t0"], abs_h)

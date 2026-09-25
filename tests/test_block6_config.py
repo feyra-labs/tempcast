@@ -187,7 +187,7 @@ def test_unknown_keys_are_rejected_everywhere():
     with pytest.raises(ConfigError):
         model_config_for("gru", {"arch": "dlinear"})
     with pytest.raises(ConfigError, match="контрактом сплитов"):
-        DataConfig(time_bounds={**DataConfig().time_bounds, "val_days": 30})
+        DataConfig(time_layout={**DataConfig().time_layout, "n_blocks": 6})
 
 
 def test_configs_roundtrip_through_json():

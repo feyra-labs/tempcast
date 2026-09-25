@@ -7,7 +7,7 @@
     число окон с каждой станции) и метаданными окон для разрезов;
   * сбор предсказаний МАЯК + нейробейзлайнов (GRU, DLinear, LRU, PatchTST) +
     статистических; перед сравнением проверяется, что все чекпойнты обучены по одному
-    протоколу (``mayak.lit.check_comparable``);
+    протоколу (mayak.lit.check_comparable);
   * таблицы в двух видах агрегирования — пуловом и макро - с доверительными
     интервалами блочного бутстрапа по станциям;
   * разрезы: по лидам, ролям станций, полным зонам Кёппена, сезонам, длине
@@ -16,10 +16,10 @@
     покрытия;
   * графики по каждой метрике, кривую холодного старта и проверку L=0;
   * отчёт о влиянии конформной калибровки (PICP/CRPS/MAE до и после);
-  * покрытие по разрезам с вердиктами и критерий условной поправки; ``--save-preds``
+  * покрытие по разрезам с вердиктами и критерий условной поправки; --save-preds
     сохраняет предсказания всех моделей,
     чтобы анализ калибровки шёл без повторного запуска моделей;
-  * внешний тест на наблюдениях реальной сети (``--external-manifest``): те же
+  * внешний тест на наблюдениях реальной сети (--external-manifest): те же
     таблицы и разрезы, разрезы внешнего теста (шаг отчётности, Δ высоты станции и
     ЦМР, канал давления) и сопоставление «внутренний тест против внешнего»;
   * проверки этапа A (поле), декомпозицию L=0, суточные амплитуды, ablation.
@@ -32,8 +32,8 @@ from torch.utils.data import DataLoader, Dataset
 
 from mayak import baselines as BL
 from mayak.constants import H, L_MAX, QUANTILES
-from mayak.data.dataset import (footprint, history_len, norm_scale, slice_history, slice_target,
-                                valid_starts)
+from mayak.data.dataset import (block_starts, footprint, history_len, norm_scale, slice_history,
+                                slice_target)
 from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats
 from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, apply_conformal, breakdown,
                            by_lead, calibrate_forecast, coverage, metric_table, pinball_crps,
@@ -93,20 +93,21 @@ class EvalSet(Dataset):
                  manifest="data/manifest.csv", time_key="test",
                  every_hours=72, L=None, max_windows=6000, windows_per_station=None,
                  target_mask=DEFAULT_TARGET_MASK):
-        from mayak.data.splits import time_bounds
+        from mayak.data.splits import time_layout
         from mayak.data.store import read_manifest
         split_of = {r["id"]: r.get("split") for r in read_manifest(manifest)}
         self.station_splits, self.time_key = tuple(station_splits), time_key
-        self.bounds, self.roles = {}, {}
+        self.floor, self.roles = {}, {}
         self.filter_stats = FilterStats()
         per_station = {}
         for sid, s in clims.items():
             sp = split_of.get(sid)
             if sp not in station_splits:
                 continue
-            lo, hi = self.bounds[sid] = time_bounds(s["N"])[time_key]
-            cand, ok = valid_starts(s["mask"][:, 0], lo, hi, every_hours, cfg=target_mask,
-                                    history=L_MAX)
+            layout = time_layout(s["N"])
+            self.floor[sid] = layout.history_floor(time_key)
+            cand, ok = block_starts(layout, time_key, s["mask"][:, 0], every_hours,
+                                    cfg=target_mask)
             self.filter_stats.add(len(cand), len(ok))
             self.roles[sid] = sp
             per_station[sid] = ok.tolist()
@@ -120,9 +121,9 @@ class EvalSet(Dataset):
 
     def footprints(self):
         for sid, t in self.items:
-            lo, hi = footprint(t, self.L, self.bounds[sid][0])
+            lo, hi = footprint(t, self.L, self.floor[sid])
             yield dict(sid=sid, N=self.clims[sid]["N"], time_key=self.time_key,
-                       lo=np.array([lo]), hi=np.array([hi]))
+                       lo=np.array([lo]), t=np.array([t]), hi=np.array([hi]))
 
     def station_attrs(self):
         if getattr(self, "_attrs", None) is None:
@@ -139,7 +140,7 @@ class EvalSet(Dataset):
         attrs = self.station_attrs()
         for sid, t in self.items:
             s = self.clims[sid]
-            L = history_len(self.L, t, self.bounds[sid][0])
+            L = history_len(self.L, t, self.floor[sid])
             m = s["mask"][t - L:t, 0] if L > 0 else np.zeros(0, np.float32)
             month = int(np.asarray(window_month(s["t0"], [t])).ravel()[0])
             sid_a.append(sid)
@@ -164,7 +165,7 @@ class EvalSet(Dataset):
         s = self.clims[sid]
         clim = s["clim"]
         t0 = s["t0"]
-        L = history_len(self.L, t, self.bounds[sid][0])
+        L = history_len(self.L, t, self.floor[sid])
         k = np.arange(L_MAX)
         abs_h = t - L_MAX + k
         doy_h, hour_h = window_calendar(t0, abs_h)

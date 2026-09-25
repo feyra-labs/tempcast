@@ -12,9 +12,9 @@ import torch
 from mayak.constants import H, L_MAX
 from mayak.data import store as S
 from mayak.data.splits import (MIN_GAP_HOURS, ROLE_TEST, ROLE_TRAIN, ROLE_VAL, ROLES,
-                               TIME_KEYS, assign_roles, strata_report, stratum_of, time_bounds)
+                               TIME_KEYS, assign_roles, strata_report, stratum_of, time_layout)
 from mayak.leakage import (SELECTION_KEY, LeakageError, check_checkpoint, check_climatology,
-                           check_conformal, check_time_bounds, check_windows, conformal_record,
+                           check_conformal, check_time_layout, check_windows, conformal_record,
                            run_checklist, save_conformal, selection_record)
 
 REPO = Path(__file__).resolve().parents[1]
@@ -89,26 +89,29 @@ class _Fake:
 
 
 @pytest.mark.parametrize("n", [8_000, 12_000, 17_531, 87_660, 200_000])
-def test_time_bounds_ordered_disjoint_and_gapped(n):
-    b = check_time_bounds(n)
-    assert list(b) == list(TIME_KEYS)
-    assert b["train"][0] == 0 and b["test"][1] == n
-    for a, c in zip(TIME_KEYS, TIME_KEYS[1:]):
-        assert b[c][0] - b[a][1] >= MIN_GAP_HOURS == H + L_MAX
-    for k in ("val", "calib", "test"):
-        assert b[k][1] - b[k][0] > L_MAX + H, "окно оценки не вмещает окно с полной историей"
+def test_time_layout_ordered_disjoint_and_gapped(n):
+    lay = check_time_layout(n)
+    assert list(lay.blocks) == list(TIME_KEYS)
+    assert lay.span("train")[0] == 0 and lay.span("test")[1] == n
+    assert lay.span("val")[0] - lay.span("train")[1] >= MIN_GAP_HOURS == H + L_MAX
+    assert lay.span("test")[0] - lay.span("calib")[1] >= MIN_GAP_HOURS
+    for k in TIME_KEYS:
+        for lo, hi in lay.blocks[k]:
+            assert hi - lo > H, "блок не вмещает ни одной цели"
 
 
-def test_time_bounds_rejects_small_gap_and_short_series():
+def test_time_layout_rejects_small_gap_odd_blocks_and_short_series():
     with pytest.raises(ValueError, match="зазор"):
-        time_bounds(50_000, gap_hours=MIN_GAP_HOURS - 1)
+        time_layout(50_000, gap_hours=MIN_GAP_HOURS - 1)
+    with pytest.raises(ValueError, match="чётное"):
+        time_layout(50_000, n_blocks=7)
     with pytest.raises(ValueError, match="короток"):
-        time_bounds(5_000)
+        time_layout(5_000)
 
 
 def test_long_series_keeps_last_year_as_test():
-    b = time_bounds(10 * 8766)
-    assert b["test"] == (10 * 8766 - 8766, 10 * 8766)
+    lay = time_layout(10 * 8766)
+    assert lay.span("test") == (10 * 8766 - 8766, 10 * 8766)
 
 
 def test_short_station_is_excluded_from_cache(tmp_path):
@@ -125,7 +128,7 @@ def test_short_station_is_excluded_from_cache(tmp_path):
 
 def test_cache_records_climatology_fit_window(store):
     for s in store.stations.values():
-        assert s["clim_fit"] == time_bounds(s["N"])["train"]
+        assert s["clim_fit"] == time_layout(s["N"]).span("train")
 
 
 def test_sampled_train_windows_stay_in_train_window_with_gap(dm):
@@ -137,9 +140,10 @@ def test_sampled_train_windows_stay_in_train_window_with_gap(dm):
     assert {sid for sid, *_ in seen} <= {sid for sid, r in STATIONS if r == ROLE_TRAIN}
     assert any(L == 0 for *_, L in seen) and any(L == L_MAX for *_, L in seen)
     for _sid, N, t, L in seen:
-        b = time_bounds(N)
-        assert b["train"][0] <= t - L and t + H <= b["train"][1]
-        assert b["val"][0] - (t + H) >= H + L_MAX, "окно ближе зазора к валидационному окну"
+        lay = time_layout(N)
+        lo, hi = lay.span("train")
+        assert lo <= t - L and t + H <= hi
+        assert lay.span("val")[0] - (t + H) >= H + L_MAX, "окно ближе зазора к валидации"
 
 
 @pytest.mark.parametrize("L", [0, 24, L_MAX])
@@ -152,9 +156,11 @@ def test_holdout_items_match_declared_footprints(manifest, store, L):
         m = ds.meta[i]
         L_real = int(ds[i]["mask_hist"][:, 0].sum())
         assert L_real == L, "окно оценки обрезало историю"
-        assert (int(fp["lo"][0]), int(fp["hi"][0])) == (m["t"] - L_real, m["t"] + H)
-        lo, hi = time_bounds(m["N"])["val"]
-        assert lo <= m["t"] - L_MAX and m["t"] + H <= hi
+        assert (int(fp["lo"][0]), int(fp["t"][0]), int(fp["hi"][0])) == \
+            (m["t"] - L_real, m["t"], m["t"] + H)
+        lay = time_layout(m["N"])
+        assert lay.block_index("val", [m["t"]], [m["t"] + H])[0] >= 0
+        assert not lay.overlaps(("train", "test"), [m["t"] - L_MAX], [m["t"]])[0]
 
 
 def test_eval_windows_do_not_depend_on_history_length(store, manifest):
@@ -238,7 +244,8 @@ def test_make_splits_script_preserves_columns(tmp_path, monkeypatch):
         w = csv.DictWriter(f, fieldnames=list(rows[0]))
         w.writeheader()
         w.writerows(rows)
-    monkeypatch.setattr(sys, "argv", ["make_splits.py", "--manifest", str(path), "--n-test", "2"])
+    monkeypatch.setattr(sys, "argv", ["make_splits.py", "--manifest", str(path), "--n-test", "2",
+                                      "--min-train-years", "0"])
     runpy.run_path(str(REPO / "scripts" / "make_splits.py"), run_name="__main__")
     out = S.read_manifest(str(path))
     assert all(r["extra"] == "keep" for r in out)
@@ -255,7 +262,7 @@ def test_checklist_passes_on_clean_pipeline(store, dm, manifest):
 
 def test_checklist_catches_climatology_fit_outside_train_window(store):
     bad = _clone(store)
-    lo, hi = time_bounds(N_HOURS)["test"]
+    lo, hi = time_layout(N_HOURS).span("test")
     bad.stations["x0"]["clim_fit"] = (lo, hi)
     with pytest.raises(LeakageError, match="климатология x0"):
         run_checklist(bad)
@@ -266,7 +273,7 @@ def test_deep_check_catches_coefficients_fit_on_test_window(store):
     from mayak.timeaxis import window_calendar
     bad = _clone(store)
     s = bad.stations["t0"]
-    lo, hi = time_bounds(s["N"])["test"]
+    lo, hi = time_layout(s["N"]).span("test")
     d, h = window_calendar(0, np.arange(lo, hi))
     s["clim"] = Climatology().fit(d.astype(float), h.astype(float), s["x"][lo:hi, 0] + 1.0,
                                   s["mask"][lo:hi, 0])
@@ -275,26 +282,28 @@ def test_deep_check_catches_coefficients_fit_on_test_window(store):
         check_climatology(bad, deep=True)
 
 
-def test_checklist_catches_window_crossing_split_boundary(store, manifest):
+def test_checklist_catches_target_crossing_block_boundary(store, manifest):
     from mayak.data.dataset import HoldoutDataset
     ds = HoldoutDataset(manifest, time_key="val", every_hours=72, store=store)
-    lo, hi = time_bounds(N_HOURS)["val"]
-    ds.meta[0] = dict(ds.meta[0], t=lo + 10, lo=lo - 100)
-    assert int(ds[0]["mask_hist"][:, 0].sum()) == 110
-    with pytest.raises(LeakageError, match="выходит за окно val"):
-        check_windows([ds], store)
+    check_windows([ds], store)
+    lo, hi = time_layout(N_HOURS).blocks["val"][0]
     ds.meta[0] = dict(ds.meta[0], t=hi - H + 1)
-    with pytest.raises(LeakageError):
+    with pytest.raises(LeakageError, match="не лежит целиком в одном блоке окна val"):
+        check_windows([ds], store)
+    ds.meta[0] = dict(ds.meta[0], t=lo - 1)
+    with pytest.raises(LeakageError, match="блоке окна val"):
         check_windows([ds], store)
 
 
 def test_checklist_catches_foreign_station_in_train_or_calib_window(store):
-    lo, _ = time_bounds(N_HOURS)["train"]
-    fp = dict(sid="x0", N=N_HOURS, time_key="train", lo=np.array([lo]), hi=np.array([lo + H]))
+    lo, _ = time_layout(N_HOURS).span("train")
+    fp = dict(sid="x0", N=N_HOURS, time_key="train", lo=np.array([lo]), t=np.array([lo]),
+              hi=np.array([lo + H]))
     with pytest.raises(LeakageError, match="роли unseen_test в окне train"):
         check_windows([_Fake([fp])], store)
-    clo, _ = time_bounds(N_HOURS)["calib"]
-    fp = dict(sid="t0", N=N_HOURS, time_key="calib", lo=np.array([clo]), hi=np.array([clo + H]))
+    clo, _ = time_layout(N_HOURS).blocks["calib"][0]
+    fp = dict(sid="t0", N=N_HOURS, time_key="calib", lo=np.array([clo]), t=np.array([clo]),
+              hi=np.array([clo + H]))
     with pytest.raises(LeakageError, match="окне calib"):
         check_windows([_Fake([fp])], store)
 

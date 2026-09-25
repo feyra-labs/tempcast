@@ -1,10 +1,8 @@
 """Внешний тест на наблюдениях реальной сети: атрибуты станций и сопоставление с внутренним.
 
-Все числа считает ``mayak/metrics.py``. Здесь:
-
 * атрибуты станции для разрезов, специфичных для внешнего теста: шаг отчётности
   (по обучающему окну станции), разность «заявленная высота − высота из ЦМР»;
-* ``transfer_table`` — прямое сопоставление «внутренний тест против внешнего» по
+* transfer_table — прямое сопоставление «внутренний тест против внешнего» по
   одинаковым лидам на общих зонах, с интервалом для разности: станции обоих наборов
   ресэмплируются независимо (блочный бутстрап по станциям, как везде в проекте).
 """
@@ -13,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 
 from mayak.data.ghcnh import report_class, report_step
-from mayak.data.splits import time_bounds
+from mayak.data.splits import time_layout
 from mayak.metrics import METRICS, quantile_ci
 from mayak.zones import koppen_group, normalize_zone
 
@@ -26,7 +24,7 @@ TRANSFER_LEADS = (1, 6, 24, 72, 168)
 
 def station_report_class(s):
     """Класс шага отчётности станции по маске T в её обучающем окне."""
-    lo, hi = time_bounds(s["N"])["train"]
+    lo, hi = time_layout(s["N"]).span("train")
     return report_class(report_step(s["mask"][lo:hi, 0]))
 
 

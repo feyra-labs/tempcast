@@ -1,11 +1,10 @@
 # Данные: значения по умолчанию = mayak.config.DataConfig().
 manifest: data/manifest.csv
-cache_root: null            # null - <каталог манифеста>/cache
-time_bounds:                # контракт сплитов (mayak/data/splits.py); расхождение - ошибка
+cache_root: null
+time_layout:
   hours_per_year: 8766
   test_frac: 0.3
-  val_days: 60
-  calib_days: 60
+  n_blocks: 12
   gap_hours: 840
 target_mask:
   min_valid_frac: 0.5

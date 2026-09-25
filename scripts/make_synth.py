@@ -1,6 +1,6 @@
 """Генератор синтетического метео-датасета.
 Запуск:
-    python scripts/make_synth.py --out data --n-stations 40 --years 2 --seed 1
+    python scripts/make_synth.py --out data --n-stations 40 --years 6 --seed 1
 """
 import argparse
 import csv
@@ -71,7 +71,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data")
     ap.add_argument("--n-stations", type=int, default=40)
-    ap.add_argument("--years", type=int, default=2)
+    ap.add_argument("--years", type=int, default=6)
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
 

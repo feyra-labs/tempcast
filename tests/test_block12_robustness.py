@@ -27,7 +27,7 @@ from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL
 
 REPO = Path(__file__).resolve().parents[1]
 CONF = REPO / "conf"
-N_HOURS = 12_000
+N_HOURS = 26_400
 ALL = tuple(SCENARIO_RULES)
 INPUT_ONLY = tuple(n for n, r in SCENARIO_RULES.items() if not r.target)
 TARGET = tuple(n for n, r in SCENARIO_RULES.items() if r.target)

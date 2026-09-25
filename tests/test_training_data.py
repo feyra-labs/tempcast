@@ -379,7 +379,8 @@ def test_pipeline_from_points_to_cache(koppen_tif, tmp_path, monkeypatch):
         assert src["valid"].all()
 
     assert _run_script(monkeypatch, "make_splits", ["--manifest", str(manifest),
-                                                    "--n-test", "2"]) == 0
+                                                    "--n-test", "2",
+                                                    "--min-train-years", "0"]) == 0
     S._STORES.clear()
     path, built = S.build_cache(str(manifest), jobs=1)
     assert built

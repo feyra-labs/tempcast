@@ -105,7 +105,7 @@ class RobustnessSet(Dataset):
         item = self.base[i] if item is None else item
         sid, t = self.base.items[i]
         s = self.base.clims[sid]
-        L = history_len(self.base.L, t, self.base.bounds[sid][0])
+        L = history_len(self.base.L, t, self.base.floor[sid])
         dem = s.get("dem_elev")
         w = AugWindow(x=_np(item["x_hist"]).astype(np.float32, copy=True),
                       m=_np(item["mask_hist"]).astype(np.float32, copy=True),

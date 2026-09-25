@@ -1,17 +1,21 @@
-"""Исполняемый чек-лист антиутече.
+"""Исполняемый чек-лист антиутечек.
 
-Четыре проверки, вызываются перед обучением и перед оценкой:
+Проверки вызываются перед обучением и перед оценкой:
 
-1. климатология каждой станции (среднее и масштаб остатка) подогнана только
-   по её обучающему окну;
-2. конформная таблица построена только по калибровочному окну и только
-   на валидационных станциях;
-3. ни одно окно датасета не выходит за границу своего временного окна
-   ни историей, ни горизонтом (а временные окна разделены зазором ≥ H + L_MAX);
-4. чекпойнт выбран по метрике на валидационных станциях в валидационном окне;
-5. окна внешних станций - только в тестовом временном окне; внешние станции не
-   встречаются в основном наборе под другой ролью, в записи о выборе чекпойнта и
-   в метаданных конформной таблицы (``check_external``).
+1. раскладка ряда каждой станции упорядочена, блоки не пусты, а год валидации и
+   калибровки отделён от обучения и теста зазором не короче горизонта и полной
+   истории вместе;
+2. климатология каждой станции подогнана только по её обучающему окну;
+3. цель каждого окна датасета лежит целиком в одном блоке своего временного окна;
+   история окон валидации и калибровки может заходить в зазор и в соседние блоки,
+   но не в обучение и тест; история тестовых окон не заходит в обучение, валидацию
+   и калибровку; история обучающих окон не выходит за обучение;
+4. конформная таблица построена только по калибровочным блокам и только на
+   валидационных станциях;
+5. чекпойнт выбран по метрике на валидационных станциях в валидационных блоках;
+6. окна внешних станций - только в тестовом окне; внешние станции не встречаются в
+   основном наборе под другой ролью, в записи о выборе чекпойнта и в метаданных
+   конформной таблицы.
 """
 from __future__ import annotations
 
@@ -21,8 +25,10 @@ import os
 
 import numpy as np
 
-from mayak.data.splits import (MIN_GAP_HOURS, ROLE_EXTERNAL, ROLE_TRAIN, ROLE_VAL,
-                               SPLITS_VERSION, TIME_BOUNDS, TIME_KEYS, time_bounds)
+from mayak.constants import H
+from mayak.data.splits import (BLOCK_KEYS, HISTORY_FORBIDDEN, MIN_BLOCK_HOURS, MIN_GAP_HOURS,
+                               ROLE_EXTERNAL, ROLE_TRAIN, ROLE_VAL, SPLITS_VERSION, TIME_KEYS,
+                               TIME_LAYOUT, time_layout)
 
 log = logging.getLogger(__name__)
 
@@ -43,14 +49,14 @@ def _fail(msg):
 
 
 def _split_state():
-    return dict(splits_version=SPLITS_VERSION, time_bounds=dict(TIME_BOUNDS))
+    return dict(splits_version=SPLITS_VERSION, time_layout=dict(TIME_LAYOUT))
 
 
 def _check_split_state(rec, what):
-    if rec.get("splits_version") != SPLITS_VERSION or rec.get("time_bounds") != dict(TIME_BOUNDS):
+    if rec.get("splits_version") != SPLITS_VERSION or rec.get("time_layout") != dict(TIME_LAYOUT):
         _fail(f"{what}: построено при других правилах сплитов "
-              f"({rec.get('splits_version')}, {rec.get('time_bounds')}) — "
-              f"сейчас ({SPLITS_VERSION}, {dict(TIME_BOUNDS)}); пересоберите")
+              f"({rec.get('splits_version')}, {rec.get('time_layout')}), "
+              f"сейчас ({SPLITS_VERSION}, {dict(TIME_LAYOUT)}); пересоберите")
 
 
 def _check_station_roles(stations, store, role, what):
@@ -63,19 +69,44 @@ def _check_station_roles(stations, store, role, what):
         _fail(f"{what}: пустой список станций")
 
 
-def check_time_bounds(n_hours):
-    """Окна идут по порядку, не пустые и разделены зазором ≥ H + L_MAX."""
-    b = time_bounds(n_hours)
-    if b["train"][0] < 0 or b["test"][1] > n_hours:
-        _fail(f"окна выходят за ряд длины {n_hours}: {b}")
+def check_time_layout(n_hours):
+    """Проверяет раскладку ряда заданной длины, не полагаясь на то, как она построена.
+
+    Args:
+        n_hours: длина ряда, ч.
+
+    Returns:
+        Проверенная раскладка.
+
+    Raises:
+        LeakageError: блок выходит за ряд, пуст или короче одного окна; блоки
+            валидации и калибровки не идут подряд или не чередуются; год валидации и
+            калибровки ближе допустимого к обучению или тесту.
+    """
+    lay = time_layout(n_hours)
     for k in TIME_KEYS:
-        if b[k][0] >= b[k][1]:
-            _fail(f"пустое окно {k}: {b[k]}")
-    for a, c in zip(TIME_KEYS, TIME_KEYS[1:]):
-        gap = b[c][0] - b[a][1]
+        if not lay.blocks[k]:
+            _fail(f"у окна {k} нет блоков")
+        for lo, hi in lay.blocks[k]:
+            if lo < 0 or hi > n_hours:
+                _fail(f"блок {k} [{lo}, {hi}) выходит за ряд длины {n_hours}")
+            if hi - lo < MIN_BLOCK_HOURS:
+                _fail(f"блок {k} [{lo}, {hi}) короче одного окна ({MIN_BLOCK_HOURS} ч)")
+    inner = sorted((lo, hi, k) for k in BLOCK_KEYS for lo, hi in lay.blocks[k])
+    if len(lay.blocks["val"]) != len(lay.blocks["calib"]):
+        _fail(f"блоков валидации {len(lay.blocks['val'])}, калибровки "
+              f"{len(lay.blocks['calib'])}: должно быть поровну")
+    for i, (lo, hi, k) in enumerate(inner):
+        if k != BLOCK_KEYS[i % 2]:
+            _fail(f"блоки валидации и калибровки не чередуются: блок {i} [{lo}, {hi}) - {k}")
+        if i and lo != inner[i - 1][1]:
+            _fail(f"между блоками {i - 1} и {i} валидации и калибровки разрыв или наложение")
+    for name, gap in (("обучением и валидацией", inner[0][0] - lay.span("train")[1]),
+                      ("калибровкой и тестом", lay.span("test")[0] - inner[-1][1])):
         if gap < MIN_GAP_HOURS:
-            _fail(f"зазор {a}→{c} = {gap} ч < H + L_MAX = {MIN_GAP_HOURS} ч")
-    return b
+            _fail(f"зазор между {name} {gap} ч меньше горизонта и полной истории вместе "
+                  f"({MIN_GAP_HOURS} ч)")
+    return lay
 
 
 def check_climatology(store, deep=False):
@@ -85,7 +116,7 @@ def check_climatology(store, deep=False):
     коэффициенты: ловит кэш, в котором записанное окно не соответствует подгонке.
     """
     for sid, s in store.stations.items():
-        want = tuple(time_bounds(s["N"])["train"])
+        want = tuple(time_layout(s["N"]).span("train"))
         got = tuple(s.get("clim_fit") or ())
         if got != want:
             _fail(f"климатология {sid}: подогнана по окну {got or 'неизвестно'}, "
@@ -108,11 +139,19 @@ def check_climatology(store, deep=False):
 
 
 def check_windows(datasets, store=None):
-    """Каждое окно каждого датасета лежит внутри своего временного окна.
+    """Проверяет, что окна датасетов не нарушают правил раскладки и ролей.
 
-    Датасет обязан отдавать footprints(): записи dict(sid, N, time_key, lo, hi),
-    где [lo, hi) — часы, которые читают окна (история + горизонт). Границы
-    пересчитываются заново через time_bounds, а не берутся из датасета.
+    Args:
+        datasets: датасеты окон.
+        store: набор станций; если задан, проверяются ещё и роли станций.
+
+    Returns:
+        Число проверенных окон.
+
+    Raises:
+        LeakageError: цель окна не лежит целиком в одном блоке своего окна, длина цели
+            не равна горизонту, история заходит в запретное окно или выходит за ряд,
+            либо станция чужой роли читается в обучении, калибровке или вне теста.
     """
     n = 0
     for ds in datasets:
@@ -123,13 +162,11 @@ def check_windows(datasets, store=None):
             key = fp["time_key"]
             if key not in TIME_KEYS:
                 _fail(f"{name}: неизвестное временное окно {key!r}")
-            lo, hi = time_bounds(fp["N"])[key]
-            flo, fhi = np.asarray(fp["lo"]), np.asarray(fp["hi"])
-            bad = np.flatnonzero((flo < lo) | (fhi > hi))
-            if bad.size:
-                i = int(bad[0])
-                _fail(f"{name}: окно станции {fp['sid']} [{int(flo[i])}, {int(fhi[i])}) "
-                      f"выходит за окно {key} [{lo}, {hi}) (всего {bad.size} окон)")
+            if "t" not in fp:
+                _fail(f"{name}: окна станции {fp['sid']} без начала горизонта (нет поля t)")
+            lay = time_layout(fp["N"])
+            flo, ft, fhi = (np.asarray(fp[k], np.int64) for k in ("lo", "t", "hi"))
+            _check_window_arrays(name, fp["sid"], key, lay, flo, ft, fhi)
             if store is not None:
                 role = store.stations[fp["sid"]]["role"]
                 if key in ALLOWED_ROLES and role not in ALLOWED_ROLES[key]:
@@ -140,6 +177,28 @@ def check_windows(datasets, store=None):
                           f"внешние станции читаются только в {sorted(EXTERNAL_TIME_KEYS)}")
             n += flo.size
     return n
+
+
+def _check_window_arrays(name, sid, key, lay, lo, t, hi):
+    def first(bad):
+        i = int(np.flatnonzero(bad)[0])
+        return f"[{int(lo[i])}, {int(t[i])}, {int(hi[i])}) (всего {int(bad.sum())} окон)"
+
+    bad = hi - t != H
+    if bad.any():
+        _fail(f"{name}: окно станции {sid} {first(bad)}: длина цели не равна горизонту {H} ч")
+    bad = (lo > t) | (lo < 0) | (hi > lay.n_hours)
+    if bad.any():
+        _fail(f"{name}: окно станции {sid} {first(bad)} выходит за ряд или история после цели")
+    bad = lay.block_index(key, t, hi) < 0
+    if bad.any():
+        _fail(f"{name}: цель окна станции {sid} {first(bad)} не лежит целиком в одном "
+              f"блоке окна {key}")
+    for other in HISTORY_FORBIDDEN[key]:
+        bad = lay.overlaps((other,), lo, t)
+        if bad.any():
+            _fail(f"{name}: история окна {key} станции {sid} {first(bad)} заходит в окно "
+                  f"{other}")
 
 
 def selection_record(val_ds, monitor):
@@ -264,7 +323,7 @@ def check_external(store, external_store, checkpoints=(), conformal=None, near_k
 def run_checklist(store, datasets=(), conformal=None, checkpoints=(), deep=False,
                   external_store=None):
     for s in store.stations.values():
-        check_time_bounds(s["N"])
+        check_time_layout(s["N"])
     check_climatology(store, deep=deep)
     n_windows = check_windows(datasets, store)
     if conformal:

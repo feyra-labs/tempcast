@@ -2,21 +2,20 @@
 
 Три датакласса верхнего уровня:
 
-* ``ModelConfig`` (МАЯК), ``GRUConfig``, ``DLinearConfig``, ``LRUConfig``,
-  ``PatchTSTConfig`` - архитектура. Всё, что раньше лежало глобальными константами
-  и числами в конструкторах модулей;
-* ``DataConfig`` - пути, временные окна, пороги масок, параметры аугментаций, QC окна;
-* ``TrainConfig`` - это ``mayak.protocol.Protocol`` (единый протокол
+* ModelConfig (МАЯК), GRUConfig, DLinearConfig, LRUConfig,
+  PatchTSTConfig - архитектура;
+* DataConfi - пути, временные окна, пороги масок, параметры аугментаций, QC окна;
+* TrainConfig - это mayak.protocol.Protocol (единый протокол
   обучения): шаги, батч, оптимизатор, расписание, ранняя остановка, сиды;
-* ``RobustnessConfig`` - сценарии робастности обученной модели: какие
+* RobustnessConfig - сценарии робастности обученной модели: какие
   преобразования окна, на каких уровнях деградации, на каких станциях и лидах,
   допуск проверки скилла. Читается ``mayak.robustness``, в обучение не входит.
-* ``CalibrationConfig`` - анализ калибровки: номинал и допуск покрытия,
+* CalibrationConfig - анализ калибровки: номинал и допуск покрытия,
   пороги страт, бутстрап, критерий условной поправки, сетка кривой «острота против
   покрытия», параметры адаптивной калибровки на устройстве. Читается
-  ``mayak.calibration`` и рантаймом, в обучение не входит.
+  mayak.calibration и рантаймом, в обучение не входит.
 
-``RunConfig`` собирает три части в один объект - его полностью разрешённая форма
+RunConfig собирает три части в один объект - его полностью разрешённая форма
 пишется рядом с чекпойнтом и внутри него.
 """
 from __future__ import annotations
@@ -29,7 +28,7 @@ from typing import Any, Optional
 
 from mayak.constants import H, L_MAX, QUANTILES
 from mayak.data.masking import TargetMaskConfig
-from mayak.data.splits import ROLE_TEST, ROLES, TIME_BOUNDS
+from mayak.data.splits import ROLE_TEST, ROLES, TIME_LAYOUT
 from mayak.metrics import ACIParams, interval_indices
 from mayak.protocol import DEFAULT_PROTOCOL, Protocol, Seeds
 
@@ -785,7 +784,7 @@ ZONE_WEIGHTINGS = {"uniform": 0.0, "inv_sqrt": 0.5, "inv": 1.0}
 class DataConfig:
     manifest: str = "data/manifest.csv"
     cache_root: Optional[str] = None
-    time_bounds: dict = field(default_factory=lambda: dict(TIME_BOUNDS))
+    time_layout: dict = field(default_factory=lambda: dict(TIME_LAYOUT))
     target_mask: TargetMaskConfig = TargetMaskConfig()
     val_every_hours: int = 72
     val_max_windows: int = 8000
@@ -807,11 +806,12 @@ class DataConfig:
                 TargetMaskConfig, self.target_mask, "data.target_mask")))
         if not isinstance(self.augment, AugmentConfig):
             object.__setattr__(self, "augment", AugmentConfig.from_dict(self.augment))
-        tb = dict(self.time_bounds)
-        if tb != dict(TIME_BOUNDS):
-            raise ConfigError(f"data.time_bounds = {tb} расходится с контрактом сплитов "
-                              f"{dict(TIME_BOUNDS)} (mayak/data/splits.py, входит в ключ кэша)")
-        object.__setattr__(self, "time_bounds", tb)
+        tl = dict(self.time_layout)
+        if tl != dict(TIME_LAYOUT):
+            raise ConfigError(f"data.time_layout = {tl} расходится с контрактом сплитов "
+                              f"{dict(TIME_LAYOUT)}: раскладка входит в ключ кэша и "
+                              f"задаётся только в коде")
+        object.__setattr__(self, "time_layout", tl)
         if self.val_every_hours < 1 or self.val_max_windows < 1:
             raise ConfigError("val_every_hours и val_max_windows ≥ 1")
         if not isinstance(self.window_qc, bool):
