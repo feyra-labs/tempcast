@@ -18,8 +18,9 @@ from collections import Counter
 import numpy as np
 
 from mayak.data.splits import (DEFAULT_TEST_FRAC, DEFAULT_VAL_FRAC, MIN_TRAIN_YEARS,
-                               ROLE_EXTERNAL, ROLES, SPLITS_VERSION, TIME_LAYOUT, assign_roles,
-                               min_hours_for_train_years, strata_report, time_layout)
+                               ROLE_EXTERNAL, ROLES, TIME_LAYOUT, assign_roles,
+                               layout_fingerprint, min_hours_for_train_years, strata_report,
+                               time_layout)
 from mayak.data.store import read_manifest, source_path
 
 REPORT_NAME = "splits_report.json"
@@ -135,7 +136,8 @@ def main():
         requested=info["requested"], assigned=counts,
         strata=[dict(koppen=kop, band=band, **{r: cnt.get(r, 0) for r in ROLES})
                 for (kop, band), cnt in strata.items()],
-        splits_version=SPLITS_VERSION, time_layout=dict(TIME_LAYOUT),
+        time_layout=dict(TIME_LAYOUT),
+        layout_code=layout_fingerprint(),
         series=dict(stations=len(lengths), required_hours=need,
                     min_hours=lengths[0] if lengths else None,
                     median_hours=int(np.median(lengths)) if lengths else None,

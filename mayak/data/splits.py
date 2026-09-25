@@ -17,11 +17,11 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from mayak.codehash import code_digests, combined_digest
 from mayak.constants import H, L_MAX
 
 log = logging.getLogger(__name__)
 
-SPLITS_VERSION = "3"   # Увеличивать при изменении; входит в ключ кэша.
 MIN_GAP_HOURS = H + L_MAX
 TIME_LAYOUT = dict(hours_per_year=8766, test_frac=0.3, n_blocks=12, gap_hours=MIN_GAP_HOURS)
 TIME_KEYS = ("train", "val", "calib", "test")
@@ -30,6 +30,12 @@ MIN_BLOCK_HOURS = H + 1
 
 HISTORY_FORBIDDEN = {"train": ("val", "calib", "test"), "val": ("train", "test"),
                      "calib": ("train", "test"), "test": ("train", "val", "calib")}
+
+LAYOUT_CODE = {
+    "mayak.data.splits": ("MIN_GAP_HOURS", "TIME_LAYOUT", "TIME_KEYS", "BLOCK_KEYS",
+                          "MIN_BLOCK_HOURS", "HISTORY_FORBIDDEN", "TimeLayout", "time_layout"),
+    "mayak.constants": ("H", "L_MAX"),
+}
 
 ROLE_TRAIN, ROLE_VAL, ROLE_TEST = "train", "unseen_val", "unseen_test"
 ROLES = (ROLE_TRAIN, ROLE_VAL, ROLE_TEST)
@@ -170,6 +176,19 @@ def time_layout(n_hours, **overrides):
                          f"{n_blocks} блоками: самые короткие блоки {short} меньше "
                          f"{MIN_BLOCK_HOURS} ч")
     return out
+
+
+def layout_fingerprint():
+    """Отпечаток кода временной раскладки ряда.
+
+    Меняется при смысловой правке раскладки, её параметров по умолчанию, горизонта,
+    длины истории и правил, куда может заходить история окна. Правка комментариев и
+    документации его не меняет.
+
+    Returns:
+        Строка из шестнадцатеричных цифр.
+    """
+    return combined_digest(code_digests(LAYOUT_CODE))
 
 
 def full_years(mask_T, t0_utc_h, lo, hi, min_month_frac=FULL_YEAR_MIN_MONTH_FRAC,

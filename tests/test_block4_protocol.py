@@ -137,9 +137,6 @@ def test_cache_stores_scale_fitted_on_train_window(store):
 
 def test_cache_key_depends_on_climatology_rules(manifest, monkeypatch):
     key = S.cache_key(S.key_payload(manifest))
-    monkeypatch.setattr(S, "CLIM_VERSION", "999")
-    assert S.cache_key(S.key_payload(manifest)) != key
-    monkeypatch.undo()
     monkeypatch.setitem(S.CLIM_PARAMS, "scale_n_day", 3)
     assert S.cache_key(S.key_payload(manifest)) != key
 

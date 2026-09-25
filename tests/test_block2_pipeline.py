@@ -172,9 +172,6 @@ def test_cache_key_depends_on_content_not_path(manifest, tmp_path, monkeypatch):
     k2 = _key(manifest)
     assert k2 not in (k0, k1)
 
-    monkeypatch.setattr(S, "QC_VERSION", "999")
-    assert _key(manifest) != k2
-    monkeypatch.undo()
     monkeypatch.setattr(S, "TIME_LAYOUT", dict(S.TIME_LAYOUT, n_blocks=6))
     assert _key(manifest) != k2
 
@@ -206,7 +203,7 @@ def test_station_without_climatology_is_excluded_and_reported(manifest):
     valid[-3000:] = 1
     _write_station(root, "s2", seed=2, valid=valid)
     path, _ = S.build_cache(manifest)
-    meta = json.loads((Path(path) / "meta.json").read_text())
+    meta = json.loads((Path(path) / "meta.json").read_text(encoding="utf-8"))
     assert "s2" in meta["excluded"]
     assert "s2" not in S.get_store(manifest).stations
 

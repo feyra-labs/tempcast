@@ -536,7 +536,7 @@ def built(tmp_path_factory):
     manifest = _manifest(root, rows)
     S._STORES.clear()
     path, _ = S.build_cache(manifest)
-    meta = json.loads((Path(path) / "meta.json").read_text())
+    meta = json.loads((Path(path) / "meta.json").read_text(encoding="utf-8"))
     with open(Path(path) / "qc_report.csv") as f:
         report = {r["id"]: r for r in csv.DictReader(f)}
     yield dict(manifest=manifest, path=path, meta=meta, report=report, root=root)
@@ -563,7 +563,7 @@ def test_qc_summary_counts_rules_and_checks(built):
     for name, c in qc["station_checks"].items():
         assert sum(c.values()) == 8, name
     assert qc["station_checks"]["dem_elevation"] == dict(**{"pass": 1, "fail": 1, "skip": 6})
-    assert qc["fingerprint"] == DEFAULT_QC.fingerprint() and qc["version"] == Q.QC_VERSION
+    assert qc["fingerprint"] == DEFAULT_QC.fingerprint() and "version" not in qc
 
 
 def test_report_has_every_station_with_status_and_reason(built):

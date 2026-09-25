@@ -3,13 +3,13 @@
 Скачанные файлы (scripts/fetch_ghcnh.py) → разбор T, Td, станционного давления и
 их штатных кодов качества → почасовая сетка без интерполяции (ближайший к целому
 часу отчёт в пределах допуска) → влажность из T и Td формулой модели →
-``<out>/stations/<id>.npz`` + ``<out>/manifest.csv`` (роль external_test) +
-``<out>/selection_report.csv``.
+<out>/stations/<id>.npz + <out>/manifest.csv (роль external_test) +
+<out>/selection_report.csv.
 
 Метаданные станции:
   * координаты - из списка станций;
-  * высота, которую видит модель (``elev``) - из цифровой модели рельефа в точке
-    станции, как у обучающих точек; заявленная высота станции - ``station_elev``,
+  * высота, которую видит модель (elev) - из цифровой модели рельефа в точке
+    станции, как у обучающих точек; заявленная высота станции - station_elev,
     их расхождение проверяет станционный QC и показывает разрез оценки;
   * зона Кёппена - полная, из растровой карты (Beck et al.).
 
@@ -19,6 +19,10 @@
                   высоты пришли из Open-Meteo, это та же модель рельефа;
   <путь к .tif>   локальный растр или VRT-мозаика в WGS84;
   station         без ЦМР: высота станции (явное отклонение от плана, пишется в лог).
+
+Рядом с манифестом пишется запись о том, каким кодом собраны файлы станций:
+сборка кэша откажется работать, если этот код потом изменится, а набор не
+пересоберут.
 
 Затем - кэш и QC тем же модулем, что для обучения:
     python scripts/build_cache.py --manifest data/ghcnh/manifest.csv
@@ -31,6 +35,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -38,8 +43,20 @@ import urllib.request
 import numpy as np
 
 from mayak.data.ghcnh import build_external_dataset, read_station_list
+from mayak.data.store import write_source_build, command_line
 
 log = logging.getLogger("make_ghcnh")
+
+BUILD_CODE = {
+    "mayak.astro": ("rh_from_dewpoint",),
+    "mayak.constants": ("H", "L_MAX", "MAGNUS_A", "MAGNUS_B"),
+    "mayak.data.ghcnh": None,
+    "mayak.data.rasters": None,
+    "mayak.data.splits": None,
+    "mayak.timeaxis": None,
+    "mayak.zones": ("KOPPEN_ZONES", "KG_TIF_CODE", "UNKNOWN_ZONE"),
+    "scripts/make_ghcnh.py": None,
+}
 
 OPEN_METEO_ELEVATION = "https://api.open-meteo.com/v1/elevation"
 
@@ -128,6 +145,8 @@ def main():
             w = csv.DictWriter(f, fieldnames=list(mrows[0]) if mrows else ["id"])
             w.writeheader()
             w.writerows(mrows)
+    write_source_build(args.out, "make_ghcnh",
+                       command_line(["python", "scripts/make_ghcnh.py", *sys.argv[1:]]), BUILD_CODE)
     reasons = {}
     for r in report:
         if r["status"] != "included":

@@ -322,7 +322,7 @@ def test_other_parameters_or_points_are_refused(tmp_path):
 def test_fetch_meta_describes_download(tmp_path):
     points = _write_points(tmp_path / "points.csv", n=3)
     _write_downloaded(tmp_path, points, SIG, skip={"p0001"})
-    meta = json.loads((tmp_path / "fetch_meta.json").read_text("utf-8"))
+    meta = json.loads((tmp_path / "fetch_meta.json").read_text(encoding="utf-8"))
     assert meta["endpoint"] == "/v1/archive" and meta["model"] == "era5"
     assert meta["variables"] == list(E.VARIABLES) and meta["timezone"] == "GMT"
     assert (meta["start_date"], meta["end_date"]) == ("2021-01-01", "2021-03-31")
@@ -364,6 +364,12 @@ def test_pipeline_from_points_to_cache(koppen_tif, tmp_path, monkeypatch):
 
     assert _run_script(monkeypatch, "make_era5", ["--data", str(data)]) == 0
     manifest = data / "manifest.csv"
+    with open(data / S.SOURCE_BUILD_NAME, encoding="utf-8") as f:
+        build = json.load(f)
+    assert build["builder"] == "make_era5"
+    assert build["command"] == S.command_line(["python", "scripts/make_era5.py",
+                                               "--data", str(data)])
+    assert set(build["code"]) == set(_load_script("make_era5").BUILD_CODE)
     with open(manifest, newline="") as f:
         header = next(csv.reader(f))
     assert header == ["id", "lat", "lon", "elev", "koppen", "cell_lat", "cell_lon"]
@@ -384,7 +390,7 @@ def test_pipeline_from_points_to_cache(koppen_tif, tmp_path, monkeypatch):
     S._STORES.clear()
     path, built = S.build_cache(str(manifest), jobs=1)
     assert built
-    with open(Path(path) / "meta.json") as f:
+    with open(Path(path) / "meta.json", encoding="utf-8") as f:
         meta = json.load(f)
     assert meta["qc"]["stations_total"] == 12
     assert meta["qc"]["stations_included"] == 12

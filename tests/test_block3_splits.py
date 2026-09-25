@@ -122,7 +122,7 @@ def test_short_station_is_excluded_from_cache(tmp_path):
                                    for s in ("ok", "short")])
     path, _ = S.build_cache(m)
     import json
-    excluded = json.load(open(Path(path) / "meta.json"))["excluded"]
+    excluded = json.loads((Path(path) / "meta.json").read_text(encoding="utf-8"))["excluded"]
     assert set(excluded) == {"short"} and "сплиты" in excluded["short"]
 
 
@@ -373,7 +373,7 @@ def test_checkpoint_selection_check(store, manifest, dm, tmp_path):
         "no_monitor": selection_record(dm.val_ds, None),
         "test_window": selection_record(on_test, "val/loss"),
         "calib_window": selection_record(on_calib, "val/loss"),
-        "old_splits": dict(selection_record(dm.val_ds, "val/loss"), splits_version="1"),
+        "old_splits": dict(selection_record(dm.val_ds, "val/loss"), layout_code="0" * 16),
     }
     for name, rec in bad.items():
         with pytest.raises(LeakageError):

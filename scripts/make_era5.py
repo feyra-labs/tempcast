@@ -4,6 +4,9 @@
 почасовой сетке UTC без интерполяции и пишет файл на каждую станцию и манифест.
 Высота станции берётся из ответа API: это высота цифровой модели рельефа, к
 которой API привёл условия в точке. Зона Кёппена берётся из таблицы точек.
+Рядом с манифестом пишется запись о том, каким кодом собраны файлы станций:
+сборка кэша откажется работать, если этот код потом изменится, а набор не
+пересоберут.
 """
 import argparse
 import csv
@@ -15,9 +18,11 @@ import numpy as np
 
 from mayak.data.era5 import (CHANNELS, MODEL, haversine_km, parse_location, raw_matches,
                              raw_path, read_raw)
+from mayak.data.store import command_line, write_source_build
 from mayak.timeaxis import from_utc_hour, to_hourly_grid
 
 MANIFEST_FIELDS = ("id", "lat", "lon", "elev", "koppen", "cell_lat", "cell_lon")
+BUILD_CODE = {"mayak.data.era5": None, "mayak.timeaxis": None, "scripts/make_era5.py": None}
 
 
 def build_station(record):
@@ -104,6 +109,8 @@ def main():
         writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
+    write_source_build(out_dir, "make_era5",
+                       command_line(["python", "scripts/make_era5.py", *sys.argv[1:]]), BUILD_CODE)
 
     if rows:
         shift = haversine_km(np.array([r["lat"] for r in rows]), np.array([r["lon"] for r in rows]),

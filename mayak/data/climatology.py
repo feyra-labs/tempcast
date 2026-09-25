@@ -3,8 +3,6 @@ import math
 
 import numpy as np
 
-CLIM_VERSION = "2"  # Увеличивать при изменении; входит в ключ кэша
-
 ABS_TO_SD = math.sqrt(math.pi / 2.0)
 SCALE_FLOOR_FRAC = 0.2
 

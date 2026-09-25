@@ -27,16 +27,14 @@ import numpy as np
 
 from mayak.constants import H
 from mayak.data.splits import (BLOCK_KEYS, HISTORY_FORBIDDEN, MIN_BLOCK_HOURS, MIN_GAP_HOURS,
-                               ROLE_EXTERNAL, ROLE_TRAIN, ROLE_VAL, SPLITS_VERSION, TIME_KEYS,
-                               TIME_LAYOUT, time_layout)
+                               ROLE_EXTERNAL, ROLE_TRAIN, ROLE_VAL, TIME_KEYS,
+                               TIME_LAYOUT, layout_fingerprint, time_layout)
 
 log = logging.getLogger(__name__)
 
 SELECTION_KEY = "mayak_selection"          # ключ записи о выборе чекпойнта в .ckpt
 SELECTION_TIME_KEY, CONFORMAL_TIME_KEY = "val", "calib"
-# какие роли станций допустимы в окнах датасета с данным временным ключом
 ALLOWED_ROLES = {"train": {ROLE_TRAIN}, "calib": {ROLE_VAL}}
-# в каких временных окнах допустимы станции внешнего теста
 EXTERNAL_TIME_KEYS = {"test"}
 
 
@@ -49,14 +47,33 @@ def _fail(msg):
 
 
 def _split_state():
-    return dict(splits_version=SPLITS_VERSION, time_layout=dict(TIME_LAYOUT))
+    """Правила сплитов, при которых построен артефакт.
+
+    Совпадение правил проверяется по параметрам раскладки и отпечатку её кода.
+
+    Returns:
+        Словарь для записи рядом с артефактом.
+    """
+    return dict(time_layout=dict(TIME_LAYOUT), layout_code=layout_fingerprint())
 
 
 def _check_split_state(rec, what):
-    if rec.get("splits_version") != SPLITS_VERSION or rec.get("time_layout") != dict(TIME_LAYOUT):
-        _fail(f"{what}: построено при других правилах сплитов "
-              f"({rec.get('splits_version')}, {rec.get('time_layout')}), "
-              f"сейчас ({SPLITS_VERSION}, {dict(TIME_LAYOUT)}); пересоберите")
+    """Проверяет, что артефакт построен при текущих правилах сплитов.
+
+    Args:
+        rec: запись о правилах из артефакта.
+        what: название артефакта для сообщения.
+
+    Raises:
+        LeakageError: параметры раскладки или её код отличаются от текущих.
+    """
+    diff = []
+    if rec.get("time_layout") != dict(TIME_LAYOUT):
+        diff.append(f"параметры раскладки {rec.get('time_layout')}, сейчас {dict(TIME_LAYOUT)}")
+    if rec.get("layout_code") != layout_fingerprint():
+        diff.append(f"код раскладки {rec.get('layout_code')}, сейчас {layout_fingerprint()}")
+    if diff:
+        _fail(f"{what}: построено при других правилах сплитов: {'; '.join(diff)}; пересоберите")
 
 
 def _check_station_roles(stations, store, role, what):

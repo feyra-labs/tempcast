@@ -1,7 +1,10 @@
 """Офлайн-сборка кэша станций: QC + станционные проверки + отбор + климатология.
 
 Все остальные шаги читают готовый кэш и никогда не пересчитывают QC.
-Повторный запуск при неизменных источниках и правилах = только хеширование.
+Повторный запуск при неизменных источниках и правилах - только хеширование.
+Ключ кэша зависит от содержимого источников, конфига QC, параметров
+климатологии, раскладки сплитов и отпечатка кода правил. При пересборке
+печатается, какая из этих частей изменилась.
 Отчёт QC - артефакт сборки: <кэш>/qc_report.csv (по станциям, включая исключённые)
 и раздел "qc" в <кэш>/meta.json (по набору).
 
@@ -28,11 +31,19 @@ def main():
 
     t = time.perf_counter()
     path, built = build_cache(args.manifest, args.cache_root, jobs=args.jobs, force=args.force)
-    with open(os.path.join(path, "meta.json")) as f:
+    with open(os.path.join(path, "meta.json"), encoding="utf-8") as f:
         meta = json.load(f)
     print(("собран" if built else "уже актуален"), f"за {time.perf_counter() - t:.1f} с:", path)
+    if built:
+        rebuild = meta["rebuild"]
+        print("причина сборки" + (f" (прошлая сборка {rebuild['previous_key']})"
+                                  if rebuild["previous_key"] else "") + ":")
+        for reason in rebuild["reasons"]:
+            print(f"  {reason}")
+    print("отпечаток кода правил:", ", ".join(f"{unit} {digest}" for unit, digest
+                                              in meta["payload"]["code"].items()))
     qc = meta["qc"]
-    print(f"QC {qc['version']} ({qc['fingerprint']}): станций {qc['stations_included']} "
+    print(f"QC, конфиг {qc['fingerprint']}: станций {qc['stations_included']} "
           f"из {qc['stations_total']}")
     for rule, cnt in qc["excluded_by_rule"].items():
         print(f"  исключено по правилу {rule}: {cnt}")

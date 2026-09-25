@@ -11,25 +11,48 @@ import hashlib
 import json
 import logging
 import os
+import shlex
 import shutil
+import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, field
 
 import numpy as np
 
-from mayak.data.climatology import CLIM_VERSION, Climatology
-from mayak.data.qc import (DEFAULT_QC, QC_CODE_DOC, QC_VERSION, STATION_CHECKS,
+from mayak.codehash import code_digests, unit_digest
+from mayak.data.climatology import Climatology
+from mayak.data.qc import (DEFAULT_QC, QC_CODE_DOC, STATION_CHECKS,
                            code_fractions, qc_station, station_checks, station_selection)
-from mayak.data.splits import (EXTERNAL_MIN_TRAIN_YEARS, ROLE_EXTERNAL, SPLITS_VERSION,
-                               TIME_LAYOUT, full_years, time_layout)
-from mayak.timeaxis import CALENDAR_VERSION, legacy_t0, window_calendar
+from mayak.data.splits import (EXTERNAL_MIN_TRAIN_YEARS, ROLE_EXTERNAL, TIME_LAYOUT, full_years,
+                               layout_fingerprint, time_layout)
+from mayak.timeaxis import legacy_t0, window_calendar
 
 log = logging.getLogger(__name__)
 
-CACHE_FORMAT = "3"   # Увеличивать при изменении; входит в ключ кэша.
 CLIM_PARAMS = dict(n_year=3, n_day=3, scale_n_year=2, scale_n_day=2, min_valid=24 * 30)
 CLIM_BASIS = ("n_year", "n_day", "scale_n_year", "scale_n_day")
+
+CACHE_CODE = {
+    "mayak.constants": ("H", "L_MAX"),
+    "mayak.data.climatology": None,
+    "mayak.data.masking": None,
+    "mayak.data.qc": None,
+    "mayak.data.splits": None,
+    "mayak.data.store": ("CLIM_PARAMS", "CLIM_BASIS", "new_climatology", "read_source",
+                         "_opt_float", "qc_meta", "qc_elev", "process_station",
+                         "_process_station_args", "qc_summary", "write_qc_report",
+                         "build_cache"),
+    "mayak.timeaxis": None,
+}
+
+CACHE_CODE_IGNORED = ("mayak.codehash", "check_sources", "read_manifest", "source_path",
+                      "key_payload", "cache_key", "default_cache_root", "previous_build",
+                      "rebuild_reasons", "log")
+KEY_PARTS = {"sources": "источники", "qc_config": "конфиг QC",
+             "clim_params": "параметры климатологии", "layout": "раскладка сплитов",
+             "code": "код правил"}
+SOURCE_BUILD_NAME = "source_build.json"
 
 
 def new_climatology():
@@ -97,14 +120,26 @@ def qc_elev(meta):
 
 
 def key_payload(manifest, rows=None, qc_cfg=DEFAULT_QC):
+    """Всё, от чего зависит содержимое кэша, по частям.
+
+    Args:
+        manifest: путь к манифесту.
+        rows: строки манифеста, если они уже прочитаны.
+        qc_cfg: пороги контроля качества.
+
+    Returns:
+        Словарь частей ключа: источники, конфиг QC, параметры климатологии,
+        раскладка сплитов и отпечатки кода правил.
+    """
     rows = read_manifest(manifest) if rows is None else rows
     stations = sorted((r["id"], file_sha256(source_path(manifest, r["id"])),
                        sorted(qc_meta(r).items())) for r in rows)
     return {
-        "format": CACHE_FORMAT, "qc": [QC_VERSION, qc_cfg.to_dict()],
-        "calendar": CALENDAR_VERSION,
-        "clim": [CLIM_VERSION, CLIM_PARAMS], "splits": [SPLITS_VERSION, TIME_LAYOUT],
-        "stations": stations,
+        "sources": stations,
+        "qc_config": qc_cfg.to_dict(),
+        "clim_params": dict(CLIM_PARAMS),
+        "layout": dict(params=dict(TIME_LAYOUT), code=layout_fingerprint()),
+        "code": code_digests(CACHE_CODE),
     }
 
 
@@ -115,6 +150,162 @@ def cache_key(payload):
 
 def default_cache_root(manifest):
     return os.path.join(os.path.dirname(os.path.abspath(manifest)), "cache")
+
+
+def previous_build(root, manifest):
+    """Метаданные самой свежей готовой сборки того же манифеста.
+
+    Args:
+        root: каталог кэшей.
+        manifest: абсолютный путь к манифесту.
+
+    Returns:
+        Словарь метаданных сборки или None, если готовых сборок нет.
+    """
+    if not os.path.isdir(root):
+        return None
+    best, best_time = None, -1
+    for name in os.listdir(root):
+        path = os.path.join(root, name, "meta.json")
+        if name.startswith(".") or not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8") as f:
+                meta = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if meta.get("manifest") not in (None, manifest):
+            continue
+        when = os.stat(path).st_mtime_ns
+        if when > best_time:
+            best, best_time = meta, when
+    return best
+
+
+def _short(ids, limit=5):
+    return ", ".join(ids[:limit]) + (", …" if len(ids) > limit else "")
+
+
+def _changed_keys(old, new):
+    out = []
+    for k in sorted(set(old) | set(new)):
+        a, b = old.get(k), new.get(k)
+        if a == b:
+            continue
+        if isinstance(a, dict) and isinstance(b, dict):
+            out += [f"{k}.{sub}" for sub in _changed_keys(a, b)]
+        else:
+            out.append(k)
+    return out
+
+
+def _sources_change(old, new):
+    a = {s[0]: (s[1], s[2]) for s in old}
+    b = {s[0]: (s[1], s[2]) for s in new}
+    both = sorted(a.keys() & b.keys())
+    content = [i for i in both if a[i][0] != b[i][0]]
+    groups = (("добавлены", sorted(b.keys() - a.keys())),
+              ("удалены", sorted(a.keys() - b.keys())),
+              ("изменено содержимое", content),
+              ("изменены метаданные", [i for i in both if i not in content and a[i] != b[i]]))
+    return "; ".join(f"{title} {len(ids)} ({_short(ids)})" for title, ids in groups if ids)
+
+
+def rebuild_reasons(old, new):
+    """Какие части ключа кэша изменились с прошлой сборки.
+
+    Args:
+        old: части ключа прошлой сборки или None, если её нет.
+        new: части ключа текущей сборки.
+
+    Returns:
+        Список строк, по одной на изменившуюся часть ключа.
+    """
+    if old is None:
+        return ["первая сборка: готовых сборок этого манифеста нет"]
+    if not set(KEY_PARTS) & set(old):
+        return ["прошлая сборка сделана с ключом другого состава, части не сравнить"]
+    new = json.loads(json.dumps(new))
+    out = []
+    for part, title in KEY_PARTS.items():
+        a, b = old.get(part), new.get(part)
+        if a == b:
+            continue
+        if a is None:
+            detail = "в прошлой сборке этой части ключа нет"
+        elif part == "sources":
+            detail = _sources_change(a, b)
+        elif isinstance(a, dict) and isinstance(b, dict):
+            detail = "изменились " + ", ".join(_changed_keys(a, b))
+        else:
+            detail = "изменилось значение"
+        out.append(f"{title}: {detail}")
+    return out or ["ключ совпадает с прошлой сборкой"]
+
+
+def command_line(args):
+    """Команда одной строкой, как её набирают в оболочке этой системы.
+
+    Args:
+        args: аргументы команды, первой идёт программа.
+
+    Returns:
+        Строка с кавычками по правилам Windows или POSIX.
+    """
+    return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+
+
+def write_source_build(out_dir, builder, command, spec):
+    """Записывает рядом с манифестом, каким кодом собраны файлы станций.
+
+    Args:
+        out_dir: каталог набора, где лежат манифест и файлы станций.
+        builder: короткое имя сборщика для сообщений.
+        command: команда, которой набор пересобирается.
+        spec: словарь: единица кода и кортеж имён определений, None означает весь файл.
+
+    Returns:
+        Путь к записанному файлу.
+    """
+    code = {unit: dict(names=None if names is None else sorted(names),
+                       digest=unit_digest(unit, names)) for unit, names in sorted(spec.items())}
+    path = os.path.join(out_dir, SOURCE_BUILD_NAME)
+    tmp = path + ".part"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(dict(builder=builder, command=command, code=code), f, ensure_ascii=False,
+                  indent=1)
+    os.replace(tmp, path)
+    return path
+
+
+def check_sources(manifest):
+    """Проверяет, что файлы станций собраны тем же кодом, что сейчас в репозитории.
+
+    Args:
+        manifest: путь к манифесту.
+
+    Raises:
+        RuntimeError: код сборщика изменился после сборки файлов станций. В
+            сообщении перечислены изменившиеся части и команда пересборки.
+    """
+    folder = os.path.dirname(os.path.abspath(manifest))
+    path = os.path.join(folder, SOURCE_BUILD_NAME)
+    if not os.path.exists(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        rec = json.load(f)
+    changed = []
+    for unit, item in sorted(rec.get("code", {}).items()):
+        try:
+            now = unit_digest(unit, item.get("names"))
+        except (OSError, ImportError, ValueError, SyntaxError):
+            now = None
+        if now != item.get("digest"):
+            changed.append(unit)
+    if changed:
+        raise RuntimeError(f"файлы станций в {folder} собраны другим кодом сборщика "
+                           f"{rec.get('builder')} (изменились: {', '.join(changed)}); "
+                           f"пересоберите их: {rec.get('command')}")
 
 
 def process_station(path, meta=None, qc_cfg=DEFAULT_QC):
@@ -176,7 +367,7 @@ def qc_summary(results, rows, all_codes, all_mask, qc_cfg=DEFAULT_QC):
         for name, c in res["checks"].items():
             checks[name][c["status"]] += 1
     return dict(
-        version=QC_VERSION, config=qc_cfg.to_dict(), fingerprint=qc_cfg.fingerprint(),
+        config=qc_cfg.to_dict(), fingerprint=qc_cfg.fingerprint(),
         codes=QC_CODE_DOC,
         stations_total=len(rows), stations_included=sum("error" not in r for r in results),
         excluded_by_rule=dict(sorted(by_rule.items())),
@@ -186,6 +377,23 @@ def qc_summary(results, rows, all_codes, all_mask, qc_cfg=DEFAULT_QC):
 
 
 def build_cache(manifest, cache_root=None, jobs=1, force=False, qc_cfg=DEFAULT_QC):
+    """Собирает кэш станций, если для текущего ключа его ещё нет.
+
+    Args:
+        manifest: путь к манифесту.
+        cache_root: каталог кэшей; по умолчанию каталог cache рядом с манифестом.
+        jobs: число процессов обработки станций.
+        force: пересобрать, даже если кэш с таким ключом уже есть.
+        qc_cfg: пороги контроля качества.
+
+    Returns:
+        Пара: путь к каталогу кэша и признак, что он собран этим вызовом.
+
+    Raises:
+        RuntimeError: файлы станций собраны устаревшим кодом сборщика или ни одна
+            станция не прошла сборку.
+    """
+    check_sources(manifest)
     rows = read_manifest(manifest)
     t_start = time.perf_counter()
     payload = key_payload(manifest, rows, qc_cfg)
@@ -195,6 +403,13 @@ def build_cache(manifest, cache_root=None, jobs=1, force=False, qc_cfg=DEFAULT_Q
     log.info("кэш: ключ %s (хеширование источников %.1f с)", key, time.perf_counter() - t_start)
     if os.path.isdir(final) and not force:
         return final, False
+    previous = previous_build(root, os.path.abspath(manifest))
+    if os.path.isdir(final):
+        reasons = ["пересборка по требованию при том же ключе"]
+    else:
+        reasons = rebuild_reasons(None if previous is None else previous.get("payload"), payload)
+    for reason in reasons:
+        log.info("кэш: причина сборки - %s", reason)
 
     args = [(source_path(manifest, r["id"]), qc_meta(r), qc_cfg) for r in rows]
     if jobs > 1:
@@ -240,8 +455,11 @@ def build_cache(manifest, cache_root=None, jobs=1, force=False, qc_cfg=DEFAULT_Q
         json.dump(index, f)
     all_codes, all_mask = np.concatenate(cs), np.concatenate(ms)
     summary = qc_summary(results, rows, all_codes, all_mask, qc_cfg)
-    with open(os.path.join(tmp, "meta.json"), "w") as f:
-        json.dump(dict(key=key, payload=payload, excluded=excluded,
+    with open(os.path.join(tmp, "meta.json"), "w", encoding="utf-8") as f:
+        json.dump(dict(key=key, manifest=os.path.abspath(manifest),
+                       rebuild=dict(previous_key=None if previous is None else previous.get("key"),
+                                    reasons=reasons),
+                       payload=payload, excluded=excluded,
                        qc_total=code_fractions(all_codes), qc=summary,
                        build_seconds=time.perf_counter() - t_start),
                   f, indent=1, ensure_ascii=False)
@@ -324,6 +542,7 @@ def get_store(manifest, cache_root=None, mmap=False, build_if_missing=True, jobs
     hit = _STORES.get(memo)
     if hit is not None and hit[0] == fp and not rebuild:
         return hit[1]
+    check_sources(manifest)
     root = cache_root or default_cache_root(manifest)
     path = os.path.join(root, cache_key(key_payload(manifest, rows)))
     if rebuild or not os.path.isdir(path):

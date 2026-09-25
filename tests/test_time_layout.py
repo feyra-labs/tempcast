@@ -253,7 +253,7 @@ def test_layout_check_catches_broken_layout(monkeypatch):
 def test_old_split_records_are_rejected(store):
     from mayak.leakage import check_selection_record
     rec = dict(monitor="val/loss", station_role=ROLE_VAL, time_key="val", stations=["v0"],
-               splits_version="2", time_layout=dict(TIME_LAYOUT))
+               time_layout=dict(TIME_LAYOUT))
     with pytest.raises(LeakageError, match="других правилах сплитов"):
         check_selection_record(rec, store)
 

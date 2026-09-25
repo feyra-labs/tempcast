@@ -288,7 +288,7 @@ def external(tmp_path_factory):
     manifest = str(out / "manifest.csv")
     S._STORES.clear()
     path, _ = S.build_cache(manifest)
-    meta = json.loads((Path(path) / "meta.json").read_text())
+    meta = json.loads((Path(path) / "meta.json").read_text(encoding="utf-8"))
     yield dict(raw=raw, out=out, manifest=manifest, rows=rows, report=report, meta=meta,
                path=path, T_long=T_long)
     S._STORES.clear()
