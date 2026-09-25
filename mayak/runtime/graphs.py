@@ -168,7 +168,7 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
     """
     import onnx
     import onnxruntime as ort
-    from mayak.data.qc import PHYS
+    from mayak.data.qc import DEFAULT_QC, PHYS
     from mayak.metrics import I_MED, conformal_table
     from mayak.provenance import provenance
     from mayak.runtime.streaming import RAW_CHANNELS, STATE_HEADER, STATE_VERSION
@@ -226,6 +226,7 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
         format=GRAPH_FORMAT, model_config=cfg.to_dict(), dims=d,
         quantiles=list(cfg.quantiles), i_med=I_MED, zq=[float(v) for v in ZQ],
         raw_channels=list(RAW_CHANNELS), phys={c: list(PHYS[c]) for c in RAW_CHANNELS},
+        qc=dict(DEFAULT_QC.to_dict(), lookback_hours=DEFAULT_QC.lookback_hours),
         state=dict(version=STATE_VERSION, header_bytes=STATE_HEADER.itemsize,
                    nbytes=state_nbytes(cfg)),
         graphs=graphs, calibration=cal, export_check_max_abs=checks, opset=opset,
@@ -287,16 +288,12 @@ class OnnxBackend:
 
 
 class GraphRuntime:
-    """Хост поверх четырёх графов: кольцо сырого окна, буфер энкодера, моды, сутки.
-
-    Без калибровки и сериализации (они проверяются эталонными векторами против
-    ``StreamingMayak`` и ``mayak.metrics``). Нужен, чтобы отделить ошибку разбиения
-    модели на графы от ошибки хоста на Rust: GraphRuntime(TorchBackend) обязан совпасть
-    с StreamingMayak, GraphRuntime(OnnxBackend) - с ним же в пределах допуска экспорта.
-    """
+    """Хост поверх четырёх графов: кольцо сырого окна, буфер энкодера, моды, сутки."""
 
     def __init__(self, backend, cfg, lat, lon, elev):
+        from mayak.data.qc import CausalQC
         self.b, self.cfg = backend, cfg
+        self.qc = CausalQC(elev=elev)
         f = lambda v: np.array([[v]], np.float32)
         self.lat, self.lon = f(lat), f(lon)
         self.loc, *self.coefs, self.z0 = backend.run("init", self.lat, self.lon, f(elev))
@@ -305,6 +302,7 @@ class GraphRuntime:
     def reset(self):
         c = self.cfg
         W, M, D = c.stream_window, c.n_modes, c.history_days
+        self.qc.reset()
         self.raw_x = np.zeros((W, 3), np.float32)
         self.raw_m = np.zeros((W, 3), np.float32)
         self.head = 0
@@ -318,8 +316,8 @@ class GraphRuntime:
         self.z = self.z0.copy()
 
     def step(self, T, P, RH, doy, hour):
-        from mayak.data.qc import point_qc
-        x, m = point_qc(T, P, RH)
+        x, codes = self.qc.push((T, P, RH))
+        m = (codes == 0).astype(np.float32)
         W, j = self.cfg.stream_window, self.head
         self.raw_x[j], self.raw_m[j] = np.where(m > 0, x, 0.0), m
         self.head = (j + 1) % W

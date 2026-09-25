@@ -32,9 +32,10 @@ from torch.utils.data import DataLoader, Dataset
 
 from mayak import baselines as BL
 from mayak.constants import H, L_MAX, QUANTILES
-from mayak.data.dataset import (block_starts, footprint, history_len, norm_scale, slice_history,
-                                slice_target)
-from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats
+from mayak.data.dataset import (block_starts, footprint, history_len, norm_scale, slice_context,
+                                slice_history, slice_target, station_qc_elev)
+from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats, enforce_invariant
+from mayak.data.qc import qc_window
 from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, apply_conformal, breakdown,
                            by_lead, calibrate_forecast, coverage, metric_table, pinball_crps,
                            seed_spread, skill, wmean)
@@ -88,7 +89,11 @@ def stratified_items(per_station, max_windows=None, windows_per_station=None):
 
 
 class EvalSet(Dataset):
-    """Окна для оценки. ``items`` - пары (станция, час начала горизонта)."""
+    """Окна для оценки.
+
+    Attributes:
+        items: пары из станции и часа начала горизонта.
+    """
     def __init__(self, clims, station_splits=("train", "unseen_test"),
                  manifest="data/manifest.csv", time_key="test",
                  every_hours=72, L=None, max_windows=6000, windows_per_station=None,
@@ -160,21 +165,42 @@ class EvalSet(Dataset):
                     elev_gap=np.array(egap, object),
                     t=np.array([t for _sid, t in self.items], np.int64))
 
+    def raw_window(self, i):
+        """Сырая история окна до QC.
+
+        Args:
+            i: номер окна.
+
+        Returns:
+            Словарь: значения и маска наличия истории формы (L_MAX, 3), контекст QC
+            до истории, длина истории и высота для проверки давления.
+        """
+        sid, t = self.items[i]
+        s = self.clims[sid]
+        L = history_len(self.L, t, self.floor[sid])
+        x, m = slice_history(s["raw"], s["present"], t, L)
+        past = slice_context(s["raw"], s["present"], t, L, self.floor[sid])
+        return dict(x=x, m=m, past=past, L=L, qc_elev=station_qc_elev(s))
+
     def __getitem__(self, i):
         sid, t = self.items[i]
         s = self.clims[sid]
         clim = s["clim"]
         t0 = s["t0"]
-        L = history_len(self.L, t, self.floor[sid])
         k = np.arange(L_MAX)
         abs_h = t - L_MAX + k
         doy_h, hour_h = window_calendar(t0, abs_h)
-        x_hist, mask_hist = slice_history(s["x"], s["mask"], t, L)
+        w = self.raw_window(i)
+        x_hist, mask_hist = w["x"], w["m"]
+        if w["L"] > 0:
+            mask_hist, _ = qc_window(x_hist, mask_hist, elev=w["qc_elev"], past=w["past"])
+            x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
         fut = np.arange(t, t + H)
         doy_f, hour_f = window_calendar(t0, fut)
         y, y_mask = slice_target(s["x"], s["mask"], t)
         mu_clim_fut = clim.predict(doy_f, hour_f).astype(np.float32)
-        a_recent, _ = BL.recent_anomaly(s["x"][:, 0], s["mask"][:, 0], clim, t, t0)
+        a_recent, _ = BL.recent_anomaly(x_hist[:, 0], mask_hist[:, 0], clim, L_MAX,
+                                        int(t0) + int(t) - L_MAX)
         return {
             "lat": torch.tensor(s["lat"], dtype=torch.float32),
             "lon": torch.tensor(s["lon"], dtype=torch.float32),

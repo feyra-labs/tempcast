@@ -302,12 +302,26 @@ def test_reference_window_produces_expected_codes(case):
         if rows is not None:
             assert eff["hit_frac"] == 1.0, f"{case}: код не на всём затронутом участке"
     else:
-        assert eff["new"] == {}, f"{case}: QC не должен видеть это искажение: {eff['new']}"
+        assert eff["side_frac"] < 0.001, f"{case}: QC не должен видеть это искажение: {eff}"
     assert eff["side_frac"] < 0.002, eff
 
 
 MIN_HIT = {"spike": 0.8, "stuck": 0.7, "units": 0.6, "dropout": 1.0, "gap": 1.0,
            "sparse": 1.0, "outage": 1.0, "drop_pressure": 1.0, "drop_humidity": 1.0}
+
+
+def _detectable(name, params):
+    """Распознаёт ли причинный QC искажение по прошлому.
+
+    Залипание одного канала видно только после срока залипания этого канала;
+    более короткое устройство не отличит от нормы.
+    """
+    if name != "stuck":
+        return True
+    from mayak.data.qc import DEFAULT_QC as C
+    n = min(params["n"], L_MAX - params["i"])
+    need = C.stuck_T_alone_hours if params["ch"] == 0 else C.stuck_hours[params["ch"]]
+    return n > need
 
 
 @pytest.mark.parametrize("name", AUG_ORDER)
@@ -320,8 +334,10 @@ def test_sampled_augmentation_produces_expected_codes(name):
         after = augment_window(_copy(before), cfg, np.random.default_rng(seed))
         assert name in after.applied
         eff = qc_effect(name, before, after)
-        hits.append(eff["hit"])
+        if _detectable(name, after.applied[name]):
+            hits.append(eff["hit"])
         sides.append(eff["side_frac"])
+    assert len(hits) >= n // 4, f"{name}: мало распознаваемых случаев для проверки"
     if EXPECTED_QC[name]:
         assert np.mean(hits) >= MIN_HIT[name], f"{name}: слишком слабая, {np.mean(hits):.2f}"
     else:

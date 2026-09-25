@@ -31,14 +31,34 @@ def future_calendar_after(series, end, horizon):
     return (hoy / 24.0).astype(np.float32), (hoy % 24).astype(np.float32)
 
 
+def device_mask(series, start, end, elev):
+    """Маска часов с start до end после причинного QC прибора.
+
+    Args:
+        series: ряд с полями x и m.
+        start: час запуска потока.
+        end: час, перед которым кончается история.
+        elev: высота станции, м.
+
+    Returns:
+        Маска float32, форма (end - start, 3).
+    """
+    from mayak.data.qc import qc_window
+    mask, _ = qc_window(series["x"][start:end], series["m"][start:end], elev=elev)
+    return mask
+
+
 def batch_forecast(model, series, end, lat, lon, elev):
-    """Пакетный выпуск по окну max_history часов, заканчивающемуся перед часом end."""
+    """Пакетный выпуск по окну max_history часов, заканчивающемуся перед часом end.
+
+    История проходит тот же причинный QC, что поток, запущенный в первом часе окна.
+    """
     cfg = model.cfg
     L = cfg.max_history
     x = np.zeros((L, 3), np.float32)
     mk = np.zeros((L, 3), np.float32)
     k = min(L, end)
-    x[L - k:], mk[L - k:] = series["x"][end - k:end], series["m"][end - k:end]
+    x[L - k:], mk[L - k:] = series["x"][end - k:end], device_mask(series, end - k, end, elev)
     hoy = (series["hoy0"] + end - L + np.arange(L)) % YEAR_H
     doy_f, hour_f = future_calendar_after(series, end, cfg.horizon)
     t = lambda a: torch.as_tensor(a, dtype=torch.float32)[None]
@@ -49,7 +69,7 @@ def batch_forecast(model, series, end, lat, lon, elev):
 
 
 def feed(stream, series, k0, k1):
-    """Часы k0 … k1 − 1 ряда в поток через публичный step (с QC точки)."""
+    """Часы с k0 до k1 ряда в поток через публичный step, с QC прибора."""
     x, m = series["x"], series["m"]
     for k in range(k0, k1):
         v = [float(x[k, j]) if m[k, j] > 0 else None for j in range(3)]

@@ -870,7 +870,7 @@ def run_label(model_cfg):
 
 
 SCENARIO_INSTRUMENT, SCENARIO_INPUT = "instrument", "input"
-ROBUSTNESS_QC = ("none", "point", "window")
+ROBUSTNESS_QC = ("none", "device")
 ROBUSTNESS_TIME_KEYS = ("val", "test")
 
 
@@ -1029,20 +1029,20 @@ class RobustnessConfig:
                           всегда external_test × test);
     every_hours, windows_per_station - шаг кандидатов и стратифицированная подвыборка
                           окон (одинаковое число окон с каждой станции);
-    qc                  - контроль качества после сценария: ``point`` - поточечный, как
-                          в рантайме на устройстве; ``window`` - оконный, как при
-                          обучении; ``none`` - без QC;
+    qc                  - контроль качества после сценария: device - причинный QC
+                          прибора, тот же, что в обучении и оценке; none - только
+                          маска наличия;
     leads               - лиды кривых и проверки скилла;
-    skill_tolerance     - допуск: скилл ``guard_models`` не ниже −skill_tolerance ни в
-                          одном сценарии с ``guard`` и ни на одном уровне и лиде;
+    skill_tolerance     - допуск: скилл guard_models не ниже −skill_tolerance ни в
+                          одном сценарии с guard и ни на одном уровне и лиде;
     seed                - сид случайных чисел сценариев (общие для всех уровней);
-    bootstrap, ci_level - блочный бутстрап по станциям (блок 5); 0 - без интервалов.
+    bootstrap, ci_level - блочный бутстрап по станциям; 0 - без интервалов.
     """
     roles: tuple = (ROLE_TEST,)
     time_key: str = "test"
     every_hours: int = 72
     windows_per_station: int = 20
-    qc: str = "point"
+    qc: str = "device"
     leads: tuple = (1, 6, 24, 72, 168)
     skill_tolerance: float = 0.05
     guard_models: tuple = ("МАЯК",)

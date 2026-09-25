@@ -4,32 +4,38 @@
 конфига модели (model.cfg), а не из глобальных констант: рантайм работает с любой
 конфигурацией и любой абляцией, с которой обучена модель.
 
-Стоимость часа. ``step`` не пересчитывает энкодер по окну: каналы часа
+Стоимость часа. step не пересчитывает энкодер по окну: каналы часа
 считаются по хвосту из CHANNEL_MAX_LAG + 1 часов, энкодер делает один потактовый шаг
 по кольцевым буферам блоков (SynopticEncoder.step), моды - один шаг O(M). Ни одна
 операция шага не зависит от длины рецептивного поля.
 
 Состояние делится на две части.
 
-* Персистентное (``serialize`` / ``load_state``): заголовок, моды
+* Персистентное (serialize / load_state): заголовок, моды
   (n_re, n_im, e), паспорт z, суточные сводки и их маска, сырое окно наблюдений
-  (``stream_window`` часов, фиксированная точка uint16 на канал) и его маска, курсор
+  (stream_window часов, фиксированная точка uint16 на канал) и его маска, курсор
   (сколько часов окна заполнено, сколько часов накоплено в текущих сутках, час года
   первой и последней позиции окна) и θ адаптивной калибровки (float32 в заголовке).
 * Эфемерное: кольцевые буферы энкодера, календарь окна, накопители текущих суток,
-  последний выпущенный прогноз для обратной связи калибровки.
-  На диск не пишется; ``load_state`` восстанавливает его одним пакетным проходом
-  энкодера по сохранённому окну (цена платится один раз при старте).
+  последний выпущенный прогноз для обратной связи калибровки, кольцо сырых часов
+  причинного QC. На диск не пишется; load_state восстанавливает его одним пакетным
+  проходом энкодера по сохранённому окну (цена платится один раз при старте). Кольцо
+  QC после загрузки заполняется значениями окна, уже прошедшими QC: отбракованные
+  часы в нём становятся пропусками, а часы старше окна в нём отсутствуют.
+
+QC часа. Каждый час проходит причинный QC прибора: коды нового часа считаются по
+кольцу из прошлых сырых часов той же функцией, что у истории в обучении и оценке.
+Решение о часе принимается один раз, в момент его прихода.
 
 Калибровка интервалов. Выпуск = квантили модели → сплит-конформная таблица →
-адаптивный множитель e^θ (``mayak.metrics``: та же реализация, что в оценке). θ
-подстраивается онлайн (``ACIParams``; Gibbs, Candès 2021), если рантайм создан с
-``aci``: каждый валидный час T сверяется с последним выпущенным прогнозом на том лиде,
+адаптивный множитель e^θ (mayak.metrics: та же реализация, что в оценке). θ
+подстраивается онлайн (ACIParams; Gibbs, Candès 2021), если рантайм создан с
+aci: каждый валидный час T сверяется с последним выпущенным прогнозом на том лиде,
 который приходится на этот час, - прибор учится на тех интервалах, которые он
 действительно выдал. Нет прогноза, нет валидного T или лид уже проверен - нет обратной
 связи, θ не меняется: длинная серия пропусков не сдвигает и не разгоняет θ. Стоимость
-обратной связи - O(1) на час. θ относится к прибору, а не к истории: ``reset`` (холодный
-старт) его не трогает, обнуляет только ``reset_calibration``.
+обратной связи - O(1) на час. θ относится к прибору, а не к истории: reset (холодный
+старт) его не трогает, обнуляет только reset_calibration.
 """
 import logging
 
@@ -38,7 +44,7 @@ import torch
 
 from mayak.astro import astro_features
 from mayak.config import CHANNEL_MAX_LAG
-from mayak.data.qc import PHYS, point_qc
+from mayak.data.qc import PHYS, CausalQC, qc_window
 from mayak.metrics import ACIParams, aci_score, apply_adaptive, apply_conformal
 
 log = logging.getLogger(__name__)
@@ -93,6 +99,7 @@ class StreamingMayak:
             self.conformal = np.asarray(conformal, np.float32)
         self.aci = ACIParams() if aci is True else aci
         self.reset_calibration()
+        self.qc = CausalQC(elev=self.elev)
 
         with torch.no_grad():
             self.loc = self.m.loc(torch.tensor([lat]), torch.tensor([lon]),
@@ -112,6 +119,7 @@ class StreamingMayak:
     def reset(self):
         """Холодный старт: история пуста (L = 0). θ калибровки сохраняется."""
         self._pending = None
+        self.qc.reset()
         M, W = self.n_modes, self.window
         self.n_re = torch.zeros(1, M)
         self.n_im = torch.zeros(1, M)
@@ -170,11 +178,6 @@ class StreamingMayak:
                         "а не пропуск шага", hoy, prev)
         self._last_hoy = hoy
 
-    @staticmethod
-    def _qc_point(T, P, RH):
-        """Поточечный QC часа - та же функция и те же пределы, что в mayak.data.qc."""
-        return point_qc(T, P, RH)
-
     @torch.no_grad()
     def _ingest(self, x, m, doy, hour):
         """Один час уже прошедших QC наблюдений: окно → каналы → энкодер → моды → сутки."""
@@ -205,8 +208,17 @@ class StreamingMayak:
         self._reset_day()
 
     def step(self, T, P, RH, doy, hour):
-        """Новый час наблюдений. None или значение вне физического диапазона - пропуск."""
-        xj, mj = self._qc_point(T, P, RH)
+        """Новый час наблюдений.
+
+        Args:
+            T: температура; None или NaN - значения нет.
+            P: давление; None или NaN - значения нет.
+            RH: влажность; None или NaN - значения нет.
+            doy: день года часа с долей суток.
+            hour: час UTC.
+        """
+        xj, codes = self.qc.push((T, P, RH))
+        mj = (codes == 0).astype(np.float32)
         if self.aci is not None and mj[0] > 0:
             self._aci_feedback(float(xj[0]), doy)
         self._ingest(xj, mj, doy, hour)
@@ -235,14 +247,22 @@ class StreamingMayak:
 
     @torch.no_grad()
     def warm_start(self, x_hist, mask_hist, doy_hist, hour_hist):
-        """Прогрев по истории (L, 3): то же состояние, что после L вызовов step.
+        """Прогрев по сырой истории: то же состояние, что после L вызовов step.
 
-        Энкодер и сводки считаются одним пакетным проходом, моды - потактово O(M).
-        Сутки считаются от начала истории, неполный остаток идёт в накопители.
+        Args:
+            x_hist: сырые значения, форма (L, 3).
+            mask_hist: маска наличия, форма (L, 3).
+            doy_hist: день года каждого часа с долей суток, форма (L,).
+            hour_hist: час UTC каждого часа, форма (L,).
         """
         self.reset()
-        mk = np.asarray(mask_hist, np.float32)
-        x = np.where(mk > 0, np.asarray(x_hist, np.float32), 0.0).astype(np.float32)
+        present = np.asarray(mask_hist, np.float32)
+        raw_x = np.where(present > 0, np.asarray(x_hist, np.float32), 0.0).astype(np.float32)
+        mk = present
+        if len(raw_x):
+            mk, _ = qc_window(raw_x, present, elev=self.elev)
+            self.qc.seed(raw_x, present)
+        x = np.where(mk > 0, raw_x, 0.0).astype(np.float32)
         doy = np.asarray(doy_hist, np.float32)
         hour = np.asarray(hour_hist, np.float32)
         L = x.shape[0]
@@ -375,6 +395,8 @@ class StreamingMayak:
         self.raw_x = decode_raw(q, self.raw_m)
         self.raw_doy[W - filled:], self.raw_hour[W - filled:] = doy, hour
         self.head, self.filled = 0, filled
+        idx = self._ordered(filled)
+        self.qc.seed(self.raw_x[idx], self.raw_m[idx])
         self._hours_in_day = hid
         self._last_hoy = int(hdr["hoy_last"]) if filled else None
         self.reset_calibration(theta)

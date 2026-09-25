@@ -187,6 +187,72 @@
    100.0
   ]
  },
+ "qc": {
+  "spike_half": 6,
+  "spike_thresh": 8.0,
+  "spike_min_valid": 4,
+  "scale_floor": [
+   1.5,
+   0.3,
+   2.0
+  ],
+  "jump_half": 24,
+  "jump_thresh": 8.0,
+  "jump_min_valid": 10,
+  "jump_floor": [
+   8.0,
+   6.0,
+   40.0
+  ],
+  "jump_max_gap": 6,
+  "excursion_max_hours": 3,
+  "stuck_hours": [
+   24,
+   24,
+   24
+  ],
+  "stuck_T_alone_hours": 72,
+  "stuck_max_gap": 6,
+  "stuck_min_count": 4,
+  "rh_sat": 99.5,
+  "rh_sat_hours": 72,
+  "units_half": 6,
+  "units_min_valid": 4,
+  "units_day_min_valid": 6,
+  "units_ref_days": 45,
+  "units_past_days": 14,
+  "units_min_days": 3,
+  "units_ref_k": 3.0,
+  "units_spread_floor": 1.0,
+  "units_min_excess": 8.0,
+  "units_min_conv": -10.0,
+  "slp_min_sep": 80.0,
+  "dewpoint_tol": 0.5,
+  "day_min_hours": 18,
+  "solar_min_amp": 0.5,
+  "solar_min_days": 30,
+  "solar_lag": [
+   -2.0,
+   6.0
+  ],
+  "cp_min_seg_days": 180,
+  "cp_min_shift": 1.5,
+  "cp_min_z": 5.0,
+  "dem_tol_m": 300.0,
+  "t_median": [
+   -70.0,
+   38.0
+  ],
+  "min_hours": 8766,
+  "min_valid_frac_T": 0.5,
+  "enforce_checks": [
+   "t_level",
+   "solar_phase",
+   "changepoint",
+   "dem_elevation"
+  ],
+  "lookback_hours": 359
+ },
  "state": {
   "version": 3,
   "header_bytes": 16,

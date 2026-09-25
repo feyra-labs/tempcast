@@ -4,14 +4,14 @@
 //!
 //! Ответственность хоста): кольцо сырого окна и календарь, буфер энкодера
 //! (двойной буфер - вход и выход графа step меняются местами), суточный накопитель,
-//! QC точки, калибровка интервалов, сериализация, откат к климатологии при сбое.
+//! причинный QC часа, калибровка интервалов, сериализация, откат к климатологии при сбое.
 use std::path::Path;
 
 use crate::calendar::{hour_of_year, YEAR_HOURS};
 use crate::calib::{aci_score, apply_adaptive, apply_conformal, AciParams};
 use crate::graphs::{Graphs, Precision};
 use crate::manifest::{Dims, Manifest};
-use crate::qc::point_qc;
+use crate::qc::CausalQc;
 use crate::state::{decode_raw, encode_raw, window_hoys, Snapshot};
 use crate::{Error, Result};
 
@@ -54,6 +54,7 @@ pub struct Runtime {
     d: Dims,
     graphs: Graphs,
     bounds: [[f64; 2]; 3],
+    qc: CausalQc,
     lat: [f32; 1],
     lon: [f32; 1],
     // признаки точки (граф init)
@@ -123,6 +124,7 @@ impl Runtime {
             (None, true) => return Err(Error::new("ACI включена, но параметров ACI в манифесте нет")),
             _ => None,
         };
+        let qc = CausalQc::new(manifest.qc.clone(), manifest.phys_bounds(), Some(elev));
         let (lat, lon, elev) = ([lat as f32], [lon as f32], [elev as f32]);
         let mut loc = vec![0.0; d.loc_dim];
         let mut coefs = d.n_coef.map(|n| vec![0.0f32; n]);
@@ -139,6 +141,7 @@ impl Runtime {
         let buf = d.encoder_width * d.enc_buf_len;
         let mut rt = Runtime {
             bounds: manifest.phys_bounds(),
+            qc,
             manifest,
             graphs,
             lat,
@@ -198,6 +201,7 @@ impl Runtime {
     /// Холодный старт: история пуста. θ калибровки сохраняется (он относится к прибору).
     pub fn reset(&mut self) {
         self.pending = false;
+        self.qc.reset();
         for v in [
             &mut self.raw_x,
             &mut self.raw_m,
@@ -268,9 +272,11 @@ impl Runtime {
         4 * self.enc.len()
     }
 
-    /// Новый час наблюдений. None, NaN или значение вне физического диапазона - пропуск.
+    /// Новый час наблюдений. None или NaN - значения нет. Час проходит причинный QC по
+    /// кольцу прошлых сырых часов; отбракованное значение становится пропуском.
     pub fn step(&mut self, obs: [Option<f64>; 3], doy: f32, hour: f32) -> Result<()> {
-        let (x, m) = point_qc(obs, &self.bounds);
+        let (x, codes) = self.qc.push(obs);
+        let m = codes.map(|c| if c == 0 { 1.0 } else { 0.0 });
         if self.aci.is_some() && m[0] > 0.0 {
             self.aci_feedback(x[0] as f64, doy);
         }
@@ -535,6 +541,7 @@ impl Runtime {
         }
         self.head = 0;
         self.filled = n;
+        self.seed_qc();
         self.hours_in_day = s.hours_in_day;
         self.last_hoy = if n > 0 { Some(s.hoy_last) } else { None };
         self.reset_calibration(s.theta);
@@ -543,6 +550,25 @@ impl Runtime {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// Кольцо QC после загрузки: значения окна, уже прошедшие QC, от старых к новым.
+    /// Отбракованные часы в нём становятся пропусками.
+    fn seed_qc(&mut self) {
+        let (w, n) = (self.d.stream_window, self.filled);
+        let mut x = Vec::with_capacity(n);
+        let mut present = Vec::with_capacity(n);
+        for p in (w - n)..w {
+            let mut v = [0.0f32; 3];
+            let mut m = [false; 3];
+            for c in 0..3 {
+                v[c] = self.raw_x[p * 3 + c];
+                m[c] = self.raw_m[p * 3 + c] > 0.0;
+            }
+            x.push(v);
+            present.push(m);
+        }
+        self.qc.seed(&x, &present);
     }
 
     fn rebuild_from_window(&mut self) -> Result<()> {

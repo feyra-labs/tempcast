@@ -63,7 +63,7 @@ AUG_KIND = {
 EXPECTED_QC = {
     "coords": set(), "scale": set(), "drift": set(), "offset": set(), "noise": set(),
     "quantize": set(),
-    "spike": {QCCode.SPIKE, QCCode.RANGE},
+    "spike": {QCCode.SPIKE, QCCode.RANGE, QCCode.JUMP},
     "stuck": {QCCode.STUCK},
     "units": {QCCode.UNITS},
     "dropout": {QCCode.MISSING}, "gap": {QCCode.MISSING}, "sparse": {QCCode.MISSING},
@@ -71,7 +71,6 @@ EXPECTED_QC = {
     "drop_humidity": {QCCode.MISSING},
 }
 SIDE_QC = {name: set() for name in EXPECTED_QC}
-SIDE_QC["spike"] = {QCCode.JUMP}
 SIDE_QC["units"] = {QCCode.RANGE, QCCode.JUMP, QCCode.SPIKE}
 
 
@@ -363,6 +362,9 @@ def clean_history(n=L_MAX, lat=45.0, lon=10.0, elev=200.0, seed=0, t0_hour=0):
     """Правдоподобная чистая история: годовой и суточный ход по солнечному времени,
     синоптический AR(1)-шум, давление по высоте. QC окна на ней ничего не находит.
 
+    Давление меняется за час в среднем на 0.4 гПа, как у настоящих рядов: при втрое
+    большей изменчивости прошлое окно видит в ней выбросы.
+
     Возвращает (x float32 (n, 3), hour (n,) час UTC).
     """
     rng = np.random.default_rng(seed)
@@ -378,7 +380,7 @@ def clean_history(n=L_MAX, lat=45.0, lon=10.0, elev=200.0, seed=0, t0_hour=0):
     for i in range(1, n):
         syn[i] = rho * syn[i - 1] + e[i]
     T_ = 12 + season + diurnal + syn + 0.2 * rng.standard_normal(n)
-    P_ = station_pressure_expected(elev) + 3 * syn + 0.3 * rng.standard_normal(n)
+    P_ = station_pressure_expected(elev) + syn + 0.15 * rng.standard_normal(n)
     RH_ = np.clip(65 - 2 * diurnal + 3 * rng.standard_normal(n), 5, 99)
     return np.stack([T_, P_, RH_], -1).astype(np.float32), hour.astype(np.float32)
 
@@ -398,10 +400,10 @@ _H0 = L_MAX - 24 * 28
 REFERENCE_CASES = (
     ("spike_T", "spike", dict(spikes=[dict(ch=T, i=400, d=20.0)]), 200.0, T, (400, 401)),
     ("spike_P", "spike", dict(spikes=[dict(ch=P, i=410, d=-25.0)]), 200.0, P, (410, 411)),
-    ("stuck_T_36h", "stuck", dict(ch=T, i=300, n=36), 200.0, T, (300, 336)),
-    ("stuck_RH_48h", "stuck", dict(ch=RH, i=200, n=48), 200.0, RH, (200, 248)),
-    ("units_T_F", "units", dict(ch=T, i=500, n=48), 200.0, T, (500, 548)),
-    ("units_P_slp", "units", dict(ch=P, i=250, n=72), 1500.0, P, (250, 322)),
+    ("stuck_T_96h", "stuck", dict(ch=T, i=300, n=96), 200.0, T, (372, 396)),
+    ("stuck_RH_48h", "stuck", dict(ch=RH, i=200, n=48), 200.0, RH, (223, 248)),
+    ("units_T_F", "units", dict(ch=T, i=500, n=48), 200.0, T, (512, 548)),
+    ("units_P_slp", "units", dict(ch=P, i=250, n=72), 1500.0, P, (256, 322)),
     ("dropout", "dropout", dict(rate=0.2, seed=3), 200.0, None, None),
     ("gap_3d", "gap", dict(gaps=[dict(i=100, n=72)]), 200.0, None, (100, 172)),
     ("sparse_3h", "sparse", dict(every=3, phase=0), 200.0, None, None),

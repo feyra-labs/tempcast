@@ -3,18 +3,18 @@
 Главное заявление проекта - плавная деградация при отказе входа и отсутствие
 провала ниже климатологии. Здесь это измеряется:
 
-* ``RobustnessSet`` - окна ``EvalSet`` (тот же отбор, та же стратифицированная
-  подвыборка), к которым на лету применяется сценарий из ``mayak.data.scenarios``;
+* RobustnessSet - окна EvalSet (тот же отбор, та же стратифицированная
+  подвыборка), к которым на лету применяется сценарий из mayak.data.scenarios;
   все уровни и все модели оцениваются на одном и том же множестве окон и лидов;
-* ``robustness_sweep`` - сетка «сценарий × уровень × модель × лид» → плоские строки
+* robustness_sweep - сетка «сценарий × уровень × модель × лид» → плоские строки
   с пуловыми и макро-метриками (MAE, RMSE, CRPS, покрытие, Winkler, скилл) и
-  доверительными интервалами блочного бутстрапа по станциям (блок 5). Для сценариев
+  доверительными интервалами блочного бутстрапа по станциям. Для сценариев
   «свойство прибора» дополнительно - величина искажения цели и «превышение»:
   на сколько рост MAE больше самого искажения (> 0 - прогноз разрушается сильнее,
   чем сдвинут прибор);
-* ``check_skill_guard`` - утверждение «скилл ``guard_models`` не ниже −допуска ни в
+* check_skill_guard - утверждение «скилл guard_models не ниже −допуска ни в
   одном сценарии с проверкой, ни на одном уровне и лиде». Нарушение - исключение
-  ``RobustnessError`` (и код выхода 1 в командной строке), а не строка в логе;
+  RobustnessError (и код выхода 1 в командной строке), а не строка в логе;
 * графики «параметр деградации → метрика» и сводный график скилла по всем сценариям.
 
 Запуск::
@@ -35,14 +35,14 @@ import torch
 from torch.utils.data import Dataset
 
 from mayak import baselines as BL
-from mayak.config import ConfigError, RobustnessConfig, SCENARIO_INSTRUMENT, ScenarioSpec
+from mayak.config import (ROBUSTNESS_QC, SCENARIO_INSTRUMENT, ConfigError, RobustnessConfig,
+                          ScenarioSpec)
 from mayak.constants import L_MAX
 from mayak.data.augment import AugWindow
-from mayak.data.dataset import history_len
 from mayak.data.masking import enforce_invariant
 from mayak.data.qc import qc_window
-from mayak.data.scenarios import (SCENARIOS, apply_scenario, level_label, point_qc_mask,
-                                  scenario_rng, variants_of)
+from mayak.data.scenarios import (SCENARIOS, apply_scenario, level_label, scenario_rng,
+                                  variants_of)
 from mayak.evaluate import (NEURAL_BASELINES, EvalSet, add_statistical_baselines,
                             collect_predictions, evaluation_for)
 from mayak.metrics import METRICS, wmean
@@ -75,13 +75,22 @@ def load_config(path=None):
 
 
 class RobustnessSet(Dataset):
-    """Окна базового ``EvalSet`` с применённым сценарием name уровня level."""
+    """Окна базового набора оценки с применённым сценарием.
 
-    def __init__(self, base: EvalSet, name, level, params=None, qc="point", seed=0):
+    Args:
+        base: базовый набор окон оценки.
+        name: имя сценария.
+        level: уровень сценария.
+        params: параметры сценария.
+        qc: режим QC после сценария.
+        seed: сид сценариев.
+    """
+
+    def __init__(self, base: EvalSet, name, level, params=None, qc="device", seed=0):
         if name not in SCENARIOS:
             raise ConfigError(f"неизвестный сценарий {name!r}; есть {tuple(SCENARIOS)}")
-        if qc not in ("none", "point", "window"):
-            raise ConfigError(f"qc = {qc!r}; допустимо none | point | window")
+        if qc not in ROBUSTNESS_QC:
+            raise ConfigError(f"qc = {qc!r}; допустимо {' | '.join(ROBUSTNESS_QC)}")
         self.base, self.name, self.level = base, name, float(level)
         self.params = dict(params or {})
         self.qc, self.seed = qc, int(seed)
@@ -101,35 +110,41 @@ class RobustnessSet(Dataset):
         return meta
 
     def window(self, i, item=None):
-        """(окно после сценария, исходный батч-элемент, запись станции)."""
+        """Сырое окно после сценария, исходный элемент набора и запись станции.
+
+        Args:
+            i: номер окна.
+            item: готовый элемент базового набора, если он уже посчитан.
+
+        Returns:
+            Тройка: окно после сценария, элемент базового набора, запись станции.
+        """
         item = self.base[i] if item is None else item
         sid, t = self.base.items[i]
         s = self.base.clims[sid]
-        L = history_len(self.base.L, t, self.base.floor[sid])
-        dem = s.get("dem_elev")
-        w = AugWindow(x=_np(item["x_hist"]).astype(np.float32, copy=True),
-                      m=_np(item["mask_hist"]).astype(np.float32, copy=True),
+        raw = self.base.raw_window(i)
+        L = raw["L"]
+        w = AugWindow(x=np.array(raw["x"], np.float32), m=np.array(raw["m"], np.float32),
                       y=_np(item["y"]).astype(np.float32, copy=True),
                       y_mask=_np(item["y_mask"]).astype(np.float32, copy=True),
                       L=L, hour=_np(item["hour_hist"]),
                       lat=float(s["lat"]), lon=float(s["lon"]), elev=float(s["elev"]),
-                      qc_elev=float(dem) if dem is not None else float(s["elev"]))
+                      qc_elev=float(raw["qc_elev"]))
         apply_scenario(w, self.name, self.level, scenario_rng(self.seed, self.name, i),
                        self.params)
         return w, item, s
 
-    def _qc(self, x, m, w):
-        if self.qc == "point":
-            m = point_qc_mask(x, m)
-        elif self.qc == "window" and w.L > 0:
-            m, _codes = qc_window(x, m, elev=w.qc_elev)
+    def _qc(self, i, x, m, w):
+        if self.qc == "device" and w.L > 0:
+            past = self.base.raw_window(i)["past"]
+            m, _codes = qc_window(x, m, elev=w.qc_elev, past=past)
         return enforce_invariant(x, m)
 
     def __getitem__(self, i):
         w, item, s = self.window(i)
         _sid, t = self.base.items[i]
         x, m = enforce_invariant(w.x, w.m)
-        x, m = self._qc(x, m, w)
+        x, m = self._qc(i, x, m, w)
         y, _ = enforce_invariant(w.y, w.y_mask)
         a_recent, _ok = BL.recent_anomaly(x[:, 0], m[:, 0], s["clim"], L_MAX,
                                           int(s["t0"]) + int(t) - L_MAX)

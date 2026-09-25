@@ -112,7 +112,7 @@ def _inject(kind, T, P, RH):
         sl, ch = slice(500, 501), 0
         T[500:] += 15.0
     elif kind == "stuck_T":
-        sl, ch = slice(600, 630), 0
+        sl, ch = slice(600, 680), 0
         T[sl] = T[600]
     elif kind == "stuck_P":
         sl, ch = slice(700, 730), 1
@@ -162,20 +162,30 @@ def test_each_artifact_yields_its_code_on_its_channel_only(clean, kind):
 def test_stuck_limits_are_respected(clean):
     T, P, RH = (a.copy() for a in clean)
     T[600:620] = T[600]
+    T[700:760] = T[700]
     RH[900:950] = 100.0
     _, _, codes = run(T, P, RH, elev=200.0)
-    assert not np.any(codes & QCCode.STUCK)
+    assert not np.any(codes & QCCode.STUCK), "одна температура 60 ч при живой влажности - норма"
+
+
+def test_temperature_stuck_together_with_humidity(clean):
+    """Температура и влажность стоят вместе 30 ч: залипание обоих каналов."""
+    T, P, RH = (a.copy() for a in clean)
+    T[600:630], RH[600:630] = T[600], RH[600]
+    _, _, codes = run(T, P, RH, elev=200.0)
+    assert has(codes, slice(600, 630), 0, QCCode.STUCK)
+    assert has(codes, slice(600, 630), 2, QCCode.STUCK)
 
 
 def test_stuck_survives_sparse_reporting(clean):
     """Замёрзший датчик со сводками раз в 3 ч ловится: серия идёт по валидным отсчётам."""
     T, P, RH = (a.copy() for a in clean)
     valid = np.ones((N, 3), np.uint8)
-    valid[600:660, 0] = 0
-    valid[600:660:3, 0] = 1
-    T[600:660] = 1.5
+    valid[600:690, 0] = 0
+    valid[600:690:3, 0] = 1
+    T[600:690] = 1.5
     _, _, codes = run(T, P, RH, valid=valid, elev=200.0)
-    assert has(codes, slice(600, 660, 3), 0, QCCode.STUCK)
+    assert has(codes, slice(600, 690, 3), 0, QCCode.STUCK)
 
 
 def test_spike_return_is_not_a_jump(clean):
@@ -247,7 +257,7 @@ def _slp_brute(P, ok, elev, cfg=DEFAULT_QC):
     sep = Q.P_SEA_LEVEL - p_exp
     if sep < cfg.slp_min_sep:
         return np.zeros(len(P), bool)
-    r = Q.rolling_median(np.asarray(P, np.float64), ok, cfg.units_half, cfg.units_min_valid)
+    r = Q.rolling_median(np.asarray(P, np.float64), ok, cfg.slp_half, cfg.units_min_valid)
     with np.errstate(invalid="ignore"):
         return ok & (r > p_exp + sep / 2)
 
@@ -285,15 +295,20 @@ def test_prefiltered_checks_match_brute_force():
     assert all(v > 0 for v in hits.values()), f"сравнение без срабатываний бессмысленно: {hits}"
 
 
-def test_batched_spike_matches_per_channel_mad():
+@pytest.mark.parametrize("causal", [False, True])
+def test_batched_spike_matches_per_channel_mad(causal):
     rng = np.random.default_rng(3)
+    cfg = DEFAULT_QC
     for trial in range(100):
         n = int(rng.integers(1, 400))
         x = (rng.standard_normal((n, 3)) * [3, 5, 10] + [10, 1000, 60]).astype(np.float32)
         x[rng.random((n, 3)) < 0.03] += 40
         b = rng.random((n, 3)) < 0.8
-        ref = np.stack([b[:, j] & ~Q.mad_ok(x[:, j], b[:, j]) for j in range(3)], -1)
-        assert np.array_equal(Q._spike_flags(x, b, DEFAULT_QC), ref), trial
+        ref = np.stack([b[:, j] & ~Q.mad_ok(x[:, j], b[:, j], cfg.spike_half, cfg.spike_thresh,
+                                            cfg.spike_min_valid, floor=cfg.scale_floor[j],
+                                            causal=causal)
+                        for j in range(3)], -1)
+        assert np.array_equal(Q._spike_flags(x, b, cfg, causal), ref), trial
 
 
 def test_source_flags_go_to_mask_without_correction(clean):
@@ -321,18 +336,27 @@ def test_flagged_value_does_not_poison_window_checks(clean):
     assert not np.any(codes[280:340, 0] & (QCCode.SPIKE | QCCode.JUMP | QCCode.UNITS))
 
 
-@pytest.mark.parametrize("kind", ["range_T", "spike", "jump", "stuck_T", "stuck_RH",
-                                  "rh_saturated", "fahrenheit", "sea_level_pressure"])
-def test_window_path_gives_same_code_as_station_path(clean, kind):
+CAUSAL_DELAY = {"range_T": 0, "spike": 0, "stuck_T": DEFAULT_QC.stuck_T_alone_hours - 1,
+                "stuck_RH": DEFAULT_QC.stuck_hours[2] - 1,
+                "rh_saturated": DEFAULT_QC.rh_sat_hours - 1, "fahrenheit": DEFAULT_QC.units_half,
+                "sea_level_pressure": DEFAULT_QC.units_min_valid}
+
+
+@pytest.mark.parametrize("kind", list(CAUSAL_DELAY))
+def test_window_path_catches_artifact_after_causal_delay(clean, kind):
+    """Окно проходит причинный QC: артефакт получает свой код на своём канале, начиная с
+    часа, когда его можно распознать по прошлому. Центрированный QC кэша помечает его
+    целиком."""
     series, extra, ch, sl = _inject(kind, *clean)
     elev = extra.get("elev", 200.0)
     _, _, c_station = run(*series, elev=elev)
-    lo = max(0, sl.start - 300) if sl.stop - sl.start < N else 0
+    lo = max(0, sl.start - 400) if sl.stop - sl.start < N else 0
     x = np.stack(series, -1)[lo:lo + L_MAX]
     mask_w, c_win = Q.qc_window(x, np.ones_like(x), elev=elev)
-    wsl = slice(sl.start - lo, min(sl.stop, lo + L_MAX) - lo)
-    assert has(c_win, wsl, ch, CASES[kind]) and has(c_station, sl, ch, CASES[kind])
-    assert np.all(mask_w[wsl, ch] == 0)
+    wsl = slice(sl.start - lo + CAUSAL_DELAY[kind], min(sl.stop, lo + L_MAX) - lo)
+    assert has(c_station, sl, ch, CASES[kind])
+    assert has(c_win, wsl, ch, CASES[kind]), kind
+    assert np.all(mask_w[sl.start - lo:wsl.stop, ch][c_win[sl.start - lo:wsl.stop, ch] > 0] == 0)
 
 
 def test_window_qc_marks_input_gaps_missing_and_keeps_values(clean):
@@ -346,18 +370,22 @@ def test_window_qc_marks_input_gaps_missing_and_keeps_values(clean):
     assert mask.dtype == np.float32
 
 
-def test_runtime_point_qc_uses_same_ranges():
-    from mayak.runtime.streaming import StreamingMayak
-    for vals in [(20.0, 1000.0, 50.0), (61.0, 1000.0, 50.0), (None, 299.0, 101.0),
-                 (float("nan"), 1100.0, 0.0), (-90.0, 300.0, 100.0)]:
-        x, m = Q.point_qc(*vals)
-        x2, m2 = StreamingMayak._qc_point(*vals)
-        assert np.array_equal(x, x2) and np.array_equal(m, m2)
-        codes = Q.check_codes(np.array([[v if v is not None else np.nan for v in vals]],
-                                       np.float32),
-                              np.array([[v is not None and np.isfinite(v) for v in vals]]))
-        src = np.array([v is not None and np.isfinite(v) for v in vals])
-        assert np.array_equal(m > 0, src & ((codes[0] & QCCode.RANGE) == 0))
+def test_runtime_step_uses_the_causal_qc(clean):
+    """Поток устройства получает коды каждого часа той же функцией, что пакет."""
+    T, P, RH = (a.copy() for a in clean)
+    T[400] += 25.0
+    RH[600:640] = RH[600]
+    T[600:640] = T[600]
+    T[700] = 75.0
+    x = np.stack([T, P, RH], -1)[:900]
+    present = np.ones_like(x, np.uint8)
+    present[50:60, 1] = 0
+    ref = Q.causal_codes(x, present, elev=200.0)
+    ring = Q.CausalQC(elev=200.0)
+    got = np.stack([ring.push([x[k, j] if present[k, j] else None for j in range(3)])[1]
+                    for k in range(len(x))])
+    assert np.array_equal(got, ref)
+    assert np.any(ref & QCCode.STUCK) and np.any(ref & QCCode.RANGE)
 
 
 LONG = 2 * YEAR

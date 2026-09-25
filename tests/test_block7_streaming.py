@@ -18,8 +18,9 @@ from mayak.config import CHANNEL_MAX_LAG, Ablations, ModelConfig
 from mayak.constants import H, L_MAX, QUANTILES
 from mayak.model import MAYAK
 from mayak.modules.encoder import ChannelGroupNorm, SynopticEncoder
-from mayak.runtime.equivalence import (batch_forecast, divergence, feed, future_calendar_after,
-                                       step_cost, stream_forecast, synthetic_series)
+from mayak.runtime.equivalence import (batch_forecast, device_mask, divergence, feed,
+                                       future_calendar_after, step_cost, stream_forecast,
+                                       synthetic_series)
 from mayak.runtime.streaming import (RAW_STEP, STATE_HEADER, StreamingMayak, decode_raw,
                                      encode_raw)
 
@@ -299,7 +300,7 @@ def test_stream_equivalence_over_long_sequence(model):
         feed(st, s, done, end)
         done = end
         x = torch.from_numpy(s["x"][:end])[None]
-        mk = torch.from_numpy(s["m"][:end])[None]
+        mk = torch.from_numpy(device_mask(s, 0, end, ELEV))[None]
         astro = astro_features(torch.from_numpy(s["doy"][:end])[None],
                                torch.from_numpy(s["hour"][:end])[None],
                                torch.tensor([[LAT]]), torch.tensor([[LON]]))

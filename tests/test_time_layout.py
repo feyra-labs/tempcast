@@ -11,6 +11,7 @@ import pytest
 
 from mayak.constants import H, L_MAX
 from mayak.data import store as S
+from mayak.data.qc import DEFAULT_QC
 from mayak.data.dataset import block_starts, history_len
 from mayak.data.splits import (BLOCK_KEYS, HISTORY_FORBIDDEN, MIN_GAP_HOURS, MIN_TRAIN_YEARS,
                                ROLE_EXTERNAL, ROLE_TEST, ROLE_TRAIN, ROLE_VAL, ROLES, TIME_KEYS,
@@ -167,7 +168,9 @@ def test_targets_inside_blocks_and_history_outside_train_and_test(manifest, stor
         for fp in ds.footprints():
             lay = time_layout(fp["N"])
             assert (lay.block_index(fp["time_key"], fp["t"], fp["hi"]) >= 0).all()
-            assert (fp["t"] - fp["lo"] == L_MAX).all(), "окно оценки обрезало историю"
+            ctx = fp["t"] - fp["lo"] - L_MAX
+            assert (ctx >= 0).all(), "окно оценки обрезало историю"
+            assert (ctx <= DEFAULT_QC.lookback_hours).all(), "контекст QC длиннее нужного"
             forbidden = HISTORY_FORBIDDEN[fp["time_key"]]
             assert "train" in forbidden
             assert fp["time_key"] == "test" or "test" in forbidden
@@ -183,7 +186,7 @@ def test_evaluation_history_leaves_its_block(manifest, store):
         starts = {int(t): int(lo) for fp in ds.footprints() for lo, t in zip(fp["lo"], fp["t"])}
         assert firsts <= set(starts), "первый час каждого блока служит началом горизонта"
         for t in firsts:
-            assert starts[t] == t - L_MAX < t, "история окна начинается до его блока"
+            assert starts[t] <= t - L_MAX < t, "история окна начинается до его блока"
 
 
 def test_test_windows_start_at_first_test_hour_with_full_history(manifest, store):

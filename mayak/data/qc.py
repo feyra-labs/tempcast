@@ -1,21 +1,28 @@
 """Единый контроль качества.
 
-Один модуль и один формат выхода для любого источника данных - реанализа, наблюдений
-реальной сети, аугментированного обучающего окна и потока рантайма:
+Один модуль и один формат выхода для любого источника данных: реанализа, наблюдений
+реальной сети, обучающего окна и потока устройства.
 
-* x     - значения float32 (N, 3), каналы CHANNELS = (T, P, RH);
-* mask  - по-канальная маска валидности uint8 (N, 3), mask == (codes == 0);
-* codes - по-канальные коды причин отбраковки uint8 (N, 3), битовые флаги QCCode.
+* x: значения float32, форма (N, 3), каналы T, P, RH;
+* mask: поканальная маска валидности uint8, форма (N, 3), единица там, где кодов нет;
+* codes: поканальные коды причин отбраковки uint8, форма (N, 3), битовые флаги QCCode.
 
-Инвариант: там, где маска ноль, значение обнулено (enforce_invariant).
+Там, где маска ноль, значение обнулено.
+
+Оконные проверки работают в двух режимах с одними правилами и одними порогами.
+
+* Центрированный режим видит часы по обе стороны от проверяемого. Им один раз
+  чистится источник при сборке кэша: из него берутся маска цели и станционные проверки.
+* Причинный режим решает о часе только по этому часу и по прошлым часам, не дальше
+  QCConfig.lookback_hours. Решение о часе не меняется, когда приходят новые часы.
+  Этим режимом проходит история в обучении, в оценке и на устройстве.
 
 Три уровня проверок:
 
-1. поточечные и оконные - одинаковы для офлайн-сборки кэша
-и для окна истории после аугментаций;
-2. станционные - выполняются один раз при сборке кэша;
-3. отбор станций - по длине ряда, доле валидной температуры
-   и по результатам станционных проверок.
+1. поточечные и оконные;
+2. станционные, выполняются один раз при сборке кэша;
+3. отбор станций по длине ряда, доле валидной температуры и результатам станционных
+   проверок.
 """
 from __future__ import annotations
 
@@ -34,7 +41,7 @@ from mayak.data.masking import enforce_invariant
 
 CHANNELS = ("T", "P", "RH")
 PHYS = {"T": (-90.0, 60.0), "RH": (0.0, 100.0), "P": (300.0, 1100.0)}
-MAD_HALF, MAD_THRESH, MAD_MIN_VALID = 6, 6.0, 4
+MAD_HALF, MAD_THRESH, MAD_MIN_VALID = 6, 8.0, 4
 MAD_TO_SD = 1.4826
 P_SEA_LEVEL = 1013.25
 
@@ -57,7 +64,7 @@ QC_CODE_DOC = {
     "RANGE": "вне физического диапазона",
     "SPIKE": "выброс относительно скользящей медианы",
     "SOURCE": "помечено источником",
-    "JUMP": "аномальный часовой скачок",
+    "JUMP": "аномальный скачок между соседними отчётами",
     "STUCK": "залипшее значение",
     "UNITS": "подмена единиц",
     "DEWPOINT": "точка росы выше температуры",
@@ -69,51 +76,126 @@ QC_CODES = tuple(c for c in QCCode if c)
 class QCConfig:
     """Пороги контроля качества. Все поля входят в ключ кэша.
 
-    Кортежи из трёх элементов - по каналам (T, P, RH).
+    Attributes:
+        spike_half: полуширина окна проверки выброса, ч.
+        spike_thresh: порог выброса в единицах робастного разброса.
+        spike_min_valid: наименьшее число отчётов в окне выброса.
+        scale_floor: нижняя граница робастного разброса по каналам, больше шага
+            записи: полтора градуса, три десятых гПа, два процента. У целочисленного
+            ряда медиана отклонений часто равна нулю, без границы любой шаг записи был
+            бы выбросом. После ровной ночи прошлое окно не знает об утреннем подъёме,
+            граница не даёт принять его за выброс.
+        jump_half: полуширина окна, в котором оцениваются приращения, ч.
+        jump_thresh: порог скачка в единицах робастного разброса приращений.
+        jump_min_valid: наименьшее число приращений в окне.
+        jump_floor: наименьший скачок по каналам в единицах за час.
+        jump_max_gap: приращение считается между соседними отчётами, если между ними
+            не больше стольких часов; оно делится на прошедшее время.
+        excursion_max_hours: скачок и обратный скачок в пределах стольких часов
+            считаются выбросом, а не сменой уровня.
+        stuck_hours: срок одного значения по каналам, ч. Для температуры это срок при
+            одновременно стоящей влажности.
+        stuck_T_alone_hours: срок одной температуры при меняющейся влажности, ч. Целая
+            температура ночью и в пасмурную погоду держится одинаковой много часов.
+        stuck_max_gap: пропуск внутри серии одинаковых значений не длиннее, ч.
+        stuck_min_count: наименьшее число отчётов в серии.
+        rh_sat: влажность не ниже этого значения считается насыщением, %.
+        rh_sat_hours: допустимый срок насыщения, ч.
+        units_half: полуширина окна медианы для проверки градусов Фаренгейта, ч. Окно
+            в сутки нужно, чтобы медиана не зависела от часа суток: она сравнивается
+            с опорой из суточных медиан.
+        units_min_valid: наименьшее число отчётов в этом окне.
+        units_day_min_valid: сутки участвуют в опорном уровне, если в них не меньше
+            стольких отчётов.
+        units_ref_days: полуширина окна опорного уровня в центрированном режиме, сутки.
+        units_past_days: сколько прошлых суток берёт опорный уровень причинного режима.
+        units_min_days: наименьшее число суток в опорном уровне, иначе проверка
+            единиц не выполняется.
+        units_ref_k: допуск вокруг опорного уровня в единицах его разброса.
+        units_spread_floor: нижняя граница разброса опорного уровня, градусы.
+        units_min_excess: наименьший отрыв медианы от опорного уровня, градусы.
+        units_min_conv: ниже этой температуры шкалы Фаренгейта и Цельсия почти совпадают.
+        slp_half: полуширина окна медианы давления, ч. Та же длина, что у окна
+            выброса: в причинном режиме, пока медиана не переключилась на приведённое
+            давление, его часы ловит проверка выброса, и разрыва между ними нет.
+        slp_min_sep: давление на уровне моря отличимо от станционного, если станция
+            ниже уровня моря по давлению хотя бы на столько гПа.
+        dewpoint_tol: допуск на округление точки росы источника, градусы.
+        day_min_hours: сутки считаются в станционных проверках, если валидно не меньше.
+        solar_min_amp: при более слабом суточном ходе проверка фазы не решает.
+        solar_min_days: наименьшее число полных суток для проверки фазы.
+        solar_lag: допустимое запаздывание максимума температуры от полудня, ч.
+        cp_min_seg_days: наименьший сегмент разладки, сутки.
+        cp_min_shift: наименьший значимый сдвиг уровня, градусы.
+        cp_min_z: наименьшая значимость сдвига.
+        dem_tol_m: допуск расхождения высоты с цифровой моделью рельефа, м.
+        t_median: допустимые пределы медианы температуры станции.
+        min_hours: наименьшая длина ряда станции, ч.
+        min_valid_frac_T: наименьшая доля валидной температуры.
+        enforce_checks: станционные проверки, провал которых исключает станцию.
     """
     spike_half: int = MAD_HALF
     spike_thresh: float = MAD_THRESH
     spike_min_valid: int = MAD_MIN_VALID
+    scale_floor: tuple = (1.5, 0.3, 2.0)
     jump_half: int = 24
     jump_thresh: float = 8.0
-    jump_min_valid: int = 12
-    jump_floor: tuple = (8.0, 6.0, 40.0)            # °C/ч, гПа/ч, %/ч
-    excursion_max_hours: int = 3                    # скачок туда и обратно за ≤ ч - выброс
-    stuck_hours: tuple = (24, 24, 24)               # допустимый срок одного значения, ч
-    stuck_max_gap: int = 6                          # пропуск внутри серии не длиннее, ч
-    stuck_min_count: int = 4                        # не меньше стольких отсчётов в серии
-    rh_sat: float = 99.5                            # «сотня процентов» для RH, %
-    rh_sat_hours: int = 72                          # допустимый срок насыщения, ч
-    units_half: int = 12                            # полуокно скользящей медианы, ч
-    units_min_valid: int = 12
-    units_ref_days: int = 45                        # полуокно опорного уровня, сутки
-    units_ref_k: float = 3.0                        # в единицах робастного разброса
-    units_spread_floor: float = 1.0                 # °C
-    units_min_excess: float = 8.0                   # °C: минимальный отрыв от опоры
-    units_min_conv: float = -10.0                   # °C: ниже шкалы °F и °C почти совпадают
-    slp_min_sep: float = 80.0                       # гПа: станция заметно выше уровня моря
-    dewpoint_tol: float = 0.5                       # °C: допуск на округление источника
-    day_min_hours: int = 18                         # сутки считаются, если валидно ≥ ч
-    solar_min_amp: float = 0.5                      # °C: слабее - проверка не решает
+    jump_min_valid: int = 10
+    jump_floor: tuple = (8.0, 6.0, 40.0)
+    jump_max_gap: int = 6
+    excursion_max_hours: int = 3
+    stuck_hours: tuple = (24, 24, 24)
+    stuck_T_alone_hours: int = 72
+    stuck_max_gap: int = 6
+    stuck_min_count: int = 4
+    rh_sat: float = 99.5
+    rh_sat_hours: int = 72
+    units_half: int = 12
+    units_min_valid: int = 6
+    units_day_min_valid: int = 6
+    units_ref_days: int = 45
+    units_past_days: int = 14
+    units_min_days: int = 3
+    units_ref_k: float = 3.0
+    units_spread_floor: float = 1.0
+    units_min_excess: float = 8.0
+    units_min_conv: float = -10.0
+    slp_half: int = 6
+    slp_min_sep: float = 80.0
+    dewpoint_tol: float = 0.5
+    day_min_hours: int = 18
+    solar_min_amp: float = 0.5
     solar_min_days: int = 30
-    solar_lag: tuple = (-2.0, 6.0)                  # ч: максимум T после солнечного полудня
+    solar_lag: tuple = (-2.0, 6.0)
     cp_min_seg_days: int = 180
-    cp_min_shift: float = 1.5                       # °C
+    cp_min_shift: float = 1.5
     cp_min_z: float = 5.0
     dem_tol_m: float = 300.0
-    t_median: tuple = (-70.0, 38.0)                 # °C: медиана T станции
+    t_median: tuple = (-70.0, 38.0)
     min_hours: int = 8766
     min_valid_frac_T: float = 0.5
     enforce_checks: tuple = ("t_level", "solar_phase", "changepoint", "dem_elevation")
 
     def __post_init__(self):
         s = object.__setattr__
-        for name in ("jump_floor", "solar_lag", "t_median"):
+        for name in ("scale_floor", "jump_floor", "solar_lag", "t_median"):
             s(self, name, tuple(float(v) for v in getattr(self, name)))
         s(self, "stuck_hours", tuple(int(v) for v in self.stuck_hours))
         s(self, "enforce_checks", tuple(str(v) for v in self.enforce_checks))
-        if len(self.jump_floor) != 3 or len(self.stuck_hours) != 3:
-            raise ValueError("jump_floor и stuck_hours — по одному значению на канал T, P, RH")
+        if len(self.jump_floor) != 3 or len(self.stuck_hours) != 3 or len(self.scale_floor) != 3:
+            raise ValueError("scale_floor, jump_floor и stuck_hours задаются по одному "
+                             "значению на канал T, P, RH")
+        if min(self.scale_floor) <= 0:
+            raise ValueError(f"scale_floor = {self.scale_floor}: нужны положительные границы")
+        if self.jump_max_gap < 1 or self.stuck_max_gap < 1:
+            raise ValueError("jump_max_gap и stuck_max_gap не меньше часа")
+        shortest = min(self.stuck_hours + (self.stuck_T_alone_hours, self.rh_sat_hours))
+        if self.stuck_min_count * self.stuck_max_gap > shortest:
+            raise ValueError(f"stuck_min_count {self.stuck_min_count} отчётов через "
+                             f"{self.stuck_max_gap} ч не помещаются в кратчайший срок "
+                             f"залипания {shortest} ч")
+        if not 1 <= self.units_min_days <= self.units_past_days:
+            raise ValueError("нужно 1 не больше units_min_days не больше units_past_days")
         unknown = set(self.enforce_checks) - set(STATION_CHECKS)
         if unknown:
             raise ValueError(f"неизвестные станционные проверки {sorted(unknown)}; "
@@ -122,6 +204,20 @@ class QCConfig:
             raise ValueError(f"solar_lag = {self.solar_lag}: нужна пара lo < hi")
         if not 0.0 <= self.min_valid_frac_T <= 1.0:
             raise ValueError("min_valid_frac_T вне [0, 1]")
+
+    @property
+    def lookback_hours(self):
+        """Сколько прошлых часов нужно причинному режиму, чтобы решить о часе.
+
+        Returns:
+            Число часов.
+        """
+        spike = 2 * self.spike_half
+        jump = self.excursion_max_hours + 2 * self.jump_half + self.jump_max_gap + spike
+        stuck = max(self.stuck_hours + (self.stuck_T_alone_hours, self.rh_sat_hours)) \
+            + self.stuck_max_gap
+        units = max(24 * self.units_past_days + 23, 2 * self.units_half, 2 * self.slp_half)
+        return max(spike, jump, stuck, units)
 
     def to_dict(self):
         return json.loads(json.dumps(dataclasses.asdict(self)))
@@ -133,33 +229,64 @@ class QCConfig:
 
 STATION_CHECKS = ("t_level", "solar_phase", "changepoint", "dem_elevation")
 DEFAULT_QC = QCConfig()
+QC_MODES = ("centered", "causal")
+
+
+def window_span(half, causal):
+    """Сколько часов окно берёт до и после проверяемого часа.
+
+    Args:
+        half: полуширина окна, ч.
+        causal: причинный режим.
+
+    Returns:
+        Пара чисел часов: до и после.
+    """
+    return (2 * half, 0) if causal else (half, half)
 
 
 def _median_sorted(s, cnt):
-    """Медиана по оси -1 для массива, отсортированного с NaN в конце; cnt - число не-NaN."""
+    """Медиана по последней оси массива, отсортированного с NaN в конце.
+
+    Args:
+        s: отсортированный массив, форма (K, W).
+        cnt: число конечных значений в каждой строке, форма (K,).
+
+    Returns:
+        Медианы, форма (K,).
+    """
     c = np.maximum(cnt, 1)
     lo = np.take_along_axis(s, ((c - 1) // 2)[:, None], -1)[:, 0]
     hi = np.take_along_axis(s, (c // 2)[:, None], -1)[:, 0]
     return (lo + hi) / 2
 
 
-def rolling_median_mad(x, valid, half, chunk=1 << 16, at=None):
-    """Скользящие медиана, MAD (+1e-6) и число валидных точек в окне [i − half, i + half].
+def rolling_median_mad(x, valid, half, chunk=1 << 16, at=None, after=None):
+    """Скользящие медиана, медиана абсолютных отклонений и число точек в окне.
 
-    Невалидные точки в окно не входят. Там, где в окне нет ни одной валидной точки,
-    медиана и MAD - NaN. at - индексы, в которых считать (по умолчанию все);
-    результат тогда длины len(at). Возвращает (med, mad, cnt).
+    Args:
+        x: значения, форма (N,).
+        valid: валидность точек, форма (N,).
+        half: сколько часов до проверяемого берёт окно.
+        chunk: сколько окон обрабатывать за раз.
+        at: индексы часов, в которых считать; по умолчанию все.
+        after: сколько часов после проверяемого берёт окно; по умолчанию half.
+
+    Returns:
+        Тройка массивов длины N или len(at): медиана, медиана отклонений и число
+        валидных точек. Там, где в окне нет ни одной точки, медиана и разброс NaN.
     """
-    x = np.asarray(x)
+    after = half if after is None else int(after)
+    x = np.asarray(x, np.float64)
     n = len(x)
-    xv = np.where(np.asarray(valid) > 0, x, np.nan).astype(x.dtype, copy=False)
-    xp = np.pad(xv, (half, half), constant_values=np.nan)
+    xv = np.where(np.asarray(valid) > 0, x, np.nan)
+    xp = np.pad(xv, (half, after), constant_values=np.nan)
     pos = np.arange(n) if at is None else np.asarray(at, np.int64)
     k = len(pos)
-    med = np.empty(k, xv.dtype)
-    mad = np.empty(k, xv.dtype)
+    med = np.empty(k)
+    mad = np.empty(k)
     cnt = np.empty(k, np.int64)
-    view = sliding_window_view(xp, 2 * half + 1)
+    view = sliding_window_view(xp, half + after + 1)
     for a in range(0, k, chunk):
         b = min(k, a + chunk)
         w = view[a:b] if at is None else view[pos[a:b]]
@@ -171,132 +298,298 @@ def rolling_median_mad(x, valid, half, chunk=1 << 16, at=None):
     return med, mad, cnt
 
 
-def rolling_median(x, valid, half, min_valid=1, at=None):
-    """Скользящая медиана по валидным точкам; NaN, где их меньше min_valid."""
-    med, _, cnt = rolling_median_mad(x, valid, half, at=at)
+def rolling_median(x, valid, half, min_valid=1, at=None, after=None):
+    """Скользящая медиана по валидным точкам.
+
+    Args:
+        x: значения, форма (N,).
+        valid: валидность точек, форма (N,).
+        half: сколько часов до проверяемого берёт окно.
+        min_valid: наименьшее число точек в окне.
+        at: индексы часов, в которых считать; по умолчанию все.
+        after: сколько часов после проверяемого берёт окно; по умолчанию half.
+
+    Returns:
+        Медианы; NaN там, где точек меньше min_valid.
+    """
+    med, _, cnt = rolling_median_mad(x, valid, half, at=at, after=after)
     return np.where(cnt >= min_valid, med, np.nan)
 
 
-def _window_count(flag, half):
-    """Число True в окне [i − half, i + half] для каждого i (кумулятивной суммой)."""
+def _window_count(flag, half, after=None):
+    """Число отмеченных часов в окне каждого часа.
+
+    Args:
+        flag: отметки, форма (N,).
+        half: сколько часов до часа берёт окно.
+        after: сколько часов после часа берёт окно; по умолчанию half.
+
+    Returns:
+        Целые счётчики, форма (N,).
+    """
+    after = half if after is None else int(after)
     c = np.concatenate([[0], np.cumsum(np.asarray(flag, np.int64))])
     n = len(flag)
     i = np.arange(n)
-    return c[np.minimum(n, i + half + 1)] - c[np.maximum(0, i - half)]
+    return c[np.minimum(n, i + after + 1)] - c[np.maximum(0, i - half)]
 
 
-def mad_ok(x, valid, half=MAD_HALF, thresh=MAD_THRESH, min_valid=MAD_MIN_VALID, chunk=1 << 16):
-    """True там, где точка не выброс: |x − med| ≤ thresh · 1.4826 · MAD (векторно)."""
-    x = np.asarray(x)
-    med, mad, cnt = rolling_median_mad(x, valid, half, chunk)
-    bad = np.abs(x - med) > thresh * MAD_TO_SD * mad
+def mad_ok(x, valid, half=MAD_HALF, thresh=MAD_THRESH, min_valid=MAD_MIN_VALID, chunk=1 << 16,
+           floor=0.0, causal=False):
+    """Какие точки не выбросы относительно скользящей медианы.
+
+    Args:
+        x: значения, форма (N,).
+        valid: валидность точек, форма (N,).
+        half: полуширина окна, ч.
+        thresh: порог в единицах разброса.
+        min_valid: наименьшее число точек в окне.
+        chunk: сколько окон обрабатывать за раз.
+        floor: нижняя граница разброса.
+        causal: причинный режим окна.
+
+    Returns:
+        Булев массив (N,): True там, где точка не выброс.
+    """
+    x = np.asarray(x, np.float64)
+    before, after = window_span(half, causal)
+    med, mad, cnt = rolling_median_mad(x, valid, before, chunk, after=after)
+    bad = np.abs(x - med) > thresh * np.maximum(MAD_TO_SD * mad, floor)
     return ~((cnt >= min_valid) & bad)
 
 
-def _mad_ok_reference(x, valid, half=MAD_HALF, thresh=MAD_THRESH, min_valid=MAD_MIN_VALID):
-    """Только для тестов. Медленная"""
+def _mad_ok_reference(x, valid, half=MAD_HALF, thresh=MAD_THRESH, min_valid=MAD_MIN_VALID,
+                      floor=0.0, causal=False):
+    """Медленный эталон проверки выброса для тестов."""
+    x = np.asarray(x, np.float64)
+    before, after = window_span(half, causal)
     n = len(x)
     ok = np.ones(n, dtype=bool)
     for i in range(n):
-        lo, hi = max(0, i - half), min(n, i + half + 1)
+        lo, hi = max(0, i - before), min(n, i + after + 1)
         seg = x[lo:hi][valid[lo:hi] > 0]
         if len(seg) < min_valid:
             continue
         med = np.median(seg)
         mad = np.median(np.abs(seg - med)) + 1e-6
-        if abs(x[i] - med) > thresh * 1.4826 * mad:
+        if abs(x[i] - med) > thresh * max(MAD_TO_SD * mad, floor):
             ok[i] = False
     return ok
 
 
-def jump_flags(x, ok, half, thresh, min_valid, floor, excursion_max_hours=0):
-    """Аномальный часовой скачок → (jump, excursion), bool (N,).
+def increments(x, ok, max_gap):
+    """Приращения между соседними валидными отчётами.
 
-    Приращение d_t = x_t − x_{t−1} определено, только если валидны оба часа (правило
-    лагов блока 1). Скачок аномален, если d_t - робастный выброс среди приращений
-    в окне ±half ч и одновременно |d_t| > floor. Флаг ставится на час t - первый
-    час после скачка.
+    Args:
+        x: значения, форма (N,).
+        ok: валидность отчётов, форма (N,).
+        max_gap: наибольшее расстояние между отчётами, ч.
+
+    Returns:
+        Тройка массивов формы (N,): приращение за час, полное изменение уровня и
+        признак того, что приращение определено.
     """
     x = np.asarray(x, np.float64)
-    ok = np.asarray(ok, bool)
     n = len(x)
+    rate, level, defined = np.zeros(n), np.zeros(n), np.zeros(n, bool)
+    idx = np.flatnonzero(np.asarray(ok, bool))
+    if idx.size < 2:
+        return rate, level, defined
+    gap = np.diff(idx)
+    use = gap <= max_gap
+    at = idx[1:][use]
+    level[at] = (x[idx[1:]] - x[idx[:-1]])[use]
+    rate[at] = level[at] / gap[use]
+    defined[at] = True
+    return rate, level, defined
+
+
+def _cancels(da, db):
+    """Второе изменение уровня возвращает ряд к уровню до первого."""
+    return da * db < 0 and abs(da + db) <= 0.5 * min(abs(da), abs(db))
+
+
+def jump_flags(x, ok, half, thresh, min_valid, floor, excursion_max_hours=0, max_gap=1,
+               scale_floor=0.0, causal=False):
+    """Аномальные скачки между соседними отчётами.
+
+    Args:
+        x: значения, форма (N,).
+        ok: валидность отчётов, форма (N,).
+        half: полуширина окна приращений, ч.
+        thresh: порог в единицах робастного разброса приращений.
+        min_valid: наименьшее число приращений в окне.
+        floor: наименьший аномальный скачок в единицах за час.
+        excursion_max_hours: наибольшая длина выброса туда и обратно, ч.
+        max_gap: наибольшее расстояние между соседними отчётами, ч.
+        scale_floor: нижняя граница разброса приращений.
+        causal: причинный режим окна.
+
+    Returns:
+        Пара булевых массивов (N,): скачки и часы выброса туда и обратно.
+    """
+    ok = np.asarray(ok, bool)
+    n = len(ok)
     jump = np.zeros(n, bool)
     exc = np.zeros(n, bool)
-    if n < 2:
-        return jump, exc
-    dv = np.zeros(n, bool)
-    dv[1:] = ok[1:] & ok[:-1]
-    d = np.zeros(n)
-    d[1:] = np.where(dv[1:], x[1:] - x[:-1], 0.0)
-    cand = np.flatnonzero(dv & (np.abs(d) > floor))
+    rate, level, dv = increments(x, ok, max_gap)
+    cand = np.flatnonzero(dv & (np.abs(rate) > floor))
     if cand.size == 0:
         return jump, exc
-    med, mad, cnt = rolling_median_mad(d, dv, half, at=cand)
-    rel = (cnt >= min_valid) & (np.abs(d[cand] - med) > thresh * MAD_TO_SD * mad)
+    before, after = window_span(half, causal)
+    med, mad, cnt = rolling_median_mad(rate, dv, before, at=cand, after=after)
+    scale = np.maximum(MAD_TO_SD * mad, scale_floor)
+    rel = (cnt >= min_valid) & (np.abs(rate[cand] - med) > thresh * scale)
     J = cand[rel]
+    if causal:
+        keep = np.ones(len(J), bool)
+        for i in range(len(J)):
+            b = J[i]
+            for k in range(i - 1, -1, -1):
+                a = J[k]
+                if b - a > excursion_max_hours:
+                    break
+                if _cancels(level[a], level[b]):
+                    keep[i] = False
+                    break
+        jump[J[keep]] = True
+        return jump, exc
     used = np.zeros(len(J), bool)
     for i in range(len(J) - 1):
         a, b = J[i], J[i + 1]
         if used[i] or b - a > excursion_max_hours:
             continue
-        if d[a] * d[b] < 0 and abs(d[a] + d[b]) <= 0.5 * min(abs(d[a]), abs(d[b])):
+        if _cancels(level[a], level[b]):
             exc[a:b] = True
             used[i] = used[i + 1] = True
     jump[J[~used]] = True
-    return jump, exc
+    return jump, exc & ok
 
 
-def _runs(idx, same, n, min_hours, max_gap, min_count):
-    """Серии соседних валидных отсчётов → флаг на отсчётах длинных серий.
+def run_lengths(x, ok, max_gap, causal=False, below=None, at_least=None):
+    """Серии соседних отчётов с одинаковым значением.
 
-    idx  — индексы валидных часов (возрастают);
-    same — (len(idx) − 1,) отсчёты k и k+1 принадлежат одной серии по значению.
-    Серия рвётся, если значения различаются или пропуск между отсчётами > max_gap.
-    Серия длинная, если охватывает ≥ min_hours часов и содержит ≥ min_count отсчётов.
+    Args:
+        x: значения, форма (N,).
+        ok: валидность отчётов, форма (N,).
+        max_gap: наибольший пропуск внутри серии, ч.
+        causal: причинный режим.
+        below: если задано, в серии участвуют только значения меньше него.
+        at_least: если задано, серия - подряд идущие значения не меньше него,
+            одинаковыми они быть не обязаны.
+
+    Returns:
+        Пара целых массивов (N,): охват серии в часах и число отчётов в ней.
+        У невалидных часов нули.
     """
-    out = np.zeros(n, bool)
-    if idx.size < max(2, min_count):
-        return out
-    cont = same & (np.diff(idx) <= max_gap)
-    start = np.r_[True, ~cont]
+    x = np.asarray(x, np.float64)
+    n = len(x)
+    span, count = np.zeros(n, np.int64), np.zeros(n, np.int64)
+    idx = np.flatnonzero(np.asarray(ok, bool))
+    if idx.size == 0:
+        return span, count
+    v = x[idx]
+    if at_least is not None:
+        el = v >= at_least
+        link = el[1:] & el[:-1]
+    else:
+        link = v[1:] == v[:-1]
+        if below is not None:
+            el = v < below
+            link &= el[1:] & el[:-1]
+    link &= np.diff(idx) <= max_gap
+    start = np.r_[True, ~link]
+    starts = np.flatnonzero(start)
     rid = np.cumsum(start) - 1
-    first = idx[start]
-    last = np.r_[idx[np.flatnonzero(start)[1:] - 1], idx[-1]]
-    count = np.bincount(rid)
-    long_ = (last - first + 1 >= min_hours) & (count >= min_count)
-    out[idx] = long_[rid]
+    first_pos = starts[rid]
+    if causal:
+        last_pos = np.arange(len(idx))
+    else:
+        last_pos = np.r_[starts[1:] - 1, len(idx) - 1][rid]
+    span[idx] = idx[last_pos] - idx[first_pos] + 1
+    count[idx] = last_pos - first_pos + 1
+    return span, count
+
+
+def _long(span, count, hours, min_count):
+    return (span >= hours) & (count >= min_count)
+
+
+def stuck_flags(x, ok, min_hours, max_gap=6, min_count=4, below=None, causal=False):
+    """Одно и то же значение дольше min_hours часов.
+
+    Args:
+        x: значения, форма (N,).
+        ok: валидность отчётов, форма (N,).
+        min_hours: допустимый срок одного значения, ч.
+        max_gap: наибольший пропуск внутри серии, ч.
+        min_count: наименьшее число отчётов в серии.
+        below: если задано, в серии участвуют только значения меньше него.
+        causal: причинный режим.
+
+    Returns:
+        Булев массив (N,).
+    """
+    span, count = run_lengths(x, ok, max_gap, causal, below=below)
+    return _long(span, count, min_hours, min_count)
+
+
+def saturation_flags(rh, ok, sat, min_hours, max_gap=6, min_count=4, causal=False):
+    """Влажность не ниже sat дольше min_hours часов: залипание на насыщении.
+
+    Args:
+        rh: влажность, форма (N,).
+        ok: валидность отчётов, форма (N,).
+        sat: порог насыщения, %.
+        min_hours: допустимый срок насыщения, ч.
+        max_gap: наибольший пропуск внутри серии, ч.
+        min_count: наименьшее число отчётов в серии.
+        causal: причинный режим.
+
+    Returns:
+        Булев массив (N,).
+    """
+    span, count = run_lengths(rh, ok, max_gap, causal, at_least=sat)
+    return _long(span, count, min_hours, min_count)
+
+
+def stuck_codes(x, base, cfg=DEFAULT_QC, causal=False):
+    """Залипание по всем каналам.
+
+    Args:
+        x: значения, форма (N, 3).
+        base: отчёты, прошедшие проверку диапазона, форма (N, 3).
+        cfg: пороги.
+        causal: причинный режим.
+
+    Returns:
+        Булев массив (N, 3).
+    """
+    out = np.zeros(base.shape, bool)
+    g, c = cfg.stuck_max_gap, cfg.stuck_min_count
+    span_t, cnt_t = run_lengths(x[:, 0], base[:, 0], g, causal)
+    span_p, cnt_p = run_lengths(x[:, 1], base[:, 1], g, causal)
+    span_r, cnt_r = run_lengths(x[:, 2], base[:, 2], g, causal, below=cfg.rh_sat)
+    rh_long = _long(span_r, cnt_r, cfg.stuck_hours[0], c)
+    out[:, 0] = _long(span_t, cnt_t, cfg.stuck_T_alone_hours, c) \
+        | (_long(span_t, cnt_t, cfg.stuck_hours[0], c) & rh_long)
+    out[:, 1] = _long(span_p, cnt_p, cfg.stuck_hours[1], c)
+    out[:, 2] = _long(span_r, cnt_r, cfg.stuck_hours[2], c)
+    out[:, 2] |= saturation_flags(x[:, 2], base[:, 2], cfg.rh_sat, cfg.rh_sat_hours, g, c,
+                                  causal)
     return out
 
 
-def stuck_flags(x, ok, min_hours, max_gap=6, min_count=4, below=None):
-    """Одно и то же значение дольше min_hours (сравнение точное, после float32).
-
-    below - если задано, в серии участвуют только значения < below (для RH значения
-    насыщения обрабатываются отдельным правилом ``saturation_flags``).
-    """
-    x = np.asarray(x)
-    idx = np.flatnonzero(np.asarray(ok, bool))
-    v = x[idx]
-    same = v[1:] == v[:-1]
-    if below is not None:
-        el = v < below
-        same &= el[1:] & el[:-1]
-    return _runs(idx, same, len(x), min_hours, max_gap, min_count)
-
-
-def saturation_flags(rh, ok, sat, min_hours, max_gap=6, min_count=4):
-    """Влажность не ниже sat дольше min_hours - залипание на сотне процентов."""
-    rh = np.asarray(rh)
-    idx = np.flatnonzero(np.asarray(ok, bool))
-    hi = rh[idx] >= sat
-    return _runs(idx, hi[1:] & hi[:-1], len(rh), min_hours, max_gap, min_count)
-
-
 def _daily_reference(x, ok, cfg):
-    """Опорный уровень и робастный разброс ряда в масштабе недель → почасовые массивы.
+    """Опорный уровень и разброс ряда в масштабе недель, центрированный режим.
 
-    Суточные медианы (блоки по 24 ч от начала массива; сутки с ≥ units_min_valid
-    валидными часами) → скользящая медиана и MAD по ±units_ref_days суток.
+    Args:
+        x: значения, форма (N,).
+        ok: валидность, форма (N,).
+        cfg: пороги.
+
+    Returns:
+        Пара почасовых массивов (N,): опорный уровень и разброс.
     """
     x = np.asarray(x, np.float64)
     n = len(x)
@@ -306,43 +599,80 @@ def _daily_reference(x, ok, cfg):
     xm = np.sort(xm.reshape(nd, 24), axis=1)
     cnt = np.isfinite(xm).sum(1)
     day = _median_sorted(xm, cnt)
-    dv = (cnt >= cfg.units_min_valid) & np.isfinite(day)
+    dv = (cnt >= cfg.units_day_min_valid) & np.isfinite(day)
     med, mad, c = rolling_median_mad(np.where(dv, day, 0.0), dv, cfg.units_ref_days)
-    ref = np.where(c >= 3, med, np.nan)
+    ref = np.where(c >= cfg.units_min_days, med, np.nan)
     spread = np.maximum(MAD_TO_SD * mad, cfg.units_spread_floor)
     hours = np.arange(n) // 24
     return ref[hours], spread[hours]
 
 
-def fahrenheit_flags(T, ok_raw, ok_ref, cfg=DEFAULT_QC):
-    """Участки ряда температуры в °F.
+def past_reference(x, ok, cfg=DEFAULT_QC):
+    """Опорный уровень и разброс ряда по прошлым суткам, причинный режим.
 
-    Суточная скользящая медиана r(t) по сырым значениям резко выше опорного уровня
-    ряда, а после перевода (r − 32) / 1.8 ложится на опорный уровень. Опора — медиана
-    суточных медиан за ±units_ref_days суток по значениям, прошедшим проверку
-    диапазона, поэтому короткий участок в °F её не сдвигает.
+    Args:
+        x: значения, форма (N,).
+        ok: валидность, форма (N,).
+        cfg: пороги.
 
-    Ограничения: около −40 °C шкалы совпадают, а при отрицательных температурах
-    отрыв (0.8·T + 32) мал — такие участки неотличимы от холодной погоды (например,
-    от арктического потепления на 10 °C).
+    Returns:
+        Пара массивов (N,): опорный уровень, NaN там, где его нет, и разброс.
+    """
+    x = np.asarray(x, np.float64)
+    n = len(x)
+    day, _, cnt = rolling_median_mad(x, ok, 23, after=0)
+    day_ok = (cnt >= cfg.units_day_min_valid) & np.isfinite(day)
+    src = np.arange(n)[:, None] - 24 * np.arange(1, cfg.units_past_days + 1)[None, :]
+    use = src >= 0
+    srcc = np.maximum(src, 0)
+    use &= day_ok[srcc]
+    vals = np.sort(np.where(use, day[srcc], np.nan), axis=1)
+    k = use.sum(1)
+    med = _median_sorted(vals, k)
+    dev = np.sort(np.abs(vals - med[:, None]), axis=1)
+    mad = _median_sorted(dev, k)
+    ref = np.where(k >= cfg.units_min_days, med, np.nan)
+    spread = np.maximum(MAD_TO_SD * np.where(k > 0, mad, 0.0), cfg.units_spread_floor)
+    return ref, spread
+
+
+def fahrenheit_flags(T, ok_raw, ok_ref, cfg=DEFAULT_QC, causal=False):
+    """Участки ряда температуры в градусах Фаренгейта.
+
+    Args:
+        T: температура, форма (N,).
+        ok_raw: значение есть, форма (N,).
+        ok_ref: значение годится для опоры, форма (N,).
+        cfg: пороги.
+        causal: причинный режим.
+
+    Returns:
+        Булев массив (N,).
     """
     T = np.asarray(T, np.float64)
     ok_raw = np.asarray(ok_raw, bool)
     out = np.zeros(len(T), bool)
-    ref, spread = _daily_reference(T, ok_ref, cfg)
-    thr = np.maximum(cfg.units_ref_k * spread, cfg.units_min_excess)
-    g = (ref + thr)[::24]
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        gmin = np.nanmin(np.stack([np.r_[g[:1], g[:-1]], g, np.r_[g[1:], g[-1:]]]), axis=0)
-    with np.errstate(invalid="ignore"):
-        above = ok_raw & (T > gmin[np.arange(len(T)) // 24])
-    n_above = _window_count(above, cfg.units_half)
-    n_valid = _window_count(ok_raw, cfg.units_half)
-    cand = np.flatnonzero(ok_raw & (n_valid >= cfg.units_min_valid) & (2 * n_above >= n_valid))
+    before, after = window_span(cfg.units_half, causal)
+    n_valid = _window_count(ok_raw, before, after)
+    if causal:
+        ref, spread = past_reference(T, ok_ref, cfg)
+        thr = np.maximum(cfg.units_ref_k * spread, cfg.units_min_excess)
+        cand = np.flatnonzero(ok_raw & (n_valid >= cfg.units_min_valid) & np.isfinite(ref))
+    else:
+        ref, spread = _daily_reference(T, ok_ref, cfg)
+        thr = np.maximum(cfg.units_ref_k * spread, cfg.units_min_excess)
+        g = (ref + thr)[::24]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            gmin = np.nanmin(np.stack([np.r_[g[:1], g[:-1]], g, np.r_[g[1:], g[-1:]]]), axis=0)
+        with np.errstate(invalid="ignore"):
+            above = ok_raw & (T > gmin[np.arange(len(T)) // 24])
+        n_above = _window_count(above, before, after)
+        cand = np.flatnonzero(ok_raw & (n_valid >= cfg.units_min_valid)
+                              & (2 * n_above >= n_valid))
     if cand.size == 0:
         return out
-    r = rolling_median(T, ok_raw, cfg.units_half, cfg.units_min_valid, at=cand)
+    r = rolling_median(T, ok_raw, before, cfg.units_min_valid, at=cand, after=after)
     conv = (r - 32.0) / 1.8
     with np.errstate(invalid="ignore"):
         high = r - ref[cand] > thr[cand]
@@ -357,13 +687,18 @@ def station_pressure_expected(elev):
     return P_SEA_LEVEL * (1.0 - float(elev) / 44330.0) ** 5.255
 
 
-def sea_level_pressure_flags(P, ok_raw, elev, cfg=DEFAULT_QC):
+def sea_level_pressure_flags(P, ok_raw, elev, cfg=DEFAULT_QC, causal=False):
     """Давление, приведённое к уровню моря, вместо станционного.
 
-    Решаемо только для станций, у которых стандартное давление ниже уровня моря
-    хотя бы на slp_min_sep (≈ 700 м и выше): иначе синоптический размах
-    перекрывает разницу. Флаг - суточная медиана ближе к уровню моря, чем
-    к ожидаемому станционному давлению.
+    Args:
+        P: давление, форма (N,).
+        ok_raw: значение есть, форма (N,).
+        elev: высота станции, м; None - проверка не выполняется.
+        cfg: пороги.
+        causal: причинный режим.
+
+    Returns:
+        Булев массив (N,).
     """
     n = len(P)
     if elev is None or not np.isfinite(elev):
@@ -375,14 +710,15 @@ def sea_level_pressure_flags(P, ok_raw, elev, cfg=DEFAULT_QC):
     P = np.asarray(P, np.float64)
     ok_raw = np.asarray(ok_raw, bool)
     out = np.zeros(n, bool)
+    before, after = window_span(cfg.slp_half, causal)
     with np.errstate(invalid="ignore"):
         above = ok_raw & (P > p_exp + sep / 2)
-    n_above = _window_count(above, cfg.units_half)
-    n_valid = _window_count(ok_raw, cfg.units_half)
+    n_above = _window_count(above, before, after)
+    n_valid = _window_count(ok_raw, before, after)
     cand = np.flatnonzero(ok_raw & (n_valid >= cfg.units_min_valid) & (2 * n_above >= n_valid))
     if cand.size == 0:
         return out
-    r = rolling_median(P, ok_raw, cfg.units_half, cfg.units_min_valid, at=cand)
+    r = rolling_median(P, ok_raw, before, cfg.units_min_valid, at=cand, after=after)
     out[cand[r > p_exp + sep / 2]] = True
     return out
 
@@ -395,66 +731,105 @@ def dewpoint_flags(T, Td, ok_T, cfg=DEFAULT_QC):
         return np.asarray(ok_T, bool) & np.isfinite(Td) & (Td > T + cfg.dewpoint_tol)
 
 
-def _spike_flags(x, base, cfg):
-    """SPIKE по всем каналам одним проходом скользящей медианы.
+def _spike_flags(x, base, cfg, causal=False):
+    """Выбросы по всем каналам одним проходом скользящей медианы.
 
-    Каналы склеиваются в один ряд через разделители из spike_half невалидных точек:
-    окно ±spike_half ни одного канала не дотягивается до соседнего, поэтому результат
-    побитово равен поканальному ``mad_ok``, а накладные расходы - втрое меньше.
+    Args:
+        x: значения, форма (N, 3).
+        base: отчёты, прошедшие проверку диапазона, форма (N, 3).
+        cfg: пороги.
+        causal: причинный режим.
+
+    Returns:
+        Булев массив (N, 3).
     """
     n, c = x.shape
-    h = cfg.spike_half
-    xs = np.full((c, n + h), np.nan, x.dtype)
-    vs = np.zeros((c, n + h), bool)
-    xs[:, :n], vs[:, :n] = x.T, base.T
-    ok = mad_ok(xs.ravel()[:-h] if h else xs.ravel(), vs.ravel()[:-h] if h else vs.ravel(),
-                h, cfg.spike_thresh, cfg.spike_min_valid)
-    ok = np.r_[ok, np.ones(h, bool)].reshape(c, n + h)[:, :n].T
+    before, after = window_span(cfg.spike_half, causal)
+    sep = max(before, after)
+    x64 = np.asarray(x, np.float64)
+    xs = np.full((c, n + sep), np.nan)
+    vs = np.zeros((c, n + sep), bool)
+    fl = np.zeros((c, n + sep))
+    xs[:, :n], vs[:, :n] = x64.T, base.T
+    fl[:] = np.asarray(cfg.scale_floor, np.float64)[:, None]
+    flat = slice(None, -sep) if sep else slice(None)
+    xf, vf, ff = xs.ravel()[flat], vs.ravel()[flat], fl.ravel()[flat]
+    med, mad, cnt = rolling_median_mad(xf, vf, before, after=after)
+    bad = np.abs(xf - med) > cfg.spike_thresh * np.maximum(MAD_TO_SD * mad, ff)
+    ok = ~((cnt >= cfg.spike_min_valid) & bad)
+    ok = np.r_[ok, np.ones(sep, bool)].reshape(c, n + sep)[:, :n].T
     return base & ~ok
 
 
-def check_codes(x, src, elev=None, Td=None, cfg=DEFAULT_QC):
-    """Поточечные и оконные проверки → коды uint8 (N, 3), без MISSING / SOURCE.
+def check_codes(x, src, elev=None, Td=None, cfg=DEFAULT_QC, causal=False):
+    """Поточечные и оконные проверки без кодов MISSING и SOURCE.
 
-    x   — значения (N, 3);
-    src — (N, 3) bool: значение есть и не помечено источником;
-    elev — высота станции, м (для проверки давления; None — проверка пропускается);
-    Td  — точка росы (N,), если источник даёт её отдельно (реальные наблюдения).
+    Args:
+        x: значения, форма (N, 3).
+        src: значение есть и не помечено источником, форма (N, 3).
+        elev: высота станции для проверки давления, м; None - проверка пропускается.
+        Td: точка росы, форма (N,), если источник даёт её отдельно.
+        cfg: пороги.
+        causal: причинный режим окон.
+
+    Returns:
+        Коды uint8, форма (N, 3).
     """
     x = np.asarray(x)
     src = np.asarray(src, bool)
     n = x.shape[0]
     codes = np.zeros((n, 3), np.uint8)
+    if n == 0:
+        return codes
     lo = np.array([PHYS[c][0] for c in CHANNELS], x.dtype)
     hi = np.array([PHYS[c][1] for c in CHANNELS], x.dtype)
     with np.errstate(invalid="ignore"):
         phys = (x >= lo) & (x <= hi)
     codes[src & ~phys] |= np.uint8(QCCode.RANGE)
     base = src & phys
-    spikes = _spike_flags(x, base, cfg)
+    spikes = _spike_flags(x, base, cfg, causal)
     codes[spikes] |= np.uint8(QCCode.SPIKE)
-    for j, name in enumerate(CHANNELS):
-        v, b, spike = x[:, j], base[:, j], spikes[:, j]
-        jump, exc = jump_flags(v, b & ~spike, cfg.jump_half, cfg.jump_thresh,
-                               cfg.jump_min_valid, cfg.jump_floor[j], cfg.excursion_max_hours)
+    for j in range(3):
+        jump, exc = jump_flags(x[:, j], base[:, j] & ~spikes[:, j], cfg.jump_half,
+                               cfg.jump_thresh, cfg.jump_min_valid, cfg.jump_floor[j],
+                               cfg.excursion_max_hours, cfg.jump_max_gap, cfg.scale_floor[j],
+                               causal)
         codes[jump, j] |= np.uint8(QCCode.JUMP)
         codes[exc, j] |= np.uint8(QCCode.SPIKE)
-        below = cfg.rh_sat if name == "RH" else None
-        stuck = stuck_flags(v, b, cfg.stuck_hours[j], cfg.stuck_max_gap, cfg.stuck_min_count,
-                            below=below)
-        codes[stuck, j] |= np.uint8(QCCode.STUCK)
-    sat = saturation_flags(x[:, 2], base[:, 2], cfg.rh_sat, cfg.rh_sat_hours,
-                           cfg.stuck_max_gap, cfg.stuck_min_count)
-    codes[sat, 2] |= np.uint8(QCCode.STUCK)
-    codes[fahrenheit_flags(x[:, 0], src[:, 0], base[:, 0], cfg), 0] |= np.uint8(QCCode.UNITS)
-    codes[sea_level_pressure_flags(x[:, 1], src[:, 1], elev, cfg), 1] |= np.uint8(QCCode.UNITS)
+    codes[stuck_codes(x, base, cfg, causal)] |= np.uint8(QCCode.STUCK)
+    codes[fahrenheit_flags(x[:, 0], src[:, 0], base[:, 0], cfg, causal), 0] |= \
+        np.uint8(QCCode.UNITS)
+    codes[sea_level_pressure_flags(x[:, 1], src[:, 1], elev, cfg, causal), 1] |= \
+        np.uint8(QCCode.UNITS)
     if Td is not None:
         codes[dewpoint_flags(x[:, 0], Td, base[:, 0], cfg), 2] |= np.uint8(QCCode.DEWPOINT)
     return codes
 
 
+def causal_codes(x, present, elev=None, cfg=DEFAULT_QC, start=0):
+    """Причинный QC ряда: то, что увидит устройство.
+
+    Args:
+        x: сырые значения, форма (N, 3).
+        present: маска наличия значения, форма (N, 3).
+        elev: высота станции для проверки давления, м.
+        cfg: пороги.
+        start: первый час, для которого нужны коды; часы до него служат контекстом.
+
+    Returns:
+        Коды uint8 часов с start до конца, форма (N - start, 3), вместе с MISSING.
+    """
+    x = np.asarray(x, np.float32)
+    src = (np.asarray(present) > 0) & np.isfinite(x)
+    start = int(start)
+    lo = max(0, start - cfg.lookback_hours)
+    codes = check_codes(x[lo:], src[lo:], elev=elev, cfg=cfg, causal=True)[start - lo:]
+    codes[~src[start:]] |= np.uint8(QCCode.MISSING)
+    return codes
+
+
 def _as_channel_valid(valid, n):
-    """Маска источника (N,) или (N, 3) → (N, 3) bool."""
+    """Маска источника формы (N,) или (N, 3) в виде булевой (N, 3)."""
     v = np.asarray(valid)
     if v.ndim == 1:
         v = np.repeat(v[:, None], len(CHANNELS), axis=1)
@@ -463,13 +838,35 @@ def _as_channel_valid(valid, n):
     return v > 0
 
 
-def qc_station(T, P, RH, valid, *, Td=None, flag=None, elev=None, cfg=DEFAULT_QC):
-    """Полный QC ряда станции → (x float32 (N,3), mask uint8 (N,3), codes uint8 (N,3)).
+def presence(x, valid):
+    """Маска наличия значения от источника.
 
-    valid - маска наличия от источника, (N,) или (N, 3);
-    flag  - штатные флаги источника «подозрительно», (N,) или (N, 3);
-    Td    - точка росы (N,), если источник даёт её отдельно;
-    elev  - высота станции, м.
+    Args:
+        x: значения, форма (N, 3).
+        valid: маска источника, форма (N,) или (N, 3).
+
+    Returns:
+        Маска uint8, форма (N, 3): значение есть и конечно.
+    """
+    x = np.asarray(x)
+    return (_as_channel_valid(valid, x.shape[0]) & np.isfinite(x)).astype(np.uint8)
+
+
+def qc_station(T, P, RH, valid, *, Td=None, flag=None, elev=None, cfg=DEFAULT_QC):
+    """Полный центрированный QC ряда станции.
+
+    Args:
+        T: температура, форма (N,).
+        P: давление, форма (N,).
+        RH: влажность, форма (N,).
+        valid: маска наличия от источника, форма (N,) или (N, 3).
+        Td: точка росы, форма (N,), если источник даёт её отдельно.
+        flag: штатные флаги источника «подозрительно», форма (N,) или (N, 3).
+        elev: высота станции, м.
+        cfg: пороги.
+
+    Returns:
+        Тройка: значения float32 (N, 3), маска uint8 (N, 3), коды uint8 (N, 3).
     """
     x = np.stack([T, P, RH], axis=-1).astype(np.float32)
     n = x.shape[0]
@@ -491,27 +888,91 @@ def run_qc(T, P, RH, valid):
     return x, mask.astype(np.float32)
 
 
-def qc_window(x, mask, elev=None, cfg=DEFAULT_QC):
-    x = np.asarray(x)
-    src = (np.asarray(mask) > 0) & np.isfinite(x)
-    codes = check_codes(x, src, elev=elev, cfg=cfg)
-    codes[~src] |= np.uint8(QCCode.MISSING)
+def qc_window(x, mask, elev=None, cfg=DEFAULT_QC, past=None):
+    """Причинный QC истории окна: тот же, что на устройстве.
+
+    Args:
+        x: сырые значения истории, форма (N, 3).
+        mask: маска наличия, форма (N, 3).
+        elev: высота станции для проверки давления, м.
+        cfg: пороги.
+        past: пара массивов значений и маски наличия часов прямо перед историей,
+            форма (K, 3) каждый; служат только контекстом. None - контекста нет.
+
+    Returns:
+        Пара: маска float32 (N, 3) и коды uint8 (N, 3). Значения не меняются.
+    """
+    x = np.asarray(x, np.float32)
+    m = np.asarray(mask)
+    k = 0
+    if past is not None:
+        xp, mp = past
+        k = len(xp)
+        x = np.concatenate([np.asarray(xp, np.float32), x])
+        m = np.concatenate([np.asarray(mp), m])
+    codes = causal_codes(x, m, elev=elev, cfg=cfg, start=k)
     return (codes == 0).astype(np.float32), codes
 
 
-def point_qc(T, P, RH):
-    out = np.zeros(3, np.float32)
-    mask = np.zeros(3, np.float32)
-    for j, (name, val) in enumerate(zip(CHANNELS, (T, P, RH))):
-        lo, hi = PHYS[name]
-        if val is not None and np.isfinite(val) and lo <= val <= hi:
-            out[j] = val
-            mask[j] = 1.0
-    return out, mask
+class CausalQC:
+    """Причинный QC потока: кольцо сырых часов и коды каждого нового часа.
+
+    Attributes:
+        size: длина кольца, ч.
+        filled: сколько часов кольца заполнено.
+    """
+
+    def __init__(self, elev=None, cfg=DEFAULT_QC):
+        self.cfg = cfg
+        self.elev = None if elev is None else float(elev)
+        self.size = cfg.lookback_hours + 1
+        self.reset()
+
+    def reset(self):
+        """Кольцо пусто: устройство ничего не знает о прошлом."""
+        self.x = np.zeros((self.size, 3), np.float32)
+        self.present = np.zeros((self.size, 3), np.uint8)
+        self.filled = 0
+
+    def seed(self, x, present):
+        """Заполняет кольцо прошлыми часами без расчёта кодов.
+
+        Args:
+            x: значения, форма (K, 3), от старых к новым.
+            present: маска наличия, форма (K, 3).
+        """
+        self.reset()
+        x = np.asarray(x, np.float32)[-self.size:]
+        p = np.asarray(present)[-self.size:]
+        k = len(x)
+        if k:
+            self.x[-k:] = np.where(p > 0, x, 0.0)
+            self.present[-k:] = p > 0
+        self.filled = k
+
+    def push(self, values):
+        """Новый час наблюдений.
+
+        Args:
+            values: три значения T, P, RH; None или NaN - значения нет.
+
+        Returns:
+            Пара: значения float32 (3,) с нулями на месте отбракованных и коды uint8 (3,).
+        """
+        v = np.array([np.nan if a is None else float(a) for a in values], np.float32)
+        p = np.isfinite(v)
+        self.x[:-1], self.present[:-1] = self.x[1:], self.present[1:]
+        self.x[-1] = np.where(p, v, 0.0)
+        self.present[-1] = p
+        self.filled = min(self.size, self.filled + 1)
+        n = self.filled
+        codes = causal_codes(self.x[-n:], self.present[-n:], self.elev, self.cfg,
+                             start=n - 1)[0]
+        return np.where(codes == 0, self.x[-1], 0.0).astype(np.float32), codes
 
 
 def code_fractions(codes, mask=None):
-    """Доли часов с каждым кодом по каналам (+ доля валидных, если дана маска)."""
+    """Доли часов с каждым кодом по каналам и доля валидных, если дана маска."""
     codes = np.asarray(codes)
     n = len(codes)
     out = {}

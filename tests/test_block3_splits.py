@@ -149,15 +149,20 @@ def test_sampled_train_windows_stay_in_train_window_with_gap(dm):
 @pytest.mark.parametrize("L", [0, 24, L_MAX])
 def test_holdout_items_match_declared_footprints(manifest, store, L):
     from mayak.data.dataset import HoldoutDataset
+    from mayak.data.dataset import qc_context
+    from mayak.data.qc import DEFAULT_QC
     ds = HoldoutDataset(manifest, time_key="val", every_hours=48, L=L, store=store)
     fps = list(ds.footprints())
     assert len(ds) == len(fps) > 0
     for i, fp in enumerate(fps):
         m = ds.meta[i]
         L_real = int(ds[i]["mask_hist"][:, 0].sum())
-        assert L_real == L, "окно оценки обрезало историю"
+        assert L_real == L, "окно оценки обрезало историю или QC отбраковал чистый ряд"
+        ctx = qc_context(m["t"], L, m["floor"])
         assert (int(fp["lo"][0]), int(fp["t"][0]), int(fp["hi"][0])) == \
-            (m["t"] - L_real, m["t"], m["t"] + H)
+            (m["t"] - L - ctx, m["t"], m["t"] + H)
+        assert ctx == (min(DEFAULT_QC.lookback_hours, m["t"] - L - m["floor"]) if L == L_MAX
+                       else 0)
         lay = time_layout(m["N"])
         assert lay.block_index("val", [m["t"]], [m["t"] + H])[0] >= 0
         assert not lay.overlaps(("train", "test"), [m["t"] - L_MAX], [m["t"]])[0]

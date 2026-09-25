@@ -15,7 +15,6 @@ import numpy as np
 from mayak.config import SCENARIO_INPUT, SCENARIO_INSTRUMENT, SCENARIO_RULES, ScenarioRule
 from mayak.constants import H, L_MAX
 from mayak.data.augment import P, RH, T, AugWindow, apply_one
-from mayak.data.qc import CHANNELS, PHYS
 
 DROP_CHANNEL_LABELS = ("все каналы", "без P", "без RH", "без P и RH")
 
@@ -205,17 +204,6 @@ def apply_scenario(w: AugWindow, name, level, rng, params=None):
     return w
 
 
-def point_qc_mask(x, m):
-    """Поточечный QC рантайма (``mayak.data.qc.point_qc``) на всём окне сразу:
-    значение вне физического диапазона канала - невалидно. Маска (N, 3) float32."""
-    x = np.asarray(x)
-    lo = np.array([PHYS[c][0] for c in CHANNELS], np.float32)
-    hi = np.array([PHYS[c][1] for c in CHANNELS], np.float32)
-    with np.errstate(invalid="ignore"):
-        ok = np.isfinite(x) & (x >= lo) & (x <= hi)
-    return ((np.asarray(m) > 0) & ok).astype(np.float32)
-
-
 def level_label(name, level):
     """Подпись уровня для таблиц и осей."""
     if name == "drop_channel":
@@ -226,4 +214,4 @@ def level_label(name, level):
 
 
 __all__ = ["DROP_CHANNEL_LABELS", "SCENARIOS", "ScenarioDef", "apply_scenario", "drift_history",
-           "drift_target", "level_label", "point_qc_mask", "scenario_rng", "variants_of"]
+           "drift_target", "level_label", "scenario_rng", "variants_of"]

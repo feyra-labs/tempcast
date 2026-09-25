@@ -1,8 +1,11 @@
 """Офлайн-кэш станций и единая точка загрузки.
 
-Сборка:  исходные файлы станций → QC (поточечный и оконный) → станционные проверки →
-         отбор станций → сплиты → климатология → кэш и отчёт QC на диске.
-Загрузка: кэш → StationStore в памяти, один объект на процесс.
+Сборка: исходные файлы станций, центрированный QC, станционные проверки, отбор станций,
+сплиты, климатология, затем кэш и отчёт QC на диске. Кроме очищенного ряда кэш хранит
+сырые значения до QC и маску наличия от источника: из них история окна проходит тот же
+причинный QC, что на устройстве.
+
+Загрузка: кэш читается в StationStore, один объект на процесс.
 """
 from __future__ import annotations
 
@@ -22,8 +25,8 @@ import numpy as np
 
 from mayak.codehash import code_digests, unit_digest
 from mayak.data.climatology import Climatology
-from mayak.data.qc import (DEFAULT_QC, QC_CODE_DOC, STATION_CHECKS,
-                           code_fractions, qc_station, station_checks, station_selection)
+from mayak.data.qc import (DEFAULT_QC, QC_CODE_DOC, STATION_CHECKS, code_fractions, presence,
+                           qc_station, station_checks, station_selection)
 from mayak.data.splits import (EXTERNAL_MIN_TRAIN_YEARS, ROLE_EXTERNAL, TIME_LAYOUT, full_years,
                                layout_fingerprint, time_layout)
 from mayak.timeaxis import legacy_t0, window_calendar
@@ -319,6 +322,9 @@ def process_station(path, meta=None, qc_cfg=DEFAULT_QC):
     x, mask, codes = qc_station(src["T"], src["P"], src["RH"], src["valid"],
                                 Td=src.get("Td"), flag=src.get("flag"),
                                 elev=qc_elev(meta), cfg=qc_cfg)
+    raw = np.stack([src["T"], src["P"], src["RH"]], axis=-1).astype(np.float32)
+    present = presence(raw, src["valid"])
+    raw = np.where(present > 0, raw, 0.0).astype(np.float32)
     n = x.shape[0]
     checks = station_checks(x, mask, src["t0"], lon=meta.get("lon"), elev=meta.get("elev"),
                             dem_elev=meta.get("dem_elev"), cfg=qc_cfg,
@@ -350,7 +356,8 @@ def process_station(path, meta=None, qc_cfg=DEFAULT_QC):
     base = dict(report=report, reasons=reasons, checks=checks)
     if reasons:
         return dict(base, error="; ".join(text for _, text in reasons))
-    return dict(base, x=x, mask=mask, codes=codes, t0=src["t0"], beta=clim.beta,
+    return dict(base, x=x, mask=mask, codes=codes, raw=raw, present=present, t0=src["t0"],
+                beta=clim.beta,
                 sigma=clim.sigma, scale_beta=clim.scale_beta, clim_fit=[int(lo), int(hi)])
 
 
@@ -418,7 +425,8 @@ def build_cache(manifest, cache_root=None, jobs=1, force=False, qc_cfg=DEFAULT_Q
     else:
         results = [process_station(*a) for a in args]
 
-    xs, ms, cs, betas, scale_betas, index, excluded, report = [], [], [], [], [], [], {}, []
+    xs, ms, cs, raws, pres = [], [], [], [], []
+    betas, scale_betas, index, excluded, report = [], [], [], {}, []
     off = 0
     for r, res in zip(rows, results):
         status = "excluded" if "error" in res else "included"
@@ -431,6 +439,8 @@ def build_cache(manifest, cache_root=None, jobs=1, force=False, qc_cfg=DEFAULT_Q
         xs.append(res["x"])
         ms.append(res["mask"])
         cs.append(res["codes"])
+        raws.append(res["raw"])
+        pres.append(res["present"])
         betas.append(res["beta"])
         scale_betas.append(res["scale_beta"])
         index.append(dict(id=r["id"], offset=off, n=n, t0_utc_h=res["t0"], clim_sigma=res["sigma"],
@@ -449,6 +459,8 @@ def build_cache(manifest, cache_root=None, jobs=1, force=False, qc_cfg=DEFAULT_Q
     np.save(os.path.join(tmp, "x.npy"), np.concatenate(xs))
     np.save(os.path.join(tmp, "mask.npy"), np.concatenate(ms))
     np.save(os.path.join(tmp, "qc.npy"), np.concatenate(cs))
+    np.save(os.path.join(tmp, "raw.npy"), np.concatenate(raws))
+    np.save(os.path.join(tmp, "present.npy"), np.concatenate(pres))
     np.save(os.path.join(tmp, "clim_beta.npy"), np.stack(betas))
     np.save(os.path.join(tmp, "clim_scale_beta.npy"), np.stack(scale_betas))
     with open(os.path.join(tmp, "index.json"), "w") as f:
@@ -504,6 +516,8 @@ def load_cache(path, rows, mmap=False):
     x = np.load(os.path.join(path, "x.npy"), mmap_mode=mode)
     mask = np.load(os.path.join(path, "mask.npy"), mmap_mode=mode)
     qc = np.load(os.path.join(path, "qc.npy"), mmap_mode=mode)
+    raw = np.load(os.path.join(path, "raw.npy"), mmap_mode=mode)
+    present = np.load(os.path.join(path, "present.npy"), mmap_mode=mode)
     beta = np.load(os.path.join(path, "clim_beta.npy"))
     scale_beta = np.load(os.path.join(path, "clim_scale_beta.npy"))
     basis = {k: CLIM_PARAMS[k] for k in CLIM_BASIS}
@@ -520,7 +534,8 @@ def load_cache(path, rows, mmap=False):
             report_every=_opt_float(r.get("report_every")),
             koppen=r["koppen"], role=r.get("split"),
             qc_checks=it.get("qc_checks", {}),
-            x=x[a:a + n], mask=mask[a:a + n], qc=qc[a:a + n], N=n, t0=int(it["t0_utc_h"]),
+            x=x[a:a + n], mask=mask[a:a + n], qc=qc[a:a + n], raw=raw[a:a + n],
+            present=present[a:a + n], N=n, t0=int(it["t0_utc_h"]),
             clim_fit=tuple(it["clim_fit"]),
             clim=Climatology.from_params(beta[i], it["clim_sigma"], scale_beta[i], **basis))
     return store

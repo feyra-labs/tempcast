@@ -20,9 +20,8 @@ from mayak.config import (SCENARIO_INPUT, SCENARIO_INSTRUMENT, SCENARIO_RULES, C
 from mayak.constants import H, L_MAX
 from mayak.data import store as S
 from mayak.data.augment import P, RH, T, clean_history, make_window
-from mayak.data.qc import point_qc
 from mayak.data.scenarios import (SCENARIOS, apply_scenario, drift_history, drift_target,
-                                  point_qc_mask, scenario_rng)
+                                  scenario_rng)
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL
 
 REPO = Path(__file__).resolve().parents[1]
@@ -211,17 +210,6 @@ def test_metadata_errors_have_requested_magnitude():
     assert -90.0 <= edge.lat <= 90.0 and -180.0 <= edge.lon < 180.0
 
 
-def test_point_qc_mask_matches_runtime_point_qc():
-    rng = np.random.default_rng(0)
-    x = np.stack([rng.uniform(-120, 90, 500), rng.uniform(200, 1200, 500),
-                  rng.uniform(-20, 130, 500)], -1).astype(np.float32)
-    x[::37, 1] = np.nan
-    m = (rng.random((500, 3)) > 0.1).astype(np.float32)
-    got = point_qc_mask(x, m)
-    ref = np.stack([point_qc(*row)[1] for row in x]) * m
-    np.testing.assert_array_equal(got, ref)
-
-
 def test_yaml_matches_dataclass():
     d = yaml.safe_load((CONF / "robustness" / "default.yaml").read_text(encoding="utf-8"))
     assert set(d) == {f.name for f in dataclasses.fields(RobustnessConfig)}
@@ -326,12 +314,12 @@ def base(store, manifest):
     return ds
 
 
-def _rset(base, name, level, qc="point", params=None):
+def _rset(base, name, level, qc="device", params=None):
     from mayak.robustness import RobustnessSet
     return RobustnessSet(base, name, level, params, qc=qc)
 
 
-@pytest.mark.parametrize("qc", ["none", "point"])
+@pytest.mark.parametrize("qc", ["device"])
 @pytest.mark.parametrize("name", ALL)
 def test_zero_level_dataset_equals_eval_set(base, name, qc):
     """Нулевой параметр на полном пути (сценарий → инвариант → QC → батч): тот же батч,
@@ -362,7 +350,8 @@ def test_invariant_holds_after_every_scenario_and_level(base):
                 a, b = base[i], ds[i]
                 x, m = b["x_hist"], b["mask_hist"]
                 assert torch.all(x[m == 0] == 0), (sc.name, level)
-                assert torch.all(m <= a["mask_hist"]), f"{sc.name}: сценарий создал валидность"
+                present = torch.from_numpy(base.raw_window(i)["m"])
+                assert torch.all(m <= present), f"{sc.name}: сценарий создал наличие данных"
                 assert torch.equal(b["y_mask"], a["y_mask"])
                 assert torch.isfinite(x).all() and torch.isfinite(b["y"]).all()
                 assert -90 <= float(b["lat"]) <= 90 and -180 <= float(b["lon"]) < 180
@@ -384,17 +373,19 @@ def test_full_loss_of_history_is_cold_start(base, store, manifest):
             assert float(b["a_recent"]) == 0.0
 
 
-def test_window_qc_catches_frozen_sensor_point_qc_does_not(base):
+def test_device_qc_catches_frozen_sensor(base):
+    """Залипание всех каналов на 72 ч: QC прибора бракует часы после срока залипания,
+    без QC они проходят как данные."""
     n = 72
-    pt, wq = _rset(base, "freeze", n, qc="point"), _rset(base, "freeze", n, qc="window")
-    frac_pt, frac_wq = [], []
+    none, dev = _rset(base, "freeze", n, qc="none"), _rset(base, "freeze", n, qc="device")
+    frac_none, frac_dev = [], []
     for i in range(len(base)):
-        m0 = base[i]["mask_hist"][-n:, 0]
-        ok = m0 > 0
-        frac_pt.append(float((pt[i]["mask_hist"][-n:, 0][ok] > 0).float().mean()))
-        frac_wq.append(float((wq[i]["mask_hist"][-n:, 0][ok] > 0).float().mean()))
-    assert min(frac_pt) == 1.0, "поточечный QC рантайма залипание не видит"
-    assert max(frac_wq) < 0.5, "оконный QC залипание на 72 ч ловит"
+        ok = base.raw_window(i)["m"][-n:, 0] > 0
+        frac_none.append(float((none[i]["mask_hist"][-n:, 0].numpy()[ok] > 0).mean()))
+        frac_dev.append(float((dev[i]["mask_hist"][-n:, 0].numpy()[ok] > 0).mean()))
+    assert min(frac_none) == 1.0, "без QC залипание проходит"
+    assert max(frac_dev) < 0.5, "QC прибора залипание на 72 ч ловит"
+
 
 class _Anchored(torch.nn.Module):
     """Модели с известным поведением, выход как у МАЯК (mu, q).

@@ -10,7 +10,7 @@ from mayak.constants import L_MAX, H
 from mayak.data.augment import AugWindow, augment_window
 from mayak.data.masking import (DEFAULT_TARGET_MASK, FilterStats, enforce_invariant,
                                 target_window_ok)
-from mayak.data.qc import qc_window
+from mayak.data.qc import DEFAULT_QC, qc_window
 from mayak.data.splits import ROLE_TRAIN, ROLE_VAL, time_layout
 from mayak.data.store import get_store
 from mayak.timeaxis import window_calendar
@@ -53,6 +53,67 @@ def slice_history(x, mask, t, L):
         src = np.arange(t - L, t)
         x_hist[L_MAX - L:], mask_hist[L_MAX - L:] = enforce_invariant(x[src], mask[src])
     return x_hist, mask_hist
+
+
+def qc_context(t, L, floor, lookback=None):
+    """Сколько часов перед историей окна видит причинный QC.
+
+    Args:
+        t: начало горизонта, индекс часа.
+        L: фактическая длина истории, ч.
+        floor: самый ранний час, доступный истории окна.
+        lookback: сколько прошлых часов нужно QC; по умолчанию из порогов QC.
+
+    Returns:
+        Число часов контекста.
+    """
+    lookback = DEFAULT_QC.lookback_hours if lookback is None else int(lookback)
+    if L < L_MAX:
+        return 0
+    return int(max(0, min(lookback, t - L - floor)))
+
+
+def slice_context(raw, present, t, L, floor):
+    """Сырые часы прямо перед историей окна, контекст причинного QC.
+
+    Args:
+        raw: сырые значения ряда, форма (N, 3).
+        present: маска наличия ряда, форма (N, 3).
+        t: начало горизонта, индекс часа.
+        L: фактическая длина истории, ч.
+        floor: самый ранний час, доступный истории окна.
+
+    Returns:
+        Пара массивов (K, 3): значения и маска наличия, от старых к новым.
+    """
+    k = qc_context(t, L, floor)
+    src = np.arange(t - L - k, t - L)
+    return enforce_invariant(raw[src], present[src])
+
+
+def device_history(s, t, L, floor):
+    """История окна так, как её увидит прибор.
+
+    Args:
+        s: запись станции с полями raw, present и qc_elev.
+        t: начало горизонта, индекс часа.
+        L: фактическая длина истории, ч.
+        floor: самый ранний час, доступный истории окна.
+
+    Returns:
+        Пара массивов (L_MAX, 3): значения и маска после QC.
+    """
+    x_hist, m_hist = slice_history(s["raw"], s["present"], t, L)
+    if L == 0:
+        return x_hist, m_hist
+    past = slice_context(s["raw"], s["present"], t, L, floor)
+    mask, _ = qc_window(x_hist, m_hist, elev=s["qc_elev"], past=past)
+    return enforce_invariant(x_hist, mask)
+
+
+def station_qc_elev(r):
+    """Высота для проверки давления: из ЦМР, если есть, иначе заявленная."""
+    return r.get("dem_elev") if r.get("dem_elev") is not None else float(r["elev"])
 
 
 def slice_target(x, mask, t):
@@ -153,7 +214,7 @@ def zone_distribution(zones, p):
 
 
 def footprint(t, L, floor):
-    """Часы, которые читает окно: от начала фактической истории до конца горизонта.
+    """Часы, которые читает окно: от начала контекста QC до конца горизонта.
 
     Args:
         t: начало горизонта, индекс часа.
@@ -163,7 +224,8 @@ def footprint(t, L, floor):
     Returns:
         Пара (начало, конец), конец не входит.
     """
-    return t - history_len(L, t, floor), t + H
+    n = history_len(L, t, floor)
+    return t - n - qc_context(t, n, floor), t + H
 
 
 class WindowDataset(Dataset):
@@ -200,8 +262,8 @@ class WindowDataset(Dataset):
                 continue
             self.st.append(dict(
                 id=r["id"], lat=float(r["lat"]), lon=float(r["lon"]), elev=float(r["elev"]),
-                koppen=r["koppen"], x=x, mask=mask, N=N, t0=r["t0"], clim=r["clim"],
-                qc_elev=r.get("dem_elev") if r.get("dem_elev") is not None else float(r["elev"]),
+                koppen=r["koppen"], x=x, mask=mask, raw=r["raw"], present=r["present"], N=N,
+                t0=r["t0"], clim=r["clim"], qc_elev=station_qc_elev(r),
                 floor=layout.history_floor(self.time_key), starts=ok))
         self.filter_stats.report("train")
         assert self.st, "ни у одной train-станции нет окон, прошедших маску цели"
@@ -221,8 +283,8 @@ class WindowDataset(Dataset):
     def footprints(self):
         for s in self.st:
             t = s["starts"]
-            yield dict(sid=s["id"], N=s["N"], time_key=self.time_key,
-                       lo=t - np.minimum(L_MAX, t - s["floor"]), t=t, hi=t + H)
+            lo = np.maximum(s["floor"], t - L_MAX - DEFAULT_QC.lookback_hours)
+            yield dict(sid=s["id"], N=s["N"], time_key=self.time_key, lo=lo, t=t, hi=t + H)
 
     def __len__(self):
         return self.n
@@ -252,12 +314,19 @@ class WindowDataset(Dataset):
     def build(self, s, t, L, info=None):
         """Окно станции s с началом горизонта t и историей L, с аугментациями.
 
-        info - если передан dict, в него кладутся параметры применённых аугментаций.
+        Args:
+            s: запись станции.
+            t: начало горизонта, индекс часа.
+            L: длина истории, ч.
+            info: если передан словарь, в него кладутся параметры аугментаций.
+
+        Returns:
+            Словарь тензоров окна.
         """
         k = np.arange(L_MAX)
         abs_h = t - L_MAX + k
         doy_h, hour_h = window_calendar(s["t0"], abs_h)
-        x_hist, mask_hist = slice_history(s["x"], s["mask"], t, L)
+        x_hist, mask_hist = slice_history(s["raw"], s["present"], t, L)
 
         fut = np.arange(t, t + H)
         doy_f, hour_f = window_calendar(s["t0"], fut)
@@ -273,7 +342,8 @@ class WindowDataset(Dataset):
         lat, lon, elev, y = w.lat, w.lon, w.elev, w.y
         x_hist, mask_hist = enforce_invariant(w.x, w.m)
         if self.window_qc and L > 0:
-            mask_hist, _ = qc_window(x_hist, mask_hist, elev=w.qc_elev)
+            past = slice_context(s["raw"], s["present"], t, L, s["floor"])
+            mask_hist, _ = qc_window(x_hist, mask_hist, elev=w.qc_elev, past=past)
             x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
 
         return {
@@ -293,7 +363,10 @@ class WindowDataset(Dataset):
 
 
 class HoldoutDataset(Dataset):
-    """Детерминированные окна для валидации/оценки: фиксированный L, без аугментаций"""
+    """Детерминированные окна валидации: фиксированная история, без аугментаций.
+
+    История проходит тот же причинный QC, что на приборе.
+    """
 
     def __init__(self, manifest, station_split=ROLE_VAL, time_key="val",
                  every_hours=72, L=L_MAX, max_windows=8000,
@@ -310,7 +383,8 @@ class HoldoutDataset(Dataset):
             self.filter_stats.add(len(cand), len(ok))
             for t in ok.tolist():
                 self.meta.append(dict(id=r["id"], N=N, floor=floor, x=x, mask=mask, t=t,
-                                      t0=r["t0"],
+                                      raw=r["raw"], present=r["present"],
+                                      qc_elev=station_qc_elev(r), t0=r["t0"],
                                       clim=r["clim"],
                                       lat=float(r["lat"]), lon=float(r["lon"]),
                                       elev=float(r["elev"]), koppen=r["koppen"],
@@ -336,7 +410,7 @@ class HoldoutDataset(Dataset):
         k = np.arange(L_MAX)
         abs_h = t - L_MAX + k
         doy_h, hour_h = window_calendar(m["t0"], abs_h)
-        x_hist, mask_hist = slice_history(m["x"], m["mask"], t, L)
+        x_hist, mask_hist = device_history(m, t, L, m["floor"])
         fut = np.arange(t, t + H)
         doy_f, hour_f = window_calendar(m["t0"], fut)
         y, y_mask = slice_target(m["x"], m["mask"], t)

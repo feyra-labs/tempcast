@@ -6,7 +6,7 @@ roles: [unseen_test]        # внешний тест - отдельно: --exte
 time_key: test
 every_hours: 72
 windows_per_station: 20
-qc: point                   # после сценария: point (как рантайм) | window (как обучение) | none
+qc: device                  # после сценария: device (причинный QC прибора) | none (только маска наличия)
 leads: [1, 6, 24, 72, 168]
 skill_tolerance: 0.05
 guard_models: [МАЯК]

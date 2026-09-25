@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::qc::QcConfig;
 use crate::{Error, Result};
 
 pub const FORMAT: u32 = 1;
@@ -65,6 +66,7 @@ pub struct Manifest {
     pub zq: Vec<f32>,
     pub raw_channels: Vec<String>,
     pub phys: HashMap<String, [f64; 2]>,
+    pub qc: QcConfig,
     pub state: StateInfo,
     pub graphs: HashMap<String, GraphEntry>,
     pub calibration: Calibration,
@@ -120,7 +122,7 @@ impl Manifest {
         Ok(())
     }
 
-    /// Пределы физических диапазонов [T, P, RH] - те же, что mayak.data.qc.PHYS.
+    /// Пределы физических диапазонов каналов T, P, RH из манифеста модели.
     pub fn phys_bounds(&self) -> [[f64; 2]; 3] {
         ["T", "P", "RH"].map(|c| self.phys[c])
     }
