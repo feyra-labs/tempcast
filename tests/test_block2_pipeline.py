@@ -19,6 +19,7 @@ import mayak
 from mayak.constants import H, L_MAX
 from mayak.data import store as S
 from mayak.data.qc import QCCode, _mad_ok_reference, mad_ok, qc_station, run_qc
+from mayak.data.recording import record_values
 from mayak.timeaxis import (future_calendar, legacy_t0, to_hourly_grid,
                             to_utc_hour, utc_to_doy_hour, window_calendar)
 
@@ -135,7 +136,8 @@ def test_cache_content_equals_direct_qc(manifest):
     store = S.get_store(manifest)
     for sid, s in store.stations.items():
         src = S.read_source(S.source_path(manifest, sid))
-        x, mask, codes = qc_station(src["T"], src["P"], src["RH"], src["valid"])
+        rec = record_values(np.stack([src["T"], src["P"], src["RH"]], -1))
+        x, mask, codes = qc_station(rec[:, 0], rec[:, 1], rec[:, 2], src["valid"])
         assert s["x"].dtype == np.float32 and s["mask"].dtype == np.uint8
         assert np.array_equal(s["x"], x) and np.array_equal(s["mask"], mask)
         assert np.array_equal(s["qc"], codes) and s["t0"] == T0

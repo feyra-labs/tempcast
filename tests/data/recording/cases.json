@@ -1,0 +1,255 @@
+{
+ "format": 1,
+ "cases": [
+  {
+   "channel": "T",
+   "x": -90.5,
+   "recorded": -90.0
+  },
+  {
+   "channel": "T",
+   "x": -89.5,
+   "recorded": -90.0
+  },
+  {
+   "channel": "T",
+   "x": -3.5,
+   "recorded": -4.0
+  },
+  {
+   "channel": "T",
+   "x": -2.5,
+   "recorded": -2.0
+  },
+  {
+   "channel": "T",
+   "x": -1.5,
+   "recorded": -2.0
+  },
+  {
+   "channel": "T",
+   "x": -0.5,
+   "recorded": 0.0
+  },
+  {
+   "channel": "T",
+   "x": -0.4000000059604645,
+   "recorded": 0.0
+  },
+  {
+   "channel": "T",
+   "x": -0.0,
+   "recorded": 0.0
+  },
+  {
+   "channel": "T",
+   "x": 0.0,
+   "recorded": 0.0
+  },
+  {
+   "channel": "T",
+   "x": 0.4000000059604645,
+   "recorded": 0.0
+  },
+  {
+   "channel": "T",
+   "x": 0.5,
+   "recorded": 0.0
+  },
+  {
+   "channel": "T",
+   "x": 1.5,
+   "recorded": 2.0
+  },
+  {
+   "channel": "T",
+   "x": 2.5,
+   "recorded": 2.0
+  },
+  {
+   "channel": "T",
+   "x": 3.5,
+   "recorded": 4.0
+  },
+  {
+   "channel": "T",
+   "x": 12.489999771118164,
+   "recorded": 12.0
+  },
+  {
+   "channel": "T",
+   "x": 12.510000228881836,
+   "recorded": 13.0
+  },
+  {
+   "channel": "T",
+   "x": 59.5,
+   "recorded": 60.0
+  },
+  {
+   "channel": "T",
+   "x": 60.5,
+   "recorded": 60.0
+  },
+  {
+   "channel": "T",
+   "x": 0.4999999701976776,
+   "recorded": 0.0
+  },
+  {
+   "channel": "T",
+   "x": 0.5000000596046448,
+   "recorded": 1.0
+  },
+  {
+   "channel": "T",
+   "x": -0.5000000596046448,
+   "recorded": -1.0
+  },
+  {
+   "channel": "T",
+   "x": 21.700000762939453,
+   "recorded": 22.0
+  },
+  {
+   "channel": "T",
+   "x": -7.300000190734863,
+   "recorded": -7.0
+  },
+  {
+   "channel": "P",
+   "x": 299.95001220703125,
+   "recorded": 300.0
+  },
+  {
+   "channel": "P",
+   "x": 300.04998779296875,
+   "recorded": 300.0
+  },
+  {
+   "channel": "P",
+   "x": 1013.25,
+   "recorded": 1013.2000122070312
+  },
+  {
+   "channel": "P",
+   "x": 1013.3499755859375,
+   "recorded": 1013.2999877929688
+  },
+  {
+   "channel": "P",
+   "x": 1013.1500244140625,
+   "recorded": 1013.2000122070312
+  },
+  {
+   "channel": "P",
+   "x": 999.9500122070312,
+   "recorded": 1000.0
+  },
+  {
+   "channel": "P",
+   "x": 1000.0499877929688,
+   "recorded": 1000.0
+  },
+  {
+   "channel": "P",
+   "x": 1100.050048828125,
+   "recorded": 1100.0999755859375
+  },
+  {
+   "channel": "P",
+   "x": 1100.1500244140625,
+   "recorded": 1100.199951171875
+  },
+  {
+   "channel": "P",
+   "x": 850.4500122070312,
+   "recorded": 850.5
+  },
+  {
+   "channel": "P",
+   "x": 850.5499877929688,
+   "recorded": 850.5
+  },
+  {
+   "channel": "P",
+   "x": 701.25,
+   "recorded": 701.2000122070312
+  },
+  {
+   "channel": "P",
+   "x": 701.75,
+   "recorded": 701.7999877929688
+  },
+  {
+   "channel": "P",
+   "x": 0.25,
+   "recorded": 0.20000000298023224
+  },
+  {
+   "channel": "P",
+   "x": 0.3499999940395355,
+   "recorded": 0.30000001192092896
+  },
+  {
+   "channel": "RH",
+   "x": -0.5,
+   "recorded": 0.0
+  },
+  {
+   "channel": "RH",
+   "x": 0.5,
+   "recorded": 0.0
+  },
+  {
+   "channel": "RH",
+   "x": 1.5,
+   "recorded": 2.0
+  },
+  {
+   "channel": "RH",
+   "x": 2.5,
+   "recorded": 2.0
+  },
+  {
+   "channel": "RH",
+   "x": 55.5,
+   "recorded": 56.0
+  },
+  {
+   "channel": "RH",
+   "x": 56.5,
+   "recorded": 56.0
+  },
+  {
+   "channel": "RH",
+   "x": 98.5,
+   "recorded": 98.0
+  },
+  {
+   "channel": "RH",
+   "x": 99.5,
+   "recorded": 100.0
+  },
+  {
+   "channel": "RH",
+   "x": 100.5,
+   "recorded": 100.0
+  },
+  {
+   "channel": "RH",
+   "x": 101.5,
+   "recorded": 102.0
+  },
+  {
+   "channel": "RH",
+   "x": 42.400001525878906,
+   "recorded": 42.0
+  },
+  {
+   "channel": "RH",
+   "x": 42.599998474121094,
+   "recorded": 43.0
+  }
+ ]
+}

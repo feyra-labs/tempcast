@@ -13,8 +13,8 @@ from collections.abc import Callable
 import numpy as np
 
 from mayak.config import SCENARIO_INPUT, SCENARIO_INSTRUMENT, SCENARIO_RULES, ScenarioRule
-from mayak.constants import H, L_MAX
-from mayak.data.augment import P, RH, T, AugWindow, apply_one
+from mayak.constants import L_MAX
+from mayak.data.augment import P, RH, AugWindow, apply_one
 
 DROP_CHANNEL_LABELS = ("все каналы", "без P", "без RH", "без P и RH")
 
@@ -33,41 +33,49 @@ def _gap(w, level, rng, p):
 
 
 def _offset(w, level, rng, p):
-    """Постоянное смещение T - та же функция, что аугментация обучения: история и цель."""
+    """Постоянное смещение температуры: история и цель, та же функция, что в обучении."""
     apply_one(w, "offset", dict(b=float(level)))
 
 
 def _offset_input(w, level, rng, p):
-    w.x[:, T] += np.float32(level) * (w.m[:, T] > 0)
+    """То же смещение, но цель не трогается: незамеченное смещение прибора."""
+    apply_one(w, "offset", dict(b=float(level), target=False))
 
 
-def drift_history(w, rate_per_day):
-    """Дрейф на часах истории: 0 в первом часе фактической истории (прибор откалиброван)
-    и rate·(k − h0)/24 далее. (L_MAX,) float32."""
-    k = np.arange(L_MAX, dtype=np.float64) - w.h0
-    return (np.float64(rate_per_day) / 24.0 * np.maximum(k, 0.0)).astype(np.float32)
+def drift_offset(L, rate_per_day):
+    """Смещение прибора в момент выпуска при дрейфе с постоянной скоростью.
+
+    Прибор откалиброван в первом часе фактической истории и к её последнему часу
+    уходит на скорость, умноженную на прошедшее время.
+
+    Args:
+        L: длина истории, ч.
+        rate_per_day: скорость дрейфа, градусы в сутки.
+
+    Returns:
+        Смещение в последнем часе истории, градусы. Без истории - ноль.
+    """
+    return float(rate_per_day) * max(int(L) - 1, 0) / 24.0
 
 
-def drift_target(w, rate_per_day):
-    """Продолжение того же дрейфа на горизонте: rate·(L + j)/24, j = 0..H−1."""
-    j = w.L + np.arange(H, dtype=np.float64)
-    return (np.float64(rate_per_day) / 24.0 * j).astype(np.float32)
+def _drift_params(w, level, target):
+    return dict(b=[drift_offset(w.L, level), 0.0, 0.0], walk=False, seed=0, target=target)
 
 
 def _drift(w, level, rng, p):
-    w.x[:, T] += drift_history(w, level) * (w.m[:, T] > 0)
-    w.y[:] = w.y + drift_target(w, level) * (w.y_mask > 0)
+    """Дрейф температуры той же функцией, что в обучении: история нарастает до текущего
+    смещения, цель получает это смещение постоянным."""
+    apply_one(w, "drift", _drift_params(w, level, True))
 
 
 def _drift_input(w, level, rng, p):
-    w.x[:, T] += drift_history(w, level) * (w.m[:, T] > 0)
+    """Тот же дрейф, но цель не трогается: незамеченный дрейф прибора."""
+    apply_one(w, "drift", _drift_params(w, level, False))
 
 
 def _scale(w, level, rng, p):
-    """Ошибка масштаба T: множитель 1 + level и на истории, и на цели."""
-    k = np.float32(1.0 + level)
-    w.x[:, T] = np.where(w.m[:, T] > 0, w.x[:, T] * k, w.x[:, T])
-    w.y[:] = np.where(w.y_mask > 0, w.y * k, w.y)
+    """Ошибка масштаба температуры той же функцией, что в обучении: история и цель."""
+    apply_one(w, "scale", dict(k=[1.0 + float(level), 1.0, 1.0]))
 
 
 def _noise(w, level, rng, p):
@@ -169,6 +177,9 @@ _FN = {"dropout": _dropout, "gap": _gap, "noise": _noise, "spikes": _spikes,
 _STREAM = {"dropout": 1, "gap": 2, "offset": 3, "offset_input": 3, "drift": 4,
            "drift_input": 4, "scale": 5, "noise": 6, "spikes": 7, "freeze": 8,
            "drop_channel": 9, "history": 10, "coords": 11, "elev": 12}
+_DITHER_STREAM = 14
+DITHER_SCENARIOS = frozenset({"noise", "offset", "offset_input", "drift", "drift_input",
+                              "scale"})
 assert set(_FN) == set(_STREAM) == set(SCENARIO_RULES)
 for _r in SCENARIO_RULES.values():
     assert _r.kind in (SCENARIO_INPUT, SCENARIO_INSTRUMENT)
@@ -185,6 +196,11 @@ def variants_of(name):
 def scenario_rng(seed, name, index):
     """Генератор сценария name на окне index - одинаковый на всех уровнях."""
     return np.random.default_rng([int(seed), SCENARIOS[name].stream, int(index)])
+
+
+def dither_rng(seed, index):
+    """Генератор шума непрерывности окна index - общий для всех сценариев и уровней."""
+    return np.random.default_rng([int(seed), _DITHER_STREAM, int(index)])
 
 
 def apply_scenario(w: AugWindow, name, level, rng, params=None):
@@ -213,5 +229,6 @@ def level_label(name, level):
     return f"{level:g}"
 
 
-__all__ = ["DROP_CHANNEL_LABELS", "SCENARIOS", "ScenarioDef", "apply_scenario", "drift_history",
-           "drift_target", "level_label", "scenario_rng", "variants_of"]
+__all__ = ["DITHER_SCENARIOS", "DROP_CHANNEL_LABELS", "SCENARIOS", "ScenarioDef",
+           "apply_scenario", "dither_rng", "drift_offset", "level_label", "scenario_rng",
+           "variants_of"]

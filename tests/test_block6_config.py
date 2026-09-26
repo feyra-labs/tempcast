@@ -15,6 +15,7 @@ from mayak.config import (ABLATION_NAMES, Ablations, AugmentConfig, ConfigError,
                           check_pipeline_compat, model_config_for)
 from mayak.constants import H, L_MAX, QUANTILES
 from mayak.data import store as S
+from mayak.data.recording import record_values
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL
 from mayak.model import MAYAK
 from mayak.protocol import DEFAULT_PROTOCOL, Protocol, Seeds, Stage
@@ -343,7 +344,8 @@ def test_no_offset_aug_moves_to_data_without_shifting_other_augmentations(manife
         assert torch.equal(a["x_hist"][:, 1:], b["x_hist"][:, 1:])
         d = (a["y"] - b["y"])[a["y_mask"] > 0]
         if d.numel() and d.abs().max() > 0:
-            assert torch.allclose(d, d[:1].expand_as(d), atol=1e-4)
+            assert d.max() - d.min() <= 1.0, "смещение после записи - соседние целые"
+            assert bool((d >= 0).all()) or bool((d <= 0).all()), "один знак смещения"
             n_diff_y += 1
     assert n_diff_y > 0
 
@@ -371,6 +373,9 @@ def test_runtime_follows_model_config(flag):
     cfg = ModelConfig(ablations=Ablations(**({flag: True} if flag else {})))
     m = _model(cfg)
     b = {k: (v[:1] if torch.is_tensor(v) and v.dim() > 0 else v) for k, v in _batch().items()}
+    b["x_hist"] = torch.from_numpy(np.where(b["mask_hist"].numpy() > 0,
+                                            record_values(b["x_hist"].numpy()), 0.0)
+                                   .astype(np.float32))
     with torch.no_grad():
         ref = m(b)
     st = StreamingMayak(m, float(b["lat"]), float(b["lon"]), float(b["elev"]))

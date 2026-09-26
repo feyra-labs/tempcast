@@ -1,6 +1,7 @@
 """Офлайн-кэш станций и единая точка загрузки.
 
-Сборка: исходные файлы станций, центрированный QC, станционные проверки, отбор станций,
+Сборка: исходные файлы станций, запись значений на сетку прибора (целые градусы и
+проценты, давление в десятых), центрированный QC, станционные проверки, отбор станций,
 сплиты, климатология, затем кэш и отчёт QC на диске. Кроме очищенного ряда кэш хранит
 сырые значения до QC и маску наличия от источника: из них история окна проходит тот же
 причинный QC, что на устройстве.
@@ -27,6 +28,7 @@ from mayak.codehash import code_digests, unit_digest
 from mayak.data.climatology import Climatology
 from mayak.data.qc import (DEFAULT_QC, QC_CODE_DOC, STATION_CHECKS, code_fractions, presence,
                            qc_station, station_checks, station_selection)
+from mayak.data.recording import record_values
 from mayak.data.splits import (EXTERNAL_MIN_TRAIN_YEARS, ROLE_EXTERNAL, TIME_LAYOUT, full_years,
                                layout_fingerprint, time_layout)
 from mayak.timeaxis import legacy_t0, window_calendar
@@ -41,6 +43,7 @@ CACHE_CODE = {
     "mayak.data.climatology": None,
     "mayak.data.masking": None,
     "mayak.data.qc": None,
+    "mayak.data.recording": None,
     "mayak.data.splits": None,
     "mayak.data.store": ("CLIM_PARAMS", "CLIM_BASIS", "new_climatology", "read_source",
                          "_opt_float", "qc_meta", "qc_elev", "process_station",
@@ -319,16 +322,16 @@ def process_station(path, meta=None, qc_cfg=DEFAULT_QC):
     """
     meta = meta or {}
     src = read_source(path)
-    x, mask, codes = qc_station(src["T"], src["P"], src["RH"], src["valid"],
+    raw = record_values(np.stack([src["T"], src["P"], src["RH"]], axis=-1))
+    x, mask, codes = qc_station(raw[:, 0], raw[:, 1], raw[:, 2], src["valid"],
                                 Td=src.get("Td"), flag=src.get("flag"),
                                 elev=qc_elev(meta), cfg=qc_cfg)
-    raw = np.stack([src["T"], src["P"], src["RH"]], axis=-1).astype(np.float32)
     present = presence(raw, src["valid"])
     raw = np.where(present > 0, raw, 0.0).astype(np.float32)
     n = x.shape[0]
     checks = station_checks(x, mask, src["t0"], lon=meta.get("lon"), elev=meta.get("elev"),
                             dem_elev=meta.get("dem_elev"), cfg=qc_cfg,
-                            raw_T=src["T"], codes=codes)
+                            raw_T=raw[:, 0], codes=codes)
     reasons = station_selection(n, mask, checks, qc_cfg)
     report = dict(n_hours=n, **code_fractions(codes, mask),
                   **{f"check/{k}": v["status"] for k, v in checks.items()},

@@ -283,6 +283,9 @@ def report_step(mask_T) -> int:
     return int(vals[np.argmax(cnt)])
 
 
+# Шаг отчётности прибора проекта, ч. Станции с другим типичным шагом во внешний тест
+# не входят: интерполяция подменила бы наблюдения выдуманными значениями.
+REPORT_EVERY_HOURS = 1
 REPORT_CLASSES = {1: "1ч", 3: "3ч", 6: "6ч"}
 
 
@@ -346,7 +349,8 @@ def build_external_dataset(raw_dir, out_dir, stations, dem, koppen, tol_minutes=
     Пишет ``<out>/stations/<id>.npz`` (контракт ``mayak.data.store``),
     ``<out>/manifest.csv`` (роль external_test; elev - из ЦМР, station_elev - из
     списка станций) и ``<out>/selection_report.csv`` с причиной по каждой станции.
-    Предотбор здесь грубый (длина ряда и доля валидной T); окончательный отбор -
+    Предотбор здесь грубый (длина ряда, доля валидной T и почасовая отчётность: типичный
+    шаг между отчётами T ровно час); окончательный отбор -
     правила QC при сборке кэша, в том числе «≥ min_train_years полных лет в
     обучающем окне» для роли external_test.
     """
@@ -373,6 +377,9 @@ def build_external_dataset(raw_dir, out_dir, stations, dem, koppen, tol_minutes=
             if series.n < need_hours:
                 raise ValueError(f"ряд {series.n} ч < {need_hours} ч "
                                  f"(≥ {years} лет в обучающем окне)")
+            if rec["report_every"] != REPORT_EVERY_HOURS:
+                raise ValueError(f"шаг отчётности {rec['report_every']} ч: проект работает с "
+                                 f"приборами, отчитывающимися раз в {REPORT_EVERY_HOURS} ч")
             if rec["T_valid"] < min_valid_frac_T:
                 raise ValueError(f"валидной T {rec['T_valid']:.1%} < {min_valid_frac_T:.0%}")
             h = dem(st.lat, st.lon)
@@ -405,5 +412,6 @@ def build_external_dataset(raw_dir, out_dir, stations, dem, koppen, tol_minutes=
 
 __all__ = ["build_external_dataset", "station_files", "ELEMENTS", "GHCNH_PARSER_VERSION",
            "HourlySeries", "IGNORED_ELEMENTS",
-           "QUALITY_POLICY_VERSION", "hourly_station", "nearest_to_hour", "quality_flagged",
-           "quality_flags", "read_ghcnh", "read_station_list", "report_class", "report_step"]
+           "QUALITY_POLICY_VERSION", "REPORT_EVERY_HOURS", "hourly_station", "nearest_to_hour",
+           "quality_flagged", "quality_flags", "read_ghcnh", "read_station_list", "report_class",
+           "report_step"]

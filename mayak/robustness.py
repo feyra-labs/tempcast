@@ -38,11 +38,11 @@ from mayak import baselines as BL
 from mayak.config import (ROBUSTNESS_QC, SCENARIO_INSTRUMENT, ConfigError, RobustnessConfig,
                           ScenarioSpec)
 from mayak.constants import L_MAX
-from mayak.data.augment import AugWindow
+from mayak.data.augment import AugWindow, dither_window, record_window
 from mayak.data.masking import enforce_invariant
 from mayak.data.qc import qc_window
-from mayak.data.scenarios import (SCENARIOS, apply_scenario, level_label, scenario_rng,
-                                  variants_of)
+from mayak.data.scenarios import (DITHER_SCENARIOS, SCENARIOS, apply_scenario, dither_rng,
+                                  level_label, scenario_rng, variants_of)
 from mayak.evaluate import (NEURAL_BASELINES, EvalSet, add_statistical_baselines,
                             collect_predictions, evaluation_for)
 from mayak.metrics import METRICS, wmean
@@ -110,7 +110,10 @@ class RobustnessSet(Dataset):
         return meta
 
     def window(self, i, item=None):
-        """Сырое окно после сценария, исходный элемент набора и запись станции.
+        """Окно после сценария и записи прибором, исходный элемент набора и запись станции.
+
+        Перед сценарием, искажающим значения, записанным значениям возвращается
+        непрерывность; шум один для всех уровней, поэтому кривые по уровням парные.
 
         Args:
             i: номер окна.
@@ -130,8 +133,12 @@ class RobustnessSet(Dataset):
                       L=L, hour=_np(item["hour_hist"]),
                       lat=float(s["lat"]), lon=float(s["lon"]), elev=float(s["elev"]),
                       qc_elev=float(raw["qc_elev"]))
+        if self.name in DITHER_SCENARIOS:
+            dither_window(w, dither_rng(self.seed, i),
+                          target=SCENARIOS[self.name].rule.kind == SCENARIO_INSTRUMENT)
         apply_scenario(w, self.name, self.level, scenario_rng(self.seed, self.name, i),
                        self.params)
+        record_window(w)
         return w, item, s
 
     def _qc(self, i, x, m, w):
@@ -221,7 +228,7 @@ def robustness_sweep(named, base, cfg: RobustnessConfig, shift=None, r_damped=No
             if statistical:
                 preds = add_statistical_baselines(preds, aux, r_damped=r_damped)
             if y_ref is None:
-                y_ref = aux["y"]                       # первый уровень - 0, данные чистые
+                y_ref = aux["y"]
             dist = np.abs(aux["y"].astype(np.float64) - y_ref)
             for model, p in preds.items():
                 ev = evaluation_for(p, aux, shift)

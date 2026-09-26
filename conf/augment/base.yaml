@@ -1,5 +1,5 @@
 # @package data.augment
-# Профиль аугментаций «base»: набор аугментаций до блока 9 - для воспроизведения прежних прогонов.
+# Профиль аугментаций «base»: минимальный набор - смещение, шум, короткий разрыв, дрожание координат.
 # Отличия от значений по умолчанию (= aggressive).
 profile: base
 scale_prob: 0.0
@@ -9,7 +9,7 @@ offset_min: 0.0
 offset_max: 0.7
 noise_prob: 1.0
 noise_sd: [0.2, 0.5, 2.0]
-quant_prob: 0.0
+rh_dewpoint_prob: 0.0
 spike_prob: 0.0
 stuck_prob: 0.0
 units_prob: 0.0
@@ -17,7 +17,6 @@ dropout_prob: 0.0
 gap_prob: 0.3
 gap_max_count: 1
 gap_max_len: 24
-sparse_prob: 0.0
 outage_prob: 0.0
 drop_humidity_prob: 0.1
 drop_pressure_prob: 0.1

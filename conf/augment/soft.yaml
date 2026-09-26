@@ -8,8 +8,7 @@ drift_prob: 0.15
 drift_max: [0.7, 1.0, 3.0]
 offset_max: 1.5
 noise_sd: [0.15, 0.2, 1.5]
-quant_prob: 0.3
-quant_f_frac: 0.2
+rh_dewpoint_prob: 0.05
 spike_prob: 0.05
 spike_max_count: 1
 stuck_prob: 0.05
@@ -20,7 +19,6 @@ dropout_max_rate: 0.1
 gap_prob: 0.3
 gap_max_count: 2
 gap_max_len: 48
-sparse_prob: 0.05
 outage_prob: 0.1
 outage_hours: [24, 120]
 drop_humidity_prob: 0.1

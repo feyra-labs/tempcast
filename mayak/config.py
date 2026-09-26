@@ -588,10 +588,9 @@ def _pair(v, name, cast=float):
 AUGMENT_PROB_FIELDS = {
     "coords": "coords_prob", "scale": "scale_prob", "drift": "drift_prob",
     "offset": "offset_prob", "noise": "noise_prob", "spike": "spike_prob",
-    "stuck": "stuck_prob", "units": "units_prob", "quantize": "quant_prob",
-    "dropout": "dropout_prob", "gap": "gap_prob", "sparse": "sparse_prob",
-    "outage": "outage_prob", "drop_pressure": "drop_pressure_prob",
-    "drop_humidity": "drop_humidity_prob",
+    "stuck": "stuck_prob", "units": "units_prob", "rh_dewpoint": "rh_dewpoint_prob",
+    "dropout": "dropout_prob", "gap": "gap_prob", "outage": "outage_prob",
+    "drop_pressure": "drop_pressure_prob", "drop_humidity": "drop_humidity_prob",
 }
 
 
@@ -605,24 +604,34 @@ class AugmentConfig:
     включается с вероятностью ``*_prob`` и берёт параметры из своего диапазона.
     Кортежи из трёх элементов - по каналам (T, P, RH); пары - диапазон [lo, hi].
 
-    Инструмент (к валидным точкам истории):
+    Свойства прибора. Смещение, масштаб и дрейф - свойства самого датчика, поэтому
+    искажают и историю, и цель (цель - температура); шум - только историю:
       scale_max        - множитель 1 ± U(0, a) на канал;
-      drift_max        - дрейф за историю: к началу истории ±a, к последнему часу 0;
-      drift_rw_frac    - доля случайного блуждания (остальное - линейный дрейф);
+      drift_max        - текущее смещение прибора в момент выпуска, до ±a на канал: в
+                         первом часе истории ноль, к последнему часу нарастает до этого
+                         смещения, на горизонте цели остаётся постоянным;
+      drift_rw_frac    - доля нарастания случайным блужданием (остальное - линейно);
       offset_min/max   - постоянное смещение T, |b| log-равномерно в [min, max] (при
-                         min = 0 - равномерно в [0, max]); **и к истории, и к цели**;
-                         offset_max = 0 - выключено (абляция no_offset_aug);
-      noise_sd         - гауссов шум по каналам (°C, гПа, %);
-      quant_f_frac     - доля квантования T целыми °F (остальное - шаг 0.1 °C).
+                         min = 0 - равномерно в [0, max]); offset_max = 0 - выключено
+                         (абляция no_offset_aug);
+      noise_sd         - гауссов шум по каналам (°C, гПа, %).
+    Запись:
+      rh_dewpoint_prob - влажность восстановлена из целых температуры и точки росы и
+                         прыгает на несколько процентов, как в наблюдениях реальной сети.
+    Сама запись температуры и влажности целыми числами - не аугментация: она
+    применяется к каждому окну после всех аугментаций. Если окно искажается свойствами
+    прибора или влажностью из точки росы, перед искажением записанным значениям
+    возвращается непрерывность: к ним прибавляется равномерный шум в пределах полушага
+    записи. Без искажений запись возвращает то же значение.
     Грубые ошибки (к истории):
       spike_max_count, spike_min/max - число выбросов 1..n и их величина по каналам;
       stuck_hours      - залипание значения канала на [lo, hi] ч;
-      units_hours      - подмена единиц на участке [lo, hi] ч: T в °F либо (с долей
-                         units_p_frac) давление, приведённое к уровню моря.
+      units_hours      - давление, приведённое к уровню моря, вместо станционного на
+                         участке [lo, hi] ч. Температура всегда в градусах Цельсия: это
+                         обязанность владельца прибора.
     Доступность (к маске истории):
       dropout_max_rate - одиночные пропуски: доля часов U(0, a);
       gap_max_count, gap_max_len - блочные пропуски: число 1..n, длина 1..len ч;
-      sparse_every     - регулярная отчётность: валиден каждый k-й час, k из набора;
       outage_hours     - выпадение канала в середине истории на [lo, hi] ч;
       drop_pressure/humidity - канал отсутствует на всей истории.
     Метаданные:
@@ -640,8 +649,7 @@ class AugmentConfig:
     offset_max: float = 3.0
     noise_prob: float = 1.0
     noise_sd: tuple = (0.2, 0.3, 2.0)
-    quant_prob: float = 0.5
-    quant_f_frac: float = 0.4
+    rh_dewpoint_prob: float = 0.1
     spike_prob: float = 0.2
     spike_max_count: int = 3
     spike_min: tuple = (12.0, 15.0, 40.0)
@@ -650,14 +658,11 @@ class AugmentConfig:
     stuck_hours: tuple = (12, 96)
     units_prob: float = 0.05
     units_hours: tuple = (24, 96)
-    units_p_frac: float = 0.3
     dropout_prob: float = 0.3
     dropout_max_rate: float = 0.2
     gap_prob: float = 0.5
     gap_max_count: int = 3
     gap_max_len: int = 96
-    sparse_prob: float = 0.15
-    sparse_every: tuple = (3, 6)
     outage_prob: float = 0.2
     outage_hours: tuple = (24, 240)
     drop_humidity_prob: float = 0.15
@@ -684,12 +689,7 @@ class AugmentConfig:
             if v[0] < 1:
                 raise ConfigError(f"{name}: длительность ≥ 1 ч")
             s(self, name, v)
-        every = _ints(self.sparse_every)
-        if not every or min(every) < 2:
-            raise ConfigError(f"sparse_every - шаги отчётности ≥ 2 ч: {every}")
-        s(self, "sparse_every", every)
-        for name in (*AUGMENT_PROB_FIELDS.values(), "drift_rw_frac", "quant_f_frac",
-                     "units_p_frac", "dropout_max_rate"):
+        for name in (*AUGMENT_PROB_FIELDS.values(), "drift_rw_frac", "dropout_max_rate"):
             v = float(getattr(self, name))
             if not 0.0 <= v <= 1.0:
                 raise ConfigError(f"{name} = {v} вне [0, 1]")
@@ -756,22 +756,22 @@ AUGMENT_PROFILES = {
         drift_prob=0.15, drift_max=(0.7, 1.0, 3.0),
         offset_max=1.5,
         noise_sd=(0.15, 0.2, 1.5),
-        quant_prob=0.3, quant_f_frac=0.2,
+        rh_dewpoint_prob=0.05,
         spike_prob=0.05, spike_max_count=1,
         stuck_prob=0.05, stuck_hours=(6, 48),
         units_prob=0.01,
         dropout_prob=0.2, dropout_max_rate=0.1,
         gap_prob=0.3, gap_max_count=2, gap_max_len=48,
-        sparse_prob=0.05, outage_prob=0.1, outage_hours=(24, 120),
+        outage_prob=0.1, outage_hours=(24, 120),
         drop_humidity_prob=0.1, drop_pressure_prob=0.1,
         coord_jitter_deg=0.2, elev_jitter_m=20.0),
     "base": dict(
         scale_prob=0.0, drift_prob=0.0,
         offset_prob=1.0, offset_min=0.0, offset_max=0.7,
-        noise_prob=1.0, noise_sd=(0.2, 0.5, 2.0), quant_prob=0.0,
+        noise_prob=1.0, noise_sd=(0.2, 0.5, 2.0), rh_dewpoint_prob=0.0,
         spike_prob=0.0, stuck_prob=0.0, units_prob=0.0,
         dropout_prob=0.0, gap_prob=0.3, gap_max_count=1, gap_max_len=24,
-        sparse_prob=0.0, outage_prob=0.0,
+        outage_prob=0.0,
         drop_humidity_prob=0.1, drop_pressure_prob=0.1,
         coords_prob=1.0, coord_jitter_deg=0.4, elev_jitter_m=0.0),
     "none": {f: 0.0 for f in AUGMENT_PROB_FIELDS.values()},

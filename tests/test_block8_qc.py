@@ -24,6 +24,7 @@ from mayak.constants import L_MAX
 from mayak.data import qc as Q
 from mayak.data import store as S
 from mayak.data.qc import DEFAULT_QC, QCCode, QCConfig
+from mayak.data.recording import record_values
 from mayak.timeaxis import to_utc_hour
 
 T0 = int(to_utc_hour(datetime(2015, 1, 1)))
@@ -123,9 +124,6 @@ def _inject(kind, T, P, RH):
     elif kind == "rh_saturated":
         sl, ch = slice(900, 990), 2
         RH[sl] = 100.0
-    elif kind == "fahrenheit":
-        sl, ch = slice(1000, 1072), 0
-        T[sl] = T[sl] * 1.8 + 32.0
     elif kind == "sea_level_pressure":
         sl, ch = slice(0, len(P)), 1
         P[:] = P + (Q.P_SEA_LEVEL - Q.station_pressure_expected(1500.0))
@@ -141,7 +139,7 @@ def _inject(kind, T, P, RH):
 CASES = {
     "range_T": QCCode.RANGE, "range_RH": QCCode.RANGE, "spike": QCCode.SPIKE,
     "jump": QCCode.JUMP, "stuck_T": QCCode.STUCK, "stuck_P": QCCode.STUCK,
-    "stuck_RH": QCCode.STUCK, "rh_saturated": QCCode.STUCK, "fahrenheit": QCCode.UNITS,
+    "stuck_RH": QCCode.STUCK, "rh_saturated": QCCode.STUCK,
     "sea_level_pressure": QCCode.UNITS, "dewpoint": QCCode.DEWPOINT,
 }
 
@@ -213,32 +211,11 @@ def test_persistent_step_is_a_jump_not_a_spike(clean):
     assert codes[500, 0] & QCCode.JUMP and mask[501:520, 0].all()
 
 
-def test_units_undecidable_near_minus_forty_is_not_flagged():
-    """Около −40 °C шкалы совпадают: холодная погода не должна считаться °F."""
-    n = 24 * 90
-    T, P, RH = physical_series(n, lat=75, lon=20, seed=3)
-    T = (T - np.median(T) - 38.0).astype(np.float32)
-    T[1000:1100] += 10.0
-    _, _, codes = run(T, P, RH, elev=200.0)
-    assert not np.any(codes & QCCode.UNITS)
-
-
 def test_sea_level_pressure_not_decidable_for_low_station(clean):
     T, P, RH = clean
     P = (P + (Q.P_SEA_LEVEL - Q.station_pressure_expected(200.0))).astype(np.float32)
     _, _, codes = run(T, P, RH, elev=200.0)
     assert not np.any(codes & QCCode.UNITS), "200 м: синоптика перекрывает разницу"
-
-
-def _fahrenheit_brute(T, ok_raw, ok_ref, cfg=DEFAULT_QC):
-    T = np.asarray(T, np.float64)
-    r = Q.rolling_median(T, ok_raw, cfg.units_half, cfg.units_min_valid)
-    ref, spread = Q._daily_reference(T, ok_ref, cfg)
-    conv = (r - 32) / 1.8
-    with np.errstate(invalid="ignore"):
-        high = r - ref > np.maximum(cfg.units_ref_k * spread, cfg.units_min_excess)
-        fits = (np.abs(conv - ref) <= cfg.units_ref_k * spread) & (conv >= cfg.units_min_conv)
-    return ok_raw & high & fits
 
 
 def _jump_brute(x, ok, floor, cfg=DEFAULT_QC):
@@ -257,14 +234,14 @@ def _slp_brute(P, ok, elev, cfg=DEFAULT_QC):
     sep = Q.P_SEA_LEVEL - p_exp
     if sep < cfg.slp_min_sep:
         return np.zeros(len(P), bool)
-    r = Q.rolling_median(np.asarray(P, np.float64), ok, cfg.slp_half, cfg.units_min_valid)
+    r = Q.rolling_median(np.asarray(P, np.float64), ok, cfg.slp_half, cfg.slp_min_valid)
     with np.errstate(invalid="ignore"):
         return ok & (r > p_exp + sep / 2)
 
 
 def test_prefiltered_checks_match_brute_force():
     rng = np.random.default_rng(1)
-    hits = dict(F=0, J=0, P=0)
+    hits = dict(J=0, P=0)
     for trial in range(150):
         n = int(rng.integers(30, 1500))
         h = np.arange(n)
@@ -276,9 +253,6 @@ def test_prefiltered_checks_match_brute_force():
         if rng.random() < 0.5:
             T[int(rng.integers(1, n)):] += rng.choice([-1, 1]) * rng.uniform(5, 20)
         ok = rng.random(n) < rng.uniform(0.5, 1)
-        ok_ref = ok & (T < 60)
-        f = Q.fahrenheit_flags(T, ok, ok_ref)
-        assert np.array_equal(f, _fahrenheit_brute(T, ok, ok_ref)), trial
         j, _ = Q.jump_flags(T, ok, DEFAULT_QC.jump_half, DEFAULT_QC.jump_thresh,
                             DEFAULT_QC.jump_min_valid, DEFAULT_QC.jump_floor[0])
         assert np.array_equal(j, _jump_brute(T, ok, DEFAULT_QC.jump_floor[0])), trial
@@ -289,7 +263,6 @@ def test_prefiltered_checks_match_brute_force():
             P[a:] += Q.P_SEA_LEVEL - Q.station_pressure_expected(elev)
         p = Q.sea_level_pressure_flags(P, ok, elev)
         assert np.array_equal(p, _slp_brute(P, ok, elev)), trial
-        hits["F"] += f.sum()
         hits["J"] += j.sum()
         hits["P"] += p.sum()
     assert all(v > 0 for v in hits.values()), f"сравнение без срабатываний бессмысленно: {hits}"
@@ -338,8 +311,8 @@ def test_flagged_value_does_not_poison_window_checks(clean):
 
 CAUSAL_DELAY = {"range_T": 0, "spike": 0, "stuck_T": DEFAULT_QC.stuck_T_alone_hours - 1,
                 "stuck_RH": DEFAULT_QC.stuck_hours[2] - 1,
-                "rh_saturated": DEFAULT_QC.rh_sat_hours - 1, "fahrenheit": DEFAULT_QC.units_half,
-                "sea_level_pressure": DEFAULT_QC.units_min_valid}
+                "rh_saturated": DEFAULT_QC.rh_sat_hours - 1,
+                "sea_level_pressure": DEFAULT_QC.slp_min_valid}
 
 
 @pytest.mark.parametrize("kind", list(CAUSAL_DELAY))
@@ -380,7 +353,7 @@ def test_runtime_step_uses_the_causal_qc(clean):
     x = np.stack([T, P, RH], -1)[:900]
     present = np.ones_like(x, np.uint8)
     present[50:60, 1] = 0
-    ref = Q.causal_codes(x, present, elev=200.0)
+    ref = Q.causal_codes(record_values(x), present, elev=200.0)
     ring = Q.CausalQC(elev=200.0)
     got = np.stack([ring.push([x[k, j] if present[k, j] else None for j in range(3)])[1]
                     for k in range(len(x))])

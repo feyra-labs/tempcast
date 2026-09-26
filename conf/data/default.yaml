@@ -23,8 +23,7 @@ augment:
   offset_max: 3.0
   noise_prob: 1.0
   noise_sd: [0.2, 0.3, 2.0]
-  quant_prob: 0.5
-  quant_f_frac: 0.4
+  rh_dewpoint_prob: 0.1
   spike_prob: 0.2
   spike_max_count: 3
   spike_min: [12.0, 15.0, 40.0]
@@ -33,14 +32,11 @@ augment:
   stuck_hours: [12, 96]
   units_prob: 0.05
   units_hours: [24, 96]
-  units_p_frac: 0.3
   dropout_prob: 0.3
   dropout_max_rate: 0.2
   gap_prob: 0.5
   gap_max_count: 3
   gap_max_len: 96
-  sparse_prob: 0.15
-  sparse_every: [3, 6]
   outage_prob: 0.2
   outage_hours: [24, 240]
   drop_humidity_prob: 0.15

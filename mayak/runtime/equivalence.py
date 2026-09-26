@@ -44,21 +44,39 @@ def device_mask(series, start, end, elev):
         Маска float32, форма (end - start, 3).
     """
     from mayak.data.qc import qc_window
-    mask, _ = qc_window(series["x"][start:end], series["m"][start:end], elev=elev)
+    mask, _ = qc_window(device_values(series, start, end), series["m"][start:end], elev=elev)
     return mask
+
+
+def device_values(series, start, end):
+    """Значения часов с start до end так, как их записывает прибор.
+
+    Args:
+        series: ряд с полями x и m.
+        start: первый час.
+        end: час после последнего.
+
+    Returns:
+        Массив float32, форма (end - start, 3), нули на месте пропусков.
+    """
+    from mayak.data.recording import record_values
+    m = series["m"][start:end] > 0
+    return np.where(m, record_values(series["x"][start:end]), 0.0).astype(np.float32)
 
 
 def batch_forecast(model, series, end, lat, lon, elev):
     """Пакетный выпуск по окну max_history часов, заканчивающемуся перед часом end.
 
-    История проходит тот же причинный QC, что поток, запущенный в первом часе окна.
+    История записывается прибором и проходит тот же причинный QC, что поток, запущенный в
+    первом часе окна.
     """
     cfg = model.cfg
     L = cfg.max_history
     x = np.zeros((L, 3), np.float32)
     mk = np.zeros((L, 3), np.float32)
     k = min(L, end)
-    x[L - k:], mk[L - k:] = series["x"][end - k:end], device_mask(series, end - k, end, elev)
+    x[L - k:], mk[L - k:] = (device_values(series, end - k, end),
+                             device_mask(series, end - k, end, elev))
     hoy = (series["hoy0"] + end - L + np.arange(L)) % YEAR_H
     doy_f, hour_f = future_calendar_after(series, end, cfg.horizon)
     t = lambda a: torch.as_tensor(a, dtype=torch.float32)[None]
@@ -164,5 +182,6 @@ def stream_hour_ms(model, hours=200, seed=0, lat=52.37, lon=4.9, elev=0.0):
     return (time.perf_counter() - t0) / hours * 1e3, s
 
 
-__all__ = ["batch_forecast", "divergence", "feed", "future_calendar_after", "step_cost",
-           "stream_forecast", "stream_hour_ms", "synthetic_series"]
+__all__ = ["batch_forecast", "device_mask", "device_values", "divergence", "feed",
+           "future_calendar_after", "step_cost", "stream_forecast", "stream_hour_ms",
+           "synthetic_series"]

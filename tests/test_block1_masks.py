@@ -7,6 +7,7 @@ import torch
 
 from mayak.constants import H, L_MAX, QUANTILES
 from mayak.data.masking import (TargetMaskConfig, enforce_invariant, target_window_ok)
+from mayak.data.recording import record_values
 from mayak.loss import mayak_loss, pinball, pinball_loss
 from mayak.metrics import (fit_conformal_shift, metric_table, skill, wmean)
 
@@ -408,7 +409,7 @@ def test_streaming_daily_summaries_match_batch():
     for k in range(n):
         stream.step(T[k] if vT[k] else None, P[k] if vP[k] else None, RH[k], doy[k], hour[k])
 
-    x = torch.tensor(np.stack([np.where(vT, T, 0), np.where(vP, P, 0), RH], -1),
+    x = torch.tensor(record_values(np.stack([np.where(vT, T, 0), np.where(vP, P, 0), RH], -1)),
                      dtype=torch.float32)[None]
     mk = torch.tensor(np.stack([vT, vP, np.ones(n, bool)], -1), dtype=torch.float32)[None]
     with torch.no_grad():

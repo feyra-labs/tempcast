@@ -10,6 +10,7 @@ import pytest
 from mayak.constants import L_MAX
 from mayak.data import qc as Q
 from mayak.data.qc import DEFAULT_QC, QCCode, QCConfig
+from mayak.data.recording import record_values
 
 REPO = Path(__file__).resolve().parents[1]
 GOLDEN = REPO / "tests" / "data" / "qc_causal" / "golden.json"
@@ -32,12 +33,7 @@ def diurnal_series(n, amp=8.0, base=15.0, syn_sd=3.0, rh_mean=55.0, elev=200.0, 
     return np.stack([T, P, RH], -1)
 
 
-def recorded(x):
-    """Запись прибора: целые градусы и проценты, давление в десятых."""
-    x = np.asarray(x, np.float64).copy()
-    x[:, 0], x[:, 2] = np.round(x[:, 0]), np.round(x[:, 2])
-    x[:, 1] = np.round(x[:, 1] * 10) / 10
-    return x.astype(np.float32)
+recorded = record_values
 
 
 def with_artifacts(seed, n=1100, step=1):
@@ -50,8 +46,6 @@ def with_artifacts(seed, n=1100, step=1):
         x[i, ch] += rng.choice([-1, 1]) * [20, 25, 60][ch]
     a = int(rng.integers(0, n - 100))
     x[a:a + 90, 0], x[a:a + 90, 2] = x[a, 0], x[a, 2]
-    a = int(rng.integers(0, n - 60))
-    x[a:a + 60, 0] = x[a:a + 60, 0] * 1.8 + 32
     a = int(rng.integers(0, n - 10))
     x[a:a + 3, 0] += 15
     present[rng.random(present.shape) < 0.05] = 0
@@ -76,7 +70,7 @@ def test_stream_equals_batch_hour_by_hour(seed, step):
         v, codes = ring.push([x[k, j] if present[k, j] else None for j in range(3)])
         assert np.array_equal(codes, ref[k]), k
         assert np.all(v[codes > 0] == 0)
-    assert np.any(ref & QCCode.STUCK) and np.any(ref & QCCode.UNITS)
+    assert np.any(ref & QCCode.STUCK) and np.any(ref & QCCode.SPIKE)
 
 
 def test_window_with_context_equals_codes_of_the_whole_series():
@@ -91,10 +85,11 @@ def test_window_with_context_equals_codes_of_the_whole_series():
 
 def test_lookback_covers_every_rule():
     c = DEFAULT_QC
-    assert c.lookback_hours >= 24 * c.units_past_days + 23
     assert c.lookback_hours >= c.stuck_T_alone_hours + c.stuck_max_gap
     assert c.lookback_hours >= 2 * c.jump_half + c.jump_max_gap + 2 * c.spike_half
-    assert QCConfig(units_past_days=3).lookback_hours < c.lookback_hours
+    assert c.lookback_hours >= 2 * c.slp_half
+    assert QCConfig(stuck_T_alone_hours=24, rh_sat_hours=24).lookback_hours < c.lookback_hours
+    assert c.lookback_hours == 78, "без проверки единиц температуры глубина - трое суток"
 
 
 def test_reference_vectors_are_reproduced():
@@ -204,17 +199,14 @@ def test_return_to_previous_level_is_not_a_jump():
     assert c[202, 0] == 0
 
 
-def test_fahrenheit_needs_past_days():
+def test_temperature_units_are_not_checked_on_device():
+    """Температуру в градусах Цельсия обеспечивает владелец прибора: QC её единицы не
+    проверяет, код UNITS бывает только у давления."""
     n = 24 * 10
     x = recorded(diurnal_series(n, amp=3, base=5, seed=2))
-    x[30:60, 0] = x[30:60, 0] * 1.8 + 32
-    early = Q.causal_codes(x, np.ones((n, 3)), elev=200.0)
-    assert not np.any(early[:, 0] & QCCode.UNITS), "нет трёх прошлых суток - проверки нет"
-    x2 = recorded(diurnal_series(n, amp=3, base=5, seed=2))
-    x2[150:190, 0] = x2[150:190, 0] * 1.8 + 32
-    late = Q.causal_codes(x2, np.ones((n, 3)), elev=200.0)
-    assert np.all(late[150 + DEFAULT_QC.units_half:190, 0] != 0)
-    assert np.all(late[150 + DEFAULT_QC.units_half:190, 0] & QCCode.UNITS)
+    x[150:190, 0] = x[150:190, 0] * 1.8 + 32
+    codes = Q.causal_codes(x, np.ones((n, 3)), elev=200.0)
+    assert not np.any(codes[:, 0] & QCCode.UNITS)
 
 
 def test_qc_config_rejects_inconsistent_stuck_limits():
@@ -222,8 +214,6 @@ def test_qc_config_rejects_inconsistent_stuck_limits():
         QCConfig(stuck_min_count=10)
     with pytest.raises(ValueError, match="scale_floor"):
         QCConfig(scale_floor=(1.0, 0.0, 1.0))
-    with pytest.raises(ValueError, match="units_min_days"):
-        QCConfig(units_min_days=20)
 
 
 def test_qc_context_follows_device_age():
@@ -232,7 +222,8 @@ def test_qc_context_follows_device_age():
     assert qc_context(10_000, L_MAX, 0) == look
     assert qc_context(10_000, 100, 0) == 0, "прибор включён 100 ч назад"
     assert qc_context(L_MAX + 50, L_MAX, 0) == 50, "контекст не раньше начала ряда"
-    assert qc_context(5_000, L_MAX, 4_000) == 5_000 - L_MAX - 4_000
+    assert qc_context(5_000, L_MAX, 5_000 - L_MAX - 30) == 30
+    assert qc_context(5_000, L_MAX, 1_000) == look
     assert footprint(10_000, None, 0) == (10_000 - L_MAX - look, 10_000 + 168)
 
 

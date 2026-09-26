@@ -12,6 +12,7 @@ use crate::calib::{aci_score, apply_adaptive, apply_conformal, AciParams};
 use crate::graphs::{Graphs, Precision};
 use crate::manifest::{Dims, Manifest};
 use crate::qc::CausalQc;
+use crate::record::record_channel;
 use crate::state::{decode_raw, encode_raw, window_hoys, Snapshot};
 use crate::{Error, Result};
 
@@ -533,7 +534,10 @@ impl Runtime {
                 let valid = s.raw_m[p * 3 + c] > 0;
                 let [lo, hi] = self.bounds[c];
                 self.raw_m[p * 3 + c] = valid as u8 as f32;
-                self.raw_x[p * 3 + c] = decode_raw(s.raw_q[p * 3 + c], valid, lo, hi);
+                // Окно хранит уже записанные прибором значения; ошибка фиксированной
+                // точки меньше половины шага записи, повторная запись возвращает их точно.
+                let v = decode_raw(s.raw_q[p * 3 + c], valid, lo, hi);
+                self.raw_x[p * 3 + c] = if valid { record_channel(v, c) } else { 0.0 };
             }
         }
         for (k, h) in hoys.iter().enumerate() {

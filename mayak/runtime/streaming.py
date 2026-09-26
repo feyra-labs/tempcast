@@ -45,6 +45,7 @@ import torch
 from mayak.astro import astro_features
 from mayak.config import CHANNEL_MAX_LAG
 from mayak.data.qc import PHYS, CausalQC, qc_window
+from mayak.data.recording import record_values
 from mayak.metrics import ACIParams, aci_score, apply_adaptive, apply_conformal
 
 log = logging.getLogger(__name__)
@@ -249,6 +250,8 @@ class StreamingMayak:
     def warm_start(self, x_hist, mask_hist, doy_hist, hour_hist):
         """Прогрев по сырой истории: то же состояние, что после L вызовов step.
 
+        Значения записываются так, как их пишет прибор, до QC, как при почасовом приходе.
+
         Args:
             x_hist: сырые значения, форма (L, 3).
             mask_hist: маска наличия, форма (L, 3).
@@ -257,7 +260,10 @@ class StreamingMayak:
         """
         self.reset()
         present = np.asarray(mask_hist, np.float32)
-        raw_x = np.where(present > 0, np.asarray(x_hist, np.float32), 0.0).astype(np.float32)
+        x_hist = np.asarray(x_hist, np.float32).reshape(-1, 3)
+        present = present * np.isfinite(x_hist)
+        raw_x = np.where(present > 0, record_values(np.where(present > 0, x_hist, 0.0)),
+                         0.0).astype(np.float32)
         mk = present
         if len(raw_x):
             mk, _ = qc_window(raw_x, present, elev=self.elev)
@@ -392,7 +398,8 @@ class StreamingMayak:
         self.day_mask = torch.from_numpy(take((1, D), np.float16).astype(np.float32))
         q = take((W, 3), "<u2")
         self.raw_m = take((W, 3), np.uint8).astype(np.float32)
-        self.raw_x = decode_raw(q, self.raw_m)
+        self.raw_x = np.where(self.raw_m > 0, record_values(decode_raw(q, self.raw_m)),
+                              0.0).astype(np.float32)
         self.raw_doy[W - filled:], self.raw_hour[W - filled:] = doy, hour
         self.head, self.filled = 0, filled
         idx = self._ordered(filled)

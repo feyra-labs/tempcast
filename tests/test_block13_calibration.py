@@ -31,6 +31,7 @@ from mayak.config import (COVERAGE_DIMS_EXTERNAL, COVERAGE_DIMS_INTERNAL, Calibr
                           ConfigError)
 from mayak.constants import H, QUANTILES
 from mayak.data import store as S
+from mayak.data.recording import record_values
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN
 from mayak.metrics import (I_HI90, I_LO90, I_MED, LEAD_BINS, NQ, ACIParams, Evaluation,
                            aci_effective_level, aci_run, aci_score, apply_adaptive,
@@ -266,7 +267,7 @@ def test_runtime_theta_matches_offline_run(model):
     scores = []
     for k in range(n):
         if k and st._pending is not None:
-            y = float(s["x"][k, 0]) if s["m"][k, 0] > 0 else float("nan")
+            y = float(record_values(s["x"][k])[0]) if s["m"][k, 0] > 0 else float("nan")
             scores.append(float(aci_score(y, st._pending["q"][0], p.interval)))
         feed(st, s, k, k + 1)
         q, _ = st.forecast(*future_calendar_after(s, k + 1, H))

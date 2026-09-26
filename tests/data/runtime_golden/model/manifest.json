@@ -216,17 +216,9 @@
   "stuck_min_count": 4,
   "rh_sat": 99.5,
   "rh_sat_hours": 72,
-  "units_half": 6,
-  "units_min_valid": 4,
-  "units_day_min_valid": 6,
-  "units_ref_days": 45,
-  "units_past_days": 14,
-  "units_min_days": 3,
-  "units_ref_k": 3.0,
-  "units_spread_floor": 1.0,
-  "units_min_excess": 8.0,
-  "units_min_conv": -10.0,
+  "slp_half": 6,
   "slp_min_sep": 80.0,
+  "slp_min_valid": 6,
   "dewpoint_tol": 0.5,
   "day_min_hours": 18,
   "solar_min_amp": 0.5,
@@ -251,7 +243,7 @@
    "changepoint",
    "dem_elevation"
   ],
-  "lookback_hours": 359
+  "lookback_hours": 78
  },
  "state": {
   "version": 3,
@@ -547,7 +539,7 @@
  "opset": 17,
  "provenance": {
   "git": {
-   "commit": "42e025c48b198931a1f5a38fe017eedbf923a7b5",
+   "commit": "227e4db4c1418b0be72c177fbaefe21d8d39ded6",
    "dirty": true
   },
   "versions": {

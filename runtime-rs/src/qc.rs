@@ -7,6 +7,8 @@
 
 use serde::Deserialize;
 
+use crate::record::record_channel;
+
 pub const MISSING: u8 = 1;
 pub const RANGE: u8 = 2;
 pub const SPIKE: u8 = 4;
@@ -38,17 +40,9 @@ pub struct QcConfig {
     pub stuck_min_count: usize,
     pub rh_sat: f64,
     pub rh_sat_hours: usize,
-    pub units_half: usize,
-    pub units_min_valid: usize,
-    pub units_day_min_valid: usize,
-    pub units_past_days: usize,
-    pub units_min_days: usize,
-    pub units_ref_k: f64,
-    pub units_spread_floor: f64,
-    pub units_min_excess: f64,
-    pub units_min_conv: f64,
     pub slp_half: usize,
     pub slp_min_sep: f64,
+    pub slp_min_valid: usize,
     pub lookback_hours: usize,
 }
 
@@ -200,77 +194,6 @@ where
     (span, count)
 }
 
-/// Опорный уровень и разброс по медианам прошлых суточных блоков.
-fn past_reference(x: &[f64], ok: &[bool], cfg: &QcConfig) -> (Vec<f64>, Vec<f64>) {
-    let n = x.len();
-    let mut day = vec![f64::NAN; n];
-    let mut day_ok = vec![false; n];
-    let mut vals = Vec::new();
-    for i in 0..n {
-        vals.clear();
-        for s in window_start(i, 23)..=i {
-            if ok[s] {
-                vals.push(x[s]);
-            }
-        }
-        if !vals.is_empty() {
-            day[i] = median(&mut vals);
-        }
-        day_ok[i] = vals.len() >= cfg.units_day_min_valid;
-    }
-    let mut reference = vec![f64::NAN; n];
-    let mut spread = vec![cfg.units_spread_floor; n];
-    let mut dev = Vec::new();
-    for i in 0..n {
-        vals.clear();
-        for k in 1..=cfg.units_past_days {
-            if i >= 24 * k && day_ok[i - 24 * k] {
-                vals.push(day[i - 24 * k]);
-            }
-        }
-        if vals.is_empty() {
-            continue;
-        }
-        let count = vals.len();
-        let (med, mad) = median_mad(&mut vals, &mut dev);
-        spread[i] = f64::max(MAD_TO_SD * mad, cfg.units_spread_floor);
-        if count >= cfg.units_min_days {
-            reference[i] = med;
-        }
-    }
-    (reference, spread)
-}
-
-/// Участки температуры в градусах Фаренгейта.
-fn fahrenheit_flags(t: &[f64], src: &[bool], base: &[bool], cfg: &QcConfig) -> Vec<bool> {
-    let n = t.len();
-    let (reference, spread) = past_reference(t, base, cfg);
-    let before = 2 * cfg.units_half;
-    let mut out = vec![false; n];
-    let mut vals = Vec::new();
-    for i in 0..n {
-        if !src[i] || !reference[i].is_finite() {
-            continue;
-        }
-        vals.clear();
-        for s in window_start(i, before)..=i {
-            if src[s] {
-                vals.push(t[s]);
-            }
-        }
-        if vals.len() < cfg.units_min_valid {
-            continue;
-        }
-        let r = median(&mut vals);
-        let thr = f64::max(cfg.units_ref_k * spread[i], cfg.units_min_excess);
-        let conv = (r - 32.0) / 1.8;
-        let high = r - reference[i] > thr;
-        let fits = (conv - reference[i]).abs() <= cfg.units_ref_k * spread[i] && conv >= cfg.units_min_conv;
-        out[i] = high && fits;
-    }
-    out
-}
-
 /// Давление, приведённое к уровню моря, вместо станционного.
 fn sea_level_flags(p: &[f64], src: &[bool], elev: Option<f64>, cfg: &QcConfig) -> Vec<bool> {
     let n = p.len();
@@ -300,7 +223,7 @@ fn sea_level_flags(p: &[f64], src: &[bool], elev: Option<f64>, cfg: &QcConfig) -
                 }
             }
         }
-        if vals.len() < cfg.units_min_valid || 2 * above < vals.len() {
+        if vals.len() < cfg.slp_min_valid || 2 * above < vals.len() {
             continue;
         }
         out[i] = median(&mut vals) > thr;
@@ -375,12 +298,8 @@ pub fn causal_codes(
             codes[i][2] |= STUCK;
         }
     }
-    let fahrenheit = fahrenheit_flags(&xs[0], &src[0], &base[0], cfg);
     let sea_level = sea_level_flags(&xs[1], &src[1], elev, cfg);
     for i in 0..n {
-        if fahrenheit[i] {
-            codes[i][0] |= UNITS;
-        }
         if sea_level[i] {
             codes[i][1] |= UNITS;
         }
@@ -427,19 +346,15 @@ impl CausalQc {
     pub fn seed(&mut self, x: &[[f32; 3]], present: &[[bool; 3]]) {
         self.reset();
         let from = x.len().saturating_sub(self.size);
-        for i in from..x.len() {
-            let mut v = [0.0f32; 3];
-            for c in 0..3 {
-                if present[i][c] {
-                    v[c] = x[i][c];
-                }
-            }
+        for (xi, pi) in x.iter().zip(present).skip(from) {
+            let v: [f32; 3] = std::array::from_fn(|c| if pi[c] { xi[c] } else { 0.0 });
             self.x.push(v);
-            self.present.push(present[i]);
+            self.present.push(*pi);
         }
     }
 
-    /// Новый час: значения с нулями на месте отбракованных и коды часа.
+    /// Новый час: значения с нулями на месте отбракованных и коды часа. Имеющееся
+    /// значение сразу записывается так, как его пишет прибор; проверки видят запись.
     pub fn push(&mut self, obs: [Option<f64>; 3]) -> ([f32; 3], [u8; 3]) {
         if self.x.len() == self.size {
             self.x.remove(0);
@@ -451,7 +366,7 @@ impl CausalQc {
             if let Some(o) = obs[c] {
                 let f = o as f32;
                 if f.is_finite() {
-                    v[c] = f;
+                    v[c] = record_channel(f, c);
                     p[c] = true;
                 }
             }

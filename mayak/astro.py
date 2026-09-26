@@ -34,6 +34,22 @@ def dewpoint_c(T, RH):
     return MAGNUS_B * gamma / (MAGNUS_A - gamma)
 
 
+def dewpoint_from_rh(T, RH):
+    """Точка росы по температуре и влажности, та же формула Магнуса, что внутри модели.
+
+    Args:
+        T: температура, градусы Цельсия.
+        RH: относительная влажность, проценты; ниже одного процента считается одним.
+
+    Returns:
+        Массив float64 точки росы, градусы Цельсия.
+    """
+    T = np.asarray(T, np.float64)
+    rh = np.clip(np.asarray(RH, np.float64), 1.0, 100.0)
+    gamma = np.log(rh / 100.0) + MAGNUS_A * T / (MAGNUS_B + T)
+    return MAGNUS_B * gamma / (MAGNUS_A - gamma)
+
+
 def rh_from_dewpoint(T, Td):
     """Обратная формула Магнуса."""
     gamma_T = MAGNUS_A * T / (MAGNUS_B + T)

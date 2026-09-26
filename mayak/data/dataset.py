@@ -7,7 +7,7 @@ from torch.utils.data import Dataset, get_worker_info
 
 from mayak.config import ZONE_WEIGHTINGS, AugmentConfig
 from mayak.constants import L_MAX, H
-from mayak.data.augment import AugWindow, augment_window
+from mayak.data.augment import AugWindow, augment_window, record_window
 from mayak.data.masking import (DEFAULT_TARGET_MASK, FilterStats, enforce_invariant,
                                 target_window_ok)
 from mayak.data.qc import DEFAULT_QC, qc_window
@@ -314,6 +314,9 @@ class WindowDataset(Dataset):
     def build(self, s, t, L, info=None):
         """Окно станции s с началом горизонта t и историей L, с аугментациями.
 
+        Порядок как у прибора: искажения датчика и отказы, запись целыми градусами и
+        процентами, затем причинный QC. Запись касается и истории, и цели.
+
         Args:
             s: запись станции.
             t: начало горизонта, индекс часа.
@@ -337,6 +340,7 @@ class WindowDataset(Dataset):
                                      hour=hour_h, lat=s["lat"], lon=s["lon"],
                                      elev=s["elev"], qc_elev=s["qc_elev"]),
                            self.augment, self.rng_aug)
+        record_window(w)
         if info is not None:
             info.update(w.applied)
         lat, lon, elev, y = w.lat, w.lon, w.elev, w.y

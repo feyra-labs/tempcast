@@ -280,7 +280,9 @@ def external(tmp_path_factory):
     _write_psv(raw, "EXT_LONG2", N_LONG, 2)
     _write_psv(raw, "EXT_SHORT", N_SHORT, 3)
     _write_psv(raw, "EXT_GAPPY", N_LONG, 4, drop=_no_february)
-    stations = pd.DataFrame(dict(id=["EXT_LONG", "EXT_LONG2", "EXT_SHORT", "EXT_GAPPY", "EXT_NONE"],
+    _write_psv(raw, "EXT_3H", N_LONG, 5, drop=lambda h: np.arange(len(h)) % 3 != 0)
+    stations = pd.DataFrame(dict(id=["EXT_LONG", "EXT_LONG2", "EXT_SHORT", "EXT_GAPPY", "EXT_NONE",
+                                     "EXT_3H"],
                                  lat=50.0, lon=LON, elev=STATION_ELEV, name="x"))
     dem = lambda lat, lon: 100.0
     koppen = lambda lat, lon: "Cfb"
@@ -321,6 +323,8 @@ def test_builder_writes_store_contract_and_manifest(external):
     assert set(rows) == {"EXT_LONG", "EXT_LONG2", "EXT_SHORT", "EXT_GAPPY"}
     rep = {r["id"]: r for r in external["report"]}
     assert rep["EXT_NONE"]["status"] == "excluded" and "нет скачанных" in rep["EXT_NONE"]["reason"]
+    assert rep["EXT_3H"]["status"] == "excluded" and rep["EXT_3H"]["report_every"] == 3
+    assert "шаг отчётности 3 ч" in rep["EXT_3H"]["reason"], "только почасовые приборы"
     r = rows["EXT_LONG"]
     assert r["split"] == ROLE_EXTERNAL and r["koppen"] == "Cfb"
     assert r["elev"] == 100.0 and r["dem_elev"] == 100.0, "высота модели - из ЦМР"

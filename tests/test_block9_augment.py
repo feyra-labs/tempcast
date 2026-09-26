@@ -17,12 +17,15 @@ from mayak.data import store as S
 from mayak.data.augment import (AUG_ORDER, EXPECTED_QC, apply_one, augment_window,
                                 clean_history, make_window, qc_effect, reference_windows)
 from mayak.data.masking import enforce_invariant
+from mayak.data import qc as Q
+from mayak.data.recording import is_recorded, record_values
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL
 
 REPO = Path(__file__).resolve().parents[1]
 CONF = REPO / "conf"
-VALUE_AUGS = ("scale", "drift", "offset", "noise", "spike", "stuck", "units", "quantize")
-MASK_AUGS = ("dropout", "gap", "sparse", "outage", "drop_pressure", "drop_humidity")
+VALUE_AUGS = ("scale", "drift", "offset", "noise", "rh_dewpoint", "spike", "stuck", "units")
+INSTRUMENT_ON_TARGET = ("scale", "drift", "offset")
+MASK_AUGS = ("dropout", "gap", "outage", "drop_pressure", "drop_humidity")
 ALL_ON = {f: 1.0 for f in AUGMENT_PROB_FIELDS.values()}
 
 
@@ -113,8 +116,9 @@ def test_config_validation_and_partial_dicts():
         AugmentConfig(spike_min=(40.0, 15.0, 40.0), spike_max=(30.0, 40.0, 80.0))
     with pytest.raises(ConfigError, match="lo ≤ hi"):
         AugmentConfig(stuck_hours=(48, 12))
-    with pytest.raises(ConfigError, match="≥ 2"):
-        AugmentConfig(sparse_every=(1,))
+    for removed in ("sparse_prob", "sparse_every", "units_p_frac", "quant_prob"):
+        with pytest.raises(ConfigError, match="неизвестные ключи"):
+            AugmentConfig.from_dict({removed: 0.5})
     with pytest.raises(ConfigError, match="неизвестные ключи"):
         AugmentConfig.from_dict({"spik_prob": 0.1})
     a = AugmentConfig.from_dict({"profile": "base", "gap_prob": 0.0})
@@ -162,8 +166,8 @@ def test_availability_only_removes_validity(name):
         assert name in w.applied and w.m.sum() < w0.m.sum()
 
 
-@pytest.mark.parametrize("name", [n for n in AUG_ORDER if n != "offset"])
-def test_target_untouched_except_offset(name):
+@pytest.mark.parametrize("name", [n for n in AUG_ORDER if n not in INSTRUMENT_ON_TARGET])
+def test_target_untouched_except_instrument_properties(name):
     cfg = AugmentConfig.only(name)
     for seed in range(6):
         w0 = _window(seed, holes=0.2)
@@ -178,11 +182,17 @@ def test_offset_shifts_history_and_target_consistently():
         w = augment_window(_copy(w0), cfg, np.random.default_rng(seed))
         b = np.float32(w.applied["offset"]["b"])
         assert cfg.offset_min <= abs(b) <= cfg.offset_max
-        assert np.allclose(w.y - w0.y, b * w0.y_mask, atol=1e-5)
+        tol = A.DITHER_FRAC * 0.5 / np.array([1.0, 10.0, 1.0]) + 1e-4
+        assert np.all(np.abs(w.y - w0.y - b * w0.y_mask) <= tol[0])
+        assert np.array_equal(w.y[w0.y_mask == 0], w0.y[w0.y_mask == 0])
         assert np.array_equal(w.y_mask, w0.y_mask), "маска цели - только из данных (1.6)"
         mT = w0.m[:, 0] > 0
-        assert np.allclose(w.x[mT, 0] - w0.x[mT, 0], b, atol=1e-4)
-        assert np.array_equal(w.x[:, 1:], w0.x[:, 1:])
+        assert np.all(np.abs(w.x[mT, 0] - w0.x[mT, 0] - b) <= tol[0])
+        for ch in (1, 2):
+            assert np.all(np.abs(w.x[:, ch] - w0.x[:, ch]) <= tol[ch]), "непрерывность"
+        A.record_window(w)
+        w1 = A.record_window(_copy(w0))
+        assert np.array_equal(w.x[:, 1:], w1.x[:, 1:]), "после записи P и RH прежние"
 
 
 def test_offset_needs_history_and_obeys_ablation():
@@ -232,37 +242,76 @@ def test_firing_frequencies_follow_probabilities():
         assert abs(fired[name] / n - p) <= tol, (name, fired[name] / n, p)
 
 
-def test_drift_is_anchored_at_present():
+def test_drift_starts_calibrated_and_reaches_current_offset():
     for walk in (False, True):
-        d = A.drift_profile(300, 2.0, walk, seed=1)
-        assert d[-1] == 0.0 and d.shape == (300,)
-    assert np.isclose(A.drift_profile(300, 2.0, False, 0)[0], 2.0)
-    ends = [abs(A.drift_profile(500, 2.0, True, s)[0]) for s in range(400)]
-    assert 1.4 < np.sqrt(np.mean(np.square(ends))) < 2.6, "RMS к началу истории ≈ амплитуда"
-    w0 = _window(0)
-    w = apply_one(_copy(w0), "drift", dict(amp=[2.0, 1.0, 5.0], walk=True, seed=3))
-    assert np.array_equal(w.x[-1], w0.x[-1]), "последний час истории не сдвинут"
+        for b in (2.0, -1.5):
+            d = A.drift_profile(300, b, walk, seed=1)
+            assert d.shape == (300,) and d[0] == 0.0, "в первом часе истории прибор точен"
+            assert d[-1] == np.float32(b), "к последнему часу смещение равно текущему"
+    lin = A.drift_profile(301, 3.0, False, 0)
+    np.testing.assert_allclose(np.diff(lin), 0.01, atol=1e-6)
+    mids = [A.drift_profile(501, 2.0, True, s)[250] - 1.0 for s in range(400)]
+    assert 0.7 < np.sqrt(np.mean(np.square(mids))) < 1.3, "блуждание в середине около b / 2"
+    assert A.drift_profile(1, 0.7, True, 0).tolist() == [np.float32(0.7)]
+    assert A.drift_profile(0, 0.7, True, 0).shape == (0,)
 
 
-def test_quantization_grids():
-    v = np.linspace(-40, 45, 1001).astype(np.float32)
-    c = A.quantize_T(v, False)
-    assert np.allclose(c * 10, np.round(c * 10), atol=1e-3) and np.abs(c - v).max() <= 0.05 + 1e-5
-    f = A.quantize_T(v, True) * 1.8 + 32
-    assert np.allclose(f, np.round(f), atol=1e-3), "лестница целых °F"
-    assert np.abs(A.quantize_T(v, True) - v).max() <= 0.5 / 1.8 + 1e-5
+@pytest.mark.parametrize("L", [1, 30, L_MAX])
+def test_scale_and_drift_change_target_by_expected_amount(L):
+    w0 = _window(0, L=L, holes=0.2)
+    ok = w0.y_mask > 0
+    w = apply_one(_copy(w0), "scale", dict(k=[1.03, 1.0, 1.1]))
+    np.testing.assert_array_equal(w.y[ok], w0.y[ok] * np.float32(1.03))
+    assert np.array_equal(w.y[~ok], w0.y[~ok]) and np.array_equal(w.y_mask, w0.y_mask)
+    for walk in (False, True):
+        w = apply_one(_copy(w0), "drift", dict(b=[-1.25, 0.5, 4.0], walk=walk, seed=2))
+        np.testing.assert_array_equal(w.y[ok], w0.y[ok] + np.float32(-1.25))
+        assert np.array_equal(w.y[~ok], w0.y[~ok]) and np.array_equal(w.y_mask, w0.y_mask)
+        last = L_MAX - 1
+        for ch, b in enumerate((-1.25, 0.5, 4.0)):
+            if w0.m[last, ch] > 0:
+                assert w.x[last, ch] - w0.x[last, ch] == pytest.approx(b, abs=1e-4)
+    for name, p in (("scale", dict(k=[1.03, 1.0, 1.1])), ("offset", dict(b=2.0)),
+                    ("drift", dict(b=[1.0, 0.0, 0.0], walk=False, seed=0))):
+        w = apply_one(_copy(w0), name, dict(p, target=False))
+        assert np.array_equal(w.y, w0.y), f"{name}: вариант без цели трогает цель"
 
 
-def test_units_and_sparse_and_outage_semantics():
+@pytest.mark.parametrize("name", INSTRUMENT_ON_TARGET)
+def test_instrument_properties_never_change_target_mask(name):
+    cfg = AugmentConfig.only(name)
+    for seed in range(20):
+        w0 = _window(seed, L=(0, 5, 200, L_MAX)[seed % 4], holes=0.3)
+        w = augment_window(_copy(w0), cfg, np.random.default_rng(seed))
+        assert np.array_equal(w.y_mask, w0.y_mask)
+        assert np.all(w.y[w0.y_mask == 0] == 0)
+
+
+def test_rh_from_integer_dewpoint_jumps_by_a_few_percent():
+    w0 = _window(0, holes=0.2)
+    w = apply_one(_copy(w0), "rh_dewpoint", {})
+    both = (w0.m[:, 0] > 0) & (w0.m[:, 2] > 0)
+    d = w.x[both, 2] - w0.x[both, 2]
+    assert np.abs(d).max() > 1.0 and np.abs(d).max() < 12.0
+    assert np.all((w.x[:, 2] >= 0) & (w.x[:, 2] <= 100))
+    assert np.array_equal(w.x[~both, 2], w0.x[~both, 2]), "без пары T и RH ничего не меняется"
+    assert np.array_equal(w.x[:, :2], w0.x[:, :2]) and np.array_equal(w.m, w0.m)
+    again = apply_one(_copy(w), "rh_dewpoint", {})
+    assert np.abs(again.x[both, 2] - w.x[both, 2]).max() < 2.0, "повтор почти ничего не меняет"
+
+
+def test_units_and_outage_semantics():
+    """Подмена единиц - только давление на уровне моря: температуру в градусах Цельсия
+    обеспечивает владелец прибора."""
     w0 = _window(0, elev=1500.0)
-    w = apply_one(_copy(w0), "units", dict(ch=0, i=100, n=10))
-    assert np.allclose(w.x[100:110, 0], w0.x[100:110, 0] * 1.8 + 32, atol=1e-4)
-    w = apply_one(_copy(w0), "units", dict(ch=1, i=100, n=10))
+    w = apply_one(_copy(w0), "units", dict(i=100, n=10))
     ratio = w.x[100:110, 1] / w0.x[100:110, 1]
     assert np.allclose(ratio, A.sea_level_ratio(1500.0)) and ratio[0] > 1.15
-    w = apply_one(_copy(w0), "sparse", dict(every=6, phase=0))
-    hours = w.hour[w.m[:, 0] > 0].astype(int)
-    assert len(hours) and np.all(hours % 6 == 0), "отчётность по синоптическим срокам UTC"
+    assert np.array_equal(w.x[:, [0, 2]], w0.x[:, [0, 2]])
+    for seed in range(50):
+        w = augment_window(_window(seed), AugmentConfig.only("units"),
+                           np.random.default_rng(seed))
+        assert np.array_equal(w.x[:, 0], _window(seed).x[:, 0])
     cfg = AugmentConfig.only("outage")
     for seed in range(10):
         w = augment_window(_window(seed), cfg, np.random.default_rng(seed))
@@ -307,18 +356,22 @@ def test_reference_window_produces_expected_codes(case):
 
 
 MIN_HIT = {"spike": 0.8, "stuck": 0.7, "units": 0.6, "dropout": 1.0, "gap": 1.0,
-           "sparse": 1.0, "outage": 1.0, "drop_pressure": 1.0, "drop_humidity": 1.0}
+           "outage": 1.0, "drop_pressure": 1.0, "drop_humidity": 1.0}
 
 
-def _detectable(name, params):
+def _detectable(name, params, w):
     """Распознаёт ли причинный QC искажение по прошлому.
 
     Залипание одного канала видно только после срока залипания этого канала;
-    более короткое устройство не отличит от нормы.
+    более короткое устройство не отличит от нормы. Давление на уровне моря отличимо от
+    станционного только у достаточно высокой станции.
     """
+    from mayak.data.qc import DEFAULT_QC as C
+    if name == "units":
+        sep = Q.P_SEA_LEVEL - Q.station_pressure_expected(w.qc_elev)
+        return sep >= C.slp_min_sep
     if name != "stuck":
         return True
-    from mayak.data.qc import DEFAULT_QC as C
     n = min(params["n"], L_MAX - params["i"])
     need = C.stuck_T_alone_hours if params["ch"] == 0 else C.stuck_hours[params["ch"]]
     return n > need
@@ -334,7 +387,7 @@ def test_sampled_augmentation_produces_expected_codes(name):
         after = augment_window(_copy(before), cfg, np.random.default_rng(seed))
         assert name in after.applied
         eff = qc_effect(name, before, after)
-        if _detectable(name, after.applied[name]):
+        if _detectable(name, after.applied[name], before):
             hits.append(eff["hit"])
         sides.append(eff["side_frac"])
     assert len(hits) >= n // 4, f"{name}: мало распознаваемых случаев для проверки"
@@ -354,7 +407,7 @@ def test_reference_script_writes_artifacts(tmp_path):
     table = json.loads((tmp_path / "aug_reference.json").read_text(encoding="utf-8"))["cases"]
     assert [r["case"] for r in table] == [c[0] for c in A.REFERENCE_CASES]
     z = np.load(tmp_path / "aug_reference.npz")
-    for case in ("spike_T", "gap_3d", "quantize_F"):
+    for case in ("spike_T", "gap_3d", "rh_dewpoint"):
         for tag in ("before", "after"):
             assert z[f"{case}/{tag}/x"].shape == (L_MAX, 3)
     again = tmp_path / "again"
@@ -414,8 +467,19 @@ def test_dataset_aggressive_keeps_contract(manifest):
         assert np.all(x[m == 0] == 0) and np.all(np.isfinite(x))
         y0, ym0 = slice_target(s["x"], s["mask"], t)
         assert np.array_equal(it["y_mask"].numpy(), ym0)
-        b = info.get("offset", {}).get("b", 0.0)
-        assert np.allclose(it["y"].numpy(), y0 + np.float32(b) * ym0, atol=1e-5)
+        y = y0.astype(np.float64)
+        if "scale" in info:
+            y = np.where(ym0 > 0, y * info["scale"]["k"][0], y)
+        if "drift" in info:
+            y = y + info["drift"]["b"][0] * ym0
+        if "offset" in info:
+            y = y + info["offset"]["b"] * ym0
+        got = it["y"].numpy()
+        assert np.all(np.abs(got - y)[ym0 > 0] <= 1.0 + 1e-4), \
+            "цель - запись прибора после его свойств: не дальше полушага шума и полушага записи"
+        assert np.array_equal(got[ym0 == 0], y0[ym0 == 0])
+        assert is_recorded(it["x_hist"].numpy(), it["mask_hist"].numpy())
+        assert np.array_equal(it["y"].numpy(), np.round(it["y"].numpy()))
         for k, shape in (("x_hist", (L_MAX, 3)), ("mask_hist", (L_MAX, 3)), ("y", (H,))):
             assert tuple(it[k].shape) == shape
     assert len(seen) >= 10, f"за 24 окна сработали только {sorted(seen)}"
@@ -448,3 +512,64 @@ def test_journal_records_augment_profile(manifest, tmp_path):
                      data_config=data, enable_progress_bar=False)
     assert j["augment"]["profile"] == "soft"
     assert j["augment"]["deviations"] == {"gap_prob": [0.3, 0.9]}
+
+
+def _recorded_window(seed=0, holes=0.1):
+    w = _window(seed, holes=holes)
+    w.y[:] = np.where(w.y_mask > 0, np.round(w.y), 0.0)
+    assert is_recorded(w.x, w.m)
+    return w
+
+
+def test_dither_then_record_returns_the_same_record():
+    for seed in range(20):
+        w0 = _recorded_window(seed)
+        w = A.dither_window(_copy(w0), np.random.default_rng(seed))
+        assert not np.array_equal(w.x, w0.x) and not np.array_equal(w.y, w0.y)
+        half = A.DITHER_FRAC * 0.5 / np.array([1.0, 10.0, 1.0])
+        assert np.all(np.abs(w.x - w0.x) <= half + 1e-4)
+        A.record_window(w)
+        assert np.array_equal(w.x, w0.x) and np.array_equal(w.y, w0.y)
+        assert np.array_equal(w.m, w0.m) and np.array_equal(w.y_mask, w0.y_mask)
+
+
+def test_small_offset_shifts_the_record_like_a_real_sensor():
+    """Смещение на 0.3 градуса у настоящего датчика переворачивает запись примерно в 30 %
+    часов; без непрерывности перед искажением запись не менялась бы вовсе."""
+    diffs, flat = [], []
+    for seed in range(10):
+        w0 = _recorded_window(seed)
+        ok = w0.m[:, 0] > 0
+        w = A.dither_window(_copy(w0), np.random.default_rng(seed))
+        A.record_window(apply_one(w, "offset", dict(b=0.3)))
+        diffs.append(w.x[ok, 0] - w0.x[ok, 0])
+        v = A.record_window(apply_one(_copy(w0), "offset", dict(b=0.3)))
+        flat.append(v.x[ok, 0] - w0.x[ok, 0])
+    d = np.concatenate(diffs)
+    assert set(np.unique(d)) <= {0.0, 1.0}
+    assert abs(d.mean() - 0.3) < 0.04, d.mean()
+    assert not np.any(np.concatenate(flat)), "без непрерывности смещение 0.3 исчезает"
+
+
+def test_weak_noise_survives_recording():
+    cfg = AugmentConfig.only("noise")
+    changed = []
+    for seed in range(10):
+        w0 = _recorded_window(seed)
+        w = A.record_window(augment_window(_copy(w0), cfg, np.random.default_rng(seed)))
+        ok = w0.m[:, 0] > 0
+        changed.append(np.mean(w.x[ok, 0] != w0.x[ok, 0]))
+        assert np.array_equal(w.y, w0.y), "шум не трогает цель"
+    assert 0.10 < np.mean(changed) < 0.22, "шум 0.2 градуса меняет запись в доле часов E|шум|"
+
+
+@pytest.mark.parametrize("name", MASK_AUGS + ("spike", "stuck", "units", "coords"))
+def test_no_dither_without_sensor_distortion(name):
+    for seed in range(5):
+        w0 = _recorded_window(seed)
+        w = augment_window(_copy(w0), AugmentConfig.only(name), np.random.default_rng(seed))
+        assert np.array_equal(w.y, w0.y)
+        same = (w.m > 0) & (w0.m > 0)
+        if name in MASK_AUGS or name == "coords":
+            assert np.array_equal(w.x[same], w0.x[same]), name
+        assert is_recorded(record_values(w.x), w.m)

@@ -30,7 +30,6 @@ import dataclasses
 import hashlib
 import json
 import math
-import warnings
 from dataclasses import dataclass
 from enum import IntFlag
 
@@ -38,6 +37,7 @@ import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 
 from mayak.data.masking import enforce_invariant
+from mayak.data.recording import record_values
 
 CHANNELS = ("T", "P", "RH")
 PHYS = {"T": (-90.0, 60.0), "RH": (0.0, 100.0), "P": (300.0, 1100.0)}
@@ -66,7 +66,7 @@ QC_CODE_DOC = {
     "SOURCE": "помечено источником",
     "JUMP": "аномальный скачок между соседними отчётами",
     "STUCK": "залипшее значение",
-    "UNITS": "подмена единиц",
+    "UNITS": "давление на уровне моря вместо станционного",
     "DEWPOINT": "точка росы выше температуры",
 }
 QC_CODES = tuple(c for c in QCCode if c)
@@ -101,25 +101,12 @@ class QCConfig:
         stuck_min_count: наименьшее число отчётов в серии.
         rh_sat: влажность не ниже этого значения считается насыщением, %.
         rh_sat_hours: допустимый срок насыщения, ч.
-        units_half: полуширина окна медианы для проверки градусов Фаренгейта, ч. Окно
-            в сутки нужно, чтобы медиана не зависела от часа суток: она сравнивается
-            с опорой из суточных медиан.
-        units_min_valid: наименьшее число отчётов в этом окне.
-        units_day_min_valid: сутки участвуют в опорном уровне, если в них не меньше
-            стольких отчётов.
-        units_ref_days: полуширина окна опорного уровня в центрированном режиме, сутки.
-        units_past_days: сколько прошлых суток берёт опорный уровень причинного режима.
-        units_min_days: наименьшее число суток в опорном уровне, иначе проверка
-            единиц не выполняется.
-        units_ref_k: допуск вокруг опорного уровня в единицах его разброса.
-        units_spread_floor: нижняя граница разброса опорного уровня, градусы.
-        units_min_excess: наименьший отрыв медианы от опорного уровня, градусы.
-        units_min_conv: ниже этой температуры шкалы Фаренгейта и Цельсия почти совпадают.
         slp_half: полуширина окна медианы давления, ч. Та же длина, что у окна
             выброса: в причинном режиме, пока медиана не переключилась на приведённое
             давление, его часы ловит проверка выброса, и разрыва между ними нет.
         slp_min_sep: давление на уровне моря отличимо от станционного, если станция
             ниже уровня моря по давлению хотя бы на столько гПа.
+        slp_min_valid: наименьшее число отчётов в окне медианы давления.
         dewpoint_tol: допуск на округление точки росы источника, градусы.
         day_min_hours: сутки считаются в станционных проверках, если валидно не меньше.
         solar_min_amp: при более слабом суточном ходе проверка фазы не решает.
@@ -150,18 +137,9 @@ class QCConfig:
     stuck_min_count: int = 4
     rh_sat: float = 99.5
     rh_sat_hours: int = 72
-    units_half: int = 12
-    units_min_valid: int = 6
-    units_day_min_valid: int = 6
-    units_ref_days: int = 45
-    units_past_days: int = 14
-    units_min_days: int = 3
-    units_ref_k: float = 3.0
-    units_spread_floor: float = 1.0
-    units_min_excess: float = 8.0
-    units_min_conv: float = -10.0
     slp_half: int = 6
     slp_min_sep: float = 80.0
+    slp_min_valid: int = 6
     dewpoint_tol: float = 0.5
     day_min_hours: int = 18
     solar_min_amp: float = 0.5
@@ -194,8 +172,6 @@ class QCConfig:
             raise ValueError(f"stuck_min_count {self.stuck_min_count} отчётов через "
                              f"{self.stuck_max_gap} ч не помещаются в кратчайший срок "
                              f"залипания {shortest} ч")
-        if not 1 <= self.units_min_days <= self.units_past_days:
-            raise ValueError("нужно 1 не больше units_min_days не больше units_past_days")
         unknown = set(self.enforce_checks) - set(STATION_CHECKS)
         if unknown:
             raise ValueError(f"неизвестные станционные проверки {sorted(unknown)}; "
@@ -216,8 +192,7 @@ class QCConfig:
         jump = self.excursion_max_hours + 2 * self.jump_half + self.jump_max_gap + spike
         stuck = max(self.stuck_hours + (self.stuck_T_alone_hours, self.rh_sat_hours)) \
             + self.stuck_max_gap
-        units = max(24 * self.units_past_days + 23, 2 * self.units_half, 2 * self.slp_half)
-        return max(spike, jump, stuck, units)
+        return max(spike, jump, stuck, 2 * self.slp_half)
 
     def to_dict(self):
         return json.loads(json.dumps(dataclasses.asdict(self)))
@@ -580,108 +555,6 @@ def stuck_codes(x, base, cfg=DEFAULT_QC, causal=False):
     return out
 
 
-def _daily_reference(x, ok, cfg):
-    """Опорный уровень и разброс ряда в масштабе недель, центрированный режим.
-
-    Args:
-        x: значения, форма (N,).
-        ok: валидность, форма (N,).
-        cfg: пороги.
-
-    Returns:
-        Пара почасовых массивов (N,): опорный уровень и разброс.
-    """
-    x = np.asarray(x, np.float64)
-    n = len(x)
-    nd = -(-n // 24)
-    xm = np.full(nd * 24, np.nan)
-    xm[:n] = np.where(ok, x, np.nan)
-    xm = np.sort(xm.reshape(nd, 24), axis=1)
-    cnt = np.isfinite(xm).sum(1)
-    day = _median_sorted(xm, cnt)
-    dv = (cnt >= cfg.units_day_min_valid) & np.isfinite(day)
-    med, mad, c = rolling_median_mad(np.where(dv, day, 0.0), dv, cfg.units_ref_days)
-    ref = np.where(c >= cfg.units_min_days, med, np.nan)
-    spread = np.maximum(MAD_TO_SD * mad, cfg.units_spread_floor)
-    hours = np.arange(n) // 24
-    return ref[hours], spread[hours]
-
-
-def past_reference(x, ok, cfg=DEFAULT_QC):
-    """Опорный уровень и разброс ряда по прошлым суткам, причинный режим.
-
-    Args:
-        x: значения, форма (N,).
-        ok: валидность, форма (N,).
-        cfg: пороги.
-
-    Returns:
-        Пара массивов (N,): опорный уровень, NaN там, где его нет, и разброс.
-    """
-    x = np.asarray(x, np.float64)
-    n = len(x)
-    day, _, cnt = rolling_median_mad(x, ok, 23, after=0)
-    day_ok = (cnt >= cfg.units_day_min_valid) & np.isfinite(day)
-    src = np.arange(n)[:, None] - 24 * np.arange(1, cfg.units_past_days + 1)[None, :]
-    use = src >= 0
-    srcc = np.maximum(src, 0)
-    use &= day_ok[srcc]
-    vals = np.sort(np.where(use, day[srcc], np.nan), axis=1)
-    k = use.sum(1)
-    med = _median_sorted(vals, k)
-    dev = np.sort(np.abs(vals - med[:, None]), axis=1)
-    mad = _median_sorted(dev, k)
-    ref = np.where(k >= cfg.units_min_days, med, np.nan)
-    spread = np.maximum(MAD_TO_SD * np.where(k > 0, mad, 0.0), cfg.units_spread_floor)
-    return ref, spread
-
-
-def fahrenheit_flags(T, ok_raw, ok_ref, cfg=DEFAULT_QC, causal=False):
-    """Участки ряда температуры в градусах Фаренгейта.
-
-    Args:
-        T: температура, форма (N,).
-        ok_raw: значение есть, форма (N,).
-        ok_ref: значение годится для опоры, форма (N,).
-        cfg: пороги.
-        causal: причинный режим.
-
-    Returns:
-        Булев массив (N,).
-    """
-    T = np.asarray(T, np.float64)
-    ok_raw = np.asarray(ok_raw, bool)
-    out = np.zeros(len(T), bool)
-    before, after = window_span(cfg.units_half, causal)
-    n_valid = _window_count(ok_raw, before, after)
-    if causal:
-        ref, spread = past_reference(T, ok_ref, cfg)
-        thr = np.maximum(cfg.units_ref_k * spread, cfg.units_min_excess)
-        cand = np.flatnonzero(ok_raw & (n_valid >= cfg.units_min_valid) & np.isfinite(ref))
-    else:
-        ref, spread = _daily_reference(T, ok_ref, cfg)
-        thr = np.maximum(cfg.units_ref_k * spread, cfg.units_min_excess)
-        g = (ref + thr)[::24]
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", RuntimeWarning)
-            gmin = np.nanmin(np.stack([np.r_[g[:1], g[:-1]], g, np.r_[g[1:], g[-1:]]]), axis=0)
-        with np.errstate(invalid="ignore"):
-            above = ok_raw & (T > gmin[np.arange(len(T)) // 24])
-        n_above = _window_count(above, before, after)
-        cand = np.flatnonzero(ok_raw & (n_valid >= cfg.units_min_valid)
-                              & (2 * n_above >= n_valid))
-    if cand.size == 0:
-        return out
-    r = rolling_median(T, ok_raw, before, cfg.units_min_valid, at=cand, after=after)
-    conv = (r - 32.0) / 1.8
-    with np.errstate(invalid="ignore"):
-        high = r - ref[cand] > thr[cand]
-        fits = ((np.abs(conv - ref[cand]) <= cfg.units_ref_k * spread[cand])
-                & (conv >= cfg.units_min_conv))
-    out[cand[high & fits]] = True
-    return out
-
-
 def station_pressure_expected(elev):
     """Давление стандартной атмосферы на высоте elev, гПа."""
     return P_SEA_LEVEL * (1.0 - float(elev) / 44330.0) ** 5.255
@@ -715,10 +588,10 @@ def sea_level_pressure_flags(P, ok_raw, elev, cfg=DEFAULT_QC, causal=False):
         above = ok_raw & (P > p_exp + sep / 2)
     n_above = _window_count(above, before, after)
     n_valid = _window_count(ok_raw, before, after)
-    cand = np.flatnonzero(ok_raw & (n_valid >= cfg.units_min_valid) & (2 * n_above >= n_valid))
+    cand = np.flatnonzero(ok_raw & (n_valid >= cfg.slp_min_valid) & (2 * n_above >= n_valid))
     if cand.size == 0:
         return out
-    r = rolling_median(P, ok_raw, before, cfg.units_min_valid, at=cand, after=after)
+    r = rolling_median(P, ok_raw, before, cfg.slp_min_valid, at=cand, after=after)
     out[cand[r > p_exp + sep / 2]] = True
     return out
 
@@ -797,8 +670,6 @@ def check_codes(x, src, elev=None, Td=None, cfg=DEFAULT_QC, causal=False):
         codes[jump, j] |= np.uint8(QCCode.JUMP)
         codes[exc, j] |= np.uint8(QCCode.SPIKE)
     codes[stuck_codes(x, base, cfg, causal)] |= np.uint8(QCCode.STUCK)
-    codes[fahrenheit_flags(x[:, 0], src[:, 0], base[:, 0], cfg, causal), 0] |= \
-        np.uint8(QCCode.UNITS)
     codes[sea_level_pressure_flags(x[:, 1], src[:, 1], elev, cfg, causal), 1] |= \
         np.uint8(QCCode.UNITS)
     if Td is not None:
@@ -953,6 +824,9 @@ class CausalQC:
     def push(self, values):
         """Новый час наблюдений.
 
+        Имеющееся значение сразу записывается так, как его пишет прибор: целые градусы и
+        проценты, давление в десятых. Проверки видят уже записанное значение.
+
         Args:
             values: три значения T, P, RH; None или NaN - значения нет.
 
@@ -961,6 +835,7 @@ class CausalQC:
         """
         v = np.array([np.nan if a is None else float(a) for a in values], np.float32)
         p = np.isfinite(v)
+        v = np.where(p, record_values(np.where(p, v, 0.0)), v)
         self.x[:-1], self.present[:-1] = self.x[1:], self.present[1:]
         self.x[-1] = np.where(p, v, 0.0)
         self.present[-1] = p
@@ -997,8 +872,7 @@ def _day_index(n, t0):
 def check_t_level(T, ok, cfg=DEFAULT_QC):
     """Медиана температуры станции в допустимых пределах.
 
-    Ловит ряд, целиком записанный в °F (у тёплых и умеренных станций медиана
-    выходит за 38 °C) и прочие грубые ошибки уровня.
+    Ловит грубые ошибки уровня источника: ряд в чужих единицах или со сдвигом шкалы.
     """
     ok = np.asarray(ok, bool)
     if not ok.any():

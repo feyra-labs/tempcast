@@ -16,6 +16,7 @@ pub mod graphs;
 pub mod manifest;
 pub mod memory;
 pub mod qc;
+pub mod record;
 pub mod runtime;
 pub mod state;
 pub mod store;

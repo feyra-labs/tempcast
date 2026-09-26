@@ -20,8 +20,9 @@ from mayak.config import (SCENARIO_INPUT, SCENARIO_INSTRUMENT, SCENARIO_RULES, C
 from mayak.constants import H, L_MAX
 from mayak.data import store as S
 from mayak.data.augment import P, RH, T, clean_history, make_window
-from mayak.data.scenarios import (SCENARIOS, apply_scenario, drift_history, drift_target,
-                                  scenario_rng)
+from mayak.data.augment import apply_one
+from mayak.data.recording import is_recorded
+from mayak.data.scenarios import SCENARIOS, apply_scenario, drift_offset, scenario_rng
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL
 
 REPO = Path(__file__).resolve().parents[1]
@@ -106,22 +107,68 @@ def test_offset_is_applied_to_history_and_target_exactly():
     assert np.array_equal(wi.y, w0.y), "... но цель не трогает"
 
 
-def test_drift_is_continuous_from_history_into_target():
+def test_drift_reaches_current_offset_and_holds_it_on_target():
     rate, L = 0.24, 300                    # 0.01 °C/ч
     w0, w = _window(L=L), _window(L=L)
     _apply(w, "drift", rate)
-    dh, dt = drift_history(w0, rate), drift_target(w0, rate)
-    assert dh[w0.h0] == 0.0, "прибор откалиброван в начале фактической истории"
-    np.testing.assert_allclose(dh[-1], rate / 24 * (L - 1), rtol=1e-6)
-    np.testing.assert_allclose(dt[0], rate / 24 * L, rtol=1e-6)
-    np.testing.assert_allclose(np.diff(np.r_[dh[-1], dt]), rate / 24, rtol=1e-4)
+    b = drift_offset(L, rate)
+    assert b == pytest.approx(rate / 24 * (L - 1))
     mT = w0.m[:, T] > 0
-    np.testing.assert_allclose(w.x[mT, T] - w0.x[mT, T], dh[mT], atol=1e-4)
+    d = w.x[:, T] - w0.x[:, T]
+    first = w0.h0 + np.flatnonzero(mT[w0.h0:])[0]
+    assert d[first] == pytest.approx(rate / 24 * (first - w0.h0), abs=1e-4)
+    if mT[-1]:
+        assert d[-1] == pytest.approx(b, abs=1e-4)
+    assert np.all(np.diff(d[w0.h0:][mT[w0.h0:]]) >= 0), "линейный дрейф только нарастает"
     ok = w0.y_mask > 0
-    np.testing.assert_allclose(w.y[ok] - w0.y[ok], dt[ok], atol=1e-4)
+    np.testing.assert_allclose(w.y[ok] - w0.y[ok], b, atol=1e-5)
+    assert np.array_equal(w.x[:, 1:], w0.x[:, 1:])
     wi = _window(L=L)
     _apply(wi, "drift_input", rate)
     assert np.array_equal(wi.x, w.x) and np.array_equal(wi.y, w0.y)
+    assert drift_offset(0, rate) == 0.0 and drift_offset(1, rate) == 0.0
+
+
+@pytest.mark.parametrize("L", [0, 1, 100, L_MAX])
+def test_scenario_and_augmentation_with_same_parameters_give_same_window(L):
+    """Сценарии прибора и шага отчётности вызывают те же функции, что обучение."""
+    same = (("offset", 2.0, "offset", dict(b=2.0)),
+            ("offset_input", 2.0, "offset", dict(b=2.0, target=False)),
+            ("scale", 0.05, "scale", dict(k=[1.05, 1.0, 1.0])),
+            ("drift", 0.2, "drift", dict(b=[drift_offset(L, 0.2), 0.0, 0.0], walk=False,
+                                         seed=0)),
+            ("drift_input", 0.2, "drift", dict(b=[drift_offset(L, 0.2), 0.0, 0.0],
+                                               walk=False, seed=0, target=False)))
+    for name, level, aug, params in same:
+        a, b = _window(L=L), _window(L=L)
+        _apply(a, name, level)
+        apply_one(b, aug, params)
+        assert _snap(a) == _snap(b), name
+
+
+def test_small_input_offset_shifts_recorded_history_like_a_real_sensor(base):
+    """Перед сценарием, искажающим значения, записи возвращается непрерывность: смещение
+    на 0.3 градуса сдвигает среднюю запись истории на 0.3, цель не трогает."""
+    ds = _rset(base, "offset_input", 0.3)
+    d = []
+    for i in range(len(base)):
+        a, b = base[i], ds[i]
+        m = (a["mask_hist"][:, 0] > 0) & (b["mask_hist"][:, 0] > 0)
+        d.append((b["x_hist"][:, 0] - a["x_hist"][:, 0])[m].numpy())
+        assert torch.equal(a["y"], b["y"])
+    d = np.concatenate(d)
+    assert set(np.unique(d)) <= {0.0, 1.0} and abs(d.mean() - 0.3) < 0.05, d.mean()
+
+
+def test_robustness_windows_are_recorded_like_training(base):
+    """После сценария окно записывается прибором: целые градусы и проценты, как в обучении."""
+    for name, level in (("noise", 1.0), ("offset", 0.5), ("scale", 0.05), ("drift", 0.2)):
+        ds = _rset(base, name, level)
+        for i in range(len(base)):
+            b = ds[i]
+            assert is_recorded(b["x_hist"].numpy(), b["mask_hist"].numpy()), name
+            y, ym = b["y"].numpy(), b["y_mask"].numpy()
+            assert np.array_equal(y[ym > 0], np.round(y[ym > 0])), name
 
 
 def test_scale_multiplies_history_and_target():
