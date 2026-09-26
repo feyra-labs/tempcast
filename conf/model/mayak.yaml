@@ -13,15 +13,15 @@ mode_groups:
 tau_bounds: [3.0, 240.0]
 passport_dim: 16
 passport_hidden: 32
-encoder_width: 48
+encoder_width: 64
 encoder_dilations: [1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 32, 32]
 encoder_kernel: 3
 encoder_norm_groups: 4
-loc_freqs: 24
+loc_freqs: 48
 loc_freq_scale: 12.0
 loc_freq_max: 30.0
 loc_seed: 7
-field_hidden: 48
+field_hidden: 128
 heads_hidden: 48
 heads_z_proj: 4
 ablations:

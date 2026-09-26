@@ -271,7 +271,8 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     from mayak.config import (DataConfig, RunConfig, check_pipeline_compat, model_config_for)
     from mayak.data.datamodule import MayakData
     from mayak.leakage import run_checklist
-    from mayak.lit import ARCHS, LitForecaster, SelectionProvenance, param_group_summary
+    from mayak.lit import (ARCHS, LitForecaster, SelectionProvenance, param_group_summary,
+                           parameter_counts)
 
     protocol = protocol_for(arch, protocol or DEFAULT_PROTOCOL)
     check_deviations_documented(ARCHS[arch], protocol)
@@ -323,7 +324,11 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
             lit.load_state_dict(sd)
         if i == 0:
             journal["param_groups"] = param_group_summary(lit.model, protocol.weight_decay)
-            journal["n_params"] = int(sum(p.numel() for p in lit.model.parameters()))
+            counts = parameter_counts(lit.model)
+            journal["n_params"] = counts["total"]
+            journal["n_params_by_module"] = counts["by_module"]
+            log.info("%s: параметров %d (%s)", arch, counts["total"],
+                     ", ".join(f"{k} {v}" for k, v in counts["by_module"].items()))
 
         stage_dir = os.path.join(run_dir, f"stage{stage.name}")
         write_config(os.path.join(stage_dir, CONFIG_FILE), cfg_dict)

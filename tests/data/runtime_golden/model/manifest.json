@@ -97,7 +97,7 @@
   ],
   "passport_dim": 16,
   "passport_hidden": 32,
-  "encoder_width": 48,
+  "encoder_width": 64,
   "encoder_dilations": [
    1,
    1,
@@ -114,11 +114,11 @@
   ],
   "encoder_kernel": 3,
   "encoder_norm_groups": 4,
-  "loc_freqs": 24,
+  "loc_freqs": 48,
   "loc_freq_scale": 12.0,
   "loc_freq_max": 30.0,
   "loc_seed": 7,
-  "field_hidden": 48,
+  "field_hidden": 128,
   "heads_hidden": 48,
   "heads_z_proj": 4,
   "ablations": {
@@ -140,8 +140,8 @@
   "day_row": 4,
   "stream_window": 288,
   "ctx": 25,
-  "loc_dim": 50,
-  "encoder_width": 48,
+  "loc_dim": 98,
+  "encoder_width": 64,
   "enc_buf_len": 252,
   "n_coef": [
    36,
@@ -282,7 +282,7 @@
    "shapes_out": {
     "loc": [
      1,
-     50
+     98
     ],
     "c_mu": [
      1,
@@ -367,7 +367,7 @@
     ],
     "enc_buf": [
      1,
-     48,
+     64,
      252
     ],
     "n_re": [
@@ -386,7 +386,7 @@
    "shapes_out": {
     "enc_buf_out": [
      1,
-     48,
+     64,
      252
     ],
     "n_re_out": [
@@ -422,7 +422,7 @@
    "shapes_in": {
     "loc": [
      1,
-     50
+     98
     ],
     "day_acc": [
      1,
@@ -474,7 +474,7 @@
    "shapes_in": {
     "loc": [
      1,
-     50
+     98
     ],
     "lat": [
      1,
@@ -532,14 +532,14 @@
  },
  "export_check_max_abs": {
   "init": 5.960464477539063e-08,
-  "step": 1.9073486328125e-06,
-  "passport": 5.960464477539063e-08,
-  "issue": 2.86102294921875e-06
+  "step": 4.76837158203125e-06,
+  "passport": 3.725290298461914e-08,
+  "issue": 2.384185791015625e-06
  },
  "opset": 17,
  "provenance": {
   "git": {
-   "commit": "227e4db4c1418b0be72c177fbaefe21d8d39ded6",
+   "commit": "589d5deccdbccf3b76907b5051341196c26ad03a",
    "dirty": true
   },
   "versions": {

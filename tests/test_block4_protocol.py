@@ -482,7 +482,11 @@ def test_journals_differ_only_by_architecture(runs):
     keys = {k for j in (r["journal"] for r in res.values()) for k in j}
     varying = {k for k in keys
                if len({json.dumps(r["journal"].get(k), sort_keys=True) for r in res.values()}) > 1}
-    assert varying <= {"arch", "model_class", "stages", "final_ckpt", "param_groups", "n_params"}
+    assert varying <= {"arch", "model_class", "stages", "final_ckpt", "param_groups", "n_params",
+                       "n_params_by_module"}
+    for r in res.values():
+        j = r["journal"]
+        assert sum(j["n_params_by_module"].values()) == j["n_params"] > 0
 
 
 @pytest.mark.heavy

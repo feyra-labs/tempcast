@@ -23,7 +23,7 @@ class MAYAK(nn.Module):
     потоковый рантайм и оценка вызывают те же методы (build_channels, issue,
     readout.normalize) и получают абляцию автоматически.
     """
-    NO_WD_SUFFIX = ("raw_tau", "p_w", "p_k", "anchor_mu", "anchor_sig", "anchor_def")
+    NO_WD_SUFFIX = ("raw_tau", "p_w", "p_k", "r_kappa", "anchor_mu", "anchor_sig", "anchor_def")
     FIELD_WEIGHT_DECAY = 0.5
 
     def __init__(self, cfg=None):
@@ -44,7 +44,7 @@ class MAYAK(nn.Module):
         self.readout = LaplaceReadout(cfg.encoder_width, cfg.effective_mode_groups,
                                       cfg.tau_bounds, compression=not abl.no_compression)
         self.propagator = ModalPropagator(cfg.n_modes, cfg.passport_dim, cfg.group_sizes,
-                                          cfg.horizon)
+                                          cfg.horizon, cfg.tau_bounds)
         self.heads = Heads(cfg.passport_dim, cfg.n_groups, cfg.n_solar_head, cfg.quantiles,
                            cfg.heads_hidden, cfg.heads_z_proj)
         assert self.heads.in_dim == cfg.heads_in_dim

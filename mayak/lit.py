@@ -56,6 +56,26 @@ def optim_groups(model, weight_decay):
                  weight_decay=weight_decay)]
 
 
+def parameter_counts(model):
+    """Число параметров модели: всего и по верхним блокам.
+
+    Args:
+        model: модель любой архитектуры.
+
+    Returns:
+        Словарь с ключами total (все параметры) и by_module (число параметров каждого
+        дочернего блока верхнего уровня, в порядке объявления; блоки без параметров
+        тоже перечислены). Параметры, объявленные прямо на модели, идут под ключом
+        own, если они есть. Сумма by_module равна total.
+    """
+    by_module = {name: int(sum(p.numel() for p in child.parameters()))
+                 for name, child in model.named_children()}
+    own = int(sum(p.numel() for p in model.parameters(recurse=False)))
+    if own:
+        by_module["own"] = own
+    return dict(total=int(sum(p.numel() for p in model.parameters())), by_module=by_module)
+
+
 def param_group_summary(model, weight_decay):
     return [dict(name=g["name"], n_tensors=len(g["params"]),
                  n_params=int(sum(p.numel() for p in g["params"])),

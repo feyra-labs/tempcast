@@ -94,14 +94,16 @@ def _compose(overrides=(), hydra_cfg=False):
         return compose("config", overrides=list(overrides), return_hydra_config=hydra_cfg)
 
 
-def test_default_config_reproduces_pre_block6_architecture():
-    """Значения по умолчанию = прежние константы: те же веса и формы (чекпойнты читаются)."""
+def test_default_config_architecture_size():
+    """Размер по умолчанию закреплён числом параметров и формами ключевых весов."""
     m = _model()
-    assert sum(p.numel() for p in m.parameters()) == 52194
+    assert sum(p.numel() for p in m.parameters()) == 109379
     sd = m.state_dict()
-    assert len(sd) == 107
+    assert len(sd) == 108
     assert sd["readout.raw_tau"].shape == (24,) and sd["propagator.w_re"].shape == (24,)
-    assert sd["encoder.stem.weight"].shape == (48, 13, 1)
+    assert sd["encoder.stem.weight"].shape == (64, 13, 1)
+    assert sd["field.fc1.weight"].shape == (128, 98) and sd["field.fc2.weight"].shape == (128, 128)
+    assert sd["heads.r_kappa"].shape == ()
     assert sd["heads.fc1.weight"].shape == (48, 16)
     assert sd["passport.obs.weight"].shape == (32, 32)
     from mayak.baselines import DLinear, GRUSeq2Seq
@@ -235,9 +237,10 @@ def test_hydra_composition_to_run_config():
     assert _compose(hydra_cfg=True).hydra.job.chdir is False
     rc = run.to_run_config(_compose())
     assert rc == RunConfig()
-    rc = run.to_run_config(_compose(["model=mayak_wide", "ablation=no_anchor",
-                                     "model.encoder_width=64", "train.seed=3"]))
-    assert rc.model.field_hidden == 128 and rc.model.encoder_width == 64
+    rc = run.to_run_config(_compose(["model=mayak_small", "ablation=no_anchor",
+                                     "model.encoder_width=32", "train.seed=3"]))
+    assert rc.model.field_hidden == 48 and rc.model.loc_freqs == 24
+    assert rc.model.encoder_width == 32
     assert rc.model.ablations.active() == ("no_anchor",) and rc.train.seed == 3
     rc = run.to_run_config(_compose(["model=gru"]))
     assert rc.arch == "gru" and rc.model == GRUConfig()

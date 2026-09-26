@@ -913,6 +913,23 @@ def evaluate_external(named, external_manifest, store, r_damped=None, shift=None
     return preds, aux, ds, transfer
 
 
+def print_parameter_counts(named):
+    """Печатает таблицу числа параметров нейросетевых моделей.
+
+    Args:
+        named: словарь из имени строки таблицы в модель.
+
+    Returns:
+        Словарь из имени строки в полное число параметров модели.
+    """
+    from mayak.lit import parameter_counts
+    counts = {name: parameter_counts(m)["total"] for name, m in named.items()}
+    print("\n=== Число параметров ===")
+    for name, n in counts.items():
+        print(f"  {name:<40}{n:>12,}".replace(",", " "))
+    return counts
+
+
 def main():
     import logging
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -990,13 +1007,14 @@ def main():
         named_extra[NEURAL_BASELINES[arch]] = load_model(c)
 
     named_all = {"МАЯК": mayak, **named_extra}
+    n_params = print_parameter_counts(named_all)
     preds, aux = collect_predictions(named_all, ds)
     preds = add_statistical_baselines(preds, aux, r_damped=r)
 
     shift = np.load(args.conformal) if args.conformal else None
     boot = dict(n_boot=args.bootstrap, seed=eval_seed, level=args.ci_level)
     info = dict(ckpt=args.ckpt, conformal=args.conformal, manifest=args.manifest,
-                eval_seed=eval_seed)
+                eval_seed=eval_seed, n_params=n_params)
     if args.save_preds:
         from mayak.calibration import save_predictions
         print("Предсказания:", save_predictions(os.path.join(args.save_preds, "internal.npz"),

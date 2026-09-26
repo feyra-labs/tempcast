@@ -1,10 +1,12 @@
 import math
 
+import pytest
 import torch
 
 from mayak.config import ModelConfig
 from mayak.constants import L_MAX, H, QUANTILES
 from mayak.model import MAYAK, astro_features
+from mayak.modules.heads import R_MAX
 
 M = ModelConfig().n_modes
 from mayak.loss import mayak_loss
@@ -79,26 +81,101 @@ def test_cold_start_is_climatology():
                                rtol=0, atol=0)
 
 
-def test_cold_start_median_stays_in_the_field_band():
-    """Даже с ненулевыми головами холодный старт не уходит от поля дальше 0.6·sigma_c.
+def _shaken_model(seed=7, scale=0.5):
+    """Модель, у которой встряхнуты все слои с нулевой или особой инициализацией.
 
-    Границу задаёт конструкция голов (r = 0.6·tanh), и она должна держаться при
-    любых весах, а не только при нулевой инициализации.
+    Головы, подстройка мод паспортом, модуляция поля паспортом и сам паспорт получают
+    заметный шум. На свежей модели выходной слой голов нулевой, и поправка равна нулю
+    тривиально; здесь она нулевой быть не обязана.
     """
-    torch.manual_seed(7)
+    torch.manual_seed(seed)
     model = MAYAK().eval()
     with torch.no_grad():
-        for p in model.heads.parameters():
-            p.add_(0.5 * torch.randn_like(p))
-        batch = _toy_batch(L=0)
-        out = model(batch)
-        mu_c, sigma_c, _ = _climate_field(model, batch, out["z"])
+        for mod in (model.heads, model.propagator, model.field.film, model.passport):
+            for p in mod.parameters():
+                p.add_(scale * torch.randn_like(p))
+    return model
 
-    dev = (out["mu"] - mu_c).abs()
-    assert (dev > 1e-6).any(), "тест вырожден: головы не сдвинули медиану вовсе"
-    assert (dev <= 0.6 * sigma_c + 1e-5).all(), (
-        f"медиана холодного старта вышла за полосу поля: "
-        f"max(|mu − mu_c| / sigma_c) = {(dev / sigma_c).max().item():.4f}")
+
+def test_cold_start_median_equals_field_with_shaken_heads():
+    """Без истории медиана равна климат-полю побитно при любых весах голов."""
+    model = _shaken_model()
+    batch = _toy_batch(L=0)
+    with torch.no_grad():
+        out = model(batch)
+        mu_c, _, _ = _climate_field(model, batch, out["z"])
+        raw = model.heads.fc2(torch.nn.functional.gelu(model.heads.fc1(torch.zeros(
+            1, model.heads.in_dim))))
+    assert raw[0, 0].abs() > 1e-3, "тест вырожден: выход поправки голов нулевой и без веса"
+    assert torch.equal(out["r"], torch.zeros_like(out["r"]))
+    assert torch.equal(out["mu"], mu_c)
+    assert torch.equal(out["q"][..., QUANTILES.index(0.5)], mu_c)
+
+
+@pytest.mark.parametrize("L", [6, 24, 672])
+def test_correction_is_nonzero_with_history(L):
+    """С историей поправка включается, её модуль ограничен."""
+    model = _shaken_model()
+    with torch.no_grad():
+        out = model(_toy_batch(L=L))
+    assert out["r"].abs().max() > 1e-4, f"поправка при L={L} нулевая"
+    assert out["r"].abs().max() <= R_MAX
+
+
+def test_evidence_gate_grows_with_evidence():
+    """Вес поправки: ноль без свидетельств, монотонный рост, меньше единицы."""
+    heads = MAYAK().heads
+    e = torch.tensor([0.0, 1e-6, 1.0, 6.0, 24.0, 100.0, 1e4])[:, None].expand(-1, M)
+    with torch.no_grad():
+        g = heads.evidence_gate(e)
+    assert g[0] == 0.0
+    assert (g.diff() > 0).all() and (g < 1.0).all()
+    assert g[1] < 1e-5, "исчезающе малая масса не должна включать поправку"
+
+
+def test_stage_without_history_does_not_train_correction():
+    """При L=0 функция потерь не даёт градиента ни выходу поправки, ни её порогу.
+
+    Масштаб интервала и зазоры квантилей при этом обучаются.
+    """
+    model = _shaken_model().train()
+    loss = mayak_loss(model(_toy_batch(L=0)), _toy_batch(L=0))
+    loss.backward()
+    h = model.heads
+    assert torch.equal(h.fc2.weight.grad[0], torch.zeros_like(h.fc2.weight.grad[0]))
+    assert h.fc2.bias.grad[0] == 0.0
+    assert h.r_kappa.grad is None or h.r_kappa.grad == 0.0
+    assert h.fc2.weight.grad[1:].abs().sum() > 0, "масштаб интервала обязан учиться"
+
+
+def test_site_tau_stays_within_bounds():
+    """Постоянные времени после подстройки паспортом не выходят за границы мод."""
+    model = MAYAK()
+    lo, hi = model.cfg.tau_bounds
+    with torch.no_grad():
+        model.readout.raw_tau.copy_(torch.linspace(-12.0, 12.0, M))
+        model.propagator.site.weight.normal_(0.0, 5.0)
+        model.propagator.site.bias.normal_(0.0, 5.0)
+        tau, omega, _ = model.readout.constants()
+        z = 3.0 * torch.randn(256, model.cfg.passport_dim)
+        tau_s, _ = model.propagator.site_constants(z, tau, omega)
+    assert tau_s.min() >= lo and tau_s.max() <= hi
+    assert tau_s.max() == hi, "тест вырожден: ни одна мода не упёрлась в верхнюю границу"
+    slowest = torch.exp(-168.0 / tau_s).max()
+    assert slowest <= math.exp(-168.0 / hi) + 1e-6
+
+
+def test_correction_threshold_is_not_decayed():
+    model = MAYAK()
+    groups = {g["name"]: {id(p) for p in g["params"]} for g in model.optim_groups(1e-2)}
+    assert id(model.heads.r_kappa) in groups["no_decay"]
+
+
+def test_checkpoint_without_correction_threshold_is_rejected():
+    model = MAYAK()
+    sd = {k: v for k, v in model.state_dict().items() if k != "heads.r_kappa"}
+    with pytest.raises(RuntimeError, match="r_kappa"):
+        MAYAK().load_state_dict(sd)
 
 
 def test_batch_stream_equivalence():
