@@ -913,20 +913,24 @@ def evaluate_external(named, external_manifest, store, r_damped=None, shift=None
     return preds, aux, ds, transfer
 
 
-def print_parameter_counts(named):
-    """Печатает таблицу числа параметров нейросетевых моделей.
+def print_parameter_counts(named, reference="МАЯК"):
+    """Печатает таблицу числа параметров нейросетевых моделей и их долю от эталона.
 
     Args:
         named: словарь из имени строки таблицы в модель.
+        reference: имя строки, относительно которой считается доля. Если такой строки
+            нет, доля не печатается.
 
     Returns:
         Словарь из имени строки в полное число параметров модели.
     """
     from mayak.lit import parameter_counts
     counts = {name: parameter_counts(m)["total"] for name, m in named.items()}
+    ref = counts.get(reference)
     print("\n=== Число параметров ===")
     for name, n in counts.items():
-        print(f"  {name:<40}{n:>12,}".replace(",", " "))
+        share = f"{n / ref:>8.2f}" if ref else ""
+        print(f"  {name:<40}{n:>12,}{share}".replace(",", " "))
     return counts
 
 

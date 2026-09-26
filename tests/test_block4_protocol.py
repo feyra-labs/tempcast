@@ -1,6 +1,7 @@
 """Тесты: климатологический масштаб, единая нормировка функции потерь,
 единый протокол обучения."""
 import csv
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -17,8 +18,7 @@ from mayak.data.climatology import ABS_TO_SD, SCALE_FLOOR_FRAC, Climatology
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL, time_layout
 from mayak.loss import NORM_SCALE_CLAMP, forecast_loss, pinball
 from mayak.protocol import (ARCH_NAMES, DEFAULT_PROTOCOL, Protocol, ProtocolError, Stage,
-                            check_deviations_documented, protocol_for, read_journal,
-                            run_protocol)
+                            protocol_for, read_journal, run_protocol)
 from mayak.timeaxis import window_calendar
 
 REPO = Path(__file__).resolve().parents[1]
@@ -333,21 +333,28 @@ def test_training_objective_is_common_loss_plus_regularizer(arch):
 
 
 def test_protocol_roundtrip_through_json():
-    p = DEFAULT_PROTOCOL.deviate("причина", lr=1e-3)
+    p = Protocol(lr=1e-3, patience=9)
     d = json.loads(json.dumps(p.to_dict()))
     assert Protocol.from_dict(d) == p
-    assert Protocol.from_dict(d).common() == DEFAULT_PROTOCOL
+    assert "deviations" not in d
 
 
-def test_deviation_requires_reason_and_known_field():
-    with pytest.raises(ProtocolError, match="причин"):
-        DEFAULT_PROTOCOL.deviate("", lr=1e-3)
-    with pytest.raises(ProtocolError, match="неизвестные"):
-        DEFAULT_PROTOCOL.deviate("причина", arch="gru")
-    p = DEFAULT_PROTOCOL.deviate("не сходится", lr=1e-3, patience=9)
-    assert p.lr == 1e-3 and p.patience == 9
-    assert [(d.field, d.value, d.default) for d in p.deviations] == \
-        [("lr", 1e-3, DEFAULT_PROTOCOL.lr), ("patience", 9, DEFAULT_PROTOCOL.patience)]
+def test_protocol_has_no_per_architecture_deviations():
+    """Протокол один на все модели: полей и механизма отклонений нет."""
+    from mayak import protocol as P
+    assert "deviations" not in {f.name for f in dataclasses.fields(Protocol)}
+    for name in ("ARCH_DEVIATIONS", "Deviation", "check_deviations_documented"):
+        assert not hasattr(P, name), name
+    assert not hasattr(Protocol, "deviate") and not hasattr(Protocol, "common")
+
+
+def test_protocol_from_old_journal():
+    """Пустой список отклонений из прежних журналов читается, непустой отвергается."""
+    d = DEFAULT_PROTOCOL.to_dict()
+    assert Protocol.from_dict(dict(d, deviations=[])) == DEFAULT_PROTOCOL
+    dev = dict(field="patience", value=9, default=5, reason="плато")
+    with pytest.raises(ProtocolError, match="один на все"):
+        Protocol.from_dict(dict(d, deviations=[dev]))
 
 
 def test_protocol_rejects_invalid_values():
@@ -361,8 +368,7 @@ def test_protocol_rejects_invalid_values():
 
 def test_every_architecture_gets_the_same_protocol():
     ps = [protocol_for(a) for a in ARCH_NAMES]
-    assert all(p == ps[0] for p in ps[1:])
-    assert all(p.common() == p for p in ps), "объявлены отклонения — обновите тест и описания"
+    assert all(p is DEFAULT_PROTOCOL for p in ps)
     with pytest.raises(ProtocolError):
         protocol_for("transformer")
 
@@ -370,18 +376,6 @@ def test_every_architecture_gets_the_same_protocol():
 def test_registry_matches_protocol_names():
     from mayak.lit import ARCHS
     assert tuple(ARCHS) == ARCH_NAMES
-
-
-def test_undocumented_deviation_is_rejected(monkeypatch):
-    from mayak import protocol as P
-    from mayak.baselines import GRUSeq2Seq
-    monkeypatch.setitem(P.ARCH_DEVIATIONS, "gru", (({"patience": 9}, "долго выходит на плато"),))
-    p = protocol_for("gru")
-    assert p != protocol_for("dlinear") and p.common() == protocol_for("dlinear")
-    with pytest.raises(ProtocolError, match="patience"):
-        check_deviations_documented(GRUSeq2Seq, p)
-    monkeypatch.setattr(GRUSeq2Seq, "__doc__", "Отклонение: patience = 9 (плато).")
-    check_deviations_documented(GRUSeq2Seq, p)
 
 
 def test_optimizer_and_schedule_identical_across_architectures():
@@ -459,7 +453,6 @@ def runs(manifest, store, tmp_path_factory):
     return out, res
 
 
-@pytest.mark.heavy
 def test_all_architectures_see_identical_window_stream(runs):
     _, res = runs
     ref = res[ARCH_NAMES[0]]["hashes"]
@@ -468,13 +461,12 @@ def test_all_architectures_see_identical_window_stream(runs):
         assert res[arch]["hashes"] == ref, f"{arch}: другой поток окон"
 
 
-@pytest.mark.heavy
 def test_journals_differ_only_by_architecture(runs):
     out, res = runs
     for arch in ARCH_NAMES:
         j = read_journal(out / arch)
         assert j == res[arch]["journal"]
-        assert j["arch"] == arch and j["deviations"] == []
+        assert j["arch"] == arch and "deviations" not in j
         assert Protocol.from_dict(j["protocol"]) == TINY
         assert [s["name"] for s in j["stages"]] == ["A", "B"]
         assert j["final_ckpt"] == j["stages"][-1]["best_ckpt"] and Path(j["final_ckpt"]).exists()
@@ -489,7 +481,6 @@ def test_journals_differ_only_by_architecture(runs):
         assert sum(j["n_params_by_module"].values()) == j["n_params"] > 0
 
 
-@pytest.mark.heavy
 def test_checkpoints_carry_protocol_and_pass_checklist(runs, store):
     from mayak.leakage import run_checklist
     from mayak.lit import LitForecaster
@@ -508,7 +499,6 @@ def test_checkpoints_carry_protocol_and_pass_checklist(runs, store):
     run_checklist(store, checkpoints=ckpts)
 
 
-@pytest.mark.heavy
 def test_stage_b_starts_from_stage_a_weights(runs):
     _, res = runs
     j = res["dlinear"]["journal"]
@@ -518,20 +508,3 @@ def test_stage_b_starts_from_stage_a_weights(runs):
     lit.load_state_dict(a["state_dict"])
     for k, v in a["state_dict"].items():
         assert torch.equal(lit.state_dict()[k], v)
-
-
-def test_declared_deviation_is_journaled(manifest, store, tmp_path, monkeypatch):
-    from mayak import protocol as P
-    from mayak.baselines import DLinear
-    monkeypatch.setitem(P.ARCH_DEVIATIONS, "dlinear",
-                        (({"patience": 9}, "долго выходит на плато"),))
-    monkeypatch.setattr(DLinear, "__doc__", "Отклонение от протокола: patience = 9.")
-    j = run_protocol("dlinear", manifest, TINY, out_root=str(tmp_path), accelerator="cpu",
-                     enable_progress_bar=False)
-    assert [(d["field"], d["value"], d["reason"]) for d in j["deviations"]] == \
-        [("patience", 9, "долго выходит на плато")]
-    p = Protocol.from_dict(j["protocol"])
-    assert p.patience == 9 and p.common() == TINY
-    hp = torch.load(j["final_ckpt"], map_location="cpu", weights_only=False)["hyper_parameters"]
-    assert Protocol.from_dict(hp["protocol"]).deviations == p.deviations
-    assert read_journal(tmp_path / "dlinear")["deviations"] == j["deviations"]

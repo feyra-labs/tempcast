@@ -385,7 +385,6 @@ def test_checkpoint_selection_check(store, manifest, dm, tmp_path):
             check_checkpoint(_ckpt(tmp_path, name, rec), store)
 
 
-@pytest.mark.heavy
 def test_trainer_checkpoint_carries_selection_record(dm, store, tmp_path):
     import pytorch_lightning as L
     from pytorch_lightning.callbacks import ModelCheckpoint

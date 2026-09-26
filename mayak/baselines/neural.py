@@ -1,75 +1,108 @@
-"""Нейробейзлайны GRU seq2seq и DLinear и общая квантильная параметризация."""
+"""Нейробейзлайны GRU и DLinear и общие части нейробейзлайнов.
+
+Общие части: квантили вокруг медианы с монотонными смещениями, вход рекуррентных
+моделей и голова, общая для всех лидов.
+"""
 import torch
 import torch.nn as nn
 
-from mayak.baselines.cards import BaselineCard, Difference, Source, describe
 from mayak.config import DLinearConfig, GRUConfig
+from mayak.features import (N_FUTURE, N_HISTORY, N_SITE, T_SCALE, batch_site_features,
+                            future_features, history_features)
 
-T_SCALE, P_REF, P_SCALE, RH_REF, RH_SCALE = 30.0, 1013.0, 50.0, 50.0, 50.0
-COORD_SCALE = (90.0, 180.0, 1000.0)
-
-QUANTILE_HEAD = Difference(
-    "квантильная голова на 7 квантилей (медиана, масштаб, монотонные смещения по лиду) "
-    "вместо точечного прогноза; функция потерь — общий нормированный pinball",
-    "проект сравнивает вероятностные прогнозы одной функцией потерь (блоки 1, 4); "
-    "точечная модель не даёт ни CRPS, ни покрытия")
+N_RECURRENT_INPUT = N_HISTORY + N_SITE
+LOG_SIGMA_CLAMP = (-2.0, 4.0)
 
 
 def median_centered_offsets(gaps_param, nq, device):
-    """Монотонные смещения квантилей (H, nq) с нулём на медиане."""
+    """Монотонные смещения квантилей с нулём на медиане.
+
+    Args:
+        gaps_param: сырые зазоры между соседними квантилями, форма (H, nq - 1).
+        nq: число квантилей, нечётное, медиана посередине.
+        device: устройство результата.
+
+    Returns:
+        Смещения формы (H, nq), неубывающие по уровню квантиля, ноль на медиане.
+    """
     gaps = torch.nn.functional.softplus(gaps_param)
     offs = torch.cat([torch.zeros(gaps.shape[0], 1, device=device), torch.cumsum(gaps, -1)], -1)
     return offs - offs[:, nq // 2:nq // 2 + 1]
 
 
-_median_centered_offsets = median_centered_offsets
+def recurrent_inputs(batch):
+    """Вход рекуррентных бейзлайнов на каждый час истории.
+
+    Args:
+        batch: батч окон.
+
+    Returns:
+        Тензор формы (B, L, N_RECURRENT_INPUT): сначала каналы истории в общем порядке,
+        затем признаки точки, одинаковые для всех часов окна.
+    """
+    hist = history_features(batch)
+    site = batch_site_features(batch)
+    return torch.cat([hist, site[:, None, :].expand(-1, hist.shape[1], -1)], dim=-1)
 
 
-def normalized_obs(x):
-    """(B, L, 3) T, P, RH → фиксированная нормировка (не зависит от окна)."""
-    T, P, RH = x[..., 0], x[..., 1], x[..., 2]
-    return torch.stack([T / T_SCALE, (P - P_REF) / P_SCALE, (RH - RH_REF) / RH_SCALE], dim=-1)
+class LeadHead(nn.Module):
+    """Голова прогноза, общая для всех лидов.
+
+    Один и тот же небольшой перцептрон применяется к каждому часу горизонта. На вход он
+    получает сводку истории, ковариаты этого часа, признаки точки и долю лида в
+    горизонте. На выходе медиана в градусах и логарифм масштаба интервала. Квантили
+    строятся вокруг медианы монотонными смещениями, своими для каждого лида.
+
+    Args:
+        d_summary: размер сводки истории.
+        hidden: ширина скрытых слоёв перцептрона.
+        horizon: число лидов.
+        n_quantiles: число квантилей.
+    """
+
+    def __init__(self, d_summary, hidden, horizon, n_quantiles):
+        super().__init__()
+        self.horizon, self.nq = horizon, n_quantiles
+        self.mlp = nn.Sequential(nn.Linear(d_summary + N_FUTURE + N_SITE + 1, hidden), nn.GELU(),
+                                 nn.Linear(hidden, hidden), nn.GELU(),
+                                 nn.Linear(hidden, 2))
+        self.gaps = nn.Parameter(torch.zeros(horizon, n_quantiles - 1))
+
+    def forward(self, summary, batch):
+        """Квантили прогноза по сводке истории.
+
+        Args:
+            summary: сводка истории, форма (B, d_summary).
+            batch: батч окон, из него берутся календарь горизонта и координаты.
+
+        Returns:
+            Словарь: ``q`` формы (B, H, nq), ``mu`` и ``sigma`` формы (B, H).
+        """
+        B, Hh = summary.shape[0], self.horizon
+        dt = summary.dtype
+        lead = (torch.arange(Hh, device=summary.device, dtype=dt) + 1) / Hh
+        feat = torch.cat([summary[:, None, :].expand(-1, Hh, -1),
+                          future_features(batch).to(dt),
+                          batch_site_features(batch).to(dt)[:, None, :].expand(-1, Hh, -1),
+                          lead[None, :, None].expand(B, -1, -1)], dim=-1)
+        o = self.mlp(feat)
+        mu = T_SCALE * o[..., 0]
+        sig = torch.exp(o[..., 1].clamp(*LOG_SIGMA_CLAMP))
+        offs = median_centered_offsets(self.gaps, self.nq, summary.device)
+        q = mu[..., None] + sig[..., None] * offs[None]
+        return {"q": q, "mu": mu, "sigma": sig}
 
 
-def coord_features(batch, device):
-    """(B, 3): широта, долгота, высота в долях масштаба."""
-    coord = torch.stack([batch["lat"], batch["lon"], batch["elev"]], -1)
-    return coord / torch.tensor(COORD_SCALE, device=device)
-
-
-GRU_CARD = BaselineCard(
-    key="gru", name="GRU seq2seq", kind="neural",
-    summary="Рекуррентный кодировщик истории (GRU) и прямая голова, отображающая "
-            "последнее скрытое состояние сразу в весь горизонт.",
-    sources=(Source("K. Cho, B. van Merriënboer, C. Gulcehre, D. Bahdanau, F. Bougares, "
-                    "H. Schwenk, Y. Bengio",
-                    "Learning Phrase Representations using RNN Encoder-Decoder for "
-                    "Statistical Machine Translation", "EMNLP 2014", "arXiv:1406.1078"),
-             Source("I. Sutskever, O. Vinyals, Q. V. Le",
-                    "Sequence to Sequence Learning with Neural Networks", "NeurIPS 2014",
-                    "arXiv:1409.3215")),
-    taken=("блок GRU (Cho и соавт., 2014) — двухслойный кодировщик истории",
-           "схема «кодировщик → вектор фиксированной длины → прогноз» (Sutskever и "
-           "соавт., 2014)"),
-    differences=(
-        Difference("декодирование не авторегрессионное: последнее состояние "
-                   "кодировщика отображается MLP-головой сразу во все 168 лидов "
-                   "(direct multi-horizon); «seq2seq» в названии — только кодировщик",
-                   "авторегрессионный декодер на 168 шагов требует teacher forcing "
-                   "и накапливает ошибку; прямое отображение — стандартное упрощение "
-                   "в многогоризонтном прогнозе, и оно названо здесь явно"),
-        Difference("на входе каждого часа: T, P, RH с фиксированной нормировкой, "
-                   "умноженные на маску, сама маска и координаты станции",
-                   "вход с маской валидности (блок 1): пропуск отличим от нуля"),
-        QUANTILE_HEAD,
-    ),
-)
-
-
-@describe(GRU_CARD)
 class GRUSeq2Seq(nn.Module):
-    """GRU-кодировщик с прямой головой на весь горизонт (конфиг - GRUConfig)."""
-    N_INPUT = 3 + 3 + 3
+    """Рекуррентный кодировщик истории и прямая голова на весь горизонт.
+
+    Двухслойный GRU читает историю час за часом. Его последнее состояние - сводка
+    истории, из которой общая по лидам голова сразу строит прогноз на все часы
+    горизонта, без пошагового декодирования.
+
+    Args:
+        cfg: конфиг GRU, словарь с теми же полями или None для значений по умолчанию.
+    """
 
     def __init__(self, cfg=None):
         super().__init__()
@@ -79,72 +112,30 @@ class GRUSeq2Seq(nn.Module):
         self.cfg = cfg
         self.nq = cfg.n_quantiles
         self.horizon = cfg.horizon
-        self.gru = nn.GRU(input_size=self.N_INPUT, hidden_size=cfg.hidden,
+        self.gru = nn.GRU(input_size=N_RECURRENT_INPUT, hidden_size=cfg.hidden,
                           num_layers=cfg.layers, batch_first=True)
-        self.head_mu = nn.Sequential(nn.Linear(cfg.hidden + 3, cfg.mu_hidden), nn.GELU(),
-                                     nn.Linear(cfg.mu_hidden, cfg.horizon))
-        self.head_sig = nn.Sequential(nn.Linear(cfg.hidden + 3, cfg.sigma_hidden), nn.GELU(),
-                                      nn.Linear(cfg.sigma_hidden, cfg.horizon))
-        self.gaps = nn.Parameter(torch.zeros(cfg.horizon, self.nq - 1))
+        self.head = LeadHead(cfg.hidden, cfg.head_hidden, cfg.horizon, self.nq)
+
+    def inputs(self, batch):
+        """Вход кодировщика, форма (B, L, N_RECURRENT_INPUT)."""
+        return recurrent_inputs(batch)
 
     def forward(self, batch):
-        x = batch["x_hist"]
-        m = batch["mask_hist"]
-        xn = normalized_obs(x)
-        coord = coord_features(batch, x.device)
-        coord_seq = coord[:, None, :].expand(-1, x.shape[1], -1)
-
-        inp = torch.cat([xn * m, m, coord_seq], dim=-1)
-
-        h, _ = self.gru(inp)
-        last = h[:, -1]
-        feat = torch.cat([last, coord], dim=-1)
-        mu = self.head_mu(feat)
-        log_sig = self.head_sig(feat).clamp(-2, 4)
-        sig = torch.exp(log_sig)
-        offs = median_centered_offsets(self.gaps, self.nq, x.device)
-        q = mu[..., None] + sig[..., None] * offs[None]
-        return {"q": q, "mu": mu, "sigma": sig}
+        h, _ = self.gru(self.inputs(batch))
+        return self.head(h[:, -1], batch)
 
 
-DLINEAR_CARD = BaselineCard(
-    key="dlinear", name="DLinear", kind="neural",
-    summary="Разложение ряда температуры скользящим средним на тренд и остаток и "
-            "два независимых линейных отображения «история → горизонт», результаты "
-            "суммируются.",
-    sources=(Source("A. Zeng, M. Chen, L. Zhang, Q. Xu",
-                    "Are Transformers Effective for Time Series Forecasting?", "AAAI 2023",
-                    "arXiv:2205.13504"),),
-    code=("https://github.com/cure-lab/LTSF-Linear (models/DLinear.py)",),
-    taken=("разложение скользящим средним с ядром 25 и паддингом краёв повторением "
-           "крайнего значения (moving_avg + series_decomp оригинала)",
-           "два независимых nn.Linear по временной оси: Linear_Trend и Linear_Seasonal, "
-           "выход — их сумма; инициализация весов — по умолчанию PyTorch, как в оригинале",
-           "нормализации входа нет (RevIN и вычитания последнего значения в DLinear нет; "
-           "с ними это NLinear/RevIN-вариант — другая модель семейства LTSF-Linear)"),
-    differences=(
-        Difference("одноканальный вход: только температура (режим univariate «S» "
-                   "оригинала, individual не применим)",
-                   "прогнозируется одна температура, а в DLinear каналы не смешиваются — "
-                   "давление и влажность не могли бы повлиять на прогноз T"),
-        Difference("длина входа 672 ч вместо 336 в основных таблицах статьи",
-                   "контракт данных проекта — 28 суток истории у всех моделей; статья "
-                   "показывает, что DLinear выигрывает от длинного окна (до 720)"),
-        Difference("пропуски истории заполняются нулём (T·mask) до разложения",
-                   "в оригинале пропусков нет; ноль — единственное заполнение без "
-                   "интерполяции, а решение о маске модели принимает сама (блок 1)"),
-        QUANTILE_HEAD,
-        Difference("масштаб интервала — обучаемый параметр на лид, не зависящий от входа",
-                   "у DLinear нет нелинейностей, из которых можно было бы взять "
-                   "условный разброс, не меняя модель"),
-    ),
-)
-
-
-@describe(DLINEAR_CARD)
 class DLinear(nn.Module):
-    """DLinear: разложение скользящим средним и два линейных отображения по времени
-    (конфиг - DLinearConfig: длина входа и ядро скользящего среднего)."""
+    """Разложение ряда температуры на тренд и остаток и два линейных отображения.
+
+    Тренд - скользящее среднее с повтором крайних значений на краях, остаток - разность
+    ряда и тренда. Каждая часть линейно отображается из истории во весь горизонт,
+    результаты складываются. Модель одноканальная: давление, влажность, календарь и
+    координаты в неё не входят. Пропуски истории заполняются нулём.
+
+    Args:
+        cfg: конфиг DLinear, словарь с теми же полями или None для значений по умолчанию.
+    """
 
     def __init__(self, cfg=None):
         super().__init__()
@@ -161,7 +152,14 @@ class DLinear(nn.Module):
         self.gaps = nn.Parameter(torch.zeros(cfg.horizon, self.nq - 1))
 
     def decompose(self, T):
-        """(B, L) → (тренд, остаток): скользящее среднее с паддингом повторением краёв."""
+        """Тренд и остаток ряда.
+
+        Args:
+            T: ряд температуры, форма (B, L).
+
+        Returns:
+            Пара тензоров формы (B, L): скользящее среднее и остаток.
+        """
         pad = self.k // 2
         trend = torch.nn.functional.avg_pool1d(
             torch.nn.functional.pad(T[:, None], (pad, pad), mode="replicate"),
@@ -169,6 +167,7 @@ class DLinear(nn.Module):
         return trend, T - trend
 
     def point(self, T):
+        """Точечный прогноз по ряду длины входа модели, форма (B, H)."""
         trend, resid = self.decompose(T)
         return self.lin_trend(trend) + self.lin_resid(resid)
 

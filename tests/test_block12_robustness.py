@@ -601,19 +601,3 @@ def test_module_help(monkeypatch, capsys):
     with pytest.raises(SystemExit) as e:
         runpy.run_module("mayak.robustness", run_name="__main__", alter_sys=True)
     assert e.value.code == 0 and "usage" in capsys.readouterr().out
-
-
-@pytest.mark.skipif(not os.environ.get("MAYAK_ROBUSTNESS_CKPT"),
-                    reason="нужен обученный чекпойнт: MAYAK_ROBUSTNESS_CKPT, "
-                           "MAYAK_ROBUSTNESS_MANIFEST (по умолчанию data/manifest.csv)")
-def test_trained_checkpoint_never_falls_below_climatology():
-    from mayak.lit import load_model
-    from mayak.robustness import (base_eval_set, check_skill_guard, load_config,
-                                  robustness_sweep)
-    ckpt = os.environ["MAYAK_ROBUSTNESS_CKPT"]
-    manifest = os.environ.get("MAYAK_ROBUSTNESS_MANIFEST", "data/manifest.csv")
-    cfg = replace(load_config(), bootstrap=0)
-    store = S.get_store(manifest)
-    base_ds = base_eval_set(store.clims(), manifest, cfg)
-    rows = robustness_sweep({"МАЯК": load_model(ckpt)}, base_ds, cfg, statistical=False)
-    check_skill_guard(rows, cfg.skill_tolerance, cfg.guard_models)

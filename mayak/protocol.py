@@ -16,13 +16,9 @@ run_protocol. Для любой архитектуры одинаковы:
 в журнал прогона и в чекпойнт.
 
 Различается только архитектура (``arch``). Что архитектура определяет сама:
-регуляризаторы, не зависящие от цели, и группы весового затухания — они описаны
-в докстринге класса модели и записываются в журнал прогона.
-
-Отклонения. Если архитектура не сходится с общим протоколом, отклонение объявляется
-в ARCH_DEVIATIONS с причиной и обязано быть описано в докстринге класса модели
-(имя изменённого поля). run_protocol применяет его, пишет в журнал прогона
-``<out_root>/<tag>/protocol.json`` и в гиперпараметры каждого чекпойнта.
+регуляризаторы, не зависящие от цели, и группы весового затухания. Группы и число
+параметров записываются в журнал прогона. Отдельных настроек протокола для отдельных
+архитектур нет: протокол один на все модели.
 """
 from __future__ import annotations
 
@@ -30,7 +26,7 @@ import json
 import logging
 import os
 from dataclasses import asdict, dataclass, fields, replace
-from typing import Any, Optional
+from typing import Optional
 
 from mayak.constants import L_MAX
 
@@ -97,15 +93,6 @@ SEED_NAMES = tuple(f.name for f in fields(Seeds))
 
 
 @dataclass(frozen=True)
-class Deviation:
-    """Отклонение от общего протокола: поле, новое и исходное значение, причина."""
-    field: str
-    value: Any
-    default: Any
-    reason: str
-
-
-@dataclass(frozen=True)
 class Protocol:
     stages: tuple = (Stage("A", "L0", 10_000, 0), Stage("B", "full", 200_000, L_MAX))
     batch_size: int = 256
@@ -124,13 +111,10 @@ class Protocol:
     val_batches: int = 20
     patience: int = 5
     seeds: Seeds = Seeds()
-    deviations: tuple = ()
 
     def __post_init__(self):
         st = tuple(s if isinstance(s, Stage) else Stage(**s) for s in self.stages)
-        dv = tuple(d if isinstance(d, Deviation) else Deviation(**d) for d in self.deviations)
         object.__setattr__(self, "stages", st)
-        object.__setattr__(self, "deviations", dv)
         if not isinstance(self.seeds, Seeds):
             object.__setattr__(self, "seeds", Seeds(**dict(self.seeds or {})))
         object.__setattr__(self, "betas", tuple(float(b) for b in self.betas))
@@ -149,6 +133,24 @@ class Protocol:
 
     @classmethod
     def from_dict(cls, d):
+        """Протокол из словаря.
+
+        Пустой список ``deviations`` из журналов прежних прогонов пропускается.
+
+        Args:
+            d: словарь с полями протокола.
+
+        Returns:
+            Протокол.
+
+        Raises:
+            ProtocolError: в словаре есть непустой список отклонений архитектуры; такой
+                протокол не общий, и сравнивать по нему нельзя.
+        """
+        d = dict(d)
+        if d.pop("deviations", None):
+            raise ProtocolError("протокол с отклонениями для отдельной архитектуры не "
+                                "поддерживается: протокол один на все модели")
         return cls(**d)
 
     def resolved_seeds(self):
@@ -158,50 +160,25 @@ class Protocol:
     def total_steps(self):
         return sum(s.steps for s in self.stages)
 
-    def deviate(self, reason, **changes):
-        """Новый протокол с изменёнными полями; каждое изменение записывается с причиной."""
-        if not reason or not str(reason).strip():
-            raise ProtocolError("отклонение от протокола без причины недопустимо")
-        allowed = {f.name for f in fields(self)} - {"deviations"}
-        unknown = set(changes) - allowed
-        if unknown:
-            raise ProtocolError(f"неизвестные поля протокола: {sorted(unknown)}")
-        devs = tuple(Deviation(k, _jsonable(v), _jsonable(getattr(self, k)), str(reason))
-                     for k, v in changes.items())
-        return replace(self, **changes, deviations=self.deviations + devs)
-
-    def common(self):
-        if not self.deviations:
-            return self
-        d = self.to_dict()
-        for dev in reversed(self.deviations):
-            d[dev.field] = dev.default
-        d["deviations"] = []
-        return Protocol.from_dict(d)
-
 
 DEFAULT_PROTOCOL = Protocol()
 
-ARCH_DEVIATIONS: dict = {}
-
-
 def protocol_for(arch, base=DEFAULT_PROTOCOL):
-    """Протокол прогона архитектуры: общий + её объявленные отклонения."""
+    """Протокол прогона архитектуры: один и тот же для всех.
+
+    Args:
+        arch: имя архитектуры.
+        base: общий протокол.
+
+    Returns:
+        Тот же общий протокол.
+
+    Raises:
+        ProtocolError: неизвестная архитектура.
+    """
     if arch not in ARCH_NAMES:
         raise ProtocolError(f"неизвестная архитектура {arch!r}; есть {ARCH_NAMES}")
-    p = base
-    for changes, reason in ARCH_DEVIATIONS.get(arch, ()):
-        p = p.deviate(reason, **changes)
-    return p
-
-
-def check_deviations_documented(model_cls, protocol):
-    """Каждое отклонение обязано быть названо в докстринге класса модели."""
-    doc = model_cls.__doc__ or ""
-    missing = [d.field for d in protocol.deviations if d.field not in doc]
-    if missing:
-        raise ProtocolError(f"{model_cls.__name__}: отклонения {missing} не описаны в "
-                            f"докстринге класса — описание бейзлайна обязано их называть")
+    return base
 
 
 # (флаг, поле протокола, тип)
@@ -254,8 +231,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
                  data_config=None):
     """Обучить архитектуру ``arch`` по протоколу. Единственная функция запуска обучения.
 
-    protocol     - общий протокол (по умолчанию DEFAULT_PROTOCOL); объявленные отклонения
-                   архитектуры добавляются здесь же;
+    protocol     - общий протокол (по умолчанию DEFAULT_PROTOCOL);
     model_config - конфиг архитектуры (датакласс или словарь; None - значения по умолчанию);
     data_config  - DataConfig или словарь; manifest, если задан, перекрывает его путь.
 
@@ -275,10 +251,6 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
                            parameter_counts)
 
     protocol = protocol_for(arch, protocol or DEFAULT_PROTOCOL)
-    check_deviations_documented(ARCHS[arch], protocol)
-    for d in protocol.deviations:
-        log.warning("%s: отклонение от протокола %s = %r (было %r): %s",
-                    arch, d.field, d.value, d.default, d.reason)
     model_cfg = check_pipeline_compat(model_config_for(arch, model_config))
     if data_config is None:
         data_cfg = DataConfig()
@@ -298,7 +270,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     run_dir = os.path.join(out_root, tag)
     journal_path = os.path.join(run_dir, JOURNAL)
     journal = dict(arch=arch, model_class=f"{ARCHS[arch].__module__}.{ARCHS[arch].__qualname__}",
-                   protocol=protocol.to_dict(), deviations=[asdict(d) for d in protocol.deviations],
+                   protocol=protocol.to_dict(),
                    manifest=os.path.abspath(manifest), seeds=seeds, config_file=CONFIG_FILE,
                    augment=data_cfg.augment.summary(), stages=[], final_ckpt=None)
     write_config(os.path.join(run_dir, CONFIG_FILE), cfg_dict)
@@ -376,7 +348,6 @@ def read_journal(run_dir):
         return json.load(f)
 
 
-__all__ = ["ARCH_NAMES", "ARCH_DEVIATIONS", "CONFIG_FILE", "DEFAULT_PROTOCOL", "Deviation",
-           "Protocol", "ProtocolError", "SEED_NAMES", "Seeds", "Stage", "add_protocol_args",
-           "check_deviations_documented", "protocol_for", "protocol_from_args", "read_journal",
-           "run_experiment", "run_protocol"]
+__all__ = ["ARCH_NAMES", "CONFIG_FILE", "DEFAULT_PROTOCOL", "Protocol", "ProtocolError",
+           "SEED_NAMES", "Seeds", "Stage", "add_protocol_args", "protocol_for",
+           "protocol_from_args", "read_journal", "run_experiment", "run_protocol"]

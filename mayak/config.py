@@ -313,19 +313,29 @@ class ModelConfig:
 
 @dataclass(frozen=True)
 class GRUConfig:
-    """GRU seq2seq-бейзлайн."""
+    """Бейзлайн GRU.
+
+    Attributes:
+        hidden: размер скрытого состояния.
+        layers: число слоёв GRU.
+        head_hidden: ширина скрытых слоёв головы, общей для всех лидов.
+    """
     arch: str = "gru"
     horizon: int = H
     quantiles: tuple = QUANTILES
     hidden: int = 96
     layers: int = 2
-    mu_hidden: int = 256
-    sigma_hidden: int = 128
+    head_hidden: int = 128
 
     def __post_init__(self):
         if self.arch != "gru":
             raise ConfigError(f"GRUConfig: arch={self.arch!r}")
         object.__setattr__(self, "quantiles", _floats(self.quantiles))
+        for name in ("horizon", "hidden", "layers", "head_hidden"):
+            v = int(getattr(self, name))
+            if v < 1:
+                raise ConfigError(f"GRUConfig.{name} < 1")
+            object.__setattr__(self, name, v)
 
     @property
     def n_quantiles(self):
@@ -341,11 +351,17 @@ class GRUConfig:
 
 @dataclass(frozen=True)
 class DLinearConfig:
-    """DLinear-бейзлайн."""
+    """Бейзлайн DLinear.
+
+    Attributes:
+        input_len: длина входа в часах, последние часы истории окна. Не больше
+            максимальной длины истории.
+        kernel: ядро скользящего среднего в часах, нечётное.
+    """
     arch: str = "dlinear"
     horizon: int = H
     quantiles: tuple = QUANTILES
-    input_len: int = L_MAX
+    input_len: int = 336
     kernel: int = 25
 
     def __post_init__(self):
@@ -370,31 +386,30 @@ class DLinearConfig:
 
 @dataclass(frozen=True)
 class LRUConfig:
-    """Linear Recurrent Unit - бейзлайн «линейная память без
-    разложения на якорь и аномалию».
+    """Бейзлайн с линейной рекуррентной памятью без разложения на якорь и аномалию.
 
-    d_model    - ширина слоя (вход/выход каждого LRU-блока);
-    d_state    - число комплексных собственных значений диагональной рекуррентности;
-    layers     - число блоков (pre-LayerNorm → LRU → GELU → GLU → остаток);
-    tau_bounds - диапазон постоянных времени при инициализации, ч:
-                 |λ| ∈ [exp(−1/τ_min), exp(−1/τ_max)] (r_min, r_max оригинала). По
-                 умолчанию - тот же диапазон, что у мод МАЯК: модели отличаются
-                 разложением, а не априорной памятью;
-    min_period - наименьший начальный период колебаний, ч: фаза arg λ ∈ [0, 2π/min_period]
-                 (max_phase оригинала);
-    head_hidden - ширина MLP-головы, общей для всех лидов;
-    scan       - развёртка рекуррентности: ``chunked`` (блочный ассоциативный скан, по
-                 умолчанию), ``associative`` (скан Хиллиса-Стила по всей длине) или
-                 ``recurrent`` (наивный цикл по часам - эталон для тестов);
-    chunk      - длина блока для ``chunked``.
+    Attributes:
+        d_model: ширина входа и выхода каждого блока.
+        d_state: число комплексных собственных чисел рекуррентности в блоке.
+        layers: число блоков.
+        dropout: доля прореживания внутри блока.
+        tau_bounds: диапазон постоянных времени при инициализации, часы. По умолчанию
+            тот же, что у мод основной модели: модели отличаются разложением, а не
+            априорной памятью.
+        min_period: наименьший начальный период колебаний, часы.
+        head_hidden: ширина скрытых слоёв головы, общей для всех лидов.
+        scan: развёртка рекуррентности. ``chunked`` - блоками с параллельным переносом
+            между блоками, по умолчанию; ``associative`` - параллельный скан по всей
+            длине; ``recurrent`` - простой цикл по часам, эталон для тестов.
+        chunk: длина блока для ``chunked``.
     """
     arch: str = "lru"
     horizon: int = H
     quantiles: tuple = QUANTILES
     max_history: int = L_MAX
     d_model: int = 64
-    d_state: int = 128
-    layers: int = 4
+    d_state: int = 64
+    layers: int = 3
     dropout: float = 0.0
     tau_bounds: tuple = (3.0, 240.0)
     min_period: float = 12.0
@@ -458,27 +473,41 @@ PATCHTST_NORMS = ("batch", "layer")
 
 @dataclass(frozen=True)
 class PatchTSTConfig:
-    """PatchTST. Значения по умолчанию - конфигурация авторов для
-    набора Weather (scripts/PatchTST/weather.sh): патч 16, шаг 8, паддинг «end»,
-    3 слоя, d_model 128, 16 голов, d_ff 256, dropout 0.2, head_dropout 0, RevIN без
-    аффинных параметров (affine=0 по умолчанию в run_longExp.py).
+    """Бейзлайн PatchTST, малая конфигурация.
 
-    input_len       - длина входа (контракт данных: L_MAX);
-    patch_len, stride, padding_patch - разбиение на патчи;
-    revin_min_valid - сколько валидных часов нужно для статистики экземпляра; меньше -
-                      нормировка (0, 1) (история пуста или почти пуста).
+    Патчи - целые сутки без перекрытия, заканчивающиеся в момент выпуска.
+
+    Attributes:
+        input_len: длина входа в часах, последние часы истории окна. Не больше
+            максимальной длины истории.
+        patch_len: длина патча в часах.
+        stride: шаг между началами патчей в часах.
+        padding_patch: ``end`` - добавить патч из повторов последнего часа; ``none`` -
+            без добавки.
+        d_model: ширина представления патча.
+        n_heads: число голов внимания.
+        d_ff: ширина перцептрона в слое энкодера.
+        layers: число слоёв энкодера.
+        dropout: прореживание в энкодере.
+        attn_dropout: прореживание весов внимания.
+        head_dropout: прореживание на выходе головы медианы.
+        res_attention: прибавлять логиты внимания предыдущего слоя.
+        norm: нормализация в слоях энкодера, ``batch`` или ``layer``.
+        revin: нормировать окно его средним и разбросом.
+        revin_min_valid: сколько валидных часов нужно для статистики окна; при меньшем
+            числе нормировка не применяется.
     """
     arch: str = "patchtst"
     horizon: int = H
     quantiles: tuple = QUANTILES
-    input_len: int = L_MAX
-    patch_len: int = 16
-    stride: int = 8
-    padding_patch: str = "end"
-    d_model: int = 128
-    n_heads: int = 16
-    d_ff: int = 256
-    layers: int = 3
+    input_len: int = 504
+    patch_len: int = 24
+    stride: int = 24
+    padding_patch: str = "none"
+    d_model: int = 32
+    n_heads: int = 4
+    d_ff: int = 64
+    layers: int = 2
     dropout: float = 0.2
     attn_dropout: float = 0.0
     head_dropout: float = 0.0
@@ -513,6 +542,10 @@ class PatchTSTConfig:
             raise ConfigError(f"PatchTSTConfig.norm = {self.norm!r}; допустимо {PATCHTST_NORMS}")
         if self.patch_len > self.input_len:
             raise ConfigError(f"патч {self.patch_len} ч длиннее входа {self.input_len} ч")
+        if (self.input_len - self.patch_len) % self.stride:
+            raise ConfigError(f"вход {self.input_len} ч не делится на патчи {self.patch_len} ч "
+                              f"с шагом {self.stride} ч: последние часы окна не попали бы "
+                              f"ни в один патч")
         if self.d_model % self.n_heads:
             raise ConfigError(f"d_model {self.d_model} не делится на n_heads {self.n_heads}")
 
@@ -522,7 +555,7 @@ class PatchTSTConfig:
 
     @property
     def n_patches(self):
-        """(L − P) // S + 1 (+1 при паддинге «end» повторением последнего значения S раз)."""
+        """Число патчей окна, с учётом добавочного патча при дополнении ``end``."""
         n = (self.input_len - self.patch_len) // self.stride + 1
         return n + (1 if self.padding_patch == "end" else 0)
 
@@ -562,15 +595,30 @@ def model_config_from_dict(d):
 
 
 def check_pipeline_compat(cfg):
-    """Модель совместима с контрактом данных (горизонт, история, квантили)."""
+    """Проверка, что модель совместима с контрактом данных.
+
+    Горизонт и набор квантилей должны совпадать с контрактом. Модель, читающая историю
+    целиком, должна ждать ровно максимальную длину истории. Модель с фиксированной
+    длиной входа берёт последние часы окна, и её вход не может быть длиннее истории.
+
+    Args:
+        cfg: конфиг любой архитектуры.
+
+    Returns:
+        Тот же конфиг.
+
+    Raises:
+        ConfigError: конфиг расходится с контрактом данных.
+    """
     errs = []
     if cfg.horizon != H:
         errs.append(f"horizon={cfg.horizon}, конвейер данных - {H}")
     if tuple(cfg.quantiles) != tuple(float(q) for q in QUANTILES):
         errs.append(f"quantiles={cfg.quantiles}, модуль метрик - {QUANTILES}")
-    hist = getattr(cfg, "max_history", getattr(cfg, "input_len", L_MAX))
-    if hist != L_MAX:
-        errs.append(f"длина истории {hist}, окна датасетов - {L_MAX}")
+    if hasattr(cfg, "max_history") and cfg.max_history != L_MAX:
+        errs.append(f"длина истории {cfg.max_history}, окна датасетов - {L_MAX}")
+    if hasattr(cfg, "input_len") and not 1 <= cfg.input_len <= L_MAX:
+        errs.append(f"длина входа {cfg.input_len} вне [1, {L_MAX}] - окна датасетов")
     if errs:
         raise ConfigError("конфиг модели несовместим с контрактом данных (mayak/constants.py): "
                           + "; ".join(errs) + ". Модель это поддерживает, но сплиты, кэш и "

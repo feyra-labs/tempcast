@@ -18,7 +18,7 @@
     python scripts/train.py --arch lru --accelerator gpu
     python scripts/train.py --arch patchtst --accelerator gpu
 
-Бейзлайны, их источники и отличия от оригиналов - mayak/baselines/README.md.
+Бейзлайны, их источники и отличия от оригиналов - MODELS.md в корне репозитория.
 
 Абляции переобучением (конфиг модели с флагами, прогон в runs/mayak-<флаги>):
     python scripts/train.py --arch mayak --ablate no_anchor --accelerator gpu

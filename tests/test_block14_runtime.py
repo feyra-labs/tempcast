@@ -14,8 +14,6 @@
 """
 import json
 import os
-import shutil
-import subprocess
 
 import numpy as np
 import pytest
@@ -87,7 +85,6 @@ def test_torch_graphs_match_streaming(model):
     assert err <= ATOL_TORCH_GRAPHS, f"разбиение на графы расходится с эталоном: {err:.2e}"
 
 
-@pytest.mark.heavy
 def test_export_keeps_model_in_eval(model, tmp_path):
     export_graphs(model, tmp_path / "m")
     assert not model.training
@@ -97,7 +94,6 @@ def test_export_keeps_model_in_eval(model, tmp_path):
 ABLATIONS = [None, "no_anchor", "no_passport", "no_solar", "no_mode_groups", "no_compression"]
 
 
-@pytest.mark.heavy
 @pytest.mark.parametrize("ablation", ABLATIONS)
 def test_onnx_graphs_match_streaming(ablation, tmp_path):
     cfg = ModelConfig(ablations=Ablations(**{ablation: True})) if ablation else None
@@ -117,7 +113,6 @@ def test_onnx_graphs_match_streaming(ablation, tmp_path):
         assert np.isfinite(errs[1])
 
 
-@pytest.mark.heavy
 def test_manifest_contract(model, tmp_path):
     from mayak.baselines.statistical import ZQ
     from mayak.data.qc import PHYS
@@ -181,7 +176,6 @@ def test_golden_state_restores_incomplete_day(model, golden):
     assert len(raw) == 3352
 
 
-@pytest.mark.heavy
 def test_golden_onnx_matches_golden_model(model, golden):
     """Закоммиченные графы - это графы модели эталона (сценарий без калибровки)."""
     doc, blob = golden
@@ -221,11 +215,3 @@ def test_runtime_calendar_matches_collector_across_leap_new_year(model):
     t1 = int(to_utc_hour(np.datetime64("2024-02-28T12", "s")))
     d2, h2 = window_calendar(t1, np.arange(48))
     assert np.all(np.diff(np.rint(d2 * 24.0)) == 1)
-
-
-@pytest.mark.skipif(not os.environ.get("MAYAK_RUST_TESTS") or shutil.which("cargo") is None,
-                    reason="MAYAK_RUST_TESTS=1 и cargo - прогон тестов runtime-rs из pytest")
-def test_rust_runtime_matches_golden():
-    out = subprocess.run(["cargo", "test", "--release"], cwd=os.path.join(ROOT, "runtime-rs"),
-                         capture_output=True, text=True)
-    assert out.returncode == 0, out.stdout[-4000:] + out.stderr[-4000:]

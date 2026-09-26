@@ -1,6 +1,7 @@
-# DLinear: значения по умолчанию = mayak.config.DLinearConfig().
+# DLinear: значения по умолчанию совпадают с конфигом модели в коде.
+# Вход - последние 336 ч истории окна.
 arch: dlinear
 horizon: 168
 quantiles: [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
-input_len: 672
+input_len: 336
 kernel: 25

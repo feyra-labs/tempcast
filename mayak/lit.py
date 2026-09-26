@@ -258,17 +258,26 @@ SEED_FIELDS = ("seed", "seeds")
 
 
 def _comparable(protocol, ignore):
-    d = protocol.common().to_dict()
-    return {k: v for k, v in d.items() if k not in ignore}
+    return {k: v for k, v in protocol.to_dict().items() if k not in ignore}
 
 
 def check_comparable(reference, others, ignore=()):
-    """Все чекпойнты сравнения обучены по одному общему протоколу, что и ``reference``.
+    """Проверка, что все чекпойнты сравнения обучены по тому же протоколу, что эталон.
 
-    Сравниваются протоколы без объявленных отклонений архитектур (``Protocol.common``):
-    объявленное отклонение допустимо, необъявленная разница — нет. ``ignore`` — поля,
-    которые могут различаться (``SEED_FIELDS`` для повторов основной модели с другими
-    сидами). Возвращает {путь: архитектура}; расхождение — ProtocolError.
+    Протокол один на все архитектуры, поэтому любая разница в его полях делает
+    сравнение недействительным.
+
+    Args:
+        reference: путь к эталонному чекпойнту.
+        others: пути к остальным чекпойнтам.
+        ignore: поля протокола, которые могут различаться, например сиды у повторов
+            основной модели.
+
+    Returns:
+        Словарь из пути чекпойнта в его архитектуру.
+
+    Raises:
+        ProtocolError: протоколы различаются или у чекпойнта нет протокола.
     """
     ref_arch, ref = checkpoint_protocol(reference)
     ref_d = _comparable(ref, ignore)

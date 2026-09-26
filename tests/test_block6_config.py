@@ -107,8 +107,8 @@ def test_default_config_architecture_size():
     assert sd["heads.fc1.weight"].shape == (48, 16)
     assert sd["passport.obs.weight"].shape == (32, 32)
     from mayak.baselines import DLinear, GRUSeq2Seq
-    assert sum(p.numel() for p in GRUSeq2Seq().parameters()) == 190944
-    assert sum(p.numel() for p in DLinear().parameters()) == 227304
+    assert sum(p.numel() for p in GRUSeq2Seq().parameters()) == 120754
+    assert sum(p.numel() for p in DLinear().parameters()) == 114408
 
 
 def test_derived_dimensions_are_computed():
@@ -494,7 +494,6 @@ def test_checkpoint_carries_resolved_config_seeds_and_provenance(custom_run):
     assert load_run_record(journal["final_ckpt"])["config"]["model"]["ablations"]["no_solar"]
 
 
-@pytest.mark.heavy
 def test_resolved_config_in_checkpoint_carries_ablation_data_effect(manifest, tmp_path):
     from mayak.lit import RUN_KEY
     from mayak.protocol import run_protocol

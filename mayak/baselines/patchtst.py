@@ -1,10 +1,9 @@
-"""PatchTST — трансформер над патчами ряда с независимостью каналов и RevIN."""
+"""Трансформер над патчами ряда температуры с обратимой нормализацией окна."""
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mayak.baselines.cards import BaselineCard, Difference, Source, describe
-from mayak.baselines.neural import QUANTILE_HEAD, median_centered_offsets
+from mayak.baselines.neural import median_centered_offsets
 from mayak.config import PatchTSTConfig
 
 REVIN_EPS = 1e-5
@@ -12,11 +11,20 @@ LOG_SIG_CLAMP = (-5.0, 3.0)
 
 
 def masked_instance_stats(x, m, min_valid=2, eps=REVIN_EPS):
-    """RevIN по валидным часам: (B, L) → (μ, σ), каждое (B, 1).
+    """Среднее и разброс окна по валидным часам для нормализации экземпляра.
 
-    σ = √(Var + eps) с дисперсией без поправки Бесселя, как в RevIN. Меньше
-    ``min_valid`` валидных часов — (0, 1). Статистики отсоединены от графа, как в
-    оригинале (``.detach()``).
+    Разброс - корень из смещённой дисперсии с малой добавкой. Если валидных часов меньше
+    ``min_valid``, среднее равно нулю, а разброс единице: статистика окна не определена.
+    Градиент через статистики не идёт.
+
+    Args:
+        x: ряд, форма (B, L).
+        m: маска валидности, форма (B, L).
+        min_valid: наименьшее число валидных часов для статистики.
+        eps: добавка к дисперсии.
+
+    Returns:
+        Пара тензоров формы (B, 1): среднее и разброс.
     """
     x, m = x.detach(), m.detach().to(x.dtype)
     n = m.sum(-1, keepdim=True)
@@ -28,8 +36,20 @@ def masked_instance_stats(x, m, min_valid=2, eps=REVIN_EPS):
 
 
 def make_patches(z, patch_len, stride, padding):
-    """(B, L, C) → (B, n_patches, C·patch_len): в патче сначала P отсчётов канала 0,
-    затем канала 1, …; паддинг «end» — повтор последнего шага S раз."""
+    """Разбиение окна на патчи по оси времени.
+
+    В патче сначала идут отсчёты первого канала, затем второго. Дополнение ``end``
+    повторяет последний час окна столько раз, каков шаг, и даёт ещё один патч.
+
+    Args:
+        z: окно, форма (B, L, C).
+        patch_len: длина патча в часах.
+        stride: шаг между началами патчей в часах.
+        padding: ``end`` или ``none``.
+
+    Returns:
+        Тензор формы (B, n_patches, C * patch_len).
+    """
     if padding == "end":
         z = torch.cat([z, z[:, -1:].expand(-1, stride, -1)], dim=1)
     p = z.unfold(1, patch_len, stride)
@@ -48,8 +68,14 @@ def _norm(kind, d):
 
 
 class ResidualAttention(nn.Module):
-    """Многоголовое внимание с residual attention: к логитам слоя прибавляются логиты
-    предыдущего слоя (``prev``), как в _MultiheadAttention оригинала."""
+    """Многоголовое внимание, к логитам которого прибавляются логиты предыдущего слоя.
+
+    Args:
+        d_model: ширина представления патча.
+        n_heads: число голов.
+        attn_dropout: прореживание весов внимания.
+        proj_dropout: прореживание выхода.
+    """
 
     def __init__(self, d_model, n_heads, attn_dropout=0.0, proj_dropout=0.0):
         super().__init__()
@@ -75,7 +101,11 @@ class ResidualAttention(nn.Module):
 
 
 class TSTEncoderLayer(nn.Module):
-    """Post-norm слой энкодера оригинала: MHA → Add & Norm → FFN(GELU) → Add & Norm."""
+    """Слой энкодера: внимание и перцептрон, нормализация после каждой остаточной связи.
+
+    Args:
+        cfg: конфиг PatchTST.
+    """
 
     def __init__(self, cfg):
         super().__init__()
@@ -96,61 +126,21 @@ class TSTEncoderLayer(nn.Module):
         return x, scores
 
 
-PATCHTST_CARD = BaselineCard(
-    key="patchtst", name="PatchTST", kind="neural",
-    summary="Трансформер над патчами ряда температуры: разбиение на перекрывающиеся "
-            "патчи, независимость каналов, обратимая нормализация экземпляра (RevIN) "
-            "и Flatten-голова на весь горизонт.",
-    sources=(Source("Y. Nie, N. H. Nguyen, P. Sinthong, J. Kalagnanam",
-                    "A Time Series is Worth 64 Words: Long-term Forecasting with "
-                    "Transformers", "ICLR 2023", "arXiv:2211.14730"),
-             Source("T. Kim, J. Kim, Y. Tae, C. Park, J.-H. Choi, J. Choo",
-                    "Reversible Instance Normalization for Accurate Time-Series "
-                    "Forecasting against Distribution Shift", "ICLR 2022")),
-    code=("https://github.com/yuqinie98/PatchTST (PatchTST_supervised/layers/"
-          "PatchTST_backbone.py, layers/RevIN.py)",),
-    taken=("разбиение на патчи: длина 16, шаг 8, паддинг «end» повторением последнего "
-           "значения S раз (+1 патч)",
-           "независимость каналов: каждый канал обрабатывается одной и той же сетью "
-           "отдельно, каналы не смешиваются",
-           "RevIN: вычитание среднего и деление на σ = √(Var + 1e-5) экземпляра, "
-           "статистики без градиента, обратное преобразование на выходе; без аффинных "
-           "параметров (affine = 0 в скриптах авторов)",
-           "энкодер TSTiEncoder: линейное вложение патча W_P, обучаемое позиционное "
-           "кодирование W_pos ~ U(−0.02, 0.02), post-norm слои с BatchNorm, FFN с GELU, "
-           "residual attention (логиты предыдущего слоя прибавляются к текущим)",
-           "Flatten_Head: flatten (d_model × n_patches) → Linear на горизонт",
-           "гиперпараметры авторов для набора Weather: 3 слоя, d_model 128, 16 голов, "
-           "d_ff 256, dropout 0.2, head_dropout 0"),
-    differences=(
-        Difference("вход с маской валидности: статистики RevIN — только по валидным "
-                   "часам, невалидные часы после нормализации — ноль, в вложение патча "
-                   "подаётся [значения патча, маска патча] (W_P: 2P → d_model)",
-                   "в оригинале пропусков нет; маска — общий вход всех моделей "
-                   "(блок 1), без неё пропуск неотличим от значения, равного среднему"),
-        Difference("одна переменная — температура",
-                   "при независимости каналов прогноз температуры не зависит от истории "
-                   "давления и влажности; их прогноз в оригинале нам не нужен"),
-        Difference("при пустой или почти пустой истории (меньше 2 валидных часов) "
-                   "нормировка (μ, σ) = (0, 1)",
-                   "статистика экземпляра не определена; в оригинале такого окна нет"),
-        QUANTILE_HEAD,
-        Difference("голова выдаёт на каждый лид медиану и log σ в нормированных "
-                   "единицах; квантили строятся до обратной RevIN",
-                   "обратная RevIN — умножение на σ > 0 и сдвиг: монотонность квантилей "
-                   "и эквивариантность к масштабу входа сохраняются"),
-        Difference("длина входа 672 ч (84 патча) вместо 336 (42 патча)",
-                   "контракт данных проекта; статья показывает, что PatchTST выигрывает "
-                   "от длинного окна (PatchTST/64 — 512 ч)"),
-    ),
-    notes=("Параметров около 4 млн, из них ≈ 3.6 млн — Flatten-голова "
-           "(d_model·n_patches × 2·H), как и в оригинале при длинном входе.",),
-)
-
-
-@describe(PATCHTST_CARD)
 class PatchTST(nn.Module):
-    """PatchTST-бейзлайн (конфиг - PatchTSTConfig)."""
+    """Трансформер над патчами ряда температуры.
+
+    Окно температуры нормируется своими средним и разбросом по валидным часам и режется
+    на патчи. Каждый патч вместе со своей маской линейно вкладывается, получает
+    обучаемое позиционное смещение и проходит слои энкодера. Медиана на весь горизонт -
+    линейная голова над всеми патчами, развёрнутыми в один вектор. Масштаб интервала -
+    отдельная малая линейная голова над средним представлением патчей. Квантили
+    строятся в нормированных единицах и возвращаются в градусы обратным преобразованием.
+    Давление, влажность, календарь и координаты в модель не входят.
+
+    Args:
+        cfg: конфиг PatchTST, словарь с теми же полями или None для значений по
+            умолчанию.
+    """
 
     def __init__(self, cfg=None):
         super().__init__()
@@ -167,12 +157,22 @@ class PatchTST(nn.Module):
         self.W_pos = nn.Parameter(W_pos)
         self.drop = nn.Dropout(cfg.dropout)
         self.layers = nn.ModuleList([TSTEncoderLayer(cfg) for _ in range(cfg.layers)])
-        self.head = nn.Sequential(nn.Flatten(start_dim=-2), nn.Linear(
-            cfg.d_model * self.n_patches, 2 * cfg.horizon), nn.Dropout(cfg.head_dropout))
+        self.head_mu = nn.Sequential(nn.Flatten(start_dim=-2),
+                                     nn.Linear(cfg.d_model * self.n_patches, cfg.horizon),
+                                     nn.Dropout(cfg.head_dropout))
+        self.head_sigma = nn.Linear(cfg.d_model, cfg.horizon)
         self.gaps = nn.Parameter(torch.zeros(cfg.horizon, self.nq - 1))
 
     def normalize(self, batch):
-        """Температура и её маска на входном окне → (z·mask, mask, μ, σ)."""
+        """Нормированная температура окна входа.
+
+        Args:
+            batch: батч окон.
+
+        Returns:
+            Четвёрка: нормированная температура с нулями на невалидных часах и маска,
+            обе формы (B, input_len), затем среднее и разброс окна формы (B, 1).
+        """
         L = self.cfg.input_len
         x = batch["x_hist"][:, -L:, 0]
         m = (batch["mask_hist"][:, -L:, 0] > 0).to(x.dtype)
@@ -184,6 +184,7 @@ class PatchTST(nn.Module):
         return (x - mean) / std * m, m, mean, std
 
     def encode(self, batch):
+        """Представления патчей формы (B, n_patches, d_model), среднее и разброс окна."""
         z, m, mean, std = self.normalize(batch)
         c = self.cfg
         p = make_patches(torch.stack([z, m], -1), c.patch_len, c.stride, c.padding_patch)
@@ -196,13 +197,12 @@ class PatchTST(nn.Module):
 
     def forward(self, batch):
         u, mean, std = self.encode(batch)
-        o = self.head(u.transpose(1, 2)).view(-1, 2, self.horizon)
-        mu_n = o[:, 0]
-        sig_n = torch.exp(o[:, 1].clamp(*LOG_SIG_CLAMP))
+        mu_n = self.head_mu(u.transpose(1, 2))
+        sig_n = torch.exp(self.head_sigma(u.mean(dim=1)).clamp(*LOG_SIG_CLAMP))
         offs = median_centered_offsets(self.gaps, self.nq, u.device)
         q_n = mu_n[..., None] + sig_n[..., None] * offs[None]
         q = q_n * std[..., None] + mean[..., None]
         return {"q": q, "mu": mu_n * std + mean, "sigma": sig_n * std}
 
 
-__all__ = ["PATCHTST_CARD", "PatchTST", "make_patches", "masked_instance_stats"]
+__all__ = ["PatchTST", "make_patches", "masked_instance_stats"]

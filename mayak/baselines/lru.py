@@ -1,53 +1,78 @@
-"""Linear Recurrent Unit — бейзлайн «линейная память без разложения»."""
+"""Бейзлайн с линейной рекуррентной памятью без разложения на якорь и аномалию.
+
+Стек блоков с диагональной комплексной линейной рекуррентностью читает историю. Его
+последний выход - сводка истории, из которой общая по лидам голова строит прогноз.
+Климат-поля нет: всё, что модель знает о сезоне и суточном ходе на горизонте, она
+выводит сама из календаря, координат и истории.
+"""
 import math
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mayak.baselines.cards import BaselineCard, Difference, Source, describe
-from mayak.baselines.neural import (QUANTILE_HEAD, T_SCALE, coord_features, median_centered_offsets,
-                                    normalized_obs)
+from mayak.baselines.neural import N_RECURRENT_INPUT, LeadHead, recurrent_inputs
 from mayak.config import LRUConfig
 
-N_CALENDAR = 4
-N_INPUT = 3 + 3 + N_CALENDAR + 3
-N_LEAD = N_CALENDAR + 3 + 1
-DAYS_IN_YEAR = 365.25
 RECURRENT_PARAMS = ("nu_log", "theta_log", "gamma_log", "B_re", "B_im")
 
 
-def calendar_features(doy, hour):
-    """(…,) день года и час UTC → (…, 4): sin/cos суточной и годовой фазы."""
-    wd = 2 * math.pi * hour / 24.0
-    wy = 2 * math.pi * doy / DAYS_IN_YEAR
-    return torch.stack([torch.sin(wd), torch.cos(wd), torch.sin(wy), torch.cos(wy)], dim=-1)
-
-
 def lambda_polar(nu_log, theta_log):
-    """(модуль-логарифм, фаза): λ = exp(−ν + iθ), ν = exp(ν_log) > 0, θ = exp(θ_log)."""
+    """Скорость затухания и угловая частота собственных чисел из сырых параметров.
+
+    Обе величины положительны при любых сырых значениях: это экспоненты от них.
+
+    Args:
+        nu_log: логарифм скорости затухания, форма (N,).
+        theta_log: логарифм угловой частоты, форма (N,).
+
+    Returns:
+        Пара тензоров формы (N,): скорость затухания за час и поворот за час в радианах.
+    """
     return torch.exp(nu_log), torch.exp(theta_log)
 
 
 def lambda_power(nu, theta, p):
-    """λ^p в полярной форме: exp(−pν)·(cos pθ + i sin pθ). p (…,) × состояние (N,)."""
+    """Собственные числа в степени p, вещественная и мнимая части.
+
+    Степень считается сразу в полярной форме, без накопления произведений.
+
+    Args:
+        nu: скорость затухания за час, форма (N,).
+        theta: поворот за час, форма (N,).
+        p: показатели степени, произвольная форма.
+
+    Returns:
+        Пара тензоров формы (..., N).
+    """
     p = p[..., None].to(nu.dtype)
     mag = torch.exp(-p * nu)
     return mag * torch.cos(p * theta), mag * torch.sin(p * theta)
 
 
 def _shift(x, k):
-    """x[:, t] → x[:, t − k] с нулями при t < k (ось времени — 1)."""
+    """Сдвиг по оси времени на k часов в прошлое с нулями в начале."""
     return F.pad(x[:, :-k], (0, 0, k, 0))
 
 
 def lru_scan_associative(a_re, a_im, u_re, u_im):
-    """h_t = a ⊙ h_{t−1} + u_t, h_{−1} = 0 — скан Хиллиса–Стила, ⌈log₂ L⌉ шагов.
+    """Линейная рекуррентность с постоянным коэффициентом, параллельный скан.
 
-    a (N,) не зависит от времени; u (B, L, N). После шага с k = 2^j в h[t] собрана сумма
-    по окну длины 2k, и a^k возводится в квадрат. Умножаются только |a| ≤ 1 — без
-    переполнения на любой длине.
+    Каждое состояние равно предыдущему, умноженному на коэффициент, плюс вход часа;
+    состояние до первого часа нулевое. Скан удваивает шаг на каждой итерации и делает
+    число итераций, равное логарифму длины по основанию два. Возводятся в степень только
+    коэффициенты с модулем не больше единицы, поэтому переполнения нет на любой длине.
+
+    Args:
+        a_re: вещественная часть коэффициента, форма (N,).
+        a_im: мнимая часть коэффициента, форма (N,).
+        u_re: вещественная часть входа, форма (B, L, N).
+        u_im: мнимая часть входа, форма (B, L, N).
+
+    Returns:
+        Пара тензоров формы (B, L, N): вещественная и мнимая части состояний.
     """
+
     h_re, h_im = u_re, u_im
     L = h_re.shape[1]
     k = 1
@@ -60,12 +85,24 @@ def lru_scan_associative(a_re, a_im, u_re, u_im):
 
 
 def lru_scan_chunked(nu, theta, u_re, u_im, chunk=32):
-    """Та же рекуррентность блоками длины ``chunk``.
+    """Та же рекуррентность, развёрнутая блоками фиксированной длины.
 
-    Внутри блока h = T·u, T[i, j] = λ^{i−j} при i ≥ j (тёплицева, степени — в полярной
-    форме, без накопления произведений); перенос состояния между блоками — скан
-    Хиллиса–Стила с коэффициентом λ^C. Память — O(B·L·N), а не O(B·L·N·log L).
+    Внутри блока состояния получаются одной свёрткой со степенями собственных чисел.
+    Перенос состояния между блоками - параллельный скан с коэффициентом, равным
+    собственному числу в степени длины блока. Для градиента хранится память, линейная
+    по длине окна, а не с лишним логарифмическим множителем, как у скана по всей длине.
+
+    Args:
+        nu: скорость затухания за час, форма (N,).
+        theta: поворот за час, форма (N,).
+        u_re: вещественная часть входа, форма (B, L, N).
+        u_im: мнимая часть входа, форма (B, L, N).
+        chunk: длина блока в часах.
+
+    Returns:
+        Пара тензоров формы (B, L, N): вещественная и мнимая части состояний.
     """
+
     B, L, N = u_re.shape
     C = min(int(chunk), L)
     pad = (-L) % C
@@ -94,7 +131,7 @@ def lru_scan_chunked(nu, theta, u_re, u_im, chunk=32):
 
 
 def lru_recurrent(a_re, a_im, u_re, u_im):
-    """Наивная рекуррентность циклом по часам — эталон для проверки сканов."""
+    """Та же рекуррентность простым циклом по часам, эталон для проверки сканов."""
     B, L, N = u_re.shape
     h_re = u_re.new_zeros(B, N)
     h_im = u_re.new_zeros(B, N)
@@ -107,7 +144,23 @@ def lru_recurrent(a_re, a_im, u_re, u_im):
 
 
 class LRULayer(nn.Module):
-    """Один LRU (рекуррентное ядро), инициализация — как в minimal-LRU."""
+    """Рекуррентное ядро: диагональная комплексная линейная рекуррентность.
+
+    Вход часа проецируется в комплексное состояние, состояние затухает и поворачивается
+    на каждом часе, выход - вещественная часть проекции состояния плюс вход, умноженный
+    на обучаемый вектор. Модули собственных чисел при инициализации равномерно заполняют
+    заданный диапазон по квадрату модуля, фазы - заданный диапазон частот. Проекция входа
+    масштабируется так, чтобы разброс состояния не зависел от скорости затухания.
+
+    Args:
+        d_model: размер входа и выхода.
+        d_state: число комплексных собственных чисел.
+        r_min: наименьший модуль собственного числа при инициализации.
+        r_max: наибольший модуль собственного числа при инициализации.
+        max_phase: наибольший поворот за час при инициализации, радианы.
+        scan: способ развёртки по умолчанию.
+        chunk: длина блока для блочной развёртки.
+    """
 
     def __init__(self, d_model, d_state, r_min, r_max, max_phase, scan="chunked", chunk=32):
         super().__init__()
@@ -126,14 +179,25 @@ class LRULayer(nn.Module):
         self.D = nn.Parameter(torch.randn(d_model))
 
     def eigenvalues(self):
-        """(|λ|, arg λ) — для проверок и журнала."""
+        """Модули и фазы собственных чисел, для проверок и журнала."""
         nu, theta = lambda_polar(self.nu_log, self.theta_log)
         return torch.exp(-nu), theta
 
     def states(self, x, scan=None):
-        """(B, L, d_model) → комплексные состояния (h_re, h_im), (B, L, d_state).
+        """Комплексные состояния рекуррентности.
 
-        Считается в точности параметров (float32 при обучении), вне autocast."""
+        Считаются в точности параметров, без понижения точности при смешанном обучении.
+
+        Args:
+            x: вход, форма (B, L, d_model).
+            scan: способ развёртки; None - способ из конструктора.
+
+        Returns:
+            Пара тензоров формы (B, L, d_state).
+
+        Raises:
+            ValueError: неизвестный способ развёртки.
+        """
         scan = scan or self.scan
         x = x.to(self.B_re.dtype)
         g = torch.exp(self.gamma_log)[:, None]
@@ -155,7 +219,11 @@ class LRULayer(nn.Module):
 
 
 class LRUBlock(nn.Module):
-    """pre-LayerNorm → LRU → GELU → dropout → GLU → dropout → остаток (SequenceLayer)."""
+    """Блок стека: нормализация, рекуррентное ядро, нелинейность с затвором, остаток.
+
+    Args:
+        cfg: конфиг LRU.
+    """
 
     def __init__(self, cfg):
         super().__init__()
@@ -173,72 +241,14 @@ class LRUBlock(nn.Module):
         return x + self.drop(z)
 
 
-LRU_CARD = BaselineCard(
-    key="lru", name="LRU", kind="neural",
-    summary="Стек блоков Linear Recurrent Unit над историей наблюдений: обучаемая "
-            "линейная память с комплексными диагональными модами, но без разложения "
-            "прогноза на климатический якорь и аномалию. Прогноз на каждый лид — "
-            "MLP-голова над последним выходом стека, координатами и календарём лида.",
-    sources=(Source("A. Orvieto, S. L. Smith, A. Gu, A. Fernando, C. Gulcehre, R. Pascanu, "
-                    "S. De", "Resurrecting Recurrent Neural Networks for Long Sequences",
-                    "ICML 2023", "arXiv:2303.06349"),),
-    code=("https://github.com/NicolasZucchet/minimal-LRU (lru/model.py) — эталонная "
-          "JAX-реализация, на которую ссылаются авторы; официальной реализации авторы "
-          "не публиковали",),
-    taken=("комплексная диагональная рекуррентность h_t = λ ⊙ h_{t−1} + γ ⊙ B u_t, "
-           "y_t = Re(C h_t) + D ⊙ u_t",
-           "экспоненциальная параметризация λ = exp(−exp(ν) + i·exp(θ)) и "
-           "инициализация |λ|² ~ U[r_min², r_max²], arg λ ~ U[0, max_phase] "
-           "(nu_init, theta_init)",
-           "нормализация входа по модулю: γ = √(1 − |λ|²) при инициализации, далее "
-           "обучаемый γ_log (gamma_log_init)",
-           "инициализация B ~ N(0, 1/(2·d_model)), C ~ N(0, 1/d_state), D ~ N(0, 1)",
-           "блок SequenceLayer: нормализация → LRU → GELU → dropout → GLU "
-           "out1(x)·σ(out2(x)) → dropout → остаток",
-           "развёртка ассоциативным сканом (у авторов — jax.lax.associative_scan)",
-           "нулевое затухание весов для ν, θ, γ, B (группа «ssm» в minimal-LRU)"),
-    differences=(
-        Difference("r_min, r_max и max_phase заданы через постоянные времени "
-                   "[3, 240] ч и наименьший период 12 ч — тот же диапазон, что у мод "
-                   "МАЯК (в minimal-LRU по умолчанию r_min = 0, r_max = 1, "
-                   "max_phase = 2π)",
-                   "эксперимент проверяет разложение, а не априорную память: обе модели "
-                   "стартуют с одинаковыми постоянными времени"),
-        Difference("LayerNorm перед блоком (pre-norm), а не BatchNorm после",
-                   "BatchNorm смешивает статистику по батчу и по времени, то есть "
-                   "не причинна (то же решение для энкодера МАЯК, блок 7); pre-norm "
-                   "устойчивее на 4 слоях без подбора"),
-        Difference("скорость обучения рекуррентных параметров не уменьшена "
-                   "(в minimal-LRU lr_factor = 0.5)",
-                   "единый протокол (блок 4): одна скорость обучения на все модели; "
-                   "архитектура определяет только группы весового затухания"),
-        Difference("блочный скан: внутри блока из 32 ч — тёплицева свёртка степенями λ "
-                   "в полярной форме, между блоками — скан Хиллиса–Стила",
-                   "в PyTorch нет associative_scan; полный скан Хиллиса–Стила на 672 ч "
-                   "хранит для градиента O(L·log L) промежуточных тензоров, блочный — "
-                   "O(L); результат тот же (проверяется тестом против цикла)"),
-        Difference("вход часа: T, P, RH с фиксированной нормировкой, умноженные на маску, "
-                   "маска, календарь (sin/cos суток и года) и координаты; выход — "
-                   "последний шаг стека, а не среднее по времени",
-                   "вход с маской валидности и те же сведения о точке и времени, что "
-                   "у МАЯК; задача — прогноз из конца истории, а не классификация"),
-        Difference("прямая многогоризонтная голова: общий для всех лидов MLP над "
-                   "[последний выход стека, координаты, календарь лида, доля лида]",
-                   "без авторегрессии и без климатического якоря: всё, что модель знает "
-                   "о сезоне и суточном ходе в будущем, она выводит сама"),
-        QUANTILE_HEAD,
-    ),
-    notes=("Рекуррентность LRU сама по себе даёт O(d_state) на новый час в потоке; "
-           "потоковый рантайм для LRU не строится — это бейзлайн точности.",),
-)
-
-
-@describe(LRU_CARD)
 class LRUForecaster(nn.Module):
-    """LRU-бейзлайн (конфиг - LRUConfig).
+    """Стек линейных рекуррентных блоков над историей и общая по лидам голова.
 
-    Группы весового затухания: ``recurrent`` (ν, θ, γ, B всех блоков) — без затухания,
-    ``other`` — базовое затухание протокола.
+    Параметры рекуррентности (затухание, фаза, масштаб и проекция входа) обучаются без
+    весового затухания, остальные - с базовым затуханием протокола.
+
+    Args:
+        cfg: конфиг LRU, словарь с теми же полями или None для значений по умолчанию.
     """
 
     def __init__(self, cfg=None):
@@ -249,47 +259,27 @@ class LRUForecaster(nn.Module):
         self.cfg = cfg
         self.nq = cfg.n_quantiles
         self.horizon = cfg.horizon
-        self.embed = nn.Linear(N_INPUT, cfg.d_model)
+        self.embed = nn.Linear(N_RECURRENT_INPUT, cfg.d_model)
         self.blocks = nn.ModuleList([LRUBlock(cfg) for _ in range(cfg.layers)])
         self.out_norm = nn.LayerNorm(cfg.d_model)
-        self.head = nn.Sequential(nn.Linear(cfg.d_model + N_LEAD, cfg.head_hidden), nn.GELU(),
-                                  nn.Linear(cfg.head_hidden, cfg.head_hidden), nn.GELU(),
-                                  nn.Linear(cfg.head_hidden, 2))
-        self.gaps = nn.Parameter(torch.zeros(cfg.horizon, self.nq - 1))
+        self.head = LeadHead(cfg.d_model, cfg.head_hidden, cfg.horizon, self.nq)
 
     def inputs(self, batch):
-        """(B, L, 13): наблюдения·маска, маска, календарь часа, координаты."""
-        x, m = batch["x_hist"], batch["mask_hist"]
-        L = x.shape[1]
-        coord = coord_features(batch, x.device)
-        cal = calendar_features(batch["doy_hist"][:, -L:], batch["hour_hist"][:, -L:])
-        return torch.cat([normalized_obs(x) * m, m, cal.to(x.dtype),
-                          coord[:, None, :].expand(-1, L, -1)], dim=-1)
+        """Вход стека, форма (B, L, N_RECURRENT_INPUT)."""
+        return recurrent_inputs(batch)
 
     def encode(self, batch, scan=None):
+        """Выход стека на каждом часе истории, форма (B, L, d_model)."""
         z = self.embed(self.inputs(batch))
         for blk in self.blocks:
             z = blk(z, scan)
         return self.out_norm(z)
 
     def forward(self, batch, scan=None):
-        x = batch["x_hist"]
-        last = self.encode(batch, scan)[:, -1]
-        B, Hh = x.shape[0], self.horizon
-        coord = coord_features(batch, x.device)
-        lead = (torch.arange(Hh, device=x.device, dtype=x.dtype) + 1) / Hh
-        feat = torch.cat([last[:, None, :].expand(-1, Hh, -1),
-                          calendar_features(batch["doy_fut"], batch["hour_fut"]).to(x.dtype),
-                          coord[:, None, :].expand(-1, Hh, -1),
-                          lead[None, :, None].expand(B, -1, -1)], dim=-1)
-        o = self.head(feat)
-        mu = T_SCALE * o[..., 0]
-        sig = torch.exp(o[..., 1].clamp(-2, 4))
-        offs = median_centered_offsets(self.gaps, self.nq, x.device)
-        q = mu[..., None] + sig[..., None] * offs[None]
-        return {"q": q, "mu": mu, "sigma": sig}
+        return self.head(self.encode(batch, scan)[:, -1], batch)
 
     def optim_groups(self, weight_decay):
+        """Группы весового затухания: рекуррентные параметры без затухания, остальные с ним."""
         rec, other = [], []
         for name, p in self.named_parameters():
             if not p.requires_grad:

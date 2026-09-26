@@ -13,14 +13,14 @@ from mayak import baselines as BL
 from mayak.baselines.lru import (LRULayer, LRUForecaster, lru_recurrent, lru_scan_associative,
                                  lru_scan_chunked)
 from mayak.baselines.patchtst import make_patches, masked_instance_stats
-from mayak.config import (ConfigError, DLinearConfig, LRUConfig, PatchTSTConfig,
+from mayak.config import (ConfigError, DLinearConfig, GRUConfig, LRUConfig, PatchTSTConfig,
                           check_pipeline_compat, model_config_for)
 from mayak.constants import H, L_MAX, NQ
 from mayak.protocol import DEFAULT_PROTOCOL, Protocol, ProtocolError
 
 REPO = Path(__file__).resolve().parents[1]
 CONF = REPO / "conf"
-NEW_ARCHS = ("lru", "patchtst")
+NEW_ARCHS = ("lru", "patchtst", "gru")
 
 
 def _batch(B=3, L=L_MAX, seed=0, p_valid=0.85):
@@ -196,10 +196,13 @@ def test_lru_scan_runs_in_float32_under_bf16_autocast():
     assert (out - ref).abs().max() < 0.5
 
 
-def test_patchtst_patching_matches_original_formula():
+def test_patchtst_patching():
+    """Суточные патчи без перекрытия по умолчанию; разбиение с дополнением повтором."""
     cfg = PatchTSTConfig()
-    assert cfg.n_patches == (L_MAX - 16) // 8 + 1 + 1 == 84
-    assert PatchTSTConfig(padding_patch="none").n_patches == 83
+    assert (cfg.patch_len, cfg.stride, cfg.padding_patch) == (24, 24, "none")
+    assert cfg.n_patches == cfg.input_len // 24 == 21
+    assert PatchTSTConfig(input_len=L_MAX, patch_len=16, stride=8,
+                          padding_patch="end").n_patches == 84
     z = torch.arange(20.0).view(1, 20, 1)
     p = make_patches(z, 8, 4, "end")
     assert p.shape == (1, (20 - 8) // 4 + 2, 8)
@@ -207,6 +210,16 @@ def test_patchtst_patching_matches_original_formula():
     assert torch.equal(p[0, -1], torch.tensor([16, 17, 18, 19, 19, 19, 19, 19.0]))
     two = make_patches(torch.stack([z[..., 0], -z[..., 0]], -1), 8, 4, "none")
     assert torch.equal(two[0, 1], torch.cat([torch.arange(4.0, 12), -torch.arange(4.0, 12)]))
+
+
+def test_patchtst_last_patch_ends_at_issue_time():
+    """Последний патч заканчивается последним часом истории: вход не теряет свежие часы."""
+    cfg = PatchTSTConfig()
+    z = torch.arange(float(cfg.input_len)).view(1, -1, 1)
+    p = make_patches(z, cfg.patch_len, cfg.stride, cfg.padding_patch)
+    assert p[0, -1, -1] == cfg.input_len - 1 and p[0, 0, 0] == 0
+    with pytest.raises(ConfigError, match="не делится на патчи"):
+        PatchTSTConfig(input_len=500)
 
 
 def test_masked_revin_statistics():
@@ -256,8 +269,9 @@ def test_patchtst_matches_revin_denormalization():
     med = out["q"][..., NQ // 2]
     assert torch.allclose(med, out["mu"], atol=1e-4)
     assert (out["q"].diff(dim=-1) >= 0).all()
-    assert torch.allclose(mean[:, 0], (b["x_hist"][:, :, 0] * b["mask_hist"][:, :, 0]).sum(-1)
-                          / b["mask_hist"][:, :, 0].sum(-1), atol=1e-4)
+    n = m.cfg.input_len
+    x, v = b["x_hist"][:, -n:, 0], b["mask_hist"][:, -n:, 0]
+    assert torch.allclose(mean[:, 0], (x * v).sum(-1) / v.sum(-1), atol=1e-4)
     assert (std > 0).all()
 
 
@@ -305,10 +319,20 @@ def test_new_baselines_train_with_finite_gradients(arch, L):
     assert grads and all(torch.isfinite(g).all() for g in grads)
 
 
-def test_new_baselines_parameter_counts_are_pinned():
-    """Архитектура по умолчанию закреплена числом параметров (чекпойнты читаются)."""
-    assert sum(p.numel() for p in _model("lru").parameters()) == 194802
-    assert sum(p.numel() for p in _model("patchtst").parameters()) == 4026432
+def test_baseline_parameter_counts_are_pinned():
+    """Архитектуры по умолчанию закреплены числом параметров."""
+    counts = {a: sum(p.numel() for p in _model(a).parameters()) for a in BL.NEURAL}
+    assert counts == {"gru": 120754, "dlinear": 114408, "lru": 103986, "patchtst": 138944}
+
+
+def test_baseline_sizes_within_band_of_main_model():
+    """Каждая нейросеть по умолчанию в полосе размеров относительно основной модели."""
+    from mayak.model import MAYAK
+    ref = sum(p.numel() for p in MAYAK().parameters())
+    lo, hi = BL.SIZE_BAND
+    for arch, cls in BL.NEURAL.items():
+        n = sum(p.numel() for p in cls().parameters())
+        assert lo <= n / ref <= hi, f"{arch}: {n} параметров, доля {n / ref:.2f}"
 
 
 class _RefMovingAvg(nn.Module):
@@ -336,7 +360,7 @@ def _ref_dlinear(x, lin_seasonal, lin_trend, kernel):
 def test_dlinear_matches_reference_implementation():
     m = _model("dlinear")
     b = _batch(B=3, p_valid=1.0)
-    T = b["x_hist"][..., 0]
+    T = b["x_hist"][:, -m.input_len:, 0]
     with torch.no_grad():
         ours = m(b)["mu"]
         ref = _ref_dlinear(T[..., None], m.lin_resid, m.lin_trend, m.cfg.kernel)[..., 0]
@@ -344,10 +368,31 @@ def test_dlinear_matches_reference_implementation():
     assert m.cfg.kernel == 25 and DLinearConfig().kernel == 25
 
 
+def test_dlinear_reads_only_last_hours_of_history():
+    """Вход DLinear - последние 336 ч; более ранние часы на прогноз не влияют."""
+    m = _model("dlinear")
+    assert m.input_len == DLinearConfig().input_len == 336
+    b = _batch(B=2, p_valid=1.0)
+    early = dict(b, x_hist=b["x_hist"].clone())
+    early["x_hist"][:, :L_MAX - m.input_len, 0] += 50.0
+    with torch.no_grad():
+        assert torch.equal(m(b)["q"], m(early)["q"])
+
+
+def test_pipeline_compat_allows_shorter_input_only():
+    check_pipeline_compat(DLinearConfig(input_len=336))
+    check_pipeline_compat(PatchTSTConfig(input_len=L_MAX, patch_len=24, stride=24))
+    with pytest.raises(ConfigError, match="длина входа"):
+        check_pipeline_compat(DLinearConfig(input_len=L_MAX + 24))
+    with pytest.raises(ConfigError, match="длина истории"):
+        check_pipeline_compat(LRUConfig(max_history=336))
+
+
 def test_dlinear_has_no_input_normalization():
     m = _model("dlinear")
     g = torch.Generator().manual_seed(0)
-    x1, x2 = torch.randn(2, L_MAX, generator=g), 10 * torch.randn(2, L_MAX, generator=g)
+    n = m.input_len
+    x1, x2 = torch.randn(2, n, generator=g), 10 * torch.randn(2, n, generator=g)
     with torch.no_grad():
         lhs = m.point(x1 + x2) - m.point(x2)
         rhs = m.point(x1) - m.point(torch.zeros_like(x1))
@@ -417,7 +462,8 @@ def test_damped_coefficients_recover_known_decay():
     assert (BL.damped_coefficients(np.zeros(H), Sxy) == 0).all()
 
 
-@pytest.mark.parametrize("arch, cls", [("lru", LRUConfig), ("patchtst", PatchTSTConfig)])
+@pytest.mark.parametrize("arch, cls", [("gru", GRUConfig), ("dlinear", DLinearConfig),
+                                       ("lru", LRUConfig), ("patchtst", PatchTSTConfig)])
 def test_yaml_defaults_match_dataclasses(arch, cls):
     import yaml
     d = yaml.safe_load((CONF / "model" / f"{arch}.yaml").read_text(encoding="utf-8"))
@@ -439,7 +485,9 @@ def test_hydra_composes_new_baselines(arch):
 
 @pytest.mark.parametrize("cfg", [LRUConfig(d_model=8, scan="associative", tau_bounds=(2, 50)),
                                  PatchTSTConfig(patch_len=24, stride=12, norm="layer",
-                                                revin=False, d_model=32, n_heads=4)])
+                                                revin=False, d_model=32, n_heads=4),
+                                 GRUConfig(hidden=16, layers=1, head_hidden=16),
+                                 DLinearConfig(input_len=168, kernel=5)])
 def test_new_configs_roundtrip_and_build(cfg):
     import json
     back = model_config_for(cfg.arch, json.loads(json.dumps(cfg.to_dict())))
@@ -473,13 +521,12 @@ def _fake_ckpt(path, arch="mayak", protocol=DEFAULT_PROTOCOL):
     return str(path)
 
 
-def test_check_comparable_accepts_same_protocol_and_declared_deviations(tmp_path):
+def test_check_comparable_accepts_same_protocol(tmp_path):
     from mayak.lit import check_comparable
     ref = _fake_ckpt(tmp_path / "m.ckpt")
     lru = _fake_ckpt(tmp_path / "l.ckpt", "lru")
-    dev = _fake_ckpt(tmp_path / "p.ckpt", "patchtst",
-                     DEFAULT_PROTOCOL.deviate("не сходится", patience=9))
-    assert check_comparable(ref, [lru, dev]) == {ref: "mayak", lru: "lru", dev: "patchtst"}
+    pt = _fake_ckpt(tmp_path / "p.ckpt", "patchtst")
+    assert check_comparable(ref, [lru, pt]) == {ref: "mayak", lru: "lru", pt: "patchtst"}
 
 
 def test_check_comparable_rejects_mismatch_and_pre_protocol_checkpoints(tmp_path):

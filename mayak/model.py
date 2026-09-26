@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from mayak.astro import astro_features, dewpoint_c
-from mayak.config import N_DAILY_SUMMARY, ModelConfig
+from mayak.astro import astro_features
+from mayak.config import N_DAILY_SUMMARY, SOLAR_CHANNELS, ModelConfig
+from mayak.features import dewpoint_deficit, future_channels, history_channels, lag_valid
 from mayak.modules.loc import LocEncoder
 from mayak.modules.field import ClimateField, ConstantAnchor
 from mayak.modules.passport import Fingerprint
@@ -71,26 +71,41 @@ class MAYAK(nn.Module):
 
     @staticmethod
     def lag_valid(v, k):
-        vs = F.pad(v, (k, 0))[..., :v.shape[-1]]
-        return v * vs
+        """Маска часов, у которых валидны и сам час, и час на k раньше.
+
+        Args:
+            v: маска наличия, форма (..., L).
+            k: лаг в часах.
+
+        Returns:
+            Маска той же формы.
+        """
+        return lag_valid(v, k)
 
     def build_channels(self, x, mask, astro_h, mu_c, sigma_c, defc):
-        """Входные каналы энкодера в порядке cfg.channel_names → (ch, aT, vt)."""
-        T, P, RH = x[..., 0], x[..., 1], x[..., 2]
-        vt, vp, vr = mask[..., 0], mask[..., 1], mask[..., 2]
+        """Входные каналы энкодера в порядке имён каналов конфига.
 
-        aT = ((T - mu_c) / sigma_c).clamp(-8, 8) * vt
-        Td = dewpoint_c(T, RH)
-        adef = (((T - Td).clamp(min=0.0) - defc) / sigma_c).clamp(-8, 8) * vt * vr
+        Каналы, не зависящие от поля, берутся из общего построителя признаков. Здесь
+        добавляются только аномалии температуры и дефицита точки росы относительно поля,
+        в единицах климатологического разброса.
 
-        def dP(p, vpm, k, scale):
-            ps = F.pad(p, (k, 0))[..., :p.shape[-1]]
-            return (((p - ps) / scale).clamp(-4, 4)) * MAYAK.lag_valid(vpm, k)
+        Args:
+            x: наблюдения, форма (B, L, 3).
+            mask: маски наличия, форма (B, L, 3).
+            astro_h: солнечно-календарные признаки часов истории.
+            mu_c: среднее поля на часах истории, форма (B, L).
+            sigma_c: климатологический разброс поля, форма (B, L).
+            defc: дефицит точки росы по полю, форма (B, L).
 
-        sin_d, cos_d, _, czp, sin_y, cos_y = astro_h
-        all_ch = dict(aT=aT, adef=adef, dP3=dP(P, vp, 3, 3.0), dP24=dP(P, vp, 24, 8.0),
-                      rh=(RH / 100.0 - 0.5) * vr, sin_d=sin_d, cos_d=cos_d, czp=czp,
-                      sin_y=sin_y, cos_y=cos_y, vt=vt, vp=vp, vr=vr)
+        Returns:
+            Тройка: каналы формы (B, n_ch, L), аномалия температуры и маска температуры,
+            обе формы (B, L).
+        """
+        shared = history_channels(x, mask, astro_h)
+        vt, vr = shared["vt"], shared["vr"]
+        aT = ((x[..., 0] - mu_c) / sigma_c).clamp(-8, 8) * vt
+        adef = ((dewpoint_deficit(x, mask) - defc) / sigma_c).clamp(-8, 8) * vt * vr
+        all_ch = dict(shared, aT=aT, adef=adef)
         ch = torch.stack([all_ch[n] for n in self.cfg.channel_names], dim=1)
         return ch, aT, vt
 
@@ -102,10 +117,19 @@ class MAYAK(nn.Module):
         return [self._ch_index[n] for n in names if n in self._ch_index]
 
     def solar_future(self, astro_f):
-        """Солнечные ковариаты голов на горизонте: (B, H, n_solar_head)."""
+        """Солнечные ковариаты голов на часах горизонта.
+
+        Args:
+            astro_f: солнечно-календарные признаки часов горизонта.
+
+        Returns:
+            Тензор формы (B, H, n_solar_head); при выключенных солнечных признаках
+            последняя ось пустая.
+        """
         if self.cfg.n_solar_head == 0:
             return astro_f[0].new_zeros(*astro_f[0].shape, 0)
-        return torch.stack([astro_f[0], astro_f[1], astro_f[3]], dim=-1)
+        fut = future_channels(astro_f)
+        return torch.stack([fut[n] for n in SOLAR_CHANNELS], dim=-1)
 
     def issue(self, loc, z, a_re, a_im, e, astro_f):
         """Выпуск прогноза из состояния мод и паспорта. Общий для пакета и рантайма."""

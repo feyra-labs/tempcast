@@ -1,16 +1,16 @@
-# PatchTST: значения по умолчанию = mayak.config.PatchTSTConfig()
-# (конфигурация авторов для набора Weather, scripts/PatchTST/weather.sh).
+# PatchTST: значения по умолчанию совпадают с конфигом модели в коде.
+# Малая конфигурация: суточные патчи без перекрытия, вход - последние 504 ч (21 сутки).
 arch: patchtst
 horizon: 168
 quantiles: [0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95]
-input_len: 672
-patch_len: 16
-stride: 8
-padding_patch: end
-d_model: 128
-n_heads: 16
-d_ff: 256
-layers: 3
+input_len: 504
+patch_len: 24
+stride: 24
+padding_patch: none
+d_model: 32
+n_heads: 4
+d_ff: 64
+layers: 2
 dropout: 0.2
 attn_dropout: 0.0
 head_dropout: 0.0
