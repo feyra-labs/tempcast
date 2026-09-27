@@ -6,7 +6,9 @@
 весового затухания.
 
 Критерий выбора чекпойнта ``val/loss`` - общая часть функции потерь (нормированный
-pinball) без регуляризаторов: одно и то же число для всех моделей.
+pinball) без регуляризаторов: одно и то же число для всех моделей. Рядом пишется тот же
+нормированный pinball по бинам длины истории; на выбор он не влияет и нужен, чтобы видеть,
+на каком участке от холодного старта до полной истории модель лучше или хуже.
 
 Чекпойнт самодостаточен: в гиперпараметрах лежат архитектура, её конфиг, протокол
 и конфиг данных, а под ключом ``RUN_KEY`` - полностью разрешённый конфиг прогона,
@@ -21,8 +23,9 @@ from pytorch_lightning.callbacks import Callback
 
 from mayak.baselines import DLinear, GRUSeq2Seq, LRUForecaster, PatchTST
 from mayak.config import DataConfig, RunConfig, model_config_for
+from mayak.data.holdout import HISTORY_BINS
 from mayak.leakage import SELECTION_KEY, selection_record
-from mayak.loss import forecast_loss
+from mayak.loss import forecast_loss, forecast_terms, masked_mean
 from mayak.model import MAYAK
 from mayak.protocol import ARCH_NAMES, DEFAULT_PROTOCOL, Protocol, ProtocolError
 
@@ -83,15 +86,58 @@ def param_group_summary(model, weight_decay):
             for g in optim_groups(model, weight_decay)]
 
 
+def history_bin_key(lo, hi):
+    """Имя записи журнала для бина длины истории.
+
+    Args:
+        lo: наименьшая длина истории бина, ч.
+        hi: наибольшая длина истории бина, ч.
+
+    Returns:
+        Имя вида val/pinball_L0 или val/pinball_L1-24.
+    """
+    return f"val/pinball_L{lo}" if lo == hi else f"val/pinball_L{lo}-{hi}"
+
+
+HISTORY_LOG = tuple((lo, hi, history_bin_key(lo, hi)) for lo, hi, _name in HISTORY_BINS)
+
+
+def log_history_bins(module, per_pair, weight, hist_len):
+    """Нормированный pinball валидации по бинам длины истории.
+
+    Вес записи равен числу валидных пар «окно × лид» бина в батче. Поэтому среднее за
+    проход валидации совпадает со средним по всем парам бина во всём наборе, так же как
+    у общего числа. Бин без пар в батче не пишется.
+
+    Args:
+        module: модуль, в журнал которого идут записи.
+        per_pair: нормированный pinball пар, форма (B, H).
+        weight: вес пар, форма (B, H).
+        hist_len: длина истории окон, ч, форма (B,).
+    """
+    for lo, hi, key in HISTORY_LOG:
+        inside = ((hist_len >= lo) & (hist_len <= hi)).to(weight.dtype)
+        sel = weight * inside[:, None]
+        n = int(sel.sum())
+        if n:
+            module.log(key, masked_mean(per_pair, sel), batch_size=n)
+
+
 class SelectionProvenance(Callback):
-    """Кладёт в каждый сохраняемый чекпойнт запись о том, на чём он выбирался:
-    метрика монитора, роль станций и временное окно валидационного датасета.
-     Без этой записи чек-лист не примет чекпойнт."""
+    """Кладёт в каждый сохраняемый чекпойнт запись о том, на чём он выбирался.
+
+    В записи метрика монитора, роль станций, временное окно и правило длины истории
+    набора валидации, его отпечаток и все валидационные числа на момент сохранения.
+    Без этой записи чек-лист не примет чекпойнт.
+    """
 
     def on_save_checkpoint(self, trainer, pl_module, checkpoint):
         cb = trainer.checkpoint_callback
         monitor = getattr(cb, "monitor", None)
-        checkpoint[SELECTION_KEY] = selection_record(trainer.datamodule.val_ds, monitor)
+        scores = {k: float(v) for k, v in trainer.callback_metrics.items()
+                  if k.startswith("val/")}
+        checkpoint[SELECTION_KEY] = selection_record(trainer.datamodule.val_ds, monitor,
+                                                     scores=scores)
 
 
 class EMA:
@@ -199,8 +245,13 @@ class LitForecaster(L.LightningModule):
             self.ema.restore(self.model)
 
     def validation_step(self, batch, _):
-        out, data, reg = self.losses(batch)
+        out = self.model(batch)
+        per_pair, weight = forecast_terms(out, batch)
+        data = masked_mean(per_pair, weight)
+        reg = regularization(self.model, out)
         log_val_metrics(self, out, batch, data)
+        if "hist_len" in batch:
+            log_history_bins(self, per_pair, weight, batch["hist_len"])
         self.log("val/total", data + reg, batch_size=batch["y"].shape[0])
         return data
 

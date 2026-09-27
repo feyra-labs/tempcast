@@ -830,12 +830,31 @@ ZONE_WEIGHTINGS = {"uniform": 0.0, "inv_sqrt": 0.5, "inv": 1.0}
 
 @dataclass(frozen=True)
 class DataConfig:
+    """Данные прогона: источник, правила окон, аугментации, набор валидации.
+
+    Attributes:
+        manifest: путь к манифесту станций.
+        cache_root: каталог кэша; None - рядом с манифестом.
+        time_layout: раскладка ряда; должна совпадать с раскладкой в коде.
+        target_mask: правило годности цели окна.
+        val_every_hours: шаг между кандидатами в начала горизонта валидации, ч.
+        val_windows_per_station: сколько окон валидации берётся с каждой станции; станция
+            с меньшим числом кандидатов отдаёт все свои. Этим числом задаётся размер
+            набора валидации, проход валидации идёт по всему набору.
+        val_seed: сид выбора длины истории окон валидации. Не зависит от сидов протокола,
+            поэтому набор одинаков у всех архитектур и повторов.
+        augment: аугментации обучающих окон.
+        window_qc: причинный QC истории обучающих окон.
+        zone_weighting: вес станции при сэмплировании по её зоне.
+        zone_weight_cap: верхняя граница веса станции относительно среднего; 0 - без неё.
+    """
     manifest: str = "data/manifest.csv"
     cache_root: Optional[str] = None
     time_layout: dict = field(default_factory=lambda: dict(TIME_LAYOUT))
     target_mask: TargetMaskConfig = TargetMaskConfig()
-    val_every_hours: int = 72
-    val_max_windows: int = 8000
+    val_every_hours: int = 24
+    val_windows_per_station: int = 96
+    val_seed: int = 0
     augment: AugmentConfig = AugmentConfig()
     window_qc: bool = True
     zone_weighting: str = "inv_sqrt"
@@ -860,8 +879,10 @@ class DataConfig:
                               f"{dict(TIME_LAYOUT)}: раскладка входит в ключ кэша и "
                               f"задаётся только в коде")
         object.__setattr__(self, "time_layout", tl)
-        if self.val_every_hours < 1 or self.val_max_windows < 1:
-            raise ConfigError("val_every_hours и val_max_windows ≥ 1")
+        if self.val_every_hours < 1 or self.val_windows_per_station < 1:
+            raise ConfigError("val_every_hours и val_windows_per_station должны быть не меньше 1")
+        if self.val_seed < 0:
+            raise ConfigError(f"val_seed = {self.val_seed}: сид не может быть отрицательным")
         if not isinstance(self.window_qc, bool):
             raise ConfigError(f"window_qc должен быть bool, получено {self.window_qc!r}")
 
@@ -870,6 +891,22 @@ class DataConfig:
 
     @classmethod
     def from_dict(cls, d=None):
+        """Конфиг данных из словаря.
+
+        Args:
+            d: словарь с полями конфига; None - значения по умолчанию.
+
+        Returns:
+            Конфиг данных.
+
+        Raises:
+            ConfigError: неизвестный ключ или ключ прежнего набора валидации.
+        """
+        if d is not None and "val_max_windows" in d:
+            raise ConfigError("data.val_max_windows больше не поддерживается: размер набора "
+                              "валидации задаётся числом окон на станцию "
+                              "(val_windows_per_station). Конфиг с этим ключом принадлежит "
+                              "прогону, выбранному по прежней валидации; переобучите модель")
         return cls(**_strict_kwargs(cls, d, "data"))
 
 

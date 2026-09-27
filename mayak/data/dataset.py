@@ -11,7 +11,7 @@ from mayak.data.augment import AugWindow, augment_window, record_window
 from mayak.data.masking import (DEFAULT_TARGET_MASK, FilterStats, enforce_invariant,
                                 target_window_ok)
 from mayak.data.qc import DEFAULT_QC, qc_window
-from mayak.data.splits import ROLE_TRAIN, ROLE_VAL, time_layout
+from mayak.data.splits import ROLE_TRAIN, time_layout
 from mayak.data.store import get_store
 from mayak.timeaxis import window_calendar
 from mayak.zones import normalize_zone
@@ -19,6 +19,62 @@ from mayak.zones import normalize_zone
 log = logging.getLogger(__name__)
 
 STREAM_SAMPLE, STREAM_AUG = 0, 1
+
+# Распределение длины истории окна по куррикулумам этапов. Каждая часть задана тройкой:
+# верхняя граница накопленной вероятности, наименьшая и наибольшая длина, ч. Внутри части
+# длина равномерна. Одно распределение служит обучению и выбору чекпойнта.
+HISTORY_MIX = {
+    "L0": ((1.0, 0, 0),),
+    "full": ((0.05, 0, 0), (0.20, 1, 48), (0.45, 48, 240), (1.0, 240, L_MAX)),
+}
+
+
+def sample_history_len(rng, curriculum):
+    """Длина истории одного окна по распределению куррикулума.
+
+    Если распределение сводится к одной длине, генератор не трогается.
+
+    Args:
+        rng: генератор numpy.
+        curriculum: имя куррикулума.
+
+    Returns:
+        Длина истории, ч.
+
+    Raises:
+        ValueError: неизвестный куррикулум.
+    """
+    if curriculum not in HISTORY_MIX:
+        raise ValueError(f"неизвестный куррикулум {curriculum!r}; есть {tuple(HISTORY_MIX)}")
+    parts = HISTORY_MIX[curriculum]
+    if len(parts) == 1 and parts[0][1] == parts[0][2]:
+        return int(parts[0][1])
+    u = rng.random()
+    lo, hi = parts[-1][1:]
+    for upper, a, b in parts[:-1]:
+        if u < upper:
+            lo, hi = a, b
+            break
+    return int(lo) if lo == hi else int(rng.integers(lo, hi + 1))
+
+
+def history_probability(curriculum, lo, hi):
+    """Вероятность того, что длина истории окна лежит в заданных границах.
+
+    Args:
+        curriculum: имя куррикулума.
+        lo: наименьшая длина, ч, включительно.
+        hi: наибольшая длина, ч, включительно.
+
+    Returns:
+        Вероятность от нуля до единицы.
+    """
+    total, prev = 0.0, 0.0
+    for upper, a, b in HISTORY_MIX[curriculum]:
+        overlap = max(0, min(hi, b) - max(lo, a) + 1)
+        total += (upper - prev) * overlap / (b - a + 1)
+        prev = upper
+    return total
 
 
 def make_streams(base_seed, worker_id=0, salt=0, aug_seed=None):
@@ -89,26 +145,6 @@ def slice_context(raw, present, t, L, floor):
     k = qc_context(t, L, floor)
     src = np.arange(t - L - k, t - L)
     return enforce_invariant(raw[src], present[src])
-
-
-def device_history(s, t, L, floor):
-    """История окна так, как её увидит прибор.
-
-    Args:
-        s: запись станции с полями raw, present и qc_elev.
-        t: начало горизонта, индекс часа.
-        L: фактическая длина истории, ч.
-        floor: самый ранний час, доступный истории окна.
-
-    Returns:
-        Пара массивов (L_MAX, 3): значения и маска после QC.
-    """
-    x_hist, m_hist = slice_history(s["raw"], s["present"], t, L)
-    if L == 0:
-        return x_hist, m_hist
-    past = slice_context(s["raw"], s["present"], t, L, floor)
-    mask, _ = qc_window(x_hist, m_hist, elev=s["qc_elev"], past=past)
-    return enforce_invariant(x_hist, mask)
 
 
 def station_qc_elev(r):
@@ -234,7 +270,7 @@ class WindowDataset(Dataset):
                  store=None, aug_seed=None, augment=None, cache_root=None, window_qc=True,
                  zone_weighting="inv_sqrt", zone_weight_cap=0.0):
         assert split in ("train",)
-        assert curriculum in ("full", "L0")
+        assert curriculum in HISTORY_MIX
         self.curriculum = curriculum
         self.n = windows_per_epoch
         self.base_seed = int(seed)
@@ -290,17 +326,7 @@ class WindowDataset(Dataset):
         return self.n
 
     def _sample_L(self):
-        r = self.rng_sample
-        if self.curriculum == "L0":
-            return 0
-        u = r.random()
-        if u < 0.05:
-            return 0
-        if u < 0.20:
-            return int(r.integers(1, 49))
-        if u < 0.45:
-            return int(r.integers(2 * 24, 10 * 24 + 1))
-        return int(r.integers(10 * 24, L_MAX + 1))
+        return sample_history_len(self.rng_sample, self.curriculum)
 
     def __getitem__(self, _idx):
         r = self.rng_sample
@@ -365,66 +391,3 @@ class WindowDataset(Dataset):
             "norm_scale": torch.from_numpy(scale),
         }
 
-
-class HoldoutDataset(Dataset):
-    """Детерминированные окна валидации: фиксированная история, без аугментаций.
-
-    История проходит тот же причинный QC, что на приборе.
-    """
-
-    def __init__(self, manifest, station_split=ROLE_VAL, time_key="val",
-                 every_hours=72, L=L_MAX, max_windows=8000,
-                 target_mask=DEFAULT_TARGET_MASK, store=None):
-        store = store or get_store(manifest)
-        self.station_role, self.time_key = station_split, time_key
-        self.meta = []
-        self.filter_stats = FilterStats()
-        for r in store.by_role(station_split):
-            x, mask, N = r["x"], r["mask"], r["N"]
-            layout = time_layout(N)
-            floor = layout.history_floor(time_key)
-            cand, ok = block_starts(layout, time_key, mask[:, 0], every_hours, cfg=target_mask)
-            self.filter_stats.add(len(cand), len(ok))
-            for t in ok.tolist():
-                self.meta.append(dict(id=r["id"], N=N, floor=floor, x=x, mask=mask, t=t,
-                                      raw=r["raw"], present=r["present"],
-                                      qc_elev=station_qc_elev(r), t0=r["t0"],
-                                      clim=r["clim"],
-                                      lat=float(r["lat"]), lon=float(r["lon"]),
-                                      elev=float(r["elev"]), koppen=r["koppen"],
-                                      split=station_split, L=L))
-        self.filter_stats.report(f"{station_split}/{time_key}")
-        if len(self.meta) > max_windows:
-            step = len(self.meta) // max_windows
-            self.meta = self.meta[::step][:max_windows]
-
-    def __len__(self):
-        return len(self.meta)
-
-    def footprints(self):
-        for m in self.meta:
-            lo, hi = footprint(m["t"], m["L"], m["floor"])
-            yield dict(sid=m["id"], N=m["N"], time_key=self.time_key,
-                       lo=np.array([lo]), t=np.array([m["t"]]), hi=np.array([hi]))
-
-    def __getitem__(self, i):
-        m = self.meta[i]
-        t = m["t"]
-        L = history_len(m["L"], t, m["floor"])
-        k = np.arange(L_MAX)
-        abs_h = t - L_MAX + k
-        doy_h, hour_h = window_calendar(m["t0"], abs_h)
-        x_hist, mask_hist = device_history(m, t, L, m["floor"])
-        fut = np.arange(t, t + H)
-        doy_f, hour_f = window_calendar(m["t0"], fut)
-        y, y_mask = slice_target(m["x"], m["mask"], t)
-        return {
-            "lat": torch.tensor(m["lat"], dtype=torch.float32),
-            "lon": torch.tensor(m["lon"], dtype=torch.float32),
-            "elev": torch.tensor(m["elev"], dtype=torch.float32),
-            "x_hist": torch.from_numpy(x_hist), "mask_hist": torch.from_numpy(mask_hist),
-            "doy_hist": torch.from_numpy(doy_h), "hour_hist": torch.from_numpy(hour_h),
-            "doy_fut": torch.from_numpy(doy_f), "hour_fut": torch.from_numpy(hour_f),
-            "y": torch.from_numpy(y), "y_mask": torch.from_numpy(y_mask),
-            "norm_scale": torch.from_numpy(norm_scale(m["clim"], doy_f, hour_f)),
-        }

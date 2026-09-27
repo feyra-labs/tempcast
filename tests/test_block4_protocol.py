@@ -16,6 +16,7 @@ from mayak.constants import H, L_MAX, QUANTILES
 from mayak.data import store as S
 from mayak.data.climatology import ABS_TO_SD, SCALE_FLOOR_FRAC, Climatology
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL, time_layout
+from mayak.leakage import SELECTION_KEY
 from mayak.loss import NORM_SCALE_CLAMP, forecast_loss, pinball
 from mayak.protocol import (ARCH_NAMES, DEFAULT_PROTOCOL, Protocol, ProtocolError, Stage,
                             protocol_for, read_journal, run_protocol)
@@ -189,20 +190,22 @@ def test_norm_scale_unaffected_by_augmentations(manifest, store):
     assert all(torch.equal(items[0]["norm_scale"], it["norm_scale"]) for it in items[1:])
 
 
-def test_holdout_and_eval_sets_emit_same_norm_scale(manifest, store):
-    from mayak.data.dataset import HoldoutDataset
+def test_validation_and_eval_sets_emit_same_norm_scale(manifest, store):
+    from mayak.data.datamodule import MayakData
     from mayak.evaluate import EvalSet
-    hd = HoldoutDataset(manifest, station_split=ROLE_VAL, time_key="val", store=store)
+    dm = MayakData(manifest, windows_per_epoch=4, num_workers=0)
+    dm.setup()
+    hd = dm.val_ds
     for i in range(0, len(hd), max(1, len(hd) // 5)):
-        m = hd.meta[i]
-        assert np.allclose(hd[i]["norm_scale"].numpy(),
-                           _expected_scale(store.stations[m["id"]]["clim"], m["t0"], m["t"]))
+        sid, t = hd.items[i]
+        s = store.stations[sid]
+        assert np.allclose(hd[i]["norm_scale"].numpy(), _expected_scale(s["clim"], s["t0"], t))
     ev = EvalSet(store.clims(), station_splits=(ROLE_VAL,), manifest=manifest, time_key="val")
-    by_key = {(m["id"], m["t"]): hd[i]["norm_scale"] for i, m in enumerate(hd.meta)}
+    by_key = {item: hd[i]["norm_scale"] for i, item in enumerate(hd.items)}
     n = 0
-    for i, (sid, t) in enumerate(ev.items):
-        if (sid, t) in by_key:
-            assert torch.equal(ev[i]["norm_scale"], by_key[(sid, t)])
+    for i, item in enumerate(ev.items):
+        if item in by_key:
+            assert torch.equal(ev[i]["norm_scale"], by_key[item])
             n += 1
     assert n > 0
 
@@ -363,7 +366,16 @@ def test_protocol_rejects_invalid_values():
     with pytest.raises(ValueError):
         Protocol(lr_schedule="step")
     with pytest.raises(ValueError):
-        Protocol(stages=(Stage("A", "L0", 1, 0), Stage("A", "full", 1, L_MAX)))
+        Protocol(stages=(Stage("A", "L0", 1), Stage("A", "full", 1)))
+
+
+def test_protocol_rejects_old_validation_fields():
+    d = DEFAULT_PROTOCOL.to_dict()
+    with pytest.raises(ProtocolError, match="прежней валидации"):
+        Protocol.from_dict(dict(d, val_batches=20))
+    old_stages = [dict(s, val_L=0) for s in d["stages"]]
+    with pytest.raises(ProtocolError, match="прежней валидации"):
+        Protocol.from_dict(dict(d, stages=old_stages))
 
 
 def test_every_architecture_gets_the_same_protocol():
@@ -417,9 +429,10 @@ def test_protocol_module_never_mentions_test_window():
     assert not re.findall(r"\btest\b|unseen_test|ROLE_TEST", src)
 
 
-TINY = Protocol(stages=(Stage("A", "L0", 2, 0), Stage("B", "full", 2, L_MAX)),
+TINY = Protocol(stages=(Stage("A", "L0", 2), Stage("B", "full", 2)),
                 batch_size=2, windows_per_epoch=8, num_workers=0, seed=3, precision="32",
-                val_every=1, val_batches=1)
+                val_every=1)
+TINY_DATA = dict(val_windows_per_station=3)
 
 
 class _BatchRecorder:
@@ -441,15 +454,39 @@ class _BatchRecorder:
         return Rec()
 
 
+class _ValRecorder:
+    """Колбэк: окна каждого прохода валидации (без проверочного прохода перед обучением)."""
+
+    def __new__(cls):
+        from pytorch_lightning.callbacks import Callback
+
+        class Rec(Callback):
+            def __init__(self):
+                self.passes = []
+
+            def on_validation_epoch_start(self, trainer, pl_module):
+                if not trainer.sanity_checking:
+                    self.passes.append(dict(stage=pl_module.hparams.stage, n=0, hist=[]))
+
+            def on_validation_batch_start(self, trainer, pl_module, batch, batch_idx,
+                                          dataloader_idx=0):
+                if not trainer.sanity_checking:
+                    self.passes[-1]["n"] += int(batch["y"].shape[0])
+                    self.passes[-1]["hist"] += batch["hist_len"].tolist()
+
+        return Rec()
+
+
 @pytest.fixture(scope="module")
 def runs(manifest, store, tmp_path_factory):
     out = tmp_path_factory.mktemp("runs4")
     res = {}
     for arch in ARCH_NAMES:
-        rec = _BatchRecorder()
+        rec, val = _BatchRecorder(), _ValRecorder()
         journal = run_protocol(arch, manifest, TINY, out_root=str(out), accelerator="cpu",
-                               callbacks=[rec], enable_progress_bar=False)
-        res[arch] = dict(journal=journal, hashes=rec.hashes)
+                               callbacks=[rec, val], enable_progress_bar=False,
+                               data_config=TINY_DATA)
+        res[arch] = dict(journal=journal, hashes=rec.hashes, val=val.passes)
     return out, res
 
 
@@ -497,6 +534,51 @@ def test_checkpoints_carry_protocol_and_pass_checklist(runs, store):
                                                  map_location="cpu")
         assert type(lit.model).__name__ == type(_lit(arch).model).__name__
     run_checklist(store, checkpoints=ckpts)
+
+
+def test_validation_set_is_the_same_for_every_architecture(runs):
+    _, res = runs
+    ref = res[ARCH_NAMES[0]]
+    for arch in ARCH_NAMES:
+        j = res[arch]["journal"]
+        assert [s["val_set"] for s in j["stages"]] == \
+            [s["val_set"] for s in ref["journal"]["stages"]], arch
+        assert res[arch]["val"] == ref["val"], f"{arch}: другие окна валидации"
+        for st in j["stages"]:
+            rec = torch.load(st["best_ckpt"], map_location="cpu", weights_only=False)
+            sel = rec[SELECTION_KEY]
+            assert sel["windows_digest"] == st["val_set"]
+            assert sel["history"]["curriculum"] == st["curriculum"]
+            assert sel["scores"]["val/loss"] == pytest.approx(st["best_score"])
+            assert st["selection"] == sel["scores"]
+
+
+def test_every_validation_pass_covers_the_whole_set(runs, manifest, store):
+    from mayak.evaluate import EvalSet
+    _, res = runs
+    for arch in ARCH_NAMES:
+        passes = res[arch]["val"]
+        assert passes and {p["stage"] for p in passes} == {"A", "B"}
+        for p in passes:
+            curriculum = next(s.curriculum for s in TINY.stages if s.name == p["stage"])
+            full = EvalSet(store.clims(), station_splits=(ROLE_VAL,), manifest=manifest,
+                           time_key="val", every_hours=24, max_windows=None,
+                           windows_per_station=TINY_DATA["val_windows_per_station"],
+                           curriculum=curriculum)
+            assert p["n"] == len(full) > TINY.batch_size, "проход валидации обрезан"
+            assert p["hist"] == full.requested
+            if p["stage"] == "A":
+                assert set(p["hist"]) == {0}
+
+
+def test_selection_log_has_history_bins(runs):
+    _, res = runs
+    j = res["dlinear"]["journal"]
+    sel = {s["name"]: s["selection"] for s in j["stages"]}
+    assert set(sel["A"]) >= {"val/loss", "val/pinball_L0"}
+    assert not any(k.startswith("val/pinball_L1") for k in sel["A"]), "на этапе A только L=0"
+    bins = [k for k in sel["B"] if k.startswith("val/pinball_L")]
+    assert bins and all(np.isfinite(sel["B"][k]) for k in bins)
 
 
 def test_stage_b_starts_from_stage_a_weights(runs):

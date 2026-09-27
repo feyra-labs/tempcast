@@ -146,26 +146,27 @@ def test_sampled_train_windows_stay_in_train_window_with_gap(dm):
         assert lay.span("val")[0] - (t + H) >= H + L_MAX, "окно ближе зазора к валидации"
 
 
-@pytest.mark.parametrize("L", [0, 24, L_MAX])
-def test_holdout_items_match_declared_footprints(manifest, store, L):
-    from mayak.data.dataset import HoldoutDataset
+@pytest.mark.parametrize("L", [0, 24, L_MAX, "full"])
+def test_validation_items_match_declared_footprints(manifest, store, L):
     from mayak.data.dataset import qc_context
     from mayak.data.qc import DEFAULT_QC
-    ds = HoldoutDataset(manifest, time_key="val", every_hours=48, L=L, store=store)
+    kw = dict(curriculum=L) if L == "full" else dict(L=L)
+    ds = _eval_set(store, manifest, (ROLE_VAL,), "val", every_hours=48, **kw)
     fps = list(ds.footprints())
     assert len(ds) == len(fps) > 0
     for i, fp in enumerate(fps):
-        m = ds.meta[i]
+        sid, t = ds.items[i]
+        floor, N = ds.floor[sid], store.stations[sid]["N"]
+        n = ds.requested[i]
         L_real = int(ds[i]["mask_hist"][:, 0].sum())
-        assert L_real == L, "окно оценки обрезало историю или QC отбраковал чистый ряд"
-        ctx = qc_context(m["t"], L, m["floor"])
-        assert (int(fp["lo"][0]), int(fp["t"][0]), int(fp["hi"][0])) == \
-            (m["t"] - L - ctx, m["t"], m["t"] + H)
-        assert ctx == (min(DEFAULT_QC.lookback_hours, m["t"] - L - m["floor"]) if L == L_MAX
-                       else 0)
-        lay = time_layout(m["N"])
-        assert lay.block_index("val", [m["t"]], [m["t"] + H])[0] >= 0
-        assert not lay.overlaps(("train", "test"), [m["t"] - L_MAX], [m["t"]])[0]
+        assert L_real == n == int(ds[i]["hist_len"]), \
+            "окно оценки обрезало историю или QC отбраковал чистый ряд"
+        ctx = qc_context(t, n, floor)
+        assert (int(fp["lo"][0]), int(fp["t"][0]), int(fp["hi"][0])) == (t - n - ctx, t, t + H)
+        assert ctx == (min(DEFAULT_QC.lookback_hours, t - n - floor) if n == L_MAX else 0)
+        lay = time_layout(N)
+        assert lay.block_index("val", [t], [t + H])[0] >= 0
+        assert not lay.overlaps(("train", "test"), [t - L_MAX], [t])[0]
 
 
 def test_eval_windows_do_not_depend_on_history_length(store, manifest):
@@ -179,9 +180,10 @@ def test_eval_windows_do_not_depend_on_history_length(store, manifest):
 
 
 def test_datamodule_uses_role_and_window_contract(dm):
-    assert dm.val_ds.station_role == ROLE_VAL and dm.val_ds.time_key == "val"
+    assert dm.val_ds.station_splits == (ROLE_VAL,) and dm.val_ds.time_key == "val"
+    assert dm.val_ds.history_spec() == dict(curriculum="full", L=None, seed=0)
     assert dm.train_ds.station_role == ROLE_TRAIN and dm.train_ds.time_key == "train"
-    assert {m["id"] for m in dm.val_ds.meta} == {"v0", "v1"}
+    assert {sid for sid, _t in dm.val_ds.items} == {"v0", "v1"}
 
 
 def _rows(sizes, seed=0):
@@ -288,14 +290,14 @@ def test_deep_check_catches_coefficients_fit_on_test_window(store):
 
 
 def test_checklist_catches_target_crossing_block_boundary(store, manifest):
-    from mayak.data.dataset import HoldoutDataset
-    ds = HoldoutDataset(manifest, time_key="val", every_hours=72, store=store)
+    ds = _eval_set(store, manifest, (ROLE_VAL,), "val", every_hours=72)
     check_windows([ds], store)
     lo, hi = time_layout(N_HOURS).blocks["val"][0]
-    ds.meta[0] = dict(ds.meta[0], t=hi - H + 1)
+    sid, _t = ds.items[0]
+    ds.items[0] = (sid, hi - H + 1)
     with pytest.raises(LeakageError, match="не лежит целиком в одном блоке окна val"):
         check_windows([ds], store)
-    ds.meta[0] = dict(ds.meta[0], t=lo - 1)
+    ds.items[0] = (sid, lo - 1)
     with pytest.raises(LeakageError, match="блоке окна val"):
         check_windows([ds], store)
 
@@ -367,17 +369,18 @@ def _ckpt(tmp_path, name, record):
 
 
 def test_checkpoint_selection_check(store, manifest, dm, tmp_path):
-    from mayak.data.dataset import HoldoutDataset
     check_checkpoint(_ckpt(tmp_path, "ok", selection_record(dm.val_ds, "val/loss")), store)
 
-    on_test = HoldoutDataset(manifest, station_split=ROLE_TEST, time_key="test", store=store)
-    on_calib = HoldoutDataset(manifest, station_split=ROLE_VAL, time_key="calib", store=store)
+    on_test = _eval_set(store, manifest, (ROLE_TEST,), "test", curriculum="full")
+    on_calib = _eval_set(store, manifest, (ROLE_VAL,), "calib", curriculum="full")
+    fixed_L = _eval_set(store, manifest, (ROLE_VAL,), "val", L=L_MAX)
     bad = {
         "no_record": None,
         "train_metric": selection_record(dm.val_ds, "train/loss"),
         "no_monitor": selection_record(dm.val_ds, None),
         "test_window": selection_record(on_test, "val/loss"),
         "calib_window": selection_record(on_calib, "val/loss"),
+        "fixed_history": selection_record(fixed_L, "val/loss"),
         "old_splits": dict(selection_record(dm.val_ds, "val/loss"), layout_code="0" * 16),
     }
     for name, rec in bad.items():
@@ -399,6 +402,9 @@ def test_trainer_checkpoint_carries_selection_record(dm, store, tmp_path):
     rec = torch.load(ck.best_model_path, map_location="cpu", weights_only=False)[SELECTION_KEY]
     assert rec["station_role"] == ROLE_VAL and rec["time_key"] == "val"
     assert rec["monitor"] == "val/loss" and rec["stations"] == ["v0", "v1"]
+    assert rec["history"] == dict(curriculum="full", L=None, seed=0)
+    assert rec["windows"] == len(dm.val_ds) and rec["windows_digest"] == dm.val_ds.fingerprint()
+    assert "val/loss" in rec["scores"]
     run_checklist(store, checkpoints=[ck.best_model_path])
 
 

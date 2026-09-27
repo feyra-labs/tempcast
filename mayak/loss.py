@@ -19,12 +19,29 @@ def masked_mean(x, w):
     return num / w.sum().clamp_min(1e-8)
 
 
-def pinball(q, y, y_mask, scale):
+def pinball_terms(q, y, y_mask, scale):
+    """Нормированный pinball каждой пары «окно × лид» и её вес.
+
+    Args:
+        q: квантили прогноза, форма (B, H, 7).
+        y: цель, форма (B, H).
+        y_mask: маска цели, форма (B, H).
+        scale: нормировочный масштаб, форма (B, H).
+
+    Returns:
+        Пара тензоров формы (B, H): pinball, усреднённый по квантилям, и вес пары -
+        единица у валидной цели, ноль у пропущенной.
+    """
     taus = torch.tensor(QUANTILES, dtype=q.dtype, device=q.device)
     m = (y_mask > 0).to(q.dtype)
     y = torch.where(m > 0, y, torch.zeros_like(y))
     err = (y[..., None] - q) / scale[..., None]
     per_pair = torch.maximum(taus * err, (taus - 1.0) * err).mean(-1)
+    return per_pair, m
+
+
+def pinball(q, y, y_mask, scale):
+    per_pair, m = pinball_terms(q, y, y_mask, scale)
     return masked_mean(per_pair, m)
 
 
@@ -36,10 +53,24 @@ def loss_scale(batch):
     return batch["norm_scale"].detach().clamp(*NORM_SCALE_CLAMP)
 
 
+def forecast_terms(out, batch):
+    """Общая часть функции потерь по парам «окно × лид», до усреднения.
+
+    Args:
+        out: выход модели с квантилями под ключом q.
+        batch: батч с целью, её маской и нормировочным масштабом.
+
+    Returns:
+        Пара тензоров формы (B, H): нормированный pinball пары и её вес.
+    """
+    q = out["q"]
+    return pinball_terms(q, batch["y"], batch["y_mask"], loss_scale(batch).to(q.dtype))
+
+
 def forecast_loss(out, batch):
     """Общая часть функции потерь всех моделей: зависит только от q, y, y_mask, norm_scale."""
-    q = out["q"]
-    return pinball(q, batch["y"], batch["y_mask"], loss_scale(batch).to(q.dtype))
+    per_pair, m = forecast_terms(out, batch)
+    return masked_mean(per_pair, m)
 
 
 def mayak_regularizers(out):

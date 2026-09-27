@@ -417,7 +417,7 @@ def test_seed_spread_reports_mean_and_range():
 
 
 def test_stratified_subsample_keeps_every_station():
-    from mayak.evaluate import stratified_items
+    from mayak.data.holdout import stratified_items
     per_station = {"many": list(range(0, 1000, 10)), "few": [0, 5, 10, 15, 20]}
     items = stratified_items(per_station, max_windows=20)
     got = {sid: sum(1 for s, _ in items if s == sid) for sid in per_station}
@@ -431,14 +431,14 @@ def test_stratified_subsample_keeps_every_station():
 
 
 def test_stratified_subsample_is_spread_over_time():
-    from mayak.evaluate import stratified_items
+    from mayak.data.holdout import stratified_items
     items = stratified_items({"a": list(range(100))}, windows_per_station=5)
     ts = [t for _s, t in items]
     assert ts == [0, 25, 50, 74, 99]
 
 
 def test_stratified_subsample_keeps_everything_without_cap():
-    from mayak.evaluate import stratified_items
+    from mayak.data.holdout import stratified_items
     per_station = {"a": [1, 2, 3], "b": [4, 5]}
     assert len(stratified_items(per_station)) == 5
     assert stratified_items({}) == []

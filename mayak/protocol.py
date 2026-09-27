@@ -8,7 +8,9 @@ run_protocol. Для любой архитектуры одинаковы:
 * оптимизатор AdamW (lr, betas, базовое весовое затухание), косинусное расписание,
   обрезка градиента, точность вычислений;
 * функция потерь (mayak/loss.py) и метрика выбора чекпойнта ``val/loss`` общий
-  нормированный pinball на валидационных станциях в валидационном окне;
+  нормированный pinball на всём наборе валидации: одинаковое число окон с каждой
+  валидационной станции в валидационном окне, длина истории каждого окна - из того же
+  распределения, что при обучении этапа, генератором с фиксированным сидом;
 * ранняя остановка, выбор лучшего чекпойнта и экспоненциальное усреднение весов.
 
 Сиды раздельные (``Seeds``): инициализация весов, поток окон, аугментации, подвыборка
@@ -27,8 +29,6 @@ import logging
 import os
 from dataclasses import asdict, dataclass, fields, replace
 from typing import Optional
-
-from mayak.constants import L_MAX
 
 log = logging.getLogger(__name__)
 
@@ -49,18 +49,25 @@ def _jsonable(v):
 
 @dataclass(frozen=True)
 class Stage:
+    """Этап обучения.
+
+    Куррикулум задаёт распределение длины истории и обучающих окон, и окон валидации,
+    поэтому отдельной длины истории для валидации у этапа нет.
+
+    Attributes:
+        name: имя этапа.
+        curriculum: имя куррикулума длины истории.
+        steps: число шагов оптимизатора.
+    """
     name: str
     curriculum: str
     steps: int
-    val_L: int
 
     def __post_init__(self):
         if self.curriculum not in CURRICULA:
             raise ValueError(f"этап {self.name}: неизвестный куррикулум {self.curriculum!r}")
         if int(self.steps) < 1:
             raise ValueError(f"этап {self.name}: число шагов < 1")
-        if not 0 <= int(self.val_L) <= L_MAX:
-            raise ValueError(f"этап {self.name}: val_L вне [0, {L_MAX}]")
 
 
 @dataclass(frozen=True)
@@ -94,7 +101,7 @@ SEED_NAMES = tuple(f.name for f in fields(Seeds))
 
 @dataclass(frozen=True)
 class Protocol:
-    stages: tuple = (Stage("A", "L0", 10_000, 0), Stage("B", "full", 200_000, L_MAX))
+    stages: tuple = (Stage("A", "L0", 10_000), Stage("B", "full", 200_000))
     batch_size: int = 256
     windows_per_epoch: int = 200_000
     num_workers: int = 8
@@ -108,7 +115,6 @@ class Protocol:
     ema_decay: float = 0.999
     monitor: str = "val/loss"
     val_every: int = 2000
-    val_batches: int = 20
     patience: int = 5
     seeds: Seeds = Seeds()
 
@@ -145,12 +151,19 @@ class Protocol:
 
         Raises:
             ProtocolError: в словаре есть непустой список отклонений архитектуры; такой
-                протокол не общий, и сравнивать по нему нельзя.
+                протокол не общий, и сравнивать по нему нельзя. Или в словаре есть поля
+                прежней валидации: число батчей валидации или длина истории валидации
+                этапа; чекпойнт такого прогона выбран по другому набору.
         """
         d = dict(d)
         if d.pop("deviations", None):
             raise ProtocolError("протокол с отклонениями для отдельной архитектуры не "
                                 "поддерживается: протокол один на все модели")
+        stages = [s if isinstance(s, Stage) else dict(s) for s in d.get("stages", ())]
+        if "val_batches" in d or any(isinstance(s, dict) and "val_L" in s for s in stages):
+            raise ProtocolError("протокол прежней валидации (val_batches, val_L у этапов): "
+                                "чекпойнт выбран на части набора с одной длиной истории; "
+                                "переобучите модель")
         return cls(**d)
 
     def resolved_seeds(self):
@@ -188,7 +201,7 @@ _CLI = [
     ("--lr", "lr", float), ("--weight-decay", "weight_decay", float),
     ("--grad-clip", "grad_clip", float), ("--precision", "precision", str),
     ("--ema-decay", "ema_decay", float), ("--val-every", "val_every", int),
-    ("--val-batches", "val_batches", int), ("--patience", "patience", int),
+    ("--patience", "patience", int),
 ]
 
 
@@ -246,7 +259,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
 
     from mayak.config import (DataConfig, RunConfig, check_pipeline_compat, model_config_for)
     from mayak.data.datamodule import MayakData
-    from mayak.leakage import run_checklist
+    from mayak.leakage import SELECTION_KEY, run_checklist
     from mayak.lit import (ARCHS, LitForecaster, SelectionProvenance, param_group_summary,
                            parameter_counts)
 
@@ -283,10 +296,12 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
         dm = MayakData(manifest=manifest, curriculum=stage.curriculum,
                        batch_size=protocol.batch_size, windows_per_epoch=protocol.windows_per_epoch,
                        num_workers=protocol.num_workers, seed=seeds["data"],
-                       aug_seed=seeds["augment"], val_L=stage.val_L,
-                       data_config=data_cfg.to_dict())
+                       aug_seed=seeds["augment"], data_config=data_cfg.to_dict())
         dm.setup("fit")
         run_checklist(dm.store, datasets=[dm.train_ds, dm.val_ds])
+        log.info("%s: этап %s, валидация %d окон на %d станциях, длины истории %s, "
+                 "отпечаток %s", arch, stage.name, len(dm.val_ds), len(dm.val_ds.floor),
+                 dm.val_ds.history_spec(), dm.val_ds.fingerprint())
 
         lit = LitForecaster(arch=arch, protocol=protocol.to_dict(), stage=stage.name,
                             total_steps=stage.steps, model_config=model_cfg.to_dict(),
@@ -310,7 +325,9 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
             max_steps=stage.steps, accelerator=accelerator, devices=1,
             precision=protocol.precision, gradient_clip_val=protocol.grad_clip,
             val_check_interval=min(protocol.val_every, stage.steps), check_val_every_n_epoch=None,
-            limit_val_batches=protocol.val_batches,
+            # Проход валидации идёт по всему набору: размер набора задаётся числом
+            # окон на станцию, обрезка по батчам выбросила бы последние станции.
+            limit_val_batches=1.0,
             logger=CSVLogger(out_root, name=f"{tag}/stage{stage.name}"), log_every_n_steps=20,
             callbacks=[ckpt, SelectionProvenance(), LearningRateMonitor("step"),
                        EarlyStopping(monitor=protocol.monitor, patience=protocol.patience,
@@ -322,10 +339,15 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
                                 f"валидация ни разу не прошла")
         prev_ckpt = ckpt.best_model_path
         best = ckpt.best_model_score
+        chosen = torch.load(prev_ckpt, map_location="cpu", weights_only=False)
+        selection = (chosen.get(SELECTION_KEY) or {}).get("scores", {})
         journal["stages"].append(dict(name=stage.name, curriculum=stage.curriculum,
                                       steps_done=int(trainer.global_step),
                                       best_ckpt=prev_ckpt,
-                                      best_score=None if best is None else float(best)))
+                                      best_score=None if best is None else float(best),
+                                      val_windows=len(dm.val_ds),
+                                      val_set=dm.val_ds.fingerprint(),
+                                      selection=selection))
         journal["final_ckpt"] = prev_ckpt
         _write_journal(journal_path, journal)
     return journal

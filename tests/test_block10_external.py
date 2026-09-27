@@ -494,16 +494,19 @@ def test_check_external_rejects_contamination(main_store, external, tmp_path):
 
 
 def test_training_datasets_never_see_external_role(external):
-    from mayak.data.dataset import HoldoutDataset, WindowDataset
+    from mayak.data.dataset import WindowDataset
+    from mayak.data.holdout import EvalSet
+    store = S.get_store(external["manifest"])
     with pytest.raises(AssertionError):
-        WindowDataset(external["manifest"], windows_per_epoch=4,
-                      store=S.get_store(external["manifest"]))
-    ds = HoldoutDataset(external["manifest"], store=S.get_store(external["manifest"]))
+        WindowDataset(external["manifest"], windows_per_epoch=4, store=store)
+    ds = EvalSet(store.clims(), station_splits=(ROLE_VAL,), manifest=external["manifest"],
+                 time_key="val", curriculum="full")
     assert len(ds) == 0, "валидация берёт только unseen_val"
 
 
 def test_eval_set_meta_has_external_slices(external):
-    from mayak.evaluate import EvalSet, external_breakdowns, PRESSURE_YES
+    from mayak.data.holdout import PRESSURE_YES
+    from mayak.evaluate import EvalSet, external_breakdowns
     store = S.get_store(external["manifest"])
     ds = EvalSet(store.clims(), station_splits=(ROLE_EXTERNAL,), manifest=external["manifest"],
                  time_key="test", every_hours=48)

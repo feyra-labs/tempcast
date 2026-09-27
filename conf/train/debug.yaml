@@ -4,8 +4,8 @@ defaults:
   - _self_
 
 stages:
-  - {name: A, curriculum: L0, steps: 200, val_L: 0}
-  - {name: B, curriculum: full, steps: 1000, val_L: 672}
+  - {name: A, curriculum: L0, steps: 200}
+  - {name: B, curriculum: full, steps: 1000}
 batch_size: 32
 windows_per_epoch: 2000
 num_workers: 0

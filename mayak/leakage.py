@@ -12,7 +12,8 @@
    и калибровку; история обучающих окон не выходит за обучение;
 4. конформная таблица построена только по калибровочным блокам и только на
    валидационных станциях;
-5. чекпойнт выбран по метрике на валидационных станциях в валидационных блоках;
+5. чекпойнт выбран по метрике на валидационных станциях в валидационных блоках, а
+   длины истории окон валидации взяты из распределения куррикулума, а не одной длиной;
 6. окна внешних станций - только в тестовом окне; внешние станции не встречаются в
    основном наборе под другой ролью, в записи о выборе чекпойнта и в метаданных
    конформной таблицы.
@@ -218,11 +219,27 @@ def _check_window_arrays(name, sid, key, lay, lo, t, hi):
                   f"{other}")
 
 
-def selection_record(val_ds, monitor):
-    """Запись о том, на чём выбирался чекпойнт. Кладётся в .ckpt под SELECTION_KEY."""
+def selection_record(val_ds, monitor, scores=None):
+    """Запись о том, на чём выбирался чекпойнт. Кладётся в .ckpt под SELECTION_KEY.
+
+    Args:
+        val_ds: набор окон валидации.
+        monitor: имя метрики выбора.
+        scores: валидационные числа на момент сохранения; None - не писать.
+
+    Returns:
+        Словарь: метрика, роль станций, временное окно, станции, правила сплитов,
+        правило длины истории, число окон и отпечаток набора.
+    """
     stations = sorted({fp["sid"] for fp in val_ds.footprints()})
-    return dict(monitor=monitor, station_role=val_ds.station_role,
-                time_key=val_ds.time_key, stations=stations, **_split_state())
+    roles = tuple(val_ds.station_splits)
+    rec = dict(monitor=monitor, station_role=roles[0] if len(roles) == 1 else list(roles),
+               time_key=val_ds.time_key, stations=stations, **_split_state(),
+               history=val_ds.history_spec(), windows=len(val_ds),
+               windows_digest=val_ds.fingerprint())
+    if scores:
+        rec["scores"] = dict(sorted(scores.items()))
+    return rec
 
 
 def check_selection_record(rec, store, what="чекпойнт"):
@@ -236,6 +253,10 @@ def check_selection_record(rec, store, what="чекпойнт"):
               f"{rec.get('time_key')!r}; нужно {ROLE_VAL!r} / {SELECTION_TIME_KEY!r}")
     _check_split_state(rec, what)
     _check_station_roles(rec.get("stations", []), store, ROLE_VAL, what)
+    history = rec.get("history") or {}
+    if history.get("curriculum") is None:
+        _fail(f"{what}: выбран на окнах с одной длиной истории {history.get('L')!r}; длины "
+              f"истории окон валидации должны следовать куррикулуму этапа")
 
 
 def check_checkpoint(path, store):

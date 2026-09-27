@@ -152,10 +152,10 @@ def test_block_index_and_overlaps():
 
 
 def _datasets(manifest, store, L=None):
-    from mayak.data.dataset import HoldoutDataset
     from mayak.evaluate import EvalSet
     kw = {} if L is None else dict(L=L)
-    return [HoldoutDataset(manifest, time_key="val", every_hours=24, store=store, **kw),
+    return [EvalSet(store.clims(), station_splits=(ROLE_VAL,), manifest=manifest,
+                    time_key="val", every_hours=24, max_windows=None, **kw),
             EvalSet(store.clims(), station_splits=(ROLE_VAL,), manifest=manifest,
                     time_key="calib", every_hours=24, max_windows=None, **kw),
             EvalSet(store.clims(), station_splits=(ROLE_TRAIN, ROLE_TEST), manifest=manifest,

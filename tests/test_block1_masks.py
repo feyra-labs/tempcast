@@ -329,18 +329,18 @@ def test_target_mask_comes_only_from_data(train_ds):
             _check_item(item)
 
 
-def test_holdout_and_eval_sets_share_filter(manifest, tmp_path, monkeypatch):
+def test_validation_and_eval_sets_share_filter(manifest, tmp_path, monkeypatch):
     from mayak import baselines as BL
-    from mayak.data.dataset import HoldoutDataset
     from mayak.evaluate import EvalSet
 
-    hd = HoldoutDataset(manifest, station_split="unseen_val", time_key="calib", every_hours=24)
+    monkeypatch.chdir(tmp_path)
+    clims = BL.fit_climatologies(manifest, force=True)
+    hd = EvalSet(clims, station_splits=("unseen_val",), manifest=manifest, time_key="calib",
+                 every_hours=24, curriculum="full")
     assert len(hd) > 0
     for i in range(len(hd)):
         _check_item(hd[i])
 
-    monkeypatch.chdir(tmp_path)
-    clims = BL.fit_climatologies(manifest, force=True)
     ds_full = EvalSet(clims, station_splits=("unseen_test",), manifest=manifest,
                       time_key="test", every_hours=24)
     ds_l0 = EvalSet(clims, station_splits=("unseen_test",), manifest=manifest,

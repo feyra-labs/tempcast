@@ -164,6 +164,7 @@ class RobustnessSet(Dataset):
             mask_hist=torch.from_numpy(np.ascontiguousarray(m, np.float32)),
             y=torch.from_numpy(np.ascontiguousarray(y, np.float32)),
             a_recent=torch.tensor(a_recent, dtype=torch.float32),
+            hist_len=torch.tensor(w.L, dtype=torch.int64),
         )
         return out
 

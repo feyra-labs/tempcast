@@ -3,8 +3,8 @@
 Все числа считает ``mayak/metrics.py`` - здесь только сбор окон, сбор
 предсказаний и печать. Содержит:
 
-  * EvalSet — окна для оценки со стратифицированной подвыборкой (фиксированное
-    число окон с каждой станции) и метаданными окон для разрезов;
+  * окна для оценки со стратифицированной подвыборкой (одинаковое число окон с каждой
+    станции) и метаданными окон для разрезов;
   * сбор предсказаний МАЯК + нейробейзлайнов (GRU, DLinear, LRU, PatchTST) +
     статистических; перед сравнением проверяется, что все чекпойнты обучены по одному
     протоколу (mayak.lit.check_comparable);
@@ -28,28 +28,21 @@ import os
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 from mayak import baselines as BL
-from mayak.constants import H, L_MAX, QUANTILES
-from mayak.data.dataset import (block_starts, footprint, history_len, norm_scale, slice_context,
-                                slice_history, slice_target, station_qc_elev)
-from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats, enforce_invariant
-from mayak.data.qc import qc_window
+from mayak.constants import H, QUANTILES
+from mayak.data.holdout import HISTORY_BINS, EvalSet
 from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, apply_conformal, breakdown,
                            by_lead, calibrate_forecast, coverage, metric_table, pinball_crps,
                            seed_spread, skill, wmean)
-from mayak.timeaxis import window_calendar, window_month
-from mayak.zones import SEASON_RU, normalize_zone, season_of
+from mayak.zones import normalize_zone
 
 Q = np.array(QUANTILES, np.float32)
 
-HISTORY_BINS = ((0, 0, "L=0"), (1, 24, "L 1-24ч"), (25, 168, "L 25-168ч"),
-                (169, L_MAX, f"L 169-{L_MAX}ч"))
 HIST_VALID_BINS = ((-0.01, 0.5, "<50%"), (0.5, 0.8, "50-80%"),
                    (0.8, 0.95, "80-95%"), (0.95, 1.01, "95-100%"))
 MIN_WINDOWS, MIN_STATIONS = 20, 2
-PRESSURE_YES, PRESSURE_NO = "есть давление", "нет давления"
 BOOTSTRAP = dict(n_boot=1000, seed=0, level=0.90)
 
 NEURAL_BASELINES = {"gru": "GRU seq2seq", "dlinear": "DLinear", "lru": "LRU",
@@ -68,155 +61,6 @@ def bin_label(value, bins):
         if lo <= value <= hi:
             return name
     return "прочее"
-
-
-def stratified_items(per_station, max_windows=None, windows_per_station=None):
-    """Стратифицированная подвыборка окон: фиксированное число окон со станции."""
-    stations = [sid for sid, ts in per_station.items() if len(ts)]
-    if not stations:
-        return []
-    k = windows_per_station
-    if k is None and max_windows:
-        k = max(1, int(max_windows) // len(stations))
-    out = []
-    for sid in stations:
-        ts = list(per_station[sid])
-        if k is not None and len(ts) > k:
-            idx = np.unique(np.linspace(0, len(ts) - 1, k).round().astype(np.int64))
-            ts = [ts[i] for i in idx]
-        out += [(sid, int(t)) for t in ts]
-    return out
-
-
-class EvalSet(Dataset):
-    """Окна для оценки.
-
-    Attributes:
-        items: пары из станции и часа начала горизонта.
-    """
-    def __init__(self, clims, station_splits=("train", "unseen_test"),
-                 manifest="data/manifest.csv", time_key="test",
-                 every_hours=72, L=None, max_windows=6000, windows_per_station=None,
-                 target_mask=DEFAULT_TARGET_MASK):
-        from mayak.data.splits import time_layout
-        from mayak.data.store import read_manifest
-        split_of = {r["id"]: r.get("split") for r in read_manifest(manifest)}
-        self.station_splits, self.time_key = tuple(station_splits), time_key
-        self.floor, self.roles = {}, {}
-        self.filter_stats = FilterStats()
-        per_station = {}
-        for sid, s in clims.items():
-            sp = split_of.get(sid)
-            if sp not in station_splits:
-                continue
-            layout = time_layout(s["N"])
-            self.floor[sid] = layout.history_floor(time_key)
-            cand, ok = block_starts(layout, time_key, s["mask"][:, 0], every_hours,
-                                    cfg=target_mask)
-            self.filter_stats.add(len(cand), len(ok))
-            self.roles[sid] = sp
-            per_station[sid] = ok.tolist()
-        self.filter_stats.report(f"eval/{time_key}")
-        self.items = stratified_items(per_station, max_windows, windows_per_station)
-        self.clims = clims
-        self.L = L
-
-    def __len__(self):
-        return len(self.items)
-
-    def footprints(self):
-        for sid, t in self.items:
-            lo, hi = footprint(t, self.L, self.floor[sid])
-            yield dict(sid=sid, N=self.clims[sid]["N"], time_key=self.time_key,
-                       lo=np.array([lo]), t=np.array([t]), hi=np.array([hi]))
-
-    def station_attrs(self):
-        if getattr(self, "_attrs", None) is None:
-            from mayak.external import station_attributes
-            sids = {sid for sid, _t in self.items}
-            self._attrs = station_attributes({sid: self.clims[sid] for sid in sids})
-        return self._attrs
-
-    def window_meta(self):
-        """Метки окон для разрезов; ``t`` - час начала горизонта (порядок окон во времени
-        нужен офлайн-прогону адаптивной калибровки)."""
-        sid_a, role, zone, season, hist, hvalid = [], [], [], [], [], []
-        has_p, rep, egap = [], [], []
-        attrs = self.station_attrs()
-        for sid, t in self.items:
-            s = self.clims[sid]
-            L = history_len(self.L, t, self.floor[sid])
-            m = s["mask"][t - L:t, 0] if L > 0 else np.zeros(0, np.float32)
-            month = int(np.asarray(window_month(s["t0"], [t])).ravel()[0])
-            sid_a.append(sid)
-            role.append(self.roles[sid])
-            zone.append(normalize_zone(s["koppen"]))
-            season.append(SEASON_RU[season_of(month, s["lat"])])
-            hist.append(L)
-            hvalid.append(float((m > 0).mean()) if L > 0 else 0.0)
-            mp = s["mask"][t - L:t, 1] if L > 0 else np.zeros(0, np.float32)
-            has_p.append(PRESSURE_YES if (mp > 0).any() else PRESSURE_NO)
-            rep.append(attrs[sid]["report_class"])
-            egap.append(attrs[sid]["elev_gap_label"])
-        return dict(station=np.array(sid_a, object), role=np.array(role, object),
-                    zone=np.array(zone, object), season=np.array(season, object),
-                    history=np.array(hist, np.int64), hist_valid=np.array(hvalid, np.float64),
-                    has_pressure=np.array(has_p, object), report_class=np.array(rep, object),
-                    elev_gap=np.array(egap, object),
-                    t=np.array([t for _sid, t in self.items], np.int64))
-
-    def raw_window(self, i):
-        """Сырая история окна до QC.
-
-        Args:
-            i: номер окна.
-
-        Returns:
-            Словарь: значения и маска наличия истории формы (L_MAX, 3), контекст QC
-            до истории, длина истории и высота для проверки давления.
-        """
-        sid, t = self.items[i]
-        s = self.clims[sid]
-        L = history_len(self.L, t, self.floor[sid])
-        x, m = slice_history(s["raw"], s["present"], t, L)
-        past = slice_context(s["raw"], s["present"], t, L, self.floor[sid])
-        return dict(x=x, m=m, past=past, L=L, qc_elev=station_qc_elev(s))
-
-    def __getitem__(self, i):
-        sid, t = self.items[i]
-        s = self.clims[sid]
-        clim = s["clim"]
-        t0 = s["t0"]
-        k = np.arange(L_MAX)
-        abs_h = t - L_MAX + k
-        doy_h, hour_h = window_calendar(t0, abs_h)
-        w = self.raw_window(i)
-        x_hist, mask_hist = w["x"], w["m"]
-        if w["L"] > 0:
-            mask_hist, _ = qc_window(x_hist, mask_hist, elev=w["qc_elev"], past=w["past"])
-            x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
-        fut = np.arange(t, t + H)
-        doy_f, hour_f = window_calendar(t0, fut)
-        y, y_mask = slice_target(s["x"], s["mask"], t)
-        mu_clim_fut = clim.predict(doy_f, hour_f).astype(np.float32)
-        a_recent, _ = BL.recent_anomaly(x_hist[:, 0], mask_hist[:, 0], clim, L_MAX,
-                                        int(t0) + int(t) - L_MAX)
-        return {
-            "lat": torch.tensor(s["lat"], dtype=torch.float32),
-            "lon": torch.tensor(s["lon"], dtype=torch.float32),
-            "elev": torch.tensor(s["elev"], dtype=torch.float32),
-            "x_hist": torch.from_numpy(x_hist), "mask_hist": torch.from_numpy(mask_hist),
-            "doy_hist": torch.from_numpy(doy_h.astype(np.float32)),
-            "hour_hist": torch.from_numpy(hour_h.astype(np.float32)),
-            "doy_fut": torch.from_numpy(doy_f.astype(np.float32)),
-            "hour_fut": torch.from_numpy(hour_f.astype(np.float32)),
-            "y": torch.from_numpy(y),
-            "y_mask": torch.from_numpy(y_mask),
-            "norm_scale": torch.from_numpy(norm_scale(clim, doy_f, hour_f)),
-            "mu_clim_fut": torch.from_numpy(mu_clim_fut),
-            "sigma_clim": torch.tensor(clim.sigma, dtype=torch.float32),
-            "a_recent": torch.tensor(a_recent, dtype=torch.float32),
-        }
 
 
 def coverage90(y, q, w):

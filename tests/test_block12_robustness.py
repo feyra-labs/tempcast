@@ -418,6 +418,9 @@ def test_full_loss_of_history_is_cold_start(base, store, manifest):
             assert torch.equal(b["x_hist"], ref["x_hist"])
             assert torch.equal(b["mask_hist"], ref["mask_hist"])
             assert float(b["a_recent"]) == 0.0
+        assert int(sets[2][i]["hist_len"]) == 0, "сокращение истории меняет её длину"
+        assert int(sets[0][i]["hist_len"]) == int(base[i]["hist_len"]), \
+            "пропуски не меняют длину истории, только маску"
 
 
 def test_device_qc_catches_frozen_sensor(base):

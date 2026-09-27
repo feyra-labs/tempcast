@@ -9,8 +9,9 @@ time_layout:
 target_mask:
   min_valid_frac: 0.5
   first_day_hours: 24
-val_every_hours: 72
-val_max_windows: 8000
+val_every_hours: 24
+val_windows_per_station: 96   # размер набора валидации: окон с каждой станции
+val_seed: 0                   # сид длин истории окон валидации, общий для всех архитектур
 augment:
   profile: aggressive
   scale_prob: 0.3

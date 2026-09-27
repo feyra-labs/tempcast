@@ -188,15 +188,19 @@ def test_rebuild_after_source_change_is_picked_up(manifest):
 
 def test_one_store_per_process(manifest):
     from mayak import baselines as BL
-    from mayak.data.dataset import HoldoutDataset, WindowDataset
+    from mayak.data.dataset import WindowDataset
+    from mayak.data.holdout import EvalSet
     store = S.get_store(manifest)
     assert S.get_store(manifest) is store
     tr = WindowDataset(manifest, windows_per_epoch=8)
-    va = HoldoutDataset(manifest, station_split="unseen_val", time_key="calib", every_hours=48)
     clims = BL.fit_climatologies(manifest)
     assert clims is store.stations
+    va = EvalSet(clims, station_splits=("unseen_val",), manifest=manifest, time_key="calib",
+                 every_hours=48)
+    sid, _t = va.items[0]
+    assert sid == "s3"
     assert np.shares_memory(tr.st[0]["x"], store.stations["s0"]["x"])
-    assert np.shares_memory(va.meta[0]["x"], store.stations["s3"]["x"])
+    assert np.shares_memory(va.clims[sid]["x"], store.stations["s3"]["x"])
 
 
 def test_station_without_climatology_is_excluded_and_reported(manifest):

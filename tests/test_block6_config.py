@@ -428,9 +428,9 @@ def test_augment_seed_changes_augmentation_but_not_window_stream(manifest):
     assert not all(torch.equal(u["x_hist"], w["x_hist"]) for u, w in zip(ia, ic))
 
 
-TINY = Protocol(stages=(Stage("A", "L0", 2, 0), Stage("B", "full", 2, L_MAX)),
+TINY = Protocol(stages=(Stage("A", "L0", 2), Stage("B", "full", 2)),
                 batch_size=2, windows_per_epoch=8, num_workers=0, seed=3, precision="32",
-                val_every=1, val_batches=1, seeds=Seeds(augment=21, eval=4))
+                val_every=1, seeds=Seeds(augment=21, eval=4))
 
 CUSTOM = dict(encoder_width=16, encoder_dilations=(1, 2, 4), passport_dim=8, field_hidden=24,
               heads_hidden=16, loc_freqs=8,
@@ -449,7 +449,7 @@ def custom_run(manifest, tmp_path_factory):
                     "model.field_hidden=24", "model.heads_hidden=16", "model.loc_freqs=8",
                     "model.mode_groups=[{name:R,tau0:[3,48]},{name:D,tau0:[24],period:[24]},"
                     "{name:W,tau0:[96,168],period:[84,120]}]",
-                    f"data.manifest={manifest}"])
+                    f"data.manifest={manifest}", "data.val_windows_per_station=2"])
     rc = dataclasses.replace(run.to_run_config(cfg), train=TINY)
     assert rc.model == ModelConfig(**CUSTOM)
     out = tmp_path_factory.mktemp("runs6")
@@ -497,11 +497,11 @@ def test_checkpoint_carries_resolved_config_seeds_and_provenance(custom_run):
 def test_resolved_config_in_checkpoint_carries_ablation_data_effect(manifest, tmp_path):
     from mayak.lit import RUN_KEY
     from mayak.protocol import run_protocol
-    proto = Protocol(stages=(Stage("A", "L0", 1, 0),), batch_size=2, windows_per_epoch=4,
-                     num_workers=0, precision="32", val_every=1, val_batches=1)
+    proto = Protocol(stages=(Stage("A", "L0", 1),), batch_size=2, windows_per_epoch=4,
+                     num_workers=0, precision="32", val_every=1)
     j = run_protocol("mayak", manifest, proto, out_root=str(tmp_path), accelerator="cpu",
                      model_config=ModelConfig(ablations=Ablations(no_offset_aug=True)),
-                     enable_progress_bar=False)
+                     data_config=dict(val_windows_per_station=2), enable_progress_bar=False)
     rec = torch.load(j["final_ckpt"], map_location="cpu", weights_only=False)[RUN_KEY]
     assert rec["config"]["data"]["augment"]["offset_max"] == 0.0
 

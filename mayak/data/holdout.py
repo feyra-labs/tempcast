@@ -1,0 +1,285 @@
+"""Окна оценки: выбор чекпойнта, калибровка, внутренний и внешний тест.
+
+Один класс окон на все проверки. Набор задаётся ролями станций, временным ключом и
+правилом длины истории: полный буфер, одна длина для всех окон или распределение
+куррикулума этапа. Подвыборка стратифицирована: с каждой станции берётся одинаковое
+число окон, разнесённых по всему временному окну. История проходит тот же причинный QC,
+что на приборе; аугментаций нет.
+"""
+import hashlib
+import zlib
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+from mayak import baselines as BL
+from mayak.constants import H, L_MAX
+from mayak.data.dataset import (HISTORY_MIX, block_starts, footprint, history_len, norm_scale,
+                                sample_history_len, slice_context, slice_history, slice_target,
+                                station_qc_elev)
+from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats, enforce_invariant
+from mayak.data.qc import qc_window
+from mayak.data.splits import time_layout
+from mayak.data.store import read_manifest
+from mayak.timeaxis import window_calendar, window_month
+from mayak.zones import SEASON_RU, normalize_zone, season_of
+
+HISTORY_BINS = ((0, 0, "L=0"), (1, 24, "L 1-24ч"), (25, 168, "L 25-168ч"),
+                (169, L_MAX, f"L 169-{L_MAX}ч"))
+PRESSURE_YES, PRESSURE_NO = "есть давление", "нет давления"
+
+
+def stratified_items(per_station, max_windows=None, windows_per_station=None):
+    """Стратифицированная подвыборка окон: одинаковое число окон с каждой станции.
+
+    Окна станции берутся равномерно по её упорядоченному списку начал горизонта. Станция,
+    у которой окон меньше нормы, отдаёт все свои.
+
+    Args:
+        per_station: словарь из станции в упорядоченный список начал горизонта.
+        max_windows: общий бюджет окон; норма на станцию получается делением бюджета на
+            число станций. Не используется, если задана норма на станцию.
+        windows_per_station: норма окон на станцию; None вместе с пустым бюджетом значит
+            брать все окна.
+
+    Returns:
+        Список пар из станции и часа начала горизонта, станции в порядке словаря.
+    """
+    stations = [sid for sid, ts in per_station.items() if len(ts)]
+    if not stations:
+        return []
+    k = windows_per_station
+    if k is None and max_windows:
+        k = max(1, int(max_windows) // len(stations))
+    out = []
+    for sid in stations:
+        ts = list(per_station[sid])
+        if k is not None and len(ts) > k:
+            idx = np.unique(np.linspace(0, len(ts) - 1, k).round().astype(np.int64))
+            ts = [ts[i] for i in idx]
+        out += [(sid, int(t)) for t in ts]
+    return out
+
+
+def window_history_lengths(items, curriculum, seed):
+    """Запрошенная длина истории каждого окна по распределению куррикулума.
+
+    Длина окна зависит только от сида, станции и часа начала горизонта. Поэтому она не
+    меняется, когда в набор добавляют другие окна или убирают их, и одинакова у всех
+    моделей и во всех проверках.
+
+    Args:
+        items: пары из станции и часа начала горизонта.
+        curriculum: имя куррикулума этапа.
+        seed: сид набора, неотрицательное целое.
+
+    Returns:
+        Массив int64 длин истории, ч, по одной на окно.
+
+    Raises:
+        ValueError: неизвестный куррикулум или отрицательный сид.
+    """
+    if curriculum not in HISTORY_MIX:
+        raise ValueError(f"неизвестный куррикулум {curriculum!r}; есть {tuple(HISTORY_MIX)}")
+    if int(seed) < 0:
+        raise ValueError(f"сид набора окон {seed} отрицательный")
+    out = np.empty(len(items), np.int64)
+    for i, (sid, t) in enumerate(items):
+        rng = np.random.default_rng([int(seed), zlib.crc32(str(sid).encode()), int(t)])
+        out[i] = sample_history_len(rng, curriculum)
+    return out
+
+
+class EvalSet(Dataset):
+    """Окна оценки.
+
+    Длина истории задаётся одним из трёх способов: полный буфер (L и curriculum не
+    заданы), одна длина для всех окон (L) или своя длина у каждого окна по распределению
+    куррикулума (curriculum и history_seed).
+
+    Args:
+        clims: словарь станций набора.
+        station_splits: роли станций, окна которых входят в набор.
+        manifest: путь к манифесту с ролями станций.
+        time_key: временное окно, в котором лежат цели.
+        every_hours: шаг между кандидатами в начала горизонта, ч.
+        L: одна длина истории для всех окон, ч; None - полный буфер.
+        max_windows: общий бюджет окон стратифицированной подвыборки.
+        windows_per_station: норма окон на станцию; важнее бюджета.
+        target_mask: правило годности цели.
+        curriculum: имя куррикулума, по которому у каждого окна выбирается своя длина.
+        history_seed: сид выбора длин по куррикулуму.
+
+    Attributes:
+        items: пары из станции и часа начала горизонта.
+        requested: запрошенная длина истории каждого окна, ч; None - полный буфер.
+
+    Raises:
+        ValueError: заданы одновременно одна длина и куррикулум.
+    """
+
+    def __init__(self, clims, station_splits=("train", "unseen_test"),
+                 manifest="data/manifest.csv", time_key="test",
+                 every_hours=72, L=None, max_windows=6000, windows_per_station=None,
+                 target_mask=DEFAULT_TARGET_MASK, curriculum=None, history_seed=0):
+        if L is not None and curriculum is not None:
+            raise ValueError("длина истории задаётся либо одним числом, либо куррикулумом")
+        split_of = {r["id"]: r.get("split") for r in read_manifest(manifest)}
+        self.station_splits, self.time_key = tuple(station_splits), time_key
+        self.floor, self.roles = {}, {}
+        self.filter_stats = FilterStats()
+        per_station = {}
+        for sid, s in clims.items():
+            sp = split_of.get(sid)
+            if sp not in station_splits:
+                continue
+            layout = time_layout(s["N"])
+            self.floor[sid] = layout.history_floor(time_key)
+            cand, ok = block_starts(layout, time_key, s["mask"][:, 0], every_hours,
+                                    cfg=target_mask)
+            self.filter_stats.add(len(cand), len(ok))
+            self.roles[sid] = sp
+            per_station[sid] = ok.tolist()
+        self.filter_stats.report(f"eval/{time_key}")
+        self.items = stratified_items(per_station, max_windows, windows_per_station)
+        self.clims = clims
+        self.L = L
+        self.curriculum = curriculum
+        self.history_seed = int(history_seed)
+        if curriculum is None:
+            self.requested = [L] * len(self.items)
+        else:
+            self.requested = window_history_lengths(self.items, curriculum,
+                                                    self.history_seed).tolist()
+
+    def __len__(self):
+        return len(self.items)
+
+    def history_length(self, i):
+        """Фактическая длина истории окна с учётом самого раннего доступного часа.
+
+        Args:
+            i: номер окна.
+
+        Returns:
+            Длина истории, ч.
+        """
+        sid, t = self.items[i]
+        return history_len(self.requested[i], t, self.floor[sid])
+
+    def history_spec(self):
+        """Правило длины истории набора.
+
+        Returns:
+            Словарь: имя куррикулума, одна длина для всех окон и сид выбора длин. Не
+            заданное правило записано как None.
+        """
+        return dict(curriculum=self.curriculum, L=self.L,
+                    seed=None if self.curriculum is None else self.history_seed)
+
+    def fingerprint(self):
+        """Отпечаток набора: станции, начала горизонта и запрошенные длины истории.
+
+        Returns:
+            Строка из 16 шестнадцатеричных знаков; совпадает у наборов с одинаковыми окнами.
+        """
+        h = hashlib.sha256()
+        for (sid, t), n in zip(self.items, self.requested):
+            h.update(f"{sid}\t{t}\t{n}\n".encode())
+        return h.hexdigest()[:16]
+
+    def footprints(self):
+        for i, (sid, t) in enumerate(self.items):
+            lo, hi = footprint(t, self.requested[i], self.floor[sid])
+            yield dict(sid=sid, N=self.clims[sid]["N"], time_key=self.time_key,
+                       lo=np.array([lo]), t=np.array([t]), hi=np.array([hi]))
+
+    def station_attrs(self):
+        if getattr(self, "_attrs", None) is None:
+            from mayak.external import station_attributes
+            sids = {sid for sid, _t in self.items}
+            self._attrs = station_attributes({sid: self.clims[sid] for sid in sids})
+        return self._attrs
+
+    def window_meta(self):
+        """Метки окон для разрезов; ``t`` - час начала горизонта (порядок окон во времени
+        нужен офлайн-прогону адаптивной калибровки)."""
+        sid_a, role, zone, season, hist, hvalid = [], [], [], [], [], []
+        has_p, rep, egap = [], [], []
+        attrs = self.station_attrs()
+        for i, (sid, t) in enumerate(self.items):
+            s = self.clims[sid]
+            L = self.history_length(i)
+            m = s["mask"][t - L:t, 0] if L > 0 else np.zeros(0, np.float32)
+            month = int(np.asarray(window_month(s["t0"], [t])).ravel()[0])
+            sid_a.append(sid)
+            role.append(self.roles[sid])
+            zone.append(normalize_zone(s["koppen"]))
+            season.append(SEASON_RU[season_of(month, s["lat"])])
+            hist.append(L)
+            hvalid.append(float((m > 0).mean()) if L > 0 else 0.0)
+            mp = s["mask"][t - L:t, 1] if L > 0 else np.zeros(0, np.float32)
+            has_p.append(PRESSURE_YES if (mp > 0).any() else PRESSURE_NO)
+            rep.append(attrs[sid]["report_class"])
+            egap.append(attrs[sid]["elev_gap_label"])
+        return dict(station=np.array(sid_a, object), role=np.array(role, object),
+                    zone=np.array(zone, object), season=np.array(season, object),
+                    history=np.array(hist, np.int64), hist_valid=np.array(hvalid, np.float64),
+                    has_pressure=np.array(has_p, object), report_class=np.array(rep, object),
+                    elev_gap=np.array(egap, object),
+                    t=np.array([t for _sid, t in self.items], np.int64))
+
+    def raw_window(self, i):
+        """Сырая история окна до QC.
+
+        Args:
+            i: номер окна.
+
+        Returns:
+            Словарь: значения и маска наличия истории формы (L_MAX, 3), контекст QC
+            до истории, длина истории и высота для проверки давления.
+        """
+        sid, t = self.items[i]
+        s = self.clims[sid]
+        L = self.history_length(i)
+        x, m = slice_history(s["raw"], s["present"], t, L)
+        past = slice_context(s["raw"], s["present"], t, L, self.floor[sid])
+        return dict(x=x, m=m, past=past, L=L, qc_elev=station_qc_elev(s))
+
+    def __getitem__(self, i):
+        sid, t = self.items[i]
+        s = self.clims[sid]
+        clim = s["clim"]
+        t0 = s["t0"]
+        k = np.arange(L_MAX)
+        abs_h = t - L_MAX + k
+        doy_h, hour_h = window_calendar(t0, abs_h)
+        w = self.raw_window(i)
+        x_hist, mask_hist = w["x"], w["m"]
+        if w["L"] > 0:
+            mask_hist, _ = qc_window(x_hist, mask_hist, elev=w["qc_elev"], past=w["past"])
+            x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
+        fut = np.arange(t, t + H)
+        doy_f, hour_f = window_calendar(t0, fut)
+        y, y_mask = slice_target(s["x"], s["mask"], t)
+        mu_clim_fut = clim.predict(doy_f, hour_f).astype(np.float32)
+        a_recent, _ = BL.recent_anomaly(x_hist[:, 0], mask_hist[:, 0], clim, L_MAX,
+                                        int(t0) + int(t) - L_MAX)
+        return {
+            "lat": torch.tensor(s["lat"], dtype=torch.float32),
+            "lon": torch.tensor(s["lon"], dtype=torch.float32),
+            "elev": torch.tensor(s["elev"], dtype=torch.float32),
+            "x_hist": torch.from_numpy(x_hist), "mask_hist": torch.from_numpy(mask_hist),
+            "doy_hist": torch.from_numpy(doy_h.astype(np.float32)),
+            "hour_hist": torch.from_numpy(hour_h.astype(np.float32)),
+            "doy_fut": torch.from_numpy(doy_f.astype(np.float32)),
+            "hour_fut": torch.from_numpy(hour_f.astype(np.float32)),
+            "y": torch.from_numpy(y),
+            "y_mask": torch.from_numpy(y_mask),
+            "norm_scale": torch.from_numpy(norm_scale(clim, doy_f, hour_f)),
+            "mu_clim_fut": torch.from_numpy(mu_clim_fut),
+            "sigma_clim": torch.tensor(clim.sigma, dtype=torch.float32),
+            "a_recent": torch.tensor(a_recent, dtype=torch.float32),
+            "hist_len": torch.tensor(w["L"], dtype=torch.int64),
+        }

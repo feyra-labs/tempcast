@@ -504,9 +504,10 @@ def test_dataset_window_qc_masks_augmented_artifacts(manifest):
 
 def test_journal_records_augment_profile(manifest, tmp_path):
     from mayak.protocol import Protocol, Stage, run_protocol
-    proto = Protocol(stages=(Stage("A", "L0", 1, 0),), batch_size=2, windows_per_epoch=4,
-                     num_workers=0, precision="32", val_every=1, val_batches=1)
-    data = DataConfig(manifest=manifest, augment=AugmentConfig.from_profile("soft", gap_prob=0.9))
+    proto = Protocol(stages=(Stage("A", "L0", 1),), batch_size=2, windows_per_epoch=4,
+                     num_workers=0, precision="32", val_every=1)
+    data = DataConfig(manifest=manifest, augment=AugmentConfig.from_profile("soft", gap_prob=0.9),
+                      val_windows_per_station=2)
     j = run_protocol("mayak", manifest, proto, out_root=str(tmp_path), accelerator="cpu",
                      data_config=data, enable_progress_bar=False)
     assert j["augment"]["profile"] == "soft"
