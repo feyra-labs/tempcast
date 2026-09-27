@@ -345,11 +345,9 @@ def test_conformal_table_rejects_wrong_shape():
 
 
 def test_all_modules_share_one_conformal_implementation():
-    import mayak.evaluate as E
     import mayak.runtime.streaming as R
     from mayak import metrics as M
     calibrate = _load_module(REPO / "scripts" / "calibrate.py", "calibrate_for_test")
-    assert E.apply_conformal is M.apply_conformal
     assert R.apply_conformal is M.apply_conformal
     assert calibrate.apply_conformal is M.apply_conformal
 

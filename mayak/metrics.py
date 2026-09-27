@@ -575,13 +575,46 @@ def by_lead_bin(ev, lead_bins=LEAD_BINS, ci=False, **kw):
             for a, b in lead_bins}
 
 
-def breakdown(ev, keys, leads=None, min_windows=20, min_stations=2, ci=False, **kw):
-    """Разрез по меткам окон ``keys`` (N,)."""
+def ordered_labels(keys, order=None):
+    """Метки разреза в порядке показа.
+
+    Args:
+        keys: метки окон.
+        order: желаемый порядок меток. Метки, которых нет в наборе, пропускаются;
+            метки набора, которых нет в порядке, идут следом по алфавиту.
+
+    Returns:
+        Список различных меток в порядке показа.
+    """
+    present = {str(v) for v in np.asarray(keys).tolist()}
+    head = [str(k) for k in (order or ()) if str(k) in present]
+    return head + sorted(present - set(head))
+
+
+def breakdown(ev, keys, leads=None, min_windows=20, min_stations=2, ci=False, order=None, **kw):
+    """Разрез оценки по меткам окон.
+
+    Args:
+        ev: оценка одной модели.
+        keys: метка каждого окна, форма (N,).
+        leads: лиды, на которых считаются метрики; None значит весь горизонт.
+        min_windows: страта с меньшим числом окон не показывается.
+        min_stations: страта с меньшим числом станций не показывается.
+        ci: считать интервалы бутстрапа по станциям.
+        order: порядок меток; по умолчанию алфавитный.
+        **kw: параметры бутстрапа.
+
+    Returns:
+        Словарь из метки страты в её сводку.
+
+    Raises:
+        ValueError: число меток не совпадает с числом окон.
+    """
     keys = np.asarray(keys)
     if len(keys) != len(ev.y):
         raise ValueError(f"меток {len(keys)}, а окон {len(ev.y)}")
     rows = {}
-    for k in sorted({str(v) for v in keys.tolist()}):
+    for k in ordered_labels(keys, order):
         sub = ev.restrict(windows=(keys.astype(str) == k), leads=leads)
         c = sub.counts()
         if c["n_windows"] < min_windows or c["n_stations"] < min_stations:
@@ -654,6 +687,6 @@ __all__ = ["ACIParams", "CENTRAL_INTERVALS", "Evaluation", "FINE_LEADS", "LEAD_B
            "aci_score", "apply_adaptive", "apply_conformal", "breakdown", "by_lead",
            "by_lead_bin", "calibrate_forecast", "conformal_table", "coverage",
            "fit_conformal_shift", "inside", "interval_indices", "lead_bin_index", "lead_bin_of",
-           "lead_mask", "metric_table", "pair_terms", "pinball_crps", "seed_spread",
-           "sharpness_scales", "skill", "skill_per_lead", "spread", "width_at_coverage",
-           "winkler", "wmean"]
+           "lead_mask", "metric_table", "ordered_labels", "pair_terms", "pinball_crps",
+           "seed_spread", "sharpness_scales", "skill", "skill_per_lead", "spread",
+           "width_at_coverage", "winkler", "wmean"]

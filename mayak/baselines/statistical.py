@@ -150,7 +150,7 @@ def fit_damped_persistence(clims, n_windows=20000, seed=0):
     return damped_coefficients(Sxx, Sxy)
 
 
-def damped_persistence_forecast(a_recent, mu_clim_fut, sigma_clim, r):
+def damped_persistence_forecast(a_recent, mu_clim_fut, sigma_clim, r, valid=None):
     """Прогноз затухающей персистентностью аномалии.
 
     Недавняя аномалия прибавляется к климатологии с коэффициентом своего лида. Разброс
@@ -158,21 +158,28 @@ def damped_persistence_forecast(a_recent, mu_clim_fut, sigma_clim, r):
     разброс аномалии, которая затухает с тем же коэффициентом. Снизу доля разброса
     ограничена, иначе при коэффициенте около единицы интервал схлопывается в точку.
 
+    Если в истории окна не хватило валидных часов, аномалия неизвестна. Тогда прогноз
+    окна - климатология целиком, вместе с её разбросом: сузить интервал нечем.
+
     Args:
         a_recent: недавняя аномалия каждого окна, форма (B,).
         mu_clim_fut: климатологическое среднее на часах горизонта, форма (B, H).
         sigma_clim: климатологический масштаб станции, форма (B,).
         r: коэффициенты затухания по лидам, форма (H,).
+        valid: признак того, что аномалия окна определена, форма (B,); None значит, что
+            определена у всех окон.
 
     Returns:
         Пара: медиана формы (B, H) и квантили формы (B, H, nq).
     """
 
     a = np.asarray(a_recent, np.float32)[:, None]
-    r = np.asarray(r, np.float32)
-    mu = np.asarray(mu_clim_fut, np.float32) + r[None, :] * a
+    r = np.broadcast_to(np.asarray(r, np.float32)[None, :], (a.shape[0], len(r)))
+    if valid is not None:
+        r = np.where(np.asarray(valid, bool)[:, None], r, np.float32(0.0))
+    mu = np.asarray(mu_clim_fut, np.float32) + r * a
     sig = np.asarray(sigma_clim, np.float32)[:, None] * np.sqrt(
-        np.clip(1 - r[None, :] ** 2, DAMPED_VAR_FLOOR, 1.0))
+        np.clip(1 - r ** 2, DAMPED_VAR_FLOOR, 1.0))
     return mu, quantiles_from_normal(mu, sig)
 
 

@@ -6,6 +6,7 @@
 число окон, разнесённых по всему временному окну. История проходит тот же причинный QC,
 что на приборе; аугментаций нет.
 """
+import copy
 import hashlib
 import zlib
 
@@ -27,7 +28,82 @@ from mayak.zones import SEASON_RU, normalize_zone, season_of
 
 HISTORY_BINS = ((0, 0, "L=0"), (1, 24, "L 1-24ч"), (25, 168, "L 25-168ч"),
                 (169, L_MAX, f"L 169-{L_MAX}ч"))
+HISTORY_GRID = (0, 6, 24, 72, 168, 336, L_MAX)
+NOMINAL_HISTORY = L_MAX
 PRESSURE_YES, PRESSURE_NO = "есть давление", "нет давления"
+
+
+def history_label(L):
+    """Метка окна, у которого длина истории задана точно.
+
+    Args:
+        L: длина истории, ч.
+
+    Returns:
+        Строка вида «L=24ч».
+    """
+    return f"L={int(L)}ч"
+
+
+def history_bin_label(L):
+    """Метка бина длины истории для окна со случайной длиной истории.
+
+    Args:
+        L: длина истории, ч.
+
+    Returns:
+        Имя бина, в который попадает длина.
+    """
+    for lo, hi, name in HISTORY_BINS:
+        if lo <= int(L) <= hi:
+            return name
+    return "прочее"
+
+
+def history_strata(meta):
+    """Метки длины истории окон и порядок этих меток по возрастанию длины.
+
+    Если набор сам подписал окна, берутся его метки. Иначе окна раскладываются по бинам
+    длины истории.
+
+    Args:
+        meta: метаданные окон; нужна длина истории, метка длины необязательна.
+
+    Returns:
+        Пара: массив меток формы (N,) и список различных меток от короткой истории к
+        длинной.
+    """
+    hist = np.asarray(meta["history"], np.int64)
+    labels = meta.get("history_label")
+    if labels is None:
+        labels = [history_bin_label(v) for v in hist.tolist()]
+    labels = np.asarray(labels, object).astype(str)
+    order = sorted(set(labels.tolist()), key=lambda k: int(hist[labels == k].min()))
+    return labels, order
+
+
+def check_history_grid(grid):
+    """Проверяет сетку длин истории стенда оценки.
+
+    Args:
+        grid: длины истории, ч.
+
+    Returns:
+        Кортеж различных длин по возрастанию.
+
+    Raises:
+        ValueError: сетка пуста, длина вне допустимых границ или в сетке нет полной
+            истории, при которой считаются основные таблицы.
+    """
+    out = tuple(sorted({int(v) for v in grid}))
+    if not out:
+        raise ValueError("сетка длин истории пуста")
+    if out[0] < 0 or out[-1] > L_MAX:
+        raise ValueError(f"длины истории {out} вне [0, {L_MAX}]")
+    if NOMINAL_HISTORY not in out:
+        raise ValueError(f"в сетке {out} нет полной истории {NOMINAL_HISTORY} ч: при ней "
+                         f"считаются основные таблицы")
+    return out
 
 
 def stratified_items(per_station, max_windows=None, windows_per_station=None):
@@ -156,6 +232,24 @@ class EvalSet(Dataset):
     def __len__(self):
         return len(self.items)
 
+    def with_history(self, L):
+        """Те же окна с одной длиной истории для всех окон.
+
+        Станции, начала горизонта, цели и эталон не меняются: меняется только то, сколько
+        часов истории видят модели и эталоны.
+
+        Args:
+            L: длина истории, ч.
+
+        Returns:
+            Новый набор окон.
+        """
+        out = copy.copy(self)
+        out.L, out.curriculum = int(L), None
+        out.requested = [int(L)] * len(self.items)
+        out.__dict__.pop("_robustness_meta", None)
+        return out
+
     def history_length(self, i):
         """Фактическая длина истории окна с учётом самого раннего доступного часа.
 
@@ -203,8 +297,18 @@ class EvalSet(Dataset):
         return self._attrs
 
     def window_meta(self):
-        """Метки окон для разрезов; ``t`` - час начала горизонта (порядок окон во времени
-        нужен офлайн-прогону адаптивной калибровки)."""
+        """Метки окон для разрезов.
+
+        Если длина истории задана одним числом или берётся полный буфер, метка длины
+        точная. Если длины выбраны по куррикулуму, метка - бин длины.
+
+        Returns:
+            Словарь массивов по окнам: станция, роль, зона, сезон, длина истории и её
+            метка, доля валидных часов истории, наличие давления, класс отчётности, разница
+            высот и час начала горизонта. Час начала нужен офлайн-прогону адаптивной
+            калибровки: она идёт по окнам станции в порядке времени.
+        """
+        label = history_bin_label if self.curriculum is not None else history_label
         sid_a, role, zone, season, hist, hvalid = [], [], [], [], [], []
         has_p, rep, egap = [], [], []
         attrs = self.station_attrs()
@@ -225,7 +329,9 @@ class EvalSet(Dataset):
             egap.append(attrs[sid]["elev_gap_label"])
         return dict(station=np.array(sid_a, object), role=np.array(role, object),
                     zone=np.array(zone, object), season=np.array(season, object),
-                    history=np.array(hist, np.int64), hist_valid=np.array(hvalid, np.float64),
+                    history=np.array(hist, np.int64),
+                    history_label=np.array([label(v) for v in hist], object),
+                    hist_valid=np.array(hvalid, np.float64),
                     has_pressure=np.array(has_p, object), report_class=np.array(rep, object),
                     elev_gap=np.array(egap, object),
                     t=np.array([t for _sid, t in self.items], np.int64))
@@ -264,8 +370,8 @@ class EvalSet(Dataset):
         doy_f, hour_f = window_calendar(t0, fut)
         y, y_mask = slice_target(s["x"], s["mask"], t)
         mu_clim_fut = clim.predict(doy_f, hour_f).astype(np.float32)
-        a_recent, _ = BL.recent_anomaly(x_hist[:, 0], mask_hist[:, 0], clim, L_MAX,
-                                        int(t0) + int(t) - L_MAX)
+        a_recent, a_ok = BL.recent_anomaly(x_hist[:, 0], mask_hist[:, 0], clim, L_MAX,
+                                           int(t0) + int(t) - L_MAX)
         return {
             "lat": torch.tensor(s["lat"], dtype=torch.float32),
             "lon": torch.tensor(s["lon"], dtype=torch.float32),
@@ -281,5 +387,6 @@ class EvalSet(Dataset):
             "mu_clim_fut": torch.from_numpy(mu_clim_fut),
             "sigma_clim": torch.tensor(clim.sigma, dtype=torch.float32),
             "a_recent": torch.tensor(a_recent, dtype=torch.float32),
+            "a_recent_ok": torch.tensor(bool(a_ok)),
             "hist_len": torch.tensor(w["L"], dtype=torch.int64),
         }

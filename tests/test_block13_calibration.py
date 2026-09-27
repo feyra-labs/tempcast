@@ -162,10 +162,8 @@ def test_evaluation_with_calibration_uses_the_same_function():
 
 
 def test_all_modules_share_one_calibration_implementation():
-    import mayak.evaluate as E
     import mayak.runtime.streaming as R
     from mayak import metrics as M
-    assert E.calibrate_forecast is M.calibrate_forecast
     for name in ("apply_conformal", "apply_adaptive", "aci_score", "ACIParams"):
         assert getattr(R, name) is getattr(M, name), name
     offenders = []
@@ -571,13 +569,15 @@ def test_predictions_roundtrip_and_analysis_on_saved_file(tmp_path):
     cfg = _cfg(bootstrap=0, min_windows=1, min_stations=1)
     mem = analyze(preds, aux, shift, cfg)
     disk = analyze(p2, a2, s2, cfg, out_dir=str(tmp_path / "out"))
-    assert disk["report"]["overall"]["coverage"] == pytest.approx(
-        mem["report"]["overall"]["coverage"], abs=1e-6)
+    for part in ("raw", "calibrated"):
+        assert disk[part]["report"]["overall"]["coverage"] == pytest.approx(
+            mem[part]["report"]["overall"]["coverage"], abs=1e-6)
     names = {Path(p).name for p in disk["paths"]}
     assert names == {"sharpness_coverage_internal.png", "coverage_strata_internal.png",
-                     "calibration_internal.json"}
+                     "coverage_strata_internal_calibrated.png", "calibration_internal.json"}
     data = json.loads((tmp_path / "out" / "calibration_internal.json").read_text("utf-8"))
-    assert set(data) >= {"report", "gate", "sharpness", "aci", "config"}
+    assert set(data) >= {"raw", "calibrated", "sharpness", "aci", "config"}
+    assert data["conformal"] is True
     with pytest.raises(KeyError):
         analyze(preds, aux, None, cfg, model="нет такой")
 
@@ -618,8 +618,8 @@ def test_eval_set_meta_carries_window_time_and_feeds_analysis(tmp_path):
     path = save_predictions(tmp_path / "internal.npz", {"МАЯК": dict(mu=mu, q=_gauss_q(mu))}, aux)
     p2, a2, _s, _i = load_predictions(path)
     res = analyze(p2, a2, None, _cfg(bootstrap=0, min_windows=1, min_stations=1))
-    assert res["aci"]["overall"]["n"] > 0
-    assert res["report"]["dims"]["роль станции"]
+    assert res["aci"]["overall"]["n"] > 0 and res["calibrated"] is None
+    assert res["raw"]["report"]["dims"]["роль станции"]
 
 
 def test_cli_runs_on_saved_predictions(tmp_path, capsys):

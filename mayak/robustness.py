@@ -20,7 +20,9 @@
 Запуск::
 
     python -m mayak.robustness --ckpt runs/mayak/stageB/best.ckpt \\
-        --conformal runs/conformal.npy --external-manifest data/ghcnh/manifest.csv
+        --external-manifest data/ghcnh/manifest.csv
+
+Все модели оцениваются по сырым выходам, без калибровки.
 """
 from __future__ import annotations
 
@@ -153,7 +155,7 @@ class RobustnessSet(Dataset):
         x, m = enforce_invariant(w.x, w.m)
         x, m = self._qc(i, x, m, w)
         y, _ = enforce_invariant(w.y, w.y_mask)
-        a_recent, _ok = BL.recent_anomaly(x[:, 0], m[:, 0], s["clim"], L_MAX,
+        a_recent, a_ok = BL.recent_anomaly(x[:, 0], m[:, 0], s["clim"], L_MAX,
                                           int(s["t0"]) + int(t) - L_MAX)
         out = dict(item)
         out.update(
@@ -164,6 +166,7 @@ class RobustnessSet(Dataset):
             mask_hist=torch.from_numpy(np.ascontiguousarray(m, np.float32)),
             y=torch.from_numpy(np.ascontiguousarray(y, np.float32)),
             a_recent=torch.tensor(a_recent, dtype=torch.float32),
+            a_recent_ok=torch.tensor(bool(a_ok)),
             hist_len=torch.tensor(w.L, dtype=torch.int64),
         )
         return out
@@ -207,17 +210,26 @@ def add_excess(rows):
     return rows
 
 
-def robustness_sweep(named, base, cfg: RobustnessConfig, shift=None, r_damped=None,
+def robustness_sweep(named, base, cfg: RobustnessConfig, r_damped=None,
                      statistical=True, device="cpu", n_boot=None, boot_seed=0,
                      set_name="internal"):
-    """Сетка «сценарий × уровень × модель × лид» → плоский список строк метрик.
+    """Метрики всех моделей на каждом сценарии, уровне и лиде.
 
-    named       - {имя: модель} (как в ``mayak.evaluate``);
-    base        - ``EvalSet``: одно множество окон для всех сценариев, уровней и моделей;
-    shift       - конформная таблица (применяется ко всем моделям, как в оценке);
-    r_damped    - коэффициенты затухающей персистентности; None - без неё;
-    statistical - добавить статистические эталоны (климатология, сезонно-наивный, ...);
-    n_boot      - итераций бутстрапа по станциям; None - ``cfg.bootstrap``.
+    Все модели оцениваются по сырым выходам, без калибровки.
+
+    Args:
+        named: словарь из имени модели в модель.
+        base: набор окон, общий для всех сценариев, уровней и моделей.
+        cfg: настройки робастности.
+        r_damped: коэффициенты затухающей персистентности; None значит без неё.
+        statistical: добавить статистические эталоны.
+        device: устройство.
+        n_boot: итераций бутстрапа по станциям; None значит взять из настроек.
+        boot_seed: сид бутстрапа.
+        set_name: имя набора в строках.
+
+    Returns:
+        Плоский список строк: по одной на сценарий, уровень, модель и лид.
     """
     n_boot = cfg.bootstrap if n_boot is None else int(n_boot)
     rows = []
@@ -232,7 +244,7 @@ def robustness_sweep(named, base, cfg: RobustnessConfig, shift=None, r_damped=No
                 y_ref = aux["y"]
             dist = np.abs(aux["y"].astype(np.float64) - y_ref)
             for model, p in preds.items():
-                ev = evaluation_for(p, aux, shift)
+                ev = evaluation_for(p, aux)
                 for lead in cfg.leads:
                     summ = ev.restrict(leads=[lead]).summary(
                         ci=n_boot > 0, n_boot=n_boot, seed=boot_seed, level=cfg.ci_level)
@@ -442,7 +454,6 @@ def main(argv=None):
                     help="YAML сценариев (по умолчанию conf/robustness/default.yaml)")
     ap.add_argument("--scenarios", default=None,
                     help="подмножество сценариев через запятую, например offset,dropout")
-    ap.add_argument("--conformal", default=None, help="runs/conformal.npy (если есть)")
     ap.add_argument("--bootstrap", type=int, default=None,
                     help="итераций бутстрапа по станциям (по умолчанию из конфига; 0 - без)")
     ap.add_argument("--eval-seed", type=int, default=None,
@@ -477,7 +488,7 @@ def main(argv=None):
     store = get_store(args.manifest)
     clims = store.clims()
     base = base_eval_set(clims, args.manifest, cfg)
-    run_checklist(store, datasets=[base], conformal=args.conformal, checkpoints=all_ckpts)
+    run_checklist(store, datasets=[base], checkpoints=all_ckpts)
     rec = load_run_record(args.ckpt)
     boot_seed = args.eval_seed if args.eval_seed is not None else (
         int(rec["seeds"]["eval"]) if rec else 0)
@@ -489,8 +500,7 @@ def main(argv=None):
     if not args.no_statistical:
         r_damped = BL.fit_damped_persistence(
             {k: s for k, s in clims.items() if s["role"] == ROLE_TRAIN}, n_windows=20000)
-    shift = np.load(args.conformal) if args.conformal else None
-    kw = dict(shift=shift, r_damped=r_damped, statistical=not args.no_statistical,
+    kw = dict(r_damped=r_damped, statistical=not args.no_statistical,
               device=args.device, n_boot=args.bootstrap, boot_seed=boot_seed)
 
     sets = {"internal": base}
@@ -500,7 +510,7 @@ def main(argv=None):
         ext = base_eval_set(ext_store.clims(), args.external_manifest, cfg,
                             roles=(ROLE_EXTERNAL,), time_key="test")
         run_checklist(ext_store, datasets=[ext])
-        check_external(store, ext_store, checkpoints=all_ckpts, conformal=args.conformal)
+        check_external(store, ext_store, checkpoints=all_ckpts)
         sets["external"] = ext
         rows += robustness_sweep(named, ext, cfg, set_name="external", **kw)
 
@@ -509,7 +519,7 @@ def main(argv=None):
         for p in plot_all(rows, cfg, args.out_dir, set_name=name):
             print("  ", p)
     bad = skill_violations(rows, cfg.skill_tolerance, cfg.guard_models)
-    meta = dict(ckpt=args.ckpt, baselines=baseline_ckpts, conformal=args.conformal,
+    meta = dict(ckpt=args.ckpt, baselines=baseline_ckpts, outputs="raw",
                 qc=cfg.qc, boot_seed=boot_seed,
                 sets={n: dict(n_windows=len(d), n_stations=len({s for s, _t in d.items}))
                       for n, d in sets.items()})

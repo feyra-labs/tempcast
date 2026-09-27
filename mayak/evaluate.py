@@ -1,30 +1,27 @@
 """Единый стенд оценки МАЯК.
 
-Все числа считает ``mayak/metrics.py`` - здесь только сбор окон, сбор
-предсказаний и печать. Содержит:
+Стенд собирает окна оценки, прогоняет по ним все модели и печатает таблицы.
 
-  * окна для оценки со стратифицированной подвыборкой (одинаковое число окон с каждой
-    станции) и метаданными окон для разрезов;
-  * сбор предсказаний МАЯК + нейробейзлайнов (GRU, DLinear, LRU, PatchTST) +
-    статистических; перед сравнением проверяется, что все чекпойнты обучены по одному
-    протоколу (mayak.lit.check_comparable);
-  * таблицы в двух видах агрегирования — пуловом и макро - с доверительными
-    интервалами блочного бутстрапа по станциям;
-  * разрезы: по лидам, ролям станций, полным зонам Кёппена, сезонам, длине
-    доступной истории и доле валидных часов в истории;
-  * метрики надёжности: гистограмма PIT, диаграмма надёжности, острота против
-    покрытия;
-  * графики по каждой метрике, кривую холодного старта и проверку L=0;
-  * отчёт о влиянии конформной калибровки (PICP/CRPS/MAE до и после);
-  * покрытие по разрезам с вердиктами и критерий условной поправки; --save-preds
-    сохраняет предсказания всех моделей,
-    чтобы анализ калибровки шёл без повторного запуска моделей;
-  * внешний тест на наблюдениях реальной сети (--external-manifest): те же
-    таблицы и разрезы, разрезы внешнего теста (шаг отчётности, Δ высоты станции и
-    ЦМР, канал давления) и сопоставление «внутренний тест против внешнего»;
-  * проверки этапа A (поле), декомпозицию L=0, суточные амплитуды, ablation.
+Сравнение моделей идёт только по их сырым выходам. Основные таблицы, разрезы,
+надёжность, острота против покрытия, графики и сохранённые предсказания не зависят от
+того, задана ли конформная таблица. Таблица МАЯК даёт отдельный раздел «МАЯК после
+калибровки»: сырой и откалиброванный МАЯК рядом, покрытие по тем же разрезам и
+офлайн-прогон адаптивной калибровки устройства.
+
+Каждое окно оценивается на сетке длин истории, от холодного старта до полной истории.
+Основные таблицы считаются при полной истории. Разрез по длине истории и кривые скилла
+по длине истории строятся для всех моделей с интервалами бутстрапа по станциям. Эталоны,
+которым нужна история, видят ту же историю окна, что модели. Климатологии история не
+нужна, поэтому она считается один раз и одинакова на всей сетке.
+
+Кроме того, стенд считает таблицы в двух видах агрегирования (пуловом и макро) с
+интервалами блочного бутстрапа по станциям, разрезы по ролям станций, зонам Кёппена,
+сезонам и доле валидных часов истории, внешний тест на наблюдениях реальной сети с его
+собственными разрезами и сопоставлением с внутренним тестом, проверки поля при холодном
+старте, суточные амплитуды и строки переобученных абляций.
 """
 import os
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -32,10 +29,10 @@ from torch.utils.data import DataLoader
 
 from mayak import baselines as BL
 from mayak.constants import H, QUANTILES
-from mayak.data.holdout import HISTORY_BINS, EvalSet
-from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, apply_conformal, breakdown,
-                           by_lead, calibrate_forecast, coverage, metric_table, pinball_crps,
-                           seed_spread, skill, wmean)
+from mayak.data.holdout import (HISTORY_GRID, NOMINAL_HISTORY, EvalSet, check_history_grid,
+                                history_label, history_strata)
+from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, breakdown, by_lead, coverage,
+                           metric_table, seed_spread, skill, wmean)
 from mayak.zones import normalize_zone
 
 Q = np.array(QUANTILES, np.float32)
@@ -44,6 +41,13 @@ HIST_VALID_BINS = ((-0.01, 0.5, "<50%"), (0.5, 0.8, "50-80%"),
                    (0.8, 0.95, "80-95%"), (0.95, 1.01, "95-100%"))
 MIN_WINDOWS, MIN_STATIONS = 20, 2
 BOOTSTRAP = dict(n_boot=1000, seed=0, level=0.90)
+TABLE_LEADS = (1, 3, 6, 12, 24, 48, 72, 120, 168)
+HISTORY_LEADS = (24, 72, 168)
+BREAKDOWN_LEAD = 24
+
+MAIN_MODEL = "МАЯК"
+CLIMATOLOGY, DAMPED, SEASONAL = "Климатология", "Damped persistence", "Seasonal-naive 24ч"
+HISTORY_FREE = (CLIMATOLOGY,)
 
 NEURAL_BASELINES = {"gru": "GRU seq2seq", "dlinear": "DLinear", "lru": "LRU",
                     "patchtst": "PatchTST"}
@@ -53,7 +57,8 @@ BENCHMARK_NOTE = (
     "многолетнему обучающему окну. При короткой истории эталон располагает бо́льшим\n"
     "объёмом информации о станции, чем модель: оценка строга в пользу эталона.\n"
     "Пуловая метрика — по всем парам «окно × лид» сразу, её доминируют станции\n"
-    "с большой изменчивостью; макро — среднее по станциям, «типичная станция».")
+    "с большой изменчивостью; макро — среднее по станциям, «типичная станция».\n"
+    "Все модели сравниваются по сырым выходам, без калибровки.")
 
 
 def bin_label(value, bins):
@@ -67,27 +72,64 @@ def coverage90(y, q, w):
     return coverage(y, q, w)
 
 
+_AUX_KEYS = (("y", "y"), ("y_mask", "y_mask"), ("mu_clim", "mu_clim_fut"),
+             ("a_recent", "a_recent"), ("a_recent_ok", "a_recent_ok"),
+             ("sigma_clim", "sigma_clim"), ("x_hist", "x_hist"),
+             ("mask_hist", "mask_hist"))
+
+
 @torch.no_grad()
-def gather(model, dataset, device="cpu", batch_size=128):
-    model.eval().to(device)
-    dl = DataLoader(dataset, batch_size=batch_size)
-    ys, yms, mus, qs, mucl = [], [], [], [], []
-    a_rec, sig_cl, xh, mh = [], [], [], []
-    for b in dl:
+def gather_all(named, dataset, device="cpu", batch_size=128):
+    """Прогон всех моделей по набору окон за один проход.
+
+    Окно собирается один раз и подаётся всем моделям. Это важно, потому что сборка окна
+    с причинным QC дороже прогона небольшой модели.
+
+    Args:
+        named: словарь из имени модели в модель; может быть пустым.
+        dataset: набор окон.
+        device: устройство, на котором считают модели.
+        batch_size: размер батча.
+
+    Returns:
+        Пара: словарь из имени модели в её медиану формы (N, H) и квантили формы
+        (N, H, 7), и словарь с целью, маской цели, климатологией на горизонте, недавней
+        аномалией, климатологическим масштабом и историей окон.
+    """
+    for m in named.values():
+        m.eval().to(device)
+    outs = {name: dict(mu=[], q=[]) for name in named}
+    acc = {k: [] for k, _src in _AUX_KEYS}
+    for b in DataLoader(dataset, batch_size=batch_size):
+        for k, src in _AUX_KEYS:
+            acc[k].append(b[src].numpy())
+        if not named:
+            continue
         bb = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
-        o = model(bb)
-        ys.append(b["y"].numpy())
-        yms.append(b["y_mask"].numpy())
-        mus.append(o["mu"].cpu().numpy())
-        qs.append(o["q"].cpu().numpy())
-        mucl.append(b["mu_clim_fut"].numpy())
-        a_rec.append(b["a_recent"].numpy())
-        sig_cl.append(b["sigma_clim"].numpy())
-        xh.append(b["x_hist"].numpy())
-        mh.append(b["mask_hist"].numpy())
-    cat = lambda L: np.concatenate(L, 0)
-    return dict(y=cat(ys), y_mask=cat(yms), mu=cat(mus), q=cat(qs), mu_clim=cat(mucl),
-                a_recent=cat(a_rec), sigma_clim=cat(sig_cl), x_hist=cat(xh), mask_hist=cat(mh))
+        for name, m in named.items():
+            o = m(bb)
+            outs[name]["mu"].append(o["mu"].cpu().numpy())
+            outs[name]["q"].append(o["q"].cpu().numpy())
+    cat = lambda parts: np.concatenate(parts, 0)
+    aux = {k: cat(v) for k, v in acc.items()}
+    preds = {name: {k: cat(v) for k, v in d.items()} for name, d in outs.items()}
+    return preds, aux
+
+
+def gather(model, dataset, device="cpu", batch_size=128):
+    """Прогон одной модели по набору окон.
+
+    Args:
+        model: модель.
+        dataset: набор окон.
+        device: устройство.
+        batch_size: размер батча.
+
+    Returns:
+        Словарь: медиана, квантили и всё, что возвращает общий прогон про окна.
+    """
+    preds, aux = gather_all({"model": model}, dataset, device=device, batch_size=batch_size)
+    return dict(aux, **preds["model"])
 
 
 @torch.no_grad()
@@ -111,38 +153,97 @@ def _gather_full(model, ds, device="cpu", batch_size=128):
     return {k: np.concatenate(v, 0) for k, v in acc.items()}
 
 
-def collect_predictions(named_models, ds, device="cpu"):
-    preds, aux = {}, None
-    for name, mdl in named_models.items():
-        D = gather(mdl, ds, device=device)
-        if aux is None:
-            aux = D
-            aux["meta"] = ds.window_meta()
-        preds[name] = dict(mu=D["mu"], q=D["q"])
+def collect_predictions(named, ds, device="cpu"):
+    """Предсказания всех моделей и данные окон для таблиц.
+
+    Args:
+        named: словарь из имени модели в модель.
+        ds: набор окон.
+        device: устройство.
+
+    Returns:
+        Пара: словарь из имени модели в её медиану и квантили, и данные окон вместе с
+        метаданными для разрезов.
+    """
+    preds, aux = gather_all(named, ds, device=device)
+    aux["meta"] = ds.window_meta()
     return preds, aux
 
 
-def add_statistical_baselines(preds, aux, r_damped=None):
+def history_free_baselines(aux):
+    """Эталоны, которым история окна не нужна.
+
+    Args:
+        aux: данные окон.
+
+    Returns:
+        Словарь из имени эталона в его медиану и квантили.
+    """
+    mu, q = BL.climatology_forecast(aux["mu_clim"], aux["sigma_clim"])
+    return {CLIMATOLOGY: dict(mu=mu, q=q)}
+
+
+def history_baselines(aux, r_damped=None):
+    """Эталоны, которые читают историю окна.
+
+    Оба эталона видят ровно ту историю, что модели: усечённую до длины истории окна и
+    прошедшую причинный QC. Недавняя аномалия затухающей персистентности считается при
+    сборке окна по этой же истории.
+
+    Args:
+        aux: данные окон.
+        r_damped: коэффициенты затухания по лидам; None значит без затухающей
+            персистентности.
+
+    Returns:
+        Словарь из имени эталона в его медиану и квантили.
+    """
     mucl, sig = aux["mu_clim"], aux["sigma_clim"]
-    mu_b, q_b = BL.climatology_forecast(mucl, sig)
-    preds["Климатология"] = dict(mu=mu_b, q=q_b)
+    out = {}
     if r_damped is not None:
-        mu_b, q_b = BL.damped_persistence_forecast(aux["a_recent"], mucl, sig, r_damped)
-        preds["Damped persistence"] = dict(mu=mu_b, q=q_b)
-    mu_b, q_b = BL.seasonal_naive_forecast(aux["x_hist"], aux["mask_hist"], mucl, sig, period=24)
-    preds["Seasonal-naive 24ч"] = dict(mu=mu_b, q=q_b)
+        mu, q = BL.damped_persistence_forecast(aux["a_recent"], mucl, sig, r_damped,
+                                               valid=aux["a_recent_ok"])
+        out[DAMPED] = dict(mu=mu, q=q)
+    mu, q = BL.seasonal_naive_forecast(aux["x_hist"], aux["mask_hist"], mucl, sig, period=24)
+    out[SEASONAL] = dict(mu=mu, q=q)
+    return out
+
+
+def add_statistical_baselines(preds, aux, r_damped=None, history_free=None):
+    """Добавляет к предсказаниям статистические эталоны.
+
+    Args:
+        preds: словарь предсказаний моделей; дополняется на месте.
+        aux: данные окон.
+        r_damped: коэффициенты затухания по лидам; None значит без затухающей
+            персистентности.
+        history_free: готовые предсказания эталонов, которым история не нужна. Их
+            можно взять с любой длины истории тех же окон; None значит посчитать.
+
+    Returns:
+        Тот же словарь предсказаний.
+    """
+    preds.update(history_free if history_free is not None else history_free_baselines(aux))
+    preds.update(history_baselines(aux, r_damped))
     return preds
 
 
-def evaluation_for(pred, aux, shift=None):
-    """Предсказания одной модели → ``Evaluation``"""
-    ev = Evaluation(y=aux["y"], mu=pred["mu"], q=pred["q"], mu_clim=aux["mu_clim"],
-                    w=aux["y_mask"], station=aux["meta"]["station"])
-    return ev.with_conformal(shift)
+def evaluation_for(pred, aux):
+    """Оценка одной модели по её сырым выходам.
+
+    Args:
+        pred: медиана и квантили модели.
+        aux: цель, маска цели, климатология и метаданные тех же окон.
+
+    Returns:
+        Оценка модели.
+    """
+    return Evaluation(y=aux["y"], mu=pred["mu"], q=pred["q"], mu_clim=aux["mu_clim"],
+                      w=aux["y_mask"], station=aux["meta"]["station"])
 
 
-def evaluations(preds, aux, shift=None):
-    return {name: evaluation_for(p, aux, shift) for name, p in preds.items()}
+def evaluations(preds, aux):
+    return {name: evaluation_for(p, aux) for name, p in preds.items()}
 
 
 def build_tables(preds, aux, leads=FINE_LEADS):
@@ -197,21 +298,38 @@ def show(tbl):
               f"{m['CRPS']:>6.2f} {m['PICP80']:>7.1%} {m['PICP90']:>7.1%} {m['Winkler90']:>7.2f}")
 
 
-def print_lead_table(ev, leads=(1, 3, 6, 12, 24, 48, 72, 120, 168), ci=False, **kw):
+def print_lead_table(ev, leads=TABLE_LEADS, ci=False, **kw):
     rows = {str(h): s for h, s in by_lead(ev, leads=leads, ci=ci, **kw).items()}
     print_rows(rows, label="лид, ч", ci=ci)
 
 
 def all_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS, min_stations=MIN_STATIONS,
-                   ci=False, **kw):
-    hist = np.array([bin_label(int(v), HISTORY_BINS) for v in meta["history"]], object)
+                   ci=False, history=None, **kw):
+    """Разрезы одной модели по метаданным окон.
+
+    Args:
+        ev: оценка модели.
+        meta: метаданные тех же окон.
+        leads: лиды, на которых считаются метрики.
+        min_windows: страта с меньшим числом окон не показывается.
+        min_stations: страта с меньшим числом станций не показывается.
+        ci: считать интервалы бутстрапа по станциям.
+        history: готовые строки разреза по длине истории, посчитанные по сетке длин на
+            тех же окнах. None значит строить разрез по метаданным набора.
+        **kw: параметры бутстрапа.
+
+    Returns:
+        Словарь из имени разреза в словарь из метки страты в её сводку.
+    """
+    hist, hist_order = history_strata(meta)
     hvalid = np.array([bin_label(float(v), HIST_VALID_BINS) for v in meta["hist_valid"]], object)
     kwargs = dict(leads=leads, min_windows=min_windows, min_stations=min_stations, ci=ci, **kw)
     return {
         "роль станции": breakdown(ev, meta["role"], **kwargs),
         "зона Кёппена": breakdown(ev, meta["zone"], **kwargs),
         "сезон": breakdown(ev, meta["season"], **kwargs),
-        "длина истории": breakdown(ev, hist, **kwargs),
+        "длина истории": (history if history is not None
+                          else breakdown(ev, hist, order=hist_order, **kwargs)),
         "валидность истории": breakdown(ev, hvalid, **kwargs),
     }
 
@@ -228,14 +346,18 @@ def external_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS,
     }
 
 
-def print_breakdowns(ev, meta, leads=None, ci=False, fn=None, **kw):
-    fn = fn or all_breakdowns
-    for name, rows in fn(ev, meta, leads=leads, ci=ci, **kw).items():
+def print_breakdowns(rows_by_dim):
+    """Печатает разрезы; интервалы печатаются, если они посчитаны.
+
+    Args:
+        rows_by_dim: словарь из имени разреза в словарь из метки страты в её сводку.
+    """
+    for name, rows in rows_by_dim.items():
         print(f"\n--- разрез: {name} ---")
         if not rows:
             print("  (все страты меньше порога по числу окон или станций)")
             continue
-        print_rows(rows, label=name, ci=ci)
+        print_rows(rows, label=name, ci=any("ci" in r for r in rows.values()))
 
 
 def print_reliability(ev, lead_bins=LEAD_BINS):
@@ -396,7 +518,7 @@ def plot_pit(ev, out_dir="runs/plots"):
 def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
                            out_dir="runs/plots", time_key="test",
                            station_splits=("train", "unseen_test"),
-                           shift=None, seed=0, L=None):
+                           seed=0, L=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -418,8 +540,6 @@ def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
         out = model(batch)
         mu = out["mu"][0].cpu().numpy()
         q = out["q"][0].cpu().numpy()
-        if shift is not None:
-            q, mu = calibrate_forecast(q, shift)
         y = np.where(item["y_mask"].numpy() > 0, item["y"].numpy(), np.nan)  # дыры видны
         muc = item["mu_clim_fut"].numpy()
         sid, _t = ds.items[int(i)]
@@ -497,73 +617,337 @@ def plot_amplitude_scatter(model, clims, manifest="data/manifest.csv", out_dir="
     return p
 
 
-def evaluate_all(model, clims, manifest="data/manifest.csv", r_damped=None,
-                 named_extra=None, ds=None, preds=None, aux=None, shift=None,
-                 ci=True, bootstrap=BOOTSTRAP):
-    """Главная таблица: все модели, обе агрегации, интервалы, разрезы для МАЯК."""
-    if ds is None:
-        ds = EvalSet(clims, manifest=manifest, time_key="test")
-    if preds is None or aux is None:
-        named = {"МАЯК": model}
-        if named_extra:
-            named.update(named_extra)
-        preds, aux = collect_predictions(named, ds)
-        preds = add_statistical_baselines(preds, aux, r_damped=r_damped)
+@dataclass
+class Bench:
+    """Прогон всех моделей по одним окнам на всей сетке длин истории.
 
-    print(BENCHMARK_NOTE)
-    evs = evaluations(preds, aux, shift=shift)
-    for name, ev in evs.items():
-        print(f"\n=== {name} ===")
-        print_lead_table(ev, ci=ci, **(bootstrap if ci else {}))
+    Attributes:
+        grid: длины истории, ч, по возрастанию.
+        preds: предсказания всех моделей при полной истории.
+        aux: данные окон при полной истории.
+        history: сводки по длинам истории: словарь из имени модели в словарь из длины в
+            словарь из лида в сводку.
+        main: имя основной модели.
+        main_history: предсказания основной модели на каждой длине истории: словарь из
+            длины в медиану, квантили и метаданные окон при этой длине.
+    """
 
-    print("\n=== Общие метрики по всему горизонту ===")
-    rows = {name: ev.summary(ci=ci, **(bootstrap if ci else {})) for name, ev in evs.items()}
-    print_rows(rows, label="модель", ci=ci)
-
-    print("\n=== Разрезы (МАЯК, лид 24 ч) ===")
-    print_breakdowns(evs["МАЯК"], aux["meta"], leads=[24], ci=False)
-
-    print("\n=== Надёжность (МАЯК) ===")
-    print_reliability(evs["МАЯК"])
-    print_calibration(evs["МАЯК"], aux["meta"], bootstrap=bootstrap if ci else None)
-    return preds, aux, ds
+    grid: tuple
+    preds: dict
+    aux: dict
+    history: dict
+    main: str
+    main_history: dict
 
 
-def print_calibration(ev, meta, bootstrap=None, external=False):
+def _same_targets(a, b):
+    return all(np.array_equal(a[k], b[k]) for k in ("y", "y_mask", "mu_clim", "sigma_clim"))
+
+
+def run_bench(named, base, grid=HISTORY_GRID, r_damped=None, leads=HISTORY_LEADS, ci=True,
+              bootstrap=BOOTSTRAP, device="cpu", main=MAIN_MODEL):
+    """Прогоняет модели и эталоны по окнам набора на каждой длине истории из сетки.
+
+    Окна, цели и эталон одинаковы на всей сетке, меняется только длина истории. Эталоны
+    без истории считаются один раз, их сводки на всех длинах совпадают. Длины
+    обрабатываются по одной: в памяти остаются только сводки, предсказания при полной
+    истории и предсказания основной модели.
+
+    Args:
+        named: словарь из имени модели в модель.
+        base: набор окон.
+        grid: длины истории, ч; должна включать полную историю.
+        r_damped: коэффициенты затухающей персистентности; None значит без неё.
+        leads: лиды сводок по длине истории.
+        ci: считать интервалы бутстрапа по станциям.
+        bootstrap: параметры бутстрапа.
+        device: устройство.
+        main: имя основной модели.
+
+    Returns:
+        Результат прогона.
+
+    Raises:
+        RuntimeError: цели или эталон окон разошлись между длинами истории.
+    """
+    grid = check_history_grid(grid)
+    kw = bootstrap if ci else {}
+    history, main_history = {}, {}
+    free, first, nominal = None, None, None
+    for L in grid:
+        ds = base.with_history(L)
+        preds, aux = collect_predictions(named, ds, device=device)
+        if first is None:
+            first = aux
+        elif not _same_targets(first, aux):
+            raise RuntimeError(f"цели окон при L = {L} ч отличаются от целей при L = {grid[0]} "
+                               f"ч: сетка длин истории должна менять только историю")
+        preds = add_statistical_baselines(preds, aux, r_damped=r_damped, history_free=free)
+        for name, p in preds.items():
+            rows = history.setdefault(name, {})
+            if free is not None and name in free:
+                rows[L] = rows[grid[0]]
+                continue
+            ev = evaluation_for(p, aux)
+            rows[L] = {int(h): ev.restrict(leads=[h]).summary(ci=ci, **kw) for h in leads}
+        if free is None:
+            free = {n: preds[n] for n in HISTORY_FREE}
+        if main in preds:
+            main_history[L] = dict(preds[main], meta=aux["meta"])
+        if L == NOMINAL_HISTORY:
+            nominal = (preds, aux)
+    return Bench(grid=grid, preds=nominal[0], aux=nominal[1], history=history, main=main,
+                 main_history=main_history)
+
+
+def history_rows(bench, model, lead):
+    """Разрез по длине истории одной модели на одном лиде.
+
+    Args:
+        bench: результат прогона по сетке.
+        model: имя модели.
+        lead: лид, ч.
+
+    Returns:
+        Словарь из метки длины истории в сводку, по возрастанию длины. В нём все длины
+        сетки.
+    """
+    return {history_label(L): bench.history[model][L][int(lead)] for L in bench.grid}
+
+
+def history_evaluations(bench, shift=None):
+    """Оценки основной модели на каждой длине истории.
+
+    Оценки создаются по одной, по мере чтения, чтобы в памяти не лежали все сразу.
+
+    Args:
+        bench: результат прогона по сетке.
+        shift: конформная таблица; None значит сырые выходы.
+
+    Yields:
+        Пары из метки длины истории и оценки.
+    """
+    aux = bench.aux
+    for L in bench.grid:
+        p = bench.main_history[L]
+        ev = Evaluation(y=aux["y"], mu=p["mu"], q=p["q"], mu_clim=aux["mu_clim"],
+                        w=aux["y_mask"], station=p["meta"]["station"])
+        yield history_label(L), ev.with_conformal(shift)
+
+
+def history_predictions(bench):
+    """Предсказания основной модели по всей сетке, сложенные в один набор окон.
+
+    Каждое окно повторяется столько раз, сколько длин в сетке; метаданные повтора - те,
+    что у окна при этой длине истории.
+
+    Args:
+        bench: результат прогона по сетке.
+
+    Returns:
+        Пара из предсказаний основной модели и данных окон в том виде, в каком их
+        сохраняют для анализа калибровки.
+    """
+    parts = [bench.main_history[L] for L in bench.grid]
+    aux = bench.aux
+    n = len(parts)
+    pred = {k: np.concatenate([p[k] for p in parts], 0) for k in ("mu", "q")}
+    out = {k: np.concatenate([aux[k]] * n, 0) for k in ("y", "y_mask", "mu_clim")}
+    out["meta"] = {k: np.concatenate([p["meta"][k] for p in parts], 0)
+                   for k in parts[0]["meta"]}
+    return {bench.main: pred}, out
+
+
+def calibration_config(ci, bootstrap):
+    """Настройки анализа калибровки с параметрами бутстрапа стенда оценки."""
     from dataclasses import replace
-    from mayak.calibration import (conditional_gate, coverage_report, load_config,
-                                   print_coverage_report)
+
+    from mayak.calibration import load_config
     cfg = load_config()
-    if bootstrap:
-        cfg = replace(cfg, bootstrap=int(bootstrap["n_boot"]), seed=int(bootstrap["seed"]),
-                      ci_level=float(bootstrap["level"]))
-    else:
-        cfg = replace(cfg, bootstrap=0)
-    rep = coverage_report(ev, meta, cfg, external=external)
-    print_coverage_report(rep, conditional_gate(rep, cfg),
-                          title=f"\n=== {'[внешний] ' if external else ''}Покрытие по разрезам "
-                                f"(МАЯК, весь горизонт) ===")
-    return rep
+    if not ci:
+        return replace(cfg, bootstrap=0)
+    return replace(cfg, bootstrap=int(bootstrap["n_boot"]), seed=int(bootstrap["seed"]),
+                   ci_level=float(bootstrap["level"]))
 
 
-def coldstart_curve(model, clims, manifest="data/manifest.csv",
-                    Ls=(0, 6, 24, 72, 168, 336, 672)):
-    print("\n=== Кривая холодного старта (Skill-24ч от L) ===")
-    res = {}
-    for L in Ls:
-        ds = EvalSet(clims, manifest=manifest, time_key="test", L=L, every_hours=120)
-        D = gather(model, ds)
-        j = 24 - 1
-        sk = skill(D["y"][:, j], D["mu"][:, j], D["mu_clim"][:, j], D["y_mask"][:, j])
-        res[L] = float(sk)
-        print(f"  L={L:>4} ч : Skill-24ч = {sk:+.1%}")
-    if res.get(672, 0) > 0:
-        print(f"  Доля при L=24ч от полного: {res.get(24, 0) / res[672]:.0%}  (цель ≥80%)")
+def evaluate_set(named, base, grid=HISTORY_GRID, r_damped=None, shift=None, ci=True,
+                 bootstrap=BOOTSTRAP, device="cpu", external=False, main=MAIN_MODEL):
+    """Все числа стенда на одном наборе окон.
+
+    Сравнительная часть считается по сырым выходам всех моделей и от конформной таблицы
+    не зависит. Таблица влияет только на раздел основной модели после калибровки.
+
+    Args:
+        named: словарь из имени модели в модель; основная модель обязательна.
+        base: набор окон.
+        grid: длины истории, ч.
+        r_damped: коэффициенты затухающей персистентности; None значит без неё.
+        shift: конформная таблица основной модели; None значит без раздела после
+            калибровки.
+        ci: считать интервалы бутстрапа по станциям.
+        bootstrap: параметры бутстрапа.
+        device: устройство.
+        external: набор внешнего теста.
+        main: имя основной модели.
+
+    Returns:
+        Словарь. Сравнительная часть: прогон по сетке, таблицы по лидам и сводки по всему
+        горизонту для всех моделей, разрезы по длине истории для всех моделей, разрезы
+        основной модели, её надёжность, кривые остроты всех моделей и покрытие основной
+        модели по разрезам. Отдельно: раздел после калибровки или None.
+    """
+    from mayak.calibration import (aci_replay, calibration_effect, conditional_gate,
+                                   coverage_report, sharpness_curves)
+    bench = run_bench(named, base, grid=grid, r_damped=r_damped, ci=ci, bootstrap=bootstrap,
+                      device=device, main=main)
+    kw = bootstrap if ci else {}
+    preds, aux = bench.preds, bench.aux
+    meta = aux["meta"]
+    evs = evaluations(preds, aux)
+    cfg = calibration_config(ci, bootstrap)
+    history = {n: {h: history_rows(bench, n, h) for h in HISTORY_LEADS} for n in preds}
+    hist_main = {k: s for k, s in history[main][BREAKDOWN_LEAD].items()
+                 if s["n_windows"] >= MIN_WINDOWS and s["n_stations"] >= MIN_STATIONS}
+    breakdowns = all_breakdowns(evs[main], meta, leads=[BREAKDOWN_LEAD], history=hist_main)
+    if external:
+        breakdowns.update(external_breakdowns(evs[main], meta, leads=[BREAKDOWN_LEAD]))
+    report = coverage_report(evs[main], meta, cfg, external=external,
+                             history=history_evaluations(bench))
+    res = dict(
+        bench=bench, external=external, main=main,
+        leads={n: by_lead(ev, leads=TABLE_LEADS, ci=ci, **kw) for n, ev in evs.items()},
+        overall={n: ev.summary(ci=ci, **kw) for n, ev in evs.items()},
+        history=history, breakdowns=breakdowns, reliability=evs[main],
+        sharpness=sharpness_curves(evs, cfg),
+        coverage=dict(report=report, gate=conditional_gate(report, cfg)),
+        calibrated=None, config=cfg)
+    if shift is not None:
+        ev_cal = evs[main].with_conformal(shift)
+        rep = coverage_report(ev_cal, meta, cfg, external=external,
+                              history=history_evaluations(bench, shift))
+        res["calibrated"] = dict(effect=calibration_effect(evs[main], ev_cal), report=rep,
+                                 gate=conditional_gate(rep, cfg),
+                                 aci=aci_replay(ev_cal, meta, cfg.aci()))
     return res
 
 
-def coldstart_L0_check(model, clims, manifest="data/manifest.csv", shift=None):
-    ds = EvalSet(clims, manifest=manifest, time_key="test", L=0, every_hours=72)
+def print_history_table(history, lead, metric="Skill"):
+    """Печатает метрику всех моделей по длинам истории на одном лиде.
+
+    Args:
+        history: словарь из имени модели в словарь из лида в разрез по длине истории.
+        lead: лид, ч.
+        metric: имя метрики.
+    """
+    labels = list(next(iter(history.values()))[lead])
+    print(f"{'модель':>24} {'агрег.':>7} " + " ".join(f"{k:>22}" for k in labels))
+    for name, by_lead_rows in history.items():
+        rows = by_lead_rows[lead]
+        for agg, title in (("pooled", "пул"), ("macro", "макро")):
+            cells = [_cell(rows[k][agg], metric, rows[k].get("ci") and rows[k]["ci"][agg])
+                     for k in labels]
+            print(f"{name:>24} {title:>7} " + " ".join(f"{c:>22}" for c in cells))
+
+
+def print_evaluation(res, bootstrap=BOOTSTRAP):
+    """Печатает все таблицы стенда на одном наборе окон.
+
+    Args:
+        res: результат оценки набора.
+        bootstrap: параметры бутстрапа, с которыми он посчитан.
+    """
+    from mayak.calibration import (print_aci_replay, print_calibration_effect,
+                                   print_coverage_report, print_sharpness)
+    tag = "[внешний] " if res["external"] else ""
+    main = res["main"]
+    ci = any("ci" in s for s in res["overall"].values())
+    print(BENCHMARK_NOTE)
+    for name, rows in res["leads"].items():
+        print(f"\n=== {tag}{name} (полная история) ===")
+        print_rows({str(h): s for h, s in rows.items()}, label="лид, ч", ci=ci)
+    print(f"\n=== {tag}Общие метрики по всему горизонту (полная история) ===")
+    print_rows(res["overall"], label="модель", ci=ci)
+    for h in HISTORY_LEADS:
+        print(f"\n=== {tag}Длина истории: скилл всех моделей, лид {h} ч ===")
+        print_history_table(res["history"], h)
+    print(f"\n=== {tag}Разрезы ({main}, лид {BREAKDOWN_LEAD} ч) ===")
+    print_breakdowns(res["breakdowns"])
+    print(f"\n=== {tag}Надёжность ({main}, сырые выходы) ===")
+    print_reliability(res["reliability"])
+    print_sharpness(res["sharpness"], res["config"].nominal)
+    cov = res["coverage"]
+    print_coverage_report(cov["report"], cov["gate"],
+                          title=f"\n=== {tag}Покрытие по разрезам ({main}, сырые выходы, "
+                                f"весь горизонт) ===")
+    cal = res["calibrated"]
+    if cal is None:
+        return
+    print_calibration_effect(cal["effect"],
+                             title=f"\n########## {tag}{main} после калибровки ##########")
+    print_coverage_report(cal["report"], cal["gate"],
+                          title=f"\n=== {tag}Покрытие по разрезам ({main} после калибровки) ===")
+    print_aci_replay(cal["aci"], res["config"].tolerance)
+
+
+def plot_history_curves(history, out_dir="runs/plots", set_name="internal",
+                        leads=HISTORY_LEADS):
+    """Скилл всех моделей по длине истории на нескольких лидах.
+
+    Длины истории стоят на оси через равные промежутки. Полоса вокруг линии - интервал
+    бутстрапа по станциям для пуловой метрики, если он посчитан.
+
+    Args:
+        history: словарь из имени модели в словарь из лида в разрез по длине истории.
+        out_dir: каталог графика.
+        set_name: имя набора в имени файла.
+        leads: лиды, по панели на каждый.
+
+    Returns:
+        Путь к файлу.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    os.makedirs(out_dir, exist_ok=True)
+    fig, axes = plt.subplots(1, len(leads), figsize=(5.2 * len(leads), 4.4), squeeze=False)
+    for ax, h in zip(axes[0], leads):
+        labels = None
+        for name, rows_by_lead in history.items():
+            rows = rows_by_lead[h]
+            labels = list(rows)
+            x = np.arange(len(labels))
+            y = [rows[k]["pooled"]["Skill"] for k in labels]
+            line, = ax.plot(x, y, marker="o", ms=3, label=name)
+            if all("ci" in rows[k] for k in labels):
+                lo = [rows[k]["ci"]["pooled"]["Skill"][0] for k in labels]
+                hi = [rows[k]["ci"]["pooled"]["Skill"][1] for k in labels]
+                ax.fill_between(x, lo, hi, alpha=0.12, color=line.get_color())
+        ax.axhline(0.0, ls="--", lw=1, color="gray")
+        ax.set_xticks(np.arange(len(labels)))
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_xlabel("длина истории")
+        ax.set_title(f"лид {h} ч")
+        ax.grid(alpha=0.3)
+    axes[0][0].set_ylabel("Skill")
+    axes[0][0].legend(fontsize=7)
+    fig.suptitle(f"[{set_name}] скилл по длине истории, сырые выходы", fontsize=11)
+    fig.tight_layout()
+    p = os.path.join(out_dir, f"skill_by_history_{set_name}.png")
+    fig.savefig(p, dpi=130)
+    plt.close(fig)
+    return p
+
+
+def coldstart_L0_check(model, ds):
+    """Проверка холодного старта: при нулевой истории медиана равна полю модели.
+
+    Args:
+        model: модель МАЯК.
+        ds: окна с нулевой историей.
+
+    Returns:
+        Словарь чисел проверки.
+    """
     D = _gather_full(model, ds)
     o_abs = float(np.abs(D["o"]).mean())
     e_mean = float(np.abs(D["e"]).mean())
@@ -571,42 +955,14 @@ def coldstart_L0_check(model, clims, manifest="data/manifest.csv", shift=None):
     p_before = coverage90(D["y"], D["q"], D["y_mask"])
     diff_clim = float(np.abs(D["mu"] - D["mu_clim"]).mean())
 
-    print(f"  mean|o| = {o_abs:.3f} σ   (аномалия включена? должно быть ≈0)")
-    print(f"  mean e  = {e_mean:.3f}     (масса свидетельств; должно быть ≈0)")
-    print(f"  |медиана − поле модели| = {dev.mean():.3f} °C  (макс {dev.max():.2f}); "
-          f"= σ_c·(o+r), т.е. медиана почти равна якорю-полю")
+    print(f"  средний модуль аномалии мод = {o_abs:.3f} в долях масштаба (ожидается около 0)")
+    print(f"  средняя масса свидетельств = {e_mean:.3f} (ожидается около 0)")
+    print(f"  |медиана − поле модели| = {dev.mean():.3f} °C  (макс {dev.max():.2f})")
     print(f"  |медиана − эмпирич. климатология| = {diff_clim:.3f} °C  "
-          f"(ожидается мало: поле ≈ климатология, критерий этапа A)")
-    print(f"  PICP-90 при L=0 = {p_before:.1%}  (цель 86–94%)", end="")
-    if shift is not None:
-        p_after = coverage90(D["y"], apply_conformal(D["q"], shift), D["y_mask"])
-        print(f"  →  после конформной {p_after:.1%}")
-    else:
-        print()
+          f"(ожидается мало: поле близко к климатологии)")
+    print(f"  PICP-90 при L=0, сырые выходы = {p_before:.1%}  (цель 86–94%)")
     return dict(o_abs=o_abs, e_mean=e_mean, dev_deg=float(dev.mean()),
                 picp90=p_before, diff_clim=diff_clim)
-
-
-def calibration_quality_report(model, clims, shift, manifest="data/manifest.csv"):
-    ds = EvalSet(clims, manifest=manifest, time_key="test", every_hours=72)
-    D = gather(model, ds)
-    y, q0, w = D["y"], D["q"], D["y_mask"]
-    q1 = apply_conformal(q0, shift)
-    print(f"{'бин лидов':>11} {'PICP90 до':>10} {'PICP90 после':>13} "
-          f"{'CRPS до':>9} {'CRPS после':>11} {'MAEмед до':>10} {'MAEмед после':>13}")
-    for a, b in LEAD_BINS:
-        sl = slice(a - 1, b)
-        ys, ws = y[:, sl], w[:, sl]
-        p0 = coverage(ys, q0[:, sl], ws)
-        p1 = coverage(ys, q1[:, sl], ws)
-        c0 = wmean(pinball_crps(ys, q0[:, sl]), ws)
-        c1 = wmean(pinball_crps(ys, q1[:, sl]), ws)
-        m0 = wmean(np.abs(q0[:, sl, 3] - ys), ws)
-        m1 = wmean(np.abs(q1[:, sl, 3] - ys), ws)
-        print(f"{str(a) + '-' + str(b):>11} {p0:>10.1%} {p1:>13.1%} "
-              f"{c0:>9.3f} {c1:>11.3f} {m0:>10.3f} {m1:>13.3f}")
-    print(f"  MAE точечного прогноза mu (конформная таблица его НЕ трогает): "
-          f"{wmean(np.abs(D['mu'] - y), w):.3f} °C")
 
 
 def stage_a_field_check(model, clims, manifest="data/manifest.csv",
@@ -693,17 +1049,32 @@ def compare_ablation(model_full, model_ablated, clims, manifest="data/manifest.c
     return out
 
 
-def evaluate_external(named, external_manifest, store, r_damped=None, shift=None,
-                      ci=True, bootstrap=BOOTSTRAP, checkpoints=(), conformal=None,
+def evaluate_external(named, external_manifest, store, grid=HISTORY_GRID, r_damped=None,
+                      shift=None, ci=True, bootstrap=BOOTSTRAP, checkpoints=(), conformal=None,
                       internal=None, transfer_level="group"):
-    """Внешний тест: станции реальной сети (роль external_test), только их тестовое окно.
+    """Внешний тест: станции реальной сети, только их тестовое окно.
 
-    named    - {имя: модель}, те же модели и чекпойнты, что во внутренней оценке;
-    store    - основной набор (для чек-листа изоляции внешнего теста);
-    internal - (preds, aux) внутренней оценки для сопоставления «внутренний против
-               внешнего»; None - без сопоставления.
-    Эталон для всех моделей один - климатология каждой внешней станции по её
-    собственному обучающему окну (строится при сборке кэша внешнего набора).
+    Эталон скилла для всех моделей один: климатология каждой внешней станции по её
+    собственному обучающему окну, построенная при сборке кэша внешнего набора.
+
+    Args:
+        named: словарь из имени модели в модель; те же модели, что во внутренней оценке.
+        external_manifest: манифест внешнего набора.
+        store: основной набор, нужен чек-листу изоляции внешнего теста.
+        grid: длины истории, ч.
+        r_damped: коэффициенты затухающей персистентности; None значит без неё.
+        shift: конформная таблица основной модели; влияет только на раздел после
+            калибровки.
+        ci: считать интервалы бутстрапа по станциям.
+        bootstrap: параметры бутстрапа.
+        checkpoints: чекпойнты всех моделей, для чек-листа.
+        conformal: путь к конформной таблице, для чек-листа.
+        internal: предсказания и данные окон внутренней оценки при полной истории, для
+            сопоставления внутреннего и внешнего теста; None значит без сопоставления.
+        transfer_level: уровень зон в сопоставлении.
+
+    Returns:
+        Тройка: результат оценки внешнего набора, набор окон и таблицы сопоставления.
     """
     from mayak.data.splits import ROLE_EXTERNAL, ROLE_TEST
     from mayak.data.store import get_store
@@ -714,35 +1085,23 @@ def evaluate_external(named, external_manifest, store, r_damped=None, shift=None
                  time_key="test")
     run_checklist(ext_store, datasets=[ds])
     check_external(store, ext_store, checkpoints=checkpoints, conformal=conformal)
-    preds, aux = collect_predictions(named, ds)
-    preds = add_statistical_baselines(preds, aux, r_damped=r_damped)
     kw = bootstrap if ci else {}
 
     print(f"\n########## ВНЕШНИЙ ТЕСТ: {len(ext_store.stations)} станций, "
           f"окон {len(ds)} ##########")
-    print(BENCHMARK_NOTE)
-    evs = evaluations(preds, aux, shift=shift)
-    for name, ev in evs.items():
-        print(f"\n=== [внешний] {name} ===")
-        print_lead_table(ev, ci=ci, **kw)
-    print("\n=== [внешний] Общие метрики по всему горизонту ===")
-    print_rows({n: ev.summary(ci=ci, **kw) for n, ev in evs.items()}, label="модель", ci=ci)
-    print("\n=== [внешний] Разрезы блока 5 (МАЯК, лид 24 ч) ===")
-    print_breakdowns(evs["МАЯК"], aux["meta"], leads=[24])
-    print("\n=== [внешний] Разрезы внешнего теста (МАЯК, лид 24 ч) ===")
-    print_breakdowns(evs["МАЯК"], aux["meta"], leads=[24], fn=external_breakdowns)
-    print("\n=== [внешний] Надёжность (МАЯК) ===")
-    print_reliability(evs["МАЯК"])
-    print_calibration(evs["МАЯК"], aux["meta"], bootstrap=kw or None, external=True)
+    res = evaluate_set(named, ds, grid=grid, r_damped=r_damped, shift=shift, ci=ci,
+                       bootstrap=bootstrap, external=True)
+    print_evaluation(res, bootstrap)
 
     transfer = {}
     if internal is not None:
         p_int, a_int = internal
-        for name in ("МАЯК", "Климатология"):
+        preds, aux = res["bench"].preds, res["bench"].aux
+        for name in (MAIN_MODEL, CLIMATOLOGY):
             if name not in p_int or name not in preds:
                 continue
-            ev_i = evaluation_for(p_int[name], a_int, shift)
-            ev_e = evs[name]
+            ev_i = evaluation_for(p_int[name], a_int)
+            ev_e = evaluation_for(preds[name], aux)
             for tag, roles in (("все станции внутреннего теста", None),
                                ("только невиденные (unseen_test)", (ROLE_TEST,))):
                 sel = (np.ones(len(ev_i.y), bool) if roles is None
@@ -754,7 +1113,67 @@ def evaluate_external(named, external_manifest, store, r_damped=None, shift=None
                 transfer[(name, tag)] = tbl
                 print_transfer(tbl, title=f"\n=== Перенос: {name}, внешний против внутреннего "
                                           f"({tag}); Δ = внешний − внутренний ===")
-    return preds, aux, ds, transfer
+    return res, ds, transfer
+
+
+def save_bench(res, out_dir, set_name, shift=None, info=None):
+    """Сохраняет сырые предсказания набора для анализа калибровки без повторного прогона.
+
+    Пишутся два файла: предсказания всех моделей при полной истории и предсказания
+    основной модели на всей сетке длин истории.
+
+    Args:
+        res: результат оценки набора.
+        out_dir: каталог.
+        set_name: имя набора в именах файлов.
+        shift: конформная таблица; сохраняется рядом, сами предсказания сырые.
+        info: сведения о прогоне для заголовка файлов.
+
+    Returns:
+        Пути к двум файлам.
+    """
+    from mayak.calibration import save_predictions
+    bench = res["bench"]
+    info = dict(info or {}, history_grid=list(bench.grid))
+    nominal = save_predictions(os.path.join(out_dir, f"{set_name}.npz"), bench.preds,
+                               bench.aux, shift=shift, info=dict(info, history=NOMINAL_HISTORY))
+    h_preds, h_aux = history_predictions(bench)
+    grid_path = save_predictions(os.path.join(out_dir, f"{set_name}_history.npz"), h_preds,
+                                 h_aux, shift=shift, info=info)
+    return nominal, grid_path
+
+
+def save_history_table(res, out_dir, set_name):
+    """Сводки всех моделей по длине истории в JSON рядом с графиком.
+
+    Args:
+        res: результат оценки набора.
+        out_dir: каталог.
+        set_name: имя набора в имени файла.
+
+    Returns:
+        Путь к файлу.
+    """
+    from mayak.calibration import save_json
+    blob = dict(grid=list(res["bench"].grid), leads=list(HISTORY_LEADS),
+                models={n: {str(h): rows for h, rows in by_lead_rows.items()}
+                        for n, by_lead_rows in res["history"].items()})
+    return save_json(blob, os.path.join(out_dir, f"skill_by_history_{set_name}.json"))
+
+
+def parse_grid(text):
+    """Сетка длин истории из строки вида «0,6,24,672».
+
+    Args:
+        text: длины через запятую.
+
+    Returns:
+        Кортеж длин по возрастанию.
+
+    Raises:
+        ValueError: в строке не числа или сетка негодна.
+    """
+    return check_history_grid(int(v) for v in str(text).split(",") if v.strip())
 
 
 def print_parameter_counts(named, reference="МАЯК"):
@@ -802,7 +1221,13 @@ def main():
     ap.add_argument("--eval-seed", type=int, default=None,
                     help="сид оценки (бутстрап, примеры); по умолчанию - seeds.eval "
                          "из первого чекпойнта, иначе 0")
-    ap.add_argument("--conformal", default=None, help="runs/conformal.npy (если есть)")
+    ap.add_argument("--conformal", default=None,
+                    help="конформная таблица МАЯК (runs/conformal.npy); влияет только на "
+                         "раздел «МАЯК после калибровки», сравнительные таблицы от неё не "
+                         "зависят")
+    ap.add_argument("--history-grid", default=",".join(str(v) for v in HISTORY_GRID),
+                    help="длины истории, ч, на которых оценивается каждое окно; полная "
+                         "история обязательна, при ней считаются основные таблицы")
     ap.add_argument("--out-dir", default="runs/plots")
     ap.add_argument("--n-examples", type=int, default=10, help="число примеров прогноз vs факт")
     ap.add_argument("--bootstrap", type=int, default=BOOTSTRAP["n_boot"],
@@ -814,12 +1239,15 @@ def main():
     ap.add_argument("--transfer-zones", choices=("group", "full"), default="group",
                     help="уровень зон для сопоставления внутреннего и внешнего теста")
     ap.add_argument("--save-preds", default=None, metavar="DIR",
-                    help="сохранить предсказания всех моделей (до калибровки) в DIR/internal.npz "
-                         "и DIR/external.npz - для python -m mayak.calibration")
+                    help="сохранить сырые предсказания: DIR/internal.npz (все модели при "
+                         "полной истории) и DIR/internal_history.npz (МАЯК на всей сетке "
+                         "длин истории), для внешнего теста - DIR/external*.npz; их читает "
+                         "python -m mayak.calibration")
     args = ap.parse_args()
+    grid = parse_grid(args.history_grid)
 
-    from mayak.data.store import get_store
     from mayak.data.splits import ROLE_TRAIN
+    from mayak.data.store import get_store
     from mayak.leakage import run_checklist
     baseline_ckpts = {a: getattr(args, f"{a}_ckpt") for a in NEURAL_BASELINES
                       if getattr(args, f"{a}_ckpt")}
@@ -834,8 +1262,8 @@ def main():
 
     store = get_store(args.manifest)
     clims = store.clims()
-    ds = EvalSet(clims, manifest=args.manifest, time_key="test")
-    run_checklist(store, datasets=[ds], conformal=args.conformal, checkpoints=all_ckpts)
+    base = EvalSet(clims, manifest=args.manifest, time_key="test")
+    run_checklist(store, datasets=[base], conformal=args.conformal, checkpoints=all_ckpts)
     rec = load_run_record(args.ckpt[0])
     eval_seed = args.eval_seed
     if eval_seed is None:
@@ -854,75 +1282,69 @@ def main():
     for arch, c in baseline_ckpts.items():
         named_extra[NEURAL_BASELINES[arch]] = load_model(c)
 
-    named_all = {"МАЯК": mayak, **named_extra}
+    named_all = {MAIN_MODEL: mayak, **named_extra}
     n_params = print_parameter_counts(named_all)
-    preds, aux = collect_predictions(named_all, ds)
-    preds = add_statistical_baselines(preds, aux, r_damped=r)
-
     shift = np.load(args.conformal) if args.conformal else None
     boot = dict(n_boot=args.bootstrap, seed=eval_seed, level=args.ci_level)
+    ci = args.bootstrap > 0
+
+    print(f"\n=== Таблицы метрик: окон {len(base)}, сетка длин истории {list(grid)} ===")
+    res = evaluate_set(named_all, base, grid=grid, r_damped=r, shift=shift, ci=ci,
+                       bootstrap=boot)
+    print_evaluation(res, boot)
+    preds, aux = res["bench"].preds, res["bench"].aux
     info = dict(ckpt=args.ckpt, conformal=args.conformal, manifest=args.manifest,
                 eval_seed=eval_seed, n_params=n_params)
     if args.save_preds:
-        from mayak.calibration import save_predictions
-        print("Предсказания:", save_predictions(os.path.join(args.save_preds, "internal.npz"),
-                                                preds, aux, shift=shift, info=info))
+        for p in save_bench(res, args.save_preds, "internal", shift=shift, info=info):
+            print("Предсказания:", p)
 
-    print("\n=== Таблицы метрик ===")
-    evaluate_all(mayak, clims, args.manifest, r_damped=r,
-                 named_extra=named_extra, ds=ds, preds=preds, aux=aux,
-                 shift=shift, ci=args.bootstrap > 0, bootstrap=boot)
-
+    nominal_ds = base.with_history(NOMINAL_HISTORY)
     if len(seeds) > 1:
-        evs = [evaluation_for(dict(zip(("mu", "q"), _mu_q(m, ds))), aux, shift) for m in seeds[1:]]
-        evs = [evaluation_for(preds["МАЯК"], aux, shift)] + evs
-        print_seed_spread(evs)
+        evs = [evaluation_for(dict(zip(("mu", "q"), _mu_q(m, nominal_ds))), aux)
+               for m in seeds[1:]]
+        print_seed_spread([evaluation_for(preds[MAIN_MODEL], aux)] + evs)
 
-    coldstart_curve(mayak, clims, args.manifest)
-
-    tables = build_tables(preds, aux)
-    print("\n=== Графики по метрикам ===")
-    for p in plot_metric_curves(tables, args.out_dir):
+    print("\n=== Графики (сырые выходы) ===")
+    for p in plot_metric_curves(build_tables(preds, aux), args.out_dir):
         print("  ", p)
-
-    ev_mayak = evaluation_for(preds["МАЯК"], aux, shift)
+    ev_mayak = evaluation_for(preds[MAIN_MODEL], aux)
     print("  ", plot_reliability(ev_mayak, args.out_dir))
     print("  ", plot_pit(ev_mayak, args.out_dir))
+    print("  ", plot_history_curves(res["history"], args.out_dir, "internal"))
+    print("  ", save_history_table(res, args.out_dir, "internal"))
 
     print("\n=== Разрез по зонам Кёппена (МАЯК) ===")
     print_zone_breakdown(zone_breakdown(preds, aux))
 
     print("\n=== Холодный старт L=0 ===")
-    coldstart_L0_check(mayak, clims, args.manifest, shift=shift)
+    coldstart_L0_check(mayak, base.with_history(0))
 
-    if shift is not None:
-        print("\n=== Влияние конформной калибровки ===")
-        calibration_quality_report(mayak, clims, shift, args.manifest)
-
-    print("\n=== Графики прогноз vs факт (примеры МАЯК) ===")
+    print("\n=== Графики прогноз vs факт (примеры МАЯК, сырые выходы) ===")
     plot_forecast_examples(mayak, clims, manifest=args.manifest,
-                           n=args.n_examples, out_dir=args.out_dir, shift=shift, seed=eval_seed)
+                           n=args.n_examples, out_dir=args.out_dir, seed=eval_seed)
     plot_forecast_examples(mayak, clims, manifest=args.manifest, n=args.n_examples,
                            out_dir=args.out_dir + "/unseen",
-                           station_splits=("unseen_test",), shift=shift, seed=eval_seed)
+                           station_splits=("unseen_test",), seed=eval_seed)
     plot_forecast_examples(mayak, clims, manifest=args.manifest, n=args.n_examples, L=0,
-                           out_dir=args.out_dir, shift=shift, seed=eval_seed)
+                           out_dir=args.out_dir, seed=eval_seed)
     plot_forecast_examples(mayak, clims, manifest=args.manifest, n=args.n_examples, L=0,
                            station_splits=("unseen_test",),
-                           out_dir=args.out_dir + "/unseen", shift=shift, seed=eval_seed)
+                           out_dir=args.out_dir + "/unseen", seed=eval_seed)
     print("\n=== Суточные амплитуды ===")
     plot_amplitude_scatter(mayak, clims, manifest=args.manifest, out_dir=args.out_dir)
 
     if args.external_manifest:
-        p_ext, a_ext, _ds, _tr = evaluate_external(
-            named_all, args.external_manifest, store, r_damped=r, shift=shift,
-            ci=args.bootstrap > 0, bootstrap=boot, checkpoints=all_ckpts,
-            conformal=args.conformal, internal=(preds, aux), transfer_level=args.transfer_zones)
+        res_e, _ds, _tr = evaluate_external(
+            named_all, args.external_manifest, store, grid=grid, r_damped=r, shift=shift,
+            ci=ci, bootstrap=boot, checkpoints=all_ckpts, conformal=args.conformal,
+            internal=(preds, aux), transfer_level=args.transfer_zones)
+        print("  ", plot_history_curves(res_e["history"], args.out_dir, "external"))
+        print("  ", save_history_table(res_e, args.out_dir, "external"))
         if args.save_preds:
-            from mayak.calibration import save_predictions
-            print("Предсказания:", save_predictions(
-                os.path.join(args.save_preds, "external.npz"), p_ext, a_ext, shift=shift,
-                info=dict(info, manifest=args.external_manifest)))
+            for p in save_bench(res_e, args.save_preds, "external", shift=shift,
+                                info=dict(info, manifest=args.external_manifest)):
+                print("Предсказания:", p)
 
 
 def _mu_q(model, ds):

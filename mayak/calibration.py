@@ -1,38 +1,29 @@
 """Калибровка интервалов обученной модели.
 
-Всё считается по уже собранным предсказаниям - модель здесь не запускается. Числа
-считает ``mayak/metrics.py``; здесь - сбор разрезов, вердикты, печать и графики.
+Всё считается по уже собранным предсказаниям, модель здесь не запускается.
 
-* ``coverage_report`` - покрытие центральных интервалов по разрезам: лиды, бины
-  лидов, роли станций, полные зоны Кёппена, длина истории, доля валидных часов истории;
-  для внешнего теста - его собственные разрезы. На каждую страту: покрытие 50/80/90 %,
-  доли промахов ниже и выше интервала, ширина, интервал блочного бутстрапа по станциям
-  и два вердикта:
-    - «мимо номинала» - покрытие дальше допуска от номинала и интервал бутстрапа
-      номинал не содержит;
-    - «отличается от набора» - то же относительно покрытия всего набора. Общее для
-      всех страт отклонение исправляет маргинальная поправка (сплит-конформная таблица
-      или ACI); отличие страты от набора - нет;
-  плюс характер промаха: «узкий интервал» (промахи с обеих сторон), «факт ниже» /
-  «факт выше» (≥ 2/3 промахов с одной стороны - сдвиг, а не ширина), «широкий интервал».
-  Матрица «страта × бин лидов» показывает, есть ли в расхождении система по горизонту.
-* ``conditional_gate`` - решение, нужна ли условная конформная поправка: да,
-  только если в разрезах из ``CalibrationConfig.conditional_dims`` есть страты
-  «отличается от набора». Сама поправка заранее не реализуется.
-* ``sharpness_curves`` - кривые «острота против покрытия» для всех моделей:
-  90 %-интервал растягивается вокруг медианы в s раз, s по логарифмической сетке;
-  модели сравниваются по ширине, нужной для фактического покрытия 90 %.
-* ``aci_replay`` - офлайн-прогон адаптивной калибровки устройства по окнам
-  оценки в порядке времени на каждой станции: прибор выпускает прогноз в начале окна и
-  до следующего выпуска сверяет каждый валидный час со своим последним прогнозом (те же
-  ``aci_score`` / ``ACIParams.step``, что в рантайме). Покрытие считается
-  проспективно: каждый час - интервалом, выпущенным до того, как факт стал известен.
+Сравнение моделей идёт только по сырым выходам: кривые «острота против покрытия» всех
+моделей и покрытие по разрезам основной модели считаются без калибровки. Конформная
+таблица, если она есть, даёт отдельный раздел: та же модель после калибровки рядом с
+сырой, покрытие по тем же разрезам и офлайн-прогон адаптивной калибровки устройства.
 
-Предсказания сохраняет ``python -m mayak.evaluate ... --save-preds runs/preds``.
+Покрытие центральных интервалов разбирается по лидам, бинам лидов, ролям станций,
+полным зонам Кёппена, длине истории и доле валидных часов истории. Для внешнего теста
+разрезы свои. У каждой страты: покрытие, доли промахов ниже и выше интервала, ширина,
+интервал блочного бутстрапа по станциям и два вердикта. «Мимо номинала» значит, что
+покрытие дальше допуска от номинала и интервал бутстрапа номинал не содержит.
+«Отличается от набора» значит то же самое относительно покрытия всего набора: общее для
+всех страт отклонение исправляет маргинальная поправка, отличие страты от набора нет.
+
+Разрез по длине истории строится по сетке длин, если предсказания сохранены для всей
+сетки. Тогда каждая длина из сетки становится своей стратой.
+
+Предсказания сохраняет стенд оценки с флагом --save-preds.
 
 Запуск::
 
     python -m mayak.calibration --preds runs/preds/internal.npz \\
+        --history-preds runs/preds/internal_history.npz \\
         --external-preds runs/preds/external.npz --out-dir runs/calibration
 """
 from __future__ import annotations
@@ -45,21 +36,23 @@ import os
 import numpy as np
 
 from mayak.config import COVERAGE_DIMS_EXTERNAL, COVERAGE_DIMS_INTERNAL, CalibrationConfig
+from mayak.data.holdout import history_label, history_strata
 from mayak.metrics import (FINE_LEADS, LEAD_BINS, Evaluation, aci_effective_level, aci_run,
-                           aci_score, lead_bin_of, sharpness_scales, width_at_coverage)
+                           aci_score, lead_bin_of, ordered_labels, sharpness_scales,
+                           width_at_coverage)
 
 log = logging.getLogger(__name__)
 
 MAIN_MODEL = "МАЯК"
 DEFAULT_CONFIG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                               "conf", "calibration", "default.yaml")
-LEAD_DIM, LEAD_BIN_DIM = "лид", "бин лидов"
+LEAD_DIM, LEAD_BIN_DIM, HISTORY_DIM = "лид", "бин лидов", "длина истории"
 OFF_UNDER, OFF_OVER = "занижено", "завышено"
 KIND_NARROW, KIND_WIDE = "узкий интервал", "широкий интервал"
 KIND_BELOW, KIND_ABOVE = "факт ниже интервала", "факт выше интервала"
 ONE_SIDED = 2.0 / 3.0
-META_KEYS = ("station", "role", "zone", "season", "history", "hist_valid", "has_pressure",
-             "report_class", "elev_gap", "t")
+META_KEYS = ("station", "role", "zone", "season", "history", "history_label", "hist_valid",
+             "has_pressure", "report_class", "elev_gap", "t")
 FORMAT_VERSION = 1
 
 
@@ -124,17 +117,28 @@ def evaluation_of(pred, aux, shift=None, theta=0.0):
 
 
 def coverage_strata(meta, external=False):
-    """{имя разреза: метки окон} - те же биннинги, что в таблицах ``mayak.evaluate``."""
-    from mayak.evaluate import HIST_VALID_BINS, HISTORY_BINS, bin_label
-    hist = np.array([bin_label(int(v), HISTORY_BINS) for v in meta["history"]], object)
+    """Метки окон по каждому разрезу покрытия.
+
+    Args:
+        meta: метаданные окон.
+        external: разрезы внешнего теста вместо внутреннего.
+
+    Returns:
+        Словарь из имени разреза в пару: метки окон формы (N,) и порядок меток, в
+        котором разрез показывается; None значит алфавитный порядок.
+    """
+    from mayak.evaluate import HIST_VALID_BINS, bin_label
+    hist, hist_order = history_strata(meta)
     hvalid = np.array([bin_label(float(v), HIST_VALID_BINS) for v in meta["hist_valid"]], object)
     keys = {"роль станции": meta.get("role"), "зона Кёппена": meta.get("zone"),
-            "длина истории": hist, "валидность истории": hvalid,
+            HISTORY_DIM: hist, "валидность истории": hvalid,
             "частота отчётности": meta.get("report_class"),
             "Δ высоты станция−ЦМР": meta.get("elev_gap"),
             "канал давления": meta.get("has_pressure")}
+    orders = {HISTORY_DIM: hist_order}
     dims = COVERAGE_DIMS_EXTERNAL if external else COVERAGE_DIMS_INTERNAL
-    return {d: np.asarray(keys[d], object) for d in dims if keys.get(d) is not None}
+    return {d: (np.asarray(keys[d], object), orders.get(d)) for d in dims
+            if keys.get(d) is not None}
 
 
 def _coverage(ev, nominal):
@@ -186,11 +190,11 @@ def verdict(row, nominal, overall, tol):
                 heterogeneous=bool(het), kind=kind)
 
 
-def _strata_rows(ev, keys, cfg, overall, leads=None, boot=None):
-    """Строки по меткам keys (страты меньше порога отброшены), с вердиктами."""
+def _strata_rows(ev, keys, cfg, overall, leads=None, boot=None, order=None):
+    """Строки покрытия по меткам окон с вердиктами; страты меньше порога отброшены."""
     keys = np.asarray(keys).astype(str)
     rows = {}
-    for k in sorted(set(keys.tolist())):
+    for k in ordered_labels(keys, order):
         sub = ev.restrict(windows=keys == k, leads=leads)
         c = sub.counts()
         if c["n_windows"] < cfg.min_windows or c["n_stations"] < cfg.min_stations:
@@ -201,9 +205,66 @@ def _strata_rows(ev, keys, cfg, overall, leads=None, boot=None):
     return rows
 
 
+def _lead_bin_coverage(ev, nominal, lead_bins):
+    return {f"{a}-{b}": _coverage(ev.restrict(leads=np.arange(a, b + 1)), nominal)
+            for a, b in lead_bins}
+
+
+def history_coverage(history, cfg, boot=None, lead_bins=LEAD_BINS):
+    """Покрытие по длине истории, когда одни и те же окна оценены при разных длинах.
+
+    Каждая длина истории - своя страта. Набором для вердикта «отличается от набора»
+    служат все длины сетки вместе. Оценки приходят по одной и сразу отпускаются, поэтому
+    в памяти одновременно лежит только одна длина.
+
+    Args:
+        history: пары из метки длины и оценки модели при этой длине, по возрастанию
+            длины.
+        cfg: настройки анализа калибровки.
+        boot: параметры бутстрапа по станциям.
+        lead_bins: бины лидов для матрицы «страта против бина лидов».
+
+    Returns:
+        Тройка: строки страт с вердиктами, матрица покрытия по бинам лидов и покрытие
+        всей сетки.
+    """
+    rows, matrix = {}, {}
+    hits = pairs = 0.0
+    for label, ev in history:
+        c = ev.counts()
+        r = coverage_row(ev, cfg.nominal, **(boot or {}))
+        hits += r["coverage"] * c["n_pairs"] if c["n_pairs"] else 0.0
+        pairs += c["n_pairs"]
+        if c["n_windows"] < cfg.min_windows or c["n_stations"] < cfg.min_stations:
+            continue
+        rows[label] = r
+        matrix[label] = _lead_bin_coverage(ev, cfg.nominal, lead_bins)
+    overall = hits / pairs if pairs else float("nan")
+    for r in rows.values():
+        r.update(verdict(r, cfg.nominal, overall, cfg.tolerance))
+    return rows, matrix, overall
+
+
 def coverage_report(ev, meta, cfg=None, external=False, leads=FINE_LEADS,
-                    lead_bins=LEAD_BINS):
-    """Покрытие по всем разрезам для одной модели (оценка уже откалибрована)."""
+                    lead_bins=LEAD_BINS, history=None):
+    """Покрытие одной модели по всем разрезам.
+
+    Args:
+        ev: оценка модели на наборе окон, сырая или уже откалиброванная.
+        meta: метаданные окон того же набора.
+        cfg: настройки анализа калибровки.
+        external: разрезы внешнего теста.
+        leads: лиды для отдельных строк.
+        lead_bins: бины лидов.
+        history: пары из метки длины истории и оценки той же модели на тех же окнах при
+            этой длине. Если заданы, разрез по длине истории строится по ним, а не по
+            метаданным набора.
+
+    Returns:
+        Словарь: номинал, допуск, признак внешнего теста, строка всего набора, строки по
+        разрезам и матрицы «страта против бина лидов». Для разреза по длине истории,
+        построенного по сетке, отдельно записано покрытие всей сетки.
+    """
     cfg = cfg or CalibrationConfig()
     boot = dict(n_boot=cfg.bootstrap, seed=cfg.seed, level=cfg.ci_level)
     total = coverage_row(ev, cfg.nominal, **boot)
@@ -224,18 +285,19 @@ def coverage_report(ev, meta, cfg=None, external=False, leads=FINE_LEADS,
         bin_rows[f"{a}-{b}"] = r
     dims[LEAD_BIN_DIM] = bin_rows
     matrix = {}
-    for name, keys in coverage_strata(meta, external=external).items():
-        dims[name] = _strata_rows(ev, keys, cfg, overall, boot=boot)
+    grid_overall = None
+    for name, (keys, order) in coverage_strata(meta, external=external).items():
+        if name == HISTORY_DIM and history is not None:
+            dims[name], matrix[name], grid_overall = history_coverage(history, cfg, boot,
+                                                                      lead_bins)
+            continue
+        dims[name] = _strata_rows(ev, keys, cfg, overall, boot=boot, order=order)
         keys_s = np.asarray(keys).astype(str)
-        matrix[name] = {}
-        for k in dims[name]:
-            sel = keys_s == k
-            matrix[name][k] = {f"{a}-{b}": _coverage(ev.restrict(windows=sel,
-                                                                  leads=np.arange(a, b + 1)),
-                                                      cfg.nominal)
-                               for a, b in lead_bins}
+        matrix[name] = {k: _lead_bin_coverage(ev.restrict(windows=keys_s == k), cfg.nominal,
+                                              lead_bins)
+                        for k in dims[name]}
     return dict(nominal=cfg.nominal, tolerance=cfg.tolerance, external=bool(external),
-                overall=total, dims=dims, matrix=matrix)
+                overall=total, dims=dims, matrix=matrix, history_overall=grid_overall)
 
 
 def conditional_gate(report, cfg=None):
@@ -532,27 +594,154 @@ def print_aci_replay(r, tol=0.04):
           f"диапазон [{te['min']:+.3f}; {te['max']:+.3f}]; обновлений на границе: {r['clipped']}")
 
 
+def calibration_effect(ev_raw, ev_cal, lead_bins=LEAD_BINS):
+    """Метрики одной модели до и после калибровки рядом.
+
+    Args:
+        ev_raw: оценка по сырым выходам.
+        ev_cal: оценка тех же окон после калибровки.
+        lead_bins: бины лидов для отдельных строк.
+
+    Returns:
+        Словарь из имени строки («весь горизонт» или бин лидов) в словарь с парами
+        значений до и после для покрытия 80 и 90 %, ширины 90 %-интервала, CRPS и MAE.
+    """
+    panels = {"весь горизонт": None}
+    panels.update({f"{a}-{b}": np.arange(a, b + 1) for a, b in lead_bins})
+    out = {}
+    for name, leads in panels.items():
+        before = ev_raw.restrict(leads=leads).pooled()
+        after = ev_cal.restrict(leads=leads).pooled()
+        out[name] = {m: (float(before[m]), float(after[m]))
+                     for m in ("PICP80", "PICP90", "Width90", "CRPS", "MAE")}
+    return out
+
+
+def print_calibration_effect(effect, title=None):
+    if title:
+        print(title)
+    print(f"{'лиды':>14} {'PICP90 до':>10} {'после':>7} {'шир.90 до':>10} {'после':>7} "
+          f"{'CRPS до':>8} {'после':>7} {'MAE до':>7} {'после':>7}")
+    for name, r in effect.items():
+        print(f"{name:>14} {_pct(r['PICP90'][0]):>10} {_pct(r['PICP90'][1]):>7} "
+              f"{r['Width90'][0]:>10.2f} {r['Width90'][1]:>7.2f} {r['CRPS'][0]:>8.3f} "
+              f"{r['CRPS'][1]:>7.3f} {r['MAE'][0]:>7.3f} {r['MAE'][1]:>7.3f}")
+
+
+def split_history(pred, aux):
+    """Предсказания, сохранённые для всей сетки длин истории, по отдельным длинам.
+
+    Args:
+        pred: медиана и квантили одной модели по всем окнам всех длин.
+        aux: цели, веса, эталон и метаданные тех же окон; длина истории - в метаданных.
+
+    Yields:
+        Тройки по возрастанию длины: метка длины, предсказания и вспомогательные данные
+        окон этой длины.
+    """
+    hist = np.asarray(aux["meta"]["history"], np.int64)
+    for L in sorted(set(hist.tolist())):
+        sel = hist == L
+        p = {k: np.asarray(v)[sel] for k, v in pred.items()}
+        a = {k: np.asarray(aux[k])[sel] for k in ("y", "y_mask", "mu_clim")}
+        a["meta"] = {k: np.asarray(v)[sel] for k, v in aux["meta"].items()}
+        yield history_label(L), p, a
+
+
+def history_evaluations(history, model, shift=None):
+    """Оценки модели по длинам истории из сохранённых предсказаний сетки.
+
+    Args:
+        history: пара из предсказаний и вспомогательных данных сетки.
+        model: имя модели.
+        shift: конформная таблица; None значит сырые выходы.
+
+    Yields:
+        Пары из метки длины и оценки.
+    """
+    preds, aux = history
+    for label, p, a in split_history(preds[model], aux):
+        yield label, evaluation_of(p, a, shift)
+
+
 def analyze(preds, aux, shift=None, cfg=None, external=False, model=MAIN_MODEL,
-            out_dir=None, set_name="internal"):
+            out_dir=None, set_name="internal", history=None):
+    """Анализ калибровки по сохранённым предсказаниям.
+
+    Кривые «острота против покрытия» всех моделей и покрытие основной модели по разрезам
+    считаются по сырым выходам. Если задана конформная таблица, та же модель после
+    калибровки разбирается отдельным разделом. Офлайн-прогон адаптивной калибровки идёт
+    по тем интервалам, которые выпустил бы прибор: после конформной таблицы, если она
+    есть, иначе по сырым.
+
+    Args:
+        preds: словарь из имени модели в её медиану и квантили на окнах при полной
+            истории.
+        aux: цели, веса, эталон и метаданные тех же окон.
+        shift: конформная таблица основной модели; None значит без калибровки.
+        cfg: настройки анализа.
+        external: разрезы внешнего теста.
+        model: имя основной модели.
+        out_dir: каталог для графиков и JSON; None значит ничего не писать.
+        set_name: имя набора в именах файлов.
+        history: пара из предсказаний и вспомогательных данных тех же окон по всей
+            сетке длин истории; нужна основная модель. None значит разрез по длине
+            истории строится по метаданным набора.
+
+    Returns:
+        Словарь: модель, набор, настройки, признак калибровки, кривые остроты, покрытие
+        сырых выходов, раздел после калибровки или None, офлайн-прогон адаптивной
+        калибровки и, если что-то записано, пути к файлам.
+
+    Raises:
+        KeyError: основной модели нет в предсказаниях.
+    """
     cfg = cfg or CalibrationConfig()
     if model not in preds:
         raise KeyError(f"модели {model!r} нет в предсказаниях; есть {list(preds)}")
-    evs = {n: evaluation_of(p, aux, shift) for n, p in preds.items()}
-    report = coverage_report(evs[model], aux["meta"], cfg, external=external)
-    gate = conditional_gate(report, cfg)
+    if history is not None and model not in history[0]:
+        log.info("в предсказаниях сетки нет модели %s: разрез по длине истории - по "
+                 "метаданным набора", model)
+        history = None
+    evs = {n: evaluation_of(p, aux) for n, p in preds.items()}
     curves = sharpness_curves(evs, cfg)
-    replay = aci_replay(evs[model], aux["meta"], cfg.aci())
+
+    def section(ev, table):
+        hist = None if history is None else history_evaluations(history, model, table)
+        report = coverage_report(ev, aux["meta"], cfg, external=external, history=hist)
+        return dict(report=report, gate=conditional_gate(report, cfg))
+
+    raw = section(evs[model], None)
+    calibrated = None
+    device_ev = evs[model]
+    if shift is not None:
+        device_ev = evaluation_of(preds[model], aux, shift)
+        calibrated = section(device_ev, shift)
+        calibrated["effect"] = calibration_effect(evs[model], device_ev)
+    replay = aci_replay(device_ev, aux["meta"], cfg.aci())
+
     tag = "ВНЕШНИЙ ТЕСТ" if external else "внутренний тест"
-    print_coverage_report(report, gate, title=f"\n########## Калибровка: {model}, {tag} ##########")
+    print_coverage_report(raw["report"], raw["gate"],
+                          title=f"\n########## Калибровка: {model}, {tag}, сырые выходы "
+                                f"##########")
     for panel in next(iter(curves.values())):
         print_sharpness(curves, cfg.nominal, panel)
+    if calibrated is not None:
+        print_calibration_effect(calibrated["effect"],
+                                 title=f"\n########## {model} после калибровки, {tag} "
+                                       f"##########")
+        print_coverage_report(calibrated["report"], calibrated["gate"],
+                              title=f"\n--- {model} после калибровки: покрытие по разрезам ---")
     print_aci_replay(replay, cfg.tolerance)
-    result = dict(model=model, set=set_name, config=cfg.to_dict(), report=report, gate=gate,
-                  sharpness=curves, aci=replay)
+    result = dict(model=model, set=set_name, config=cfg.to_dict(), conformal=shift is not None,
+                  sharpness=curves, raw=raw, calibrated=calibrated, aci=replay)
     if out_dir:
         paths = [plot_sharpness(curves, out_dir, set_name, cfg.nominal),
-                 plot_coverage_strata(report, out_dir, set_name, model),
-                 save_json(result, os.path.join(out_dir, f"calibration_{set_name}.json"))]
+                 plot_coverage_strata(raw["report"], out_dir, set_name, model)]
+        if calibrated is not None:
+            paths.append(plot_coverage_strata(calibrated["report"], out_dir,
+                                              f"{set_name}_calibrated", model))
+        paths.append(save_json(result, os.path.join(out_dir, f"calibration_{set_name}.json")))
         result["paths"] = paths
     return result
 
@@ -585,17 +774,23 @@ def main(argv=None):
     import argparse
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     ap = argparse.ArgumentParser(
-        description="калибровка интервалов по сохранённым предсказаниям: разрезы покрытия, "
-                    "критерий условной поправки, острота против покрытия, офлайн-прогон "
-                    "адаптивной калибровки устройства (блок 13)")
+        description="калибровка интервалов по сохранённым предсказаниям: разрезы покрытия "
+                    "сырых выходов, критерий условной поправки, острота против покрытия, "
+                    "раздел после калибровки и офлайн-прогон адаптивной калибровки устройства")
     ap.add_argument("--preds", required=True,
-                    help="предсказания внутреннего теста (mayak.evaluate --save-preds)")
+                    help="предсказания внутреннего теста (python -m mayak.evaluate "
+                         "--save-preds DIR пишет DIR/internal.npz)")
+    ap.add_argument("--history-preds", default=None,
+                    help="предсказания внутреннего теста по сетке длин истории "
+                         "(DIR/internal_history.npz)")
     ap.add_argument("--external-preds", default=None, help="предсказания внешнего теста")
+    ap.add_argument("--external-history-preds", default=None,
+                    help="предсказания внешнего теста по сетке длин истории")
     ap.add_argument("--config", default=None,
                     help="YAML (по умолчанию conf/calibration/default.yaml)")
     ap.add_argument("--model", default=MAIN_MODEL, help="модель для разрезов и ACI")
     ap.add_argument("--no-conformal", action="store_true",
-                    help="не применять сохранённую конформную таблицу (сырые квантили)")
+                    help="не строить раздел после калибровки, даже если таблица сохранена")
     ap.add_argument("--bootstrap", type=int, default=None,
                     help="итераций бутстрапа по станциям (по умолчанию из конфига; 0 - без)")
     ap.add_argument("--out-dir", default="runs/calibration")
@@ -605,17 +800,23 @@ def main(argv=None):
     cfg = load_config(args.config)
     if args.bootstrap is not None:
         cfg = replace(cfg, bootstrap=args.bootstrap)
-    for path, external, name in ((args.preds, False, "internal"),
-                                 (args.external_preds, True, "external")):
+    for path, hist_path, external, name in (
+            (args.preds, args.history_preds, False, "internal"),
+            (args.external_preds, args.external_history_preds, True, "external")):
         if not path:
             continue
         preds, aux, shift, info = load_predictions(path)
+        history = None
+        if hist_path:
+            h_preds, h_aux, _shift, _info = load_predictions(hist_path)
+            history = (h_preds, h_aux)
         if args.no_conformal:
             shift = None
         print(f"\n{path}: моделей {len(preds)}, окон {len(aux['y'])}, конформная таблица "
-              f"{'применена' if shift is not None else 'не применяется'}; {info}")
+              f"{'есть' if shift is not None else 'нет'}; сетка длин истории "
+              f"{'есть' if history is not None else 'нет'}; {info}")
         res = analyze(preds, aux, shift, cfg, external=external, model=args.model,
-                      out_dir=args.out_dir, set_name=name)
+                      out_dir=args.out_dir, set_name=name, history=history)
         for p in res["paths"]:
             print("  ", p)
 
