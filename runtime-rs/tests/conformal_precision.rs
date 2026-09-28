@@ -44,16 +44,46 @@ fn runtime(dir: &Path, precision: Precision, conformal: bool) -> Runtime {
     Runtime::new(dir, LAT, LON, 0.0, &opts).unwrap()
 }
 
-/// Выпуск после суток наблюдений: квантили всех лидов подряд.
+/// Час года первого наблюдения и число часов наблюдений перед выпуском.
+const START_HOY: usize = 2400;
+const HOURS: usize = 30;
+
+/// Допуск между выпусками двух независимых рантаймов на одних и тех же графах. Сборки
+/// ONNX Runtime не обещают совпадения до бита между сессиями, поэтому выпуски разных
+/// рантаймов сравниваются с допуском, а до бита - только то, что считается в одном месте.
+const SESSION_ATOL: f32 = 1e-4;
+
+fn day_of_year(hoy: usize) -> f32 {
+    (hoy as f64 / 24.0) as f32
+}
+
+/// Выпуск после непрерывной серии часовых наблюдений: квантили всех лидов подряд.
 fn issue(rt: &mut Runtime) -> Vec<f32> {
-    for k in 0..30 {
+    for k in 0..HOURS {
+        let hoy = START_HOY + k;
         let obs = [Some(8.0 + 0.3 * k as f64), Some(1011.0), Some(72.0)];
-        rt.step(obs, 100.0 + (k / 24) as f32, (k % 24) as f32).unwrap();
+        rt.step(obs, day_of_year(hoy), (hoy % 24) as f32).unwrap();
     }
+    assert_eq!(rt.calendar_breaks(), 0, "серия наблюдений должна быть непрерывной");
+    let first = START_HOY + HOURS;
     let h = rt.horizon();
-    let doy: Vec<f32> = (0..h).map(|k| ((101 * 24 + 6 + k) as f32) / 24.0).collect();
-    let hour: Vec<f32> = (0..h).map(|k| ((6 + k) % 24) as f32).collect();
+    let doy: Vec<f32> = (0..h).map(|k| day_of_year(first + k)).collect();
+    let hour: Vec<f32> = (0..h).map(|k| ((first + k) % 24) as f32).collect();
     rt.forecast(&doy, &hour).unwrap().q.clone()
+}
+
+fn max_abs(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+}
+
+/// Сырые квантили, к которым таблица из манифеста применена здесь же.
+fn with_table(dir: &Path, raw: &[f32]) -> Vec<f32> {
+    let m = Manifest::load(dir).unwrap();
+    let table = m.conformal_table().unwrap().unwrap();
+    let mut q = raw.to_vec();
+    apply_conformal(&mut q, &table, m.dims.n_quantiles, m.i_med);
+    q
 }
 
 #[test]
@@ -89,7 +119,15 @@ fn rejected_table_leaves_raw_forecast() {
     let dir = model_copy("raw_forecast", Some("fp32"));
     let rejected = issue(&mut runtime(&dir, Precision::Int8, true));
     let raw = issue(&mut runtime(&dir, Precision::Int8, false));
-    assert_eq!(rejected, raw);
+    let applied = with_table(&dir, &raw);
+    assert!(
+        max_abs(&applied, &raw) > 100.0 * SESSION_ATOL,
+        "таблица эталона должна заметно менять выпуск, иначе проверка пустая"
+    );
+    assert!(
+        max_abs(&rejected, &raw) <= SESSION_ATOL,
+        "отвергнутая таблица изменила выпуск"
+    );
 }
 
 #[test]
@@ -97,13 +135,15 @@ fn table_changes_width_not_median() {
     let dir = model_copy("median", Some("fp32"));
     let raw = issue(&mut runtime(&dir, Precision::Fp32, false));
     let cal = issue(&mut runtime(&dir, Precision::Fp32, true));
+    let expect = with_table(&dir, &raw);
     let m = Manifest::load(&dir).unwrap();
     let (nq, im) = (m.dims.n_quantiles, m.i_med);
-    assert_ne!(raw, cal);
-    for (a, b) in raw.chunks(nq).zip(cal.chunks(nq)) {
-        assert_eq!(a[im].to_bits(), b[im].to_bits());
+    assert!(max_abs(&expect, &raw) > 100.0 * SESSION_ATOL);
+    for (a, b) in raw.chunks(nq).zip(expect.chunks(nq)) {
+        assert_eq!(a[im].to_bits(), b[im].to_bits(), "таблица сдвинула медиану");
         assert!(b.windows(2).all(|w| w[0] <= w[1]));
     }
+    assert!(max_abs(&cal, &expect) <= SESSION_ATOL, "рантайм применил таблицу иначе");
 }
 
 #[test]
