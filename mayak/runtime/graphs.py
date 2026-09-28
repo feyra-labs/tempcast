@@ -153,18 +153,101 @@ def example_inputs(model, seed=0):
     )
 
 
+def graphs_digest(model_dir, precision):
+    """Отпечаток графов одной точности в каталоге экспорта.
+
+    Args:
+        model_dir: каталог с графами и манифестом.
+        precision: точность графов.
+
+    Returns:
+        Первые 16 шестнадцатеричных знаков SHA-256 по именам и содержимому графов.
+
+    Raises:
+        KeyError: в экспорте нет графов этой точности.
+    """
+    with open(os.path.join(model_dir, "manifest.json"), encoding="utf-8") as fh:
+        graphs = json.load(fh)["graphs"]
+    return _files_digest(model_dir, [graphs[n][precision] for n in GRAPH_NAMES])
+
+
+def _files_digest(model_dir, files):
+    import hashlib
+    h = hashlib.sha256()
+    for name in files:
+        h.update(name.encode())
+        with open(os.path.join(model_dir, name), "rb") as fh:
+            h.update(fh.read())
+    return h.hexdigest()[:16]
+
+
+def conformal_for_export(conformal, precision, checkpoint=None):
+    """Таблица поправок для экспорта и точность, на которой она подогнана.
+
+    Args:
+        conformal: путь к таблице с записью о подгонке рядом или сама таблица.
+        precision: точность, которую объявляет экспорт: int8, если экспортируются
+            int8-графы, иначе fp32.
+        checkpoint: путь к экспортируемому чекпойнту; если задан, таблица должна быть
+            подогнана по нему же.
+
+    Returns:
+        Тройка: таблица float32, её точность и отпечаток графов, на которых она
+        подогнана (None для таблицы без записи или для fp32).
+
+    Raises:
+        ValueError: точность таблицы не совпадает с точностью экспорта, таблица подогнана
+            по другому чекпойнту или сдвигает медиану.
+    """
+    from mayak.leakage import file_digest, load_conformal, precision_mismatch
+    from mayak.metrics import check_median_free
+    if not isinstance(conformal, str):
+        shift = np.asarray(conformal, np.float32)
+        check_median_free(shift)
+        return shift, precision, None
+    shift, rec = load_conformal(conformal)
+    why = precision_mismatch(rec, precision)
+    if why:
+        raise ValueError(f"конформная таблица {conformal}: {why}. Для экспорта с --int8 "
+                         f"нужна таблица, подогнанная на int8-графах: python "
+                         f"scripts/calibrate.py --precision int8 --model-dir <экспорт>")
+    want = rec.get("checkpoint_digest")
+    if checkpoint is not None and want is not None and file_digest(checkpoint) != want:
+        raise ValueError(f"конформная таблица {conformal} подогнана по другому чекпойнту "
+                         f"({rec.get('checkpoint')}), а экспортируется {checkpoint}")
+    return shift, precision, rec.get("graphs")
+
+
 def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset=17,
-                  check_atol=1e-4, seed=0):
-    """Четыре графа ONNX + manifest.json (+ conformal.f32) в out_dir → манифест.
+                  check_atol=1e-4, seed=0, checkpoint=None):
+    """Экспорт четырёх графов, манифеста и развёрнутой по лидам конформной таблицы.
 
-    conformal - сплит-конформная таблица (бины лидов × квантили) или путь к .npy; в
-    каталог пишется развёрнутая по лидам таблица (horizon × NQ, float32 LE) - то, что
-    рантайм прибавляет к квантилям. aci - ``ACIParams`` или None.
-    Каждый граф сверяется с PyTorch на example_inputs (max|Δ| ≤ check_atol).
+    Каждый граф при экспорте сверяется с PyTorch на правдоподобных входах. Входы, от
+    которых граф не зависит, экспорт выбрасывает; манифест перечисляет фактические входы
+    графа, и хост подаёт только их.
 
-    Входы, от которых граф не зависит (например, loc в passport или в issue при абляции
-    no_anchor), экспорт выбрасывает; манифест перечисляет фактические входы графа, и
-    хост подаёт только их.
+    Args:
+        model: модель.
+        out_dir: каталог экспорта.
+        conformal: таблица поправок по бинам лидов или путь к ней с записью о подгонке
+            рядом. Точность таблицы должна совпадать с точностью экспорта: int8 при
+            экспорте int8-графов, иначе fp32. Таблица для int8 должна быть подогнана
+            именно на тех int8-графах, что получились при экспорте.
+        aci: параметры адаптивной калибровки устройства или None.
+        int8: экспортировать ещё и int8-копии графов.
+        opset: версия набора операций ONNX.
+        check_atol: допустимое расхождение графа с PyTorch.
+        seed: сид правдоподобных входов для сверки.
+        checkpoint: путь к экспортируемому чекпойнту для сверки с записью о подгонке
+            таблицы.
+
+    Returns:
+        Манифест экспорта. В разделе калибровки записана точность таблицы.
+
+    Raises:
+        ValueError: таблица другой точности, подогнана по другому чекпойнту или на
+            других графах, либо сдвигает медиану.
+        RuntimeError: граф расходится с PyTorch больше допуска.
     """
     import onnx
     import onnxruntime as ort
@@ -175,6 +258,10 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
 
     model = model.eval()
     cfg = model.cfg
+    precision = "int8" if int8 else "fp32"
+    table = None
+    if conformal is not None:
+        table, _prec, fitted_on = conformal_for_export(conformal, precision, checkpoint)
     os.makedirs(out_dir, exist_ok=True)
     inputs = example_inputs(model, seed)
     graphs, checks = {}, {}
@@ -210,12 +297,18 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
         graphs[name] = entry
 
     model.train(was_training)
-    cal = dict(conformal=None, aci=None)
-    if conformal is not None:
-        shift = np.load(conformal) if isinstance(conformal, str) else np.asarray(conformal)
-        table = conformal_table(np.asarray(shift, np.float32), cfg.horizon).astype("<f4")
-        table.tofile(os.path.join(out_dir, "conformal.f32"))
+    cal = dict(conformal=None, precision=None, aci=None)
+    if table is not None:
+        if fitted_on is not None:
+            got = _files_digest(out_dir, [graphs[n][precision] for n in GRAPH_NAMES])
+            if got != fitted_on:
+                raise ValueError(f"конформная таблица подогнана на других {precision}-графах "
+                                 f"(отпечаток {fitted_on}, у экспорта {got}); подгоните "
+                                 f"таблицу заново на этом экспорте")
+        conformal_table(table, cfg.horizon).astype("<f4").tofile(
+            os.path.join(out_dir, "conformal.f32"))
         cal["conformal"] = "conformal.f32"
+        cal["precision"] = precision
     if aci is not None:
         cal["aci"] = dict(target=aci.target, gamma=aci.gamma, max_factor=aci.max_factor,
                           interval=list(aci.interval))
@@ -317,7 +410,19 @@ class GraphRuntime:
 
     def step(self, T, P, RH, doy, hour):
         x, codes = self.qc.push((T, P, RH))
-        m = (codes == 0).astype(np.float32)
+        self.push_checked(x, (codes == 0).astype(np.float32), doy, hour)
+
+    def push_checked(self, x, m, doy, hour):
+        """Шаг по часу, который уже прошёл контроль качества.
+
+        Args:
+            x: значения T, P, RH часа, форма (3,).
+            m: маска годности тех же каналов, форма (3,).
+            doy: день года часа.
+            hour: час суток.
+        """
+        x = np.asarray(x, np.float32)
+        m = np.asarray(m, np.float32)
         W, j = self.cfg.stream_window, self.head
         self.raw_x[j], self.raw_m[j] = np.where(m > 0, x, 0.0), m
         self.head = (j + 1) % W
@@ -341,6 +446,50 @@ class GraphRuntime:
         return q[0]
 
 
-__all__ = ["CTX", "DAY_ROW", "GRAPH_IO", "GRAPH_NAMES", "GraphRuntime", "OnnxBackend",
-           "TorchBackend", "dims", "example_inputs", "export_graphs", "quantize_graph",
-           "state_nbytes"]
+class GraphModel:
+    """Модель на графах с пакетным интерфейсом модели PyTorch.
+
+    Каждое окно батча проходит через свежий хост час за часом по всему буферу истории от
+    холодного старта, затем выпускается прогноз. При таком старте поток совпадает с
+    пакетом. История окна уже прошла контроль качества, поэтому хост его не повторяет.
+
+    Args:
+        backend: исполнитель графов нужной точности.
+        cfg: конфиг модели.
+    """
+
+    def __init__(self, backend, cfg):
+        self.backend, self.cfg = backend, cfg
+
+    def eval(self):
+        return self
+
+    def to(self, device):
+        return self
+
+    def __call__(self, batch):
+        """Прогноз по батчу окон.
+
+        Args:
+            batch: батч окон оценки.
+
+        Returns:
+            Словарь: квантили формы (B, H, число квантилей) и медиана формы (B, H).
+        """
+        from mayak.metrics import I_MED
+        a = {k: (v.numpy() if torch.is_tensor(v) else np.asarray(v)) for k, v in batch.items()}
+        qs = []
+        for i in range(a["x_hist"].shape[0]):
+            rt = GraphRuntime(self.backend, self.cfg, float(a["lat"][i]), float(a["lon"][i]),
+                              float(a["elev"][i]))
+            for k in range(a["x_hist"].shape[1]):
+                rt.push_checked(a["x_hist"][i, k], a["mask_hist"][i, k], a["doy_hist"][i, k],
+                                a["hour_hist"][i, k])
+            qs.append(rt.forecast(a["doy_fut"][i], a["hour_fut"][i]))
+        q = torch.from_numpy(np.stack(qs).astype(np.float32))
+        return dict(q=q, mu=q[..., I_MED])
+
+
+__all__ = ["CTX", "DAY_ROW", "GRAPH_IO", "GRAPH_NAMES", "GraphModel", "GraphRuntime",
+           "OnnxBackend", "TorchBackend", "conformal_for_export", "dims", "example_inputs",
+           "export_graphs", "graphs_digest", "quantize_graph", "state_nbytes"]

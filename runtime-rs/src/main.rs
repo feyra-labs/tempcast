@@ -122,6 +122,7 @@ fn forecast_json(rt: &mut Runtime, last_hour: i64) -> serde_json::Value {
 
 fn status_json(rt: &Runtime, last_hour: Option<i64>) -> serde_json::Value {
     json!({"filled": rt.filled(), "hours_in_day": rt.hours_in_day(), "theta": rt.theta(),
+           "conformal": rt.conformal_applied(),
            "aci_updates": rt.aci_updates(), "aci_misses": rt.aci_misses(),
            "calendar_breaks": rt.calendar_breaks(), "fallbacks": rt.fallbacks,
            "state_bytes": rt.state_nbytes(), "last_unix_hour": last_hour,

@@ -73,7 +73,13 @@ def main():
         from mayak.calibration import load_config
         aci = load_config(args.calibration_config).aci()
     stream = StreamingMayak(model, args.lat, args.lon, args.elev, conformal=conf, aci=aci)
-    print("Конформная калибровка:", "включена" if conf else "ОТКЛЮЧЕНА (таблица не передана)")
+    if stream.conformal is not None:
+        state = "включена"
+    elif conf:
+        state = "ОТКЛЮЧЕНА (таблица не подходит этой модели, причина в логе)"
+    else:
+        state = "ОТКЛЮЧЕНА (таблица не передана)"
+    print("Конформная калибровка:", state)
     print("Адаптивная калибровка:", f"включена ({aci})" if aci else "выключена")
 
     st = latest_state()

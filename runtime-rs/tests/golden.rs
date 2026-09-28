@@ -257,7 +257,7 @@ fn calibration_matches_metrics() {
     for case in cal["cases"].as_array().unwrap() {
         let mut q = g.take(&case["q"]).to_vec();
         if case["conformal"].as_bool().unwrap() {
-            apply_conformal(&mut q, &table, nq);
+            apply_conformal(&mut q, &table, nq, im);
         }
         apply_adaptive(&mut q, f(&case["theta"]), nq, im);
         let want = g.take(&case["expect"]);

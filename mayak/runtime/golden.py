@@ -42,7 +42,7 @@ YEAR_H = 365 * 24
 GOLDEN_ACI = ACIParams(target=0.10, gamma=0.05, max_factor=4.0)
 GOLDEN_SHIFT = (np.array([-0.3, -0.2, -0.08, 0.0, 0.08, 0.2, 0.3], np.float32)[None, :]
                 * np.array([1.0, 1.5, 2.0, 2.5], np.float32)[:, None]
-                + np.array([0.0, 0.0, 0.0, 0.02, 0.05, 0.05, 0.1], np.float32))
+                + np.array([0.0, 0.0, 0.0, 0.0, 0.05, 0.05, 0.1], np.float32))
 MIN_ACI_MARGIN = 1e-3
 Q_ATOL = 5e-4
 FRESH_ATOL = 2e-4

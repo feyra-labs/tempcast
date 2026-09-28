@@ -1211,20 +1211,29 @@ CALIBRATION_NOMINALS = (0.8, 0.9)
 
 @dataclass(frozen=True)
 class CalibrationConfig:
-    """Анализ калибровки обученной модели и адаптивная калибровка на устройстве.
+    """Подгонка конформной таблицы, анализ калибровки и адаптивная калибровка на устройстве.
 
-    nominal            - номинал центрального интервала, покрытие которого разбирается;
-    tolerance          - существенное отклонение покрытия, доля (0.04 → полоса 86–94 %);
-    min_windows, min_stations - страты меньше порога не показываются;
-    bootstrap, ci_level, seed - блочный бутстрап по станциям; 0 - без интервалов, тогда
-                         вердикты опираются только на допуск;
-    conditional_dims   - разрезы, по которым допустима условная конформная поправка:
-                         она рекомендуется, только если страты этих разрезов
-                         систематически отличаются от покрытия набора в целом;
-    sharpness_range, sharpness_points - сетка множителей ширины для кривой «острота
-                         против покрытия»;
-    aci_gamma, aci_max_factor - шаг и граница множителя адаптивной калибровки
-                         (``mayak.metrics.ACIParams``); целевая доля промахов = 1 − nominal.
+    Attributes:
+        nominal: номинал центрального интервала, покрытие которого разбирается.
+        tolerance: существенное отклонение покрытия, доля; 0.04 даёт полосу 86-94 %.
+        min_windows: страты с меньшим числом окон не показываются.
+        min_stations: страты с меньшим числом станций не показываются.
+        bootstrap: число повторов блочного бутстрапа по станциям; 0 - без интервалов,
+            тогда вердикты опираются только на допуск.
+        ci_level: уровень интервалов бутстрапа.
+        seed: сид бутстрапа.
+        conditional_dims: разрезы, по которым допустима условная конформная поправка. Она
+            рекомендуется, только если страты этих разрезов систематически отличаются от
+            покрытия набора в целом.
+        sharpness_range: крайние множители ширины для кривой «острота против покрытия».
+        sharpness_points: число множителей на этой кривой.
+        aci_gamma: шаг адаптивной калибровки устройства.
+        aci_max_factor: граница множителя ширины адаптивной калибровки; целевая доля
+            промахов равна единице минус номинал.
+        fit_every_hours: шаг между кандидатами в начала горизонта калибровочного набора, ч.
+        fit_windows_per_station: сколько окон калибровочного набора берётся с каждой
+            станции; None - все окна.
+        fit_seed: сид выбора длины истории окон калибровочного набора по куррикулуму.
     """
     nominal: float = 0.90
     tolerance: float = 0.04
@@ -1238,9 +1247,20 @@ class CalibrationConfig:
     sharpness_points: int = 33
     aci_gamma: float = 0.005
     aci_max_factor: float = 4.0
+    fit_every_hours: int = 24
+    fit_windows_per_station: Optional[int] = None
+    fit_seed: int = 0
 
     def __post_init__(self):
         s = object.__setattr__
+        for name in ("fit_every_hours", "fit_seed"):
+            s(self, name, int(getattr(self, name)))
+        if self.fit_every_hours < 1 or self.fit_seed < 0:
+            raise ConfigError("calibration.fit_every_hours ≥ 1 и calibration.fit_seed ≥ 0")
+        if self.fit_windows_per_station is not None:
+            s(self, "fit_windows_per_station", int(self.fit_windows_per_station))
+            if self.fit_windows_per_station < 1:
+                raise ConfigError("calibration.fit_windows_per_station: None (все окна) или ≥ 1")
         nominal = float(self.nominal)
         if not any(abs(nominal - n) < 1e-9 for n in CALIBRATION_NOMINALS):
             raise ConfigError(f"calibration.nominal = {nominal}; допустимо {CALIBRATION_NOMINALS}")

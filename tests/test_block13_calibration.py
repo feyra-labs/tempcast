@@ -108,7 +108,10 @@ def model():
 
 
 def _shift(seed=0):
-    return np.random.default_rng(seed).normal(0, 0.4, (len(LEAD_BINS), NQ)).astype(np.float32)
+    """Случайная таблица поправок с нулевой поправкой медианы, как у подгонки."""
+    shift = np.random.default_rng(seed).normal(0, 0.4, (len(LEAD_BINS), NQ)).astype(np.float32)
+    shift[:, I_MED] = 0.0
+    return shift
 
 
 def test_apply_adaptive_zero_is_identity_and_keeps_median():

@@ -520,6 +520,7 @@
  },
  "calibration": {
   "conformal": "conformal.f32",
+  "precision": "fp32",
   "aci": {
    "target": 0.1,
    "gamma": 0.05,
@@ -539,7 +540,7 @@
  "opset": 17,
  "provenance": {
   "git": {
-   "commit": "589d5deccdbccf3b76907b5051341196c26ad03a",
+   "commit": "ca30c7b2ca03b4da148776ca11b35d76a6d0db0e",
    "dirty": true
   },
   "versions": {

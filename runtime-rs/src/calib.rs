@@ -40,13 +40,14 @@ impl AciParams {
     }
 }
 
-/// Сдвиг квантилей таблицей (horizon × NQ) и восстановление монотонности.
-pub fn apply_conformal(q: &mut [f32], table: &[f32], nq: usize) {
+/// Конформная поправка квантилей таблицей, развёрнутой по лидам: меняется ширина
+/// интервалов, медиана остаётся той, что выдала модель.
+pub fn apply_conformal(q: &mut [f32], table: &[f32], nq: usize, i_med: usize) {
     for (row, t) in q.chunks_exact_mut(nq).zip(table.chunks_exact(nq)) {
         for (v, s) in row.iter_mut().zip(t) {
             *v += *s;
         }
-        cummax(row);
+        order_around_median(row, i_med);
     }
 }
 
@@ -61,13 +62,25 @@ pub fn apply_adaptive(q: &mut [f32], theta: f32, nq: usize, i_med: usize) {
         for v in row.iter_mut() {
             *v = med + k * (*v - med);
         }
-        cummax(row);
+        order_around_median(row, i_med);
     }
 }
 
-fn cummax(row: &mut [f32]) {
-    // np.maximum.accumulate: NaN распространяется вправо.
-    for i in 1..row.len() {
+/// Порядок квантилей без сдвига медианы: выше медианы каждый квантиль не меньше соседа
+/// слева, ниже медианы - не больше соседа справа. Пропуск значения распространяется от
+/// медианы наружу.
+pub fn order_around_median(row: &mut [f32], i_med: usize) {
+    for i in (0..i_med).rev() {
+        let (a, b) = (row[i + 1], row[i]);
+        row[i] = if a.is_nan() || b.is_nan() {
+            f32::NAN
+        } else if b > a {
+            a
+        } else {
+            b
+        };
+    }
+    for i in i_med + 1..row.len() {
         let (a, b) = (row[i - 1], row[i]);
         row[i] = if a.is_nan() || b.is_nan() {
             f32::NAN

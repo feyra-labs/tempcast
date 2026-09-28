@@ -11,7 +11,7 @@ import pytest
 from mayak.constants import H, QUANTILES
 from mayak.data import store as S
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL
-from mayak.metrics import (LEAD_BINS, METRICS, NQ, Evaluation, apply_conformal, breakdown,
+from mayak.metrics import (I_MED, LEAD_BINS, METRICS, NQ, Evaluation, apply_conformal, breakdown,
                            by_lead, conformal_table, fit_conformal_shift, lead_bin_index,
                            seed_spread, spread)
 from mayak.zones import (KG_TIF_CODE, KOPPEN_ZONES, SEASONS, UNKNOWN_ZONE, koppen_group,
@@ -305,16 +305,28 @@ def test_reliability_respects_target_mask():
 
 
 def _reference_conformal(q, shift):
+    """Поправка по лидам и порядок квантилей от медианы наружу, поэлементным циклом."""
     q = np.array(q, np.float32, copy=True)
     for h in range(q.shape[-2]):
         q[..., h, :] += shift[lead_bin_index(h + 1)]
-    return np.maximum.accumulate(q, axis=-1)
+    for i in range(I_MED - 1, -1, -1):
+        q[..., i] = np.minimum(q[..., i], q[..., i + 1])
+    for i in range(I_MED + 1, NQ):
+        q[..., i] = np.maximum(q[..., i], q[..., i - 1])
+    return q
+
+
+def _median_free_shift(rng, scale):
+    """Случайная таблица поправок с нулевой поправкой медианы, как у подгонки."""
+    shift = rng.normal(0, scale, (len(LEAD_BINS), NQ)).astype(np.float32)
+    shift[:, I_MED] = 0.0
+    return shift
 
 
 def test_apply_conformal_matches_reference_loop():
     rng = np.random.default_rng(0)
     q = np.sort(rng.normal(0, 3, (17, H, NQ)), axis=-1).astype(np.float32)
-    shift = rng.normal(0, 0.5, (len(LEAD_BINS), NQ)).astype(np.float32)
+    shift = _median_free_shift(rng, 0.5)
     assert np.allclose(apply_conformal(q, shift), _reference_conformal(q, shift))
 
 
@@ -322,7 +334,7 @@ def test_apply_conformal_works_on_single_forecast_like_runtime():
     """Рантайм подаёт (H, NQ) — та же функция обязана его принять."""
     rng = np.random.default_rng(1)
     q = np.sort(rng.normal(0, 3, (H, NQ)), axis=-1).astype(np.float32)
-    shift = rng.normal(0, 0.5, (len(LEAD_BINS), NQ)).astype(np.float32)
+    shift = _median_free_shift(rng, 0.5)
     one = apply_conformal(q, shift)
     batch = apply_conformal(q[None], shift)
     assert np.allclose(one, batch[0])
@@ -332,9 +344,10 @@ def test_apply_conformal_works_on_single_forecast_like_runtime():
 def test_conformal_keeps_quantiles_monotone():
     rng = np.random.default_rng(2)
     q = np.sort(rng.normal(0, 3, (50, H, NQ)), axis=-1).astype(np.float32)
-    shift = rng.normal(0, 2.0, (len(LEAD_BINS), NQ)).astype(np.float32)
+    shift = _median_free_shift(rng, 2.0)
     out = apply_conformal(q, shift)
     assert np.all(np.diff(out, axis=-1) >= 0)
+    assert np.array_equal(out[..., I_MED], q[..., I_MED])
 
 
 def test_conformal_table_rejects_wrong_shape():
@@ -354,8 +367,9 @@ def test_all_modules_share_one_conformal_implementation():
 
 def test_with_conformal_sets_median_from_quantiles():
     ev = _case(n_windows=20, seed=17)
-    shift = np.zeros((len(LEAD_BINS), NQ), np.float32)
-    shift[:, :] = 1.5
+    shift = np.full((len(LEAD_BINS), NQ), 1.5, np.float32)
+    shift[:, :I_MED] = -1.5
+    shift[:, I_MED] = 0.0
     out = ev.with_conformal(shift)
     assert np.allclose(out.mu, out.q[..., 3])
     assert np.allclose(out.q, apply_conformal(ev.q, shift))

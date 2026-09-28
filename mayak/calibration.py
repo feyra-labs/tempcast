@@ -628,6 +628,66 @@ def print_calibration_effect(effect, title=None):
               f"{r['CRPS'][1]:>7.3f} {r['MAE'][0]:>7.3f} {r['MAE'][1]:>7.3f}")
 
 
+FIT_DIMS = ("сезон", HISTORY_DIM)
+SEASON_ORDER = ("зима", "весна", "лето", "осень")
+
+
+def fit_report(ev_raw, ev_cal, meta, cfg=None):
+    """Покрытие на калибровочном наборе до и после таблицы по сезонам и длине истории.
+
+    Числа считаются на тех же окнах, по которым подогнана таблица, поэтому покрытие после
+    таблицы в целом близко к номиналу по построению. Смысл отчёта - в стратах: таблица
+    одна на все сезоны и длины истории, и отчёт показывает, держит ли она номинал в
+    каждой из них.
+
+    Args:
+        ev_raw: оценка модели по сырым выходам.
+        ev_cal: оценка тех же окон после таблицы.
+        meta: метаданные окон калибровочного набора; нужны сезон и длина истории.
+        cfg: настройки анализа калибровки.
+
+    Returns:
+        Словарь: номинал, допуск, строки всего набора до и после и для каждого разреза
+        строки страт до и после с интервалами бутстрапа и вердиктами.
+    """
+    cfg = cfg or CalibrationConfig()
+    boot = dict(n_boot=cfg.bootstrap, seed=cfg.seed, level=cfg.ci_level)
+    hist, hist_order = history_strata(meta)
+    keys = {"сезон": (np.asarray(meta["season"], object), SEASON_ORDER),
+            HISTORY_DIM: (hist, hist_order)}
+    out = dict(nominal=cfg.nominal, tolerance=cfg.tolerance, overall={}, dims={})
+    for tag, ev in (("raw", ev_raw), ("calibrated", ev_cal)):
+        total = coverage_row(ev, cfg.nominal, **boot)
+        total.update(verdict(total, cfg.nominal, total["coverage"], cfg.tolerance))
+        out["overall"][tag] = total
+        for name in FIT_DIMS:
+            k, order = keys[name]
+            rows = _strata_rows(ev, k, cfg, total["coverage"], boot=boot, order=order)
+            out["dims"].setdefault(name, {})[tag] = rows
+    return out
+
+
+def print_fit_report(rep):
+    """Печатает отчёт о покрытии калибровочного набора до и после таблицы."""
+    key = f"{int(round(100 * rep['nominal']))}"
+    o = rep["overall"]
+    print(f"\nPICP{key} на калибровочном наборе (в выборке): до {_pct(o['raw']['coverage'])} "
+          f"{_ci(o['raw']['ci'])}, после {_pct(o['calibrated']['coverage'])} "
+          f"{_ci(o['calibrated']['ci'])}; окон {o['raw']['n_windows']}, станций "
+          f"{o['raw']['n_stations']}")
+    for name, both in rep["dims"].items():
+        print(f"\n--- PICP{key} по разрезу: {name} ---")
+        print(f"{'страта':>16} {'окон':>6} {'до':>7} {'ДИ до':>17} {'после':>7} "
+              f"{'ДИ после':>17} {'шир. до':>8} {'после':>7}  вердикт после")
+        for k, r in both["calibrated"].items():
+            b = both["raw"].get(k)
+            if b is None:
+                continue
+            print(f"{k:>16} {r['n_windows']:>6} {_pct(b['coverage']):>7} {_ci(b['ci']):>17} "
+                  f"{_pct(r['coverage']):>7} {_ci(r['ci']):>17} {b['width']:>8.2f} "
+                  f"{r['width']:>7.2f}  {_flag(r)}")
+
+
 def split_history(pred, aux):
     """Предсказания, сохранённые для всей сетки длин истории, по отдельным длинам.
 

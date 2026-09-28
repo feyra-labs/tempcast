@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::graphs::Precision;
 use crate::qc::QcConfig;
 use crate::{Error, Result};
 
@@ -47,6 +48,9 @@ pub struct AciJson {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Calibration {
     pub conformal: Option<String>,
+    /// Точность графов, на выходах которых подогнана конформная таблица: fp32 или int8.
+    #[serde(default)]
+    pub precision: Option<String>,
     pub aci: Option<AciJson>,
 }
 
@@ -137,12 +141,47 @@ impl Manifest {
         if raw.len() != 4 * n {
             return Err(Error::new(format!("{name}: {} Б, ожидалось {}", raw.len(), 4 * n)));
         }
-        Ok(Some(
-            raw.as_chunks::<4>()
-                .0
-                .iter()
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect(),
-        ))
+        let table: Vec<f32> = raw
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let nq = self.dims.n_quantiles;
+        if table.chunks_exact(nq).any(|row| row[self.i_med] != 0.0) {
+            return Err(Error::new(format!(
+                "{name}: поправка медианы не нулевая - таблица сдвигает точечный прогноз; \
+                 подгоните таблицу заново"
+            )));
+        }
+        Ok(Some(table))
+    }
+
+    /// Конформная таблица, которую можно применять к графам заданной точности.
+    ///
+    /// Таблица, подогнанная на другой точности или без записанной точности, не
+    /// применяется: вместо неё возвращается причина для лога.
+    pub fn conformal_for(&self, precision: Precision) -> Result<(Option<Vec<f32>>, Option<String>)> {
+        let Some(table) = self.conformal_table()? else {
+            return Ok((None, None));
+        };
+        match self.calibration.precision.as_deref() {
+            Some(p) if p == precision.as_str() => Ok((Some(table), None)),
+            Some(p) => Ok((
+                None,
+                Some(format!(
+                    "конформная таблица подогнана на {p}, графы считают в {}: таблица не применяется",
+                    precision.as_str()
+                )),
+            )),
+            None => Ok((
+                None,
+                Some(format!(
+                    "точность конформной таблицы не записана в манифесте, графы считают в {}: \
+                     таблица не применяется",
+                    precision.as_str()
+                )),
+            )),
+        }
     }
 }

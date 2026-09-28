@@ -111,7 +111,11 @@ impl Runtime {
         let d = manifest.dims.clone();
         let mut graphs = Graphs::open(&manifest, opts.precision, opts.threads.max(1))?;
         let conformal = if opts.conformal {
-            manifest.conformal_table()?
+            let (table, why) = manifest.conformal_for(opts.precision)?;
+            if let Some(why) = why {
+                eprintln!("mayak-rt: {why}");
+            }
+            table
         } else {
             None
         };
@@ -232,6 +236,11 @@ impl Runtime {
         self.aci_updates = 0;
         self.aci_misses = 0;
         self.pending = false;
+    }
+
+    /// Применяется ли конформная таблица к выпускам.
+    pub fn conformal_applied(&self) -> bool {
+        self.conformal.is_some()
     }
 
     pub fn theta(&self) -> f32 {
@@ -444,7 +453,7 @@ impl Runtime {
             return Err(Error::new("выход графа issue не конечен"));
         }
         if let Some(t) = &self.conformal {
-            apply_conformal(&mut self.out.q, t, nq);
+            apply_conformal(&mut self.out.q, t, nq, self.manifest.i_med);
         }
         if self.aci.is_some() {
             for (k, dv) in self.doy_fut.iter().enumerate() {

@@ -46,7 +46,9 @@ from mayak.astro import astro_features
 from mayak.config import CHANNEL_MAX_LAG
 from mayak.data.qc import PHYS, CausalQC, qc_window
 from mayak.data.recording import record_values
-from mayak.metrics import ACIParams, aci_score, apply_adaptive, apply_conformal
+from mayak.leakage import load_conformal, precision_mismatch
+from mayak.metrics import (ACIParams, aci_score, apply_adaptive, apply_conformal,
+                           check_median_free)
 
 log = logging.getLogger(__name__)
 
@@ -92,12 +94,7 @@ class StreamingMayak:
         self._lat_t = torch.tensor([[self.lat]])
         self._lon_t = torch.tensor([[self.lon]])
 
-        if conformal is None:
-            self.conformal = None
-        elif isinstance(conformal, str):
-            self.conformal = np.load(conformal).astype(np.float32)
-        else:
-            self.conformal = np.asarray(conformal, np.float32)
+        self.conformal = self._conformal(conformal)
         self.aci = ACIParams() if aci is True else aci
         self.reset_calibration()
         self.qc = CausalQC(elev=self.elev)
@@ -305,6 +302,32 @@ class StreamingMayak:
                                             vp24[0, -r:]]).numpy()
         self._hours_in_day = r
         self.z = self._recompute_passport()
+
+    @staticmethod
+    def _conformal(conformal):
+        """Таблица поправок, которую можно применять к выходам этой модели.
+
+        Модель здесь считает во fp32. Таблица, подогнанная на другой точности, не
+        применяется, причина пишется в лог.
+
+        Args:
+            conformal: None, путь к таблице с записью о подгонке рядом или сама таблица.
+
+        Returns:
+            Таблица float32 или None.
+        """
+        if conformal is None:
+            return None
+        if not isinstance(conformal, str):
+            shift = np.asarray(conformal, np.float32)
+            check_median_free(shift)
+            return shift
+        shift, rec = load_conformal(conformal)
+        why = precision_mismatch(rec, "fp32")
+        if why:
+            log.warning("конформная таблица %s не применяется: %s", conformal, why)
+            return None
+        return shift
 
     @torch.no_grad()
     def forecast(self, doy_fut, hour_fut):

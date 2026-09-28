@@ -17,6 +17,16 @@ pub enum Precision {
     Int8,
 }
 
+impl Precision {
+    /// Имя точности, как оно записано в манифесте.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Precision::Fp32 => "fp32",
+            Precision::Int8 => "int8",
+        }
+    }
+}
+
 /// Вход графа: имя, форма, данные.
 pub type Feed<'a> = (&'a str, &'a [usize], &'a [f32]);
 

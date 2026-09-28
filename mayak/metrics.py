@@ -140,22 +140,78 @@ def lead_bin_of(horizon=H, lead_bins=LEAD_BINS):
     return np.array([lead_bin_index(h + 1, lead_bins) for h in range(horizon)], np.int64)
 
 
+def order_around_median(q):
+    """Восстанавливает порядок квантилей, не трогая медиану.
+
+    Квантили выше медианы подтягиваются вверх до соседа слева, квантили ниже медианы
+    опускаются до соседа справа. Медиана остаётся ровно той, что была на входе. Пропуск
+    значения распространяется от медианы наружу.
+
+    Args:
+        q: квантили, последняя ось - набор квантилей.
+
+    Returns:
+        Упорядоченные квантили float32 той же формы.
+    """
+    q = np.asarray(q, np.float32)
+    lo = np.minimum.accumulate(q[..., I_MED::-1], axis=-1)[..., ::-1]
+    hi = np.maximum.accumulate(q[..., I_MED:], axis=-1)
+    return np.concatenate([lo[..., :-1], hi], axis=-1)
+
+
+def check_median_free(shift):
+    """Проверяет, что таблица поправок не сдвигает медиану.
+
+    Args:
+        shift: таблица поправок, форма (число бинов лидов, число квантилей).
+
+    Raises:
+        ValueError: поправка медианы хотя бы в одном бине не равна нулю.
+    """
+    med = np.asarray(shift, np.float32)[:, I_MED]
+    if np.any(med != 0.0):
+        raise ValueError(f"поправка медианы в таблице не нулевая ({med.tolist()}): такая "
+                         f"таблица сдвигает точечный прогноз; подгоните таблицу заново")
+
+
 def conformal_table(shift, horizon=H, lead_bins=LEAD_BINS):
-    """Таблица поправок по бинам → поправка на каждый лид, (horizon, NQ)."""
+    """Поправки по бинам лидов, развёрнутые на каждый лид.
+
+    Args:
+        shift: таблица поправок, форма (число бинов лидов, число квантилей).
+        horizon: число лидов.
+        lead_bins: бины лидов таблицы.
+
+    Returns:
+        Поправки float32, форма (horizon, число квантилей).
+
+    Raises:
+        ValueError: неверная форма таблицы или ненулевая поправка медианы.
+    """
     shift = np.asarray(shift, np.float32)
     if shift.ndim != 2 or shift.shape[1] != NQ:
         raise ValueError(f"таблица поправок формы {shift.shape}, нужно (бины, {NQ})")
     if shift.shape[0] != len(lead_bins):
         raise ValueError(f"таблица поправок на {shift.shape[0]} бинов, "
                          f"а бинов лидов {len(lead_bins)}")
+    check_median_free(shift)
     return shift[lead_bin_of(horizon, lead_bins)]
 
 
 def apply_conformal(q, shift, lead_bins=LEAD_BINS):
-    """Сдвиг квантилей конформной поправкой с восстановлением монотонности."""
+    """Конформная поправка квантилей: меняется ширина интервалов, медиана остаётся.
+
+    Args:
+        q: квантили, форма (..., лиды, число квантилей).
+        shift: таблица поправок по бинам лидов с нулевой поправкой медианы.
+        lead_bins: бины лидов таблицы.
+
+    Returns:
+        Поправленные и упорядоченные квантили float32.
+    """
     q = np.asarray(q, np.float32)
     table = conformal_table(shift, q.shape[-2], lead_bins)
-    return np.maximum.accumulate(q + table, axis=-1)
+    return order_around_median(q + table)
 
 
 def apply_adaptive(q, theta=0.0):
@@ -164,7 +220,7 @@ def apply_adaptive(q, theta=0.0):
     Возвращает (q, mu), mu - медиана поправленных квантилей. Медиана поправкой не
     меняется; при θ = 0 квантили возвращаются как есть, без арифметики (пакет и поток
     совпадают до бита). Растяжение с положительным множителем сохраняет порядок;
-    ``maximum.accumulate`` - защита для входа, который уже был немонотонным.
+    упорядочивание вокруг медианы - защита для входа, который уже был немонотонным.
     """
     theta = float(theta)
     if not math.isfinite(theta):
@@ -172,7 +228,7 @@ def apply_adaptive(q, theta=0.0):
     q = np.asarray(q, np.float32)
     if theta != 0.0:
         med = q[..., I_MED:I_MED + 1]
-        q = np.maximum.accumulate(med + np.float32(math.exp(theta)) * (q - med), axis=-1)
+        q = order_around_median(med + np.float32(math.exp(theta)) * (q - med))
     return q, q[..., I_MED].copy()
 
 
@@ -344,7 +400,24 @@ def width_at_coverage(coverage, width, target):
 
 
 def fit_conformal_shift(y, q, w, lead_bins=LEAD_BINS):
-    """Сплит-конформные поправки по бинам лидов: квантиль остатка на валидных часах."""
+    """Сплит-конформные поправки по бинам лидов.
+
+    Поправка квантиля в бине - квантиль того же уровня от остатков факта относительно
+    этого квантиля на валидных часах. Поправка медианы равна нулю по построению: таблица
+    меняет только ширину интервалов, точечный прогноз остаётся прогнозом модели.
+
+    Args:
+        y: факт, форма (N, H).
+        q: квантили модели, форма (N, H, число квантилей).
+        w: веса часов цели, форма (N, H); учитываются только положительные.
+        lead_bins: бины лидов.
+
+    Returns:
+        Таблица float32, форма (число бинов, число квантилей), столбец медианы - нули.
+
+    Raises:
+        ValueError: в каком-то бине нет ни одного валидного часа.
+    """
     shift = np.zeros((len(lead_bins), q.shape[-1]), np.float32)
     for bi, (a, b) in enumerate(lead_bins):
         sl = slice(a - 1, b)
@@ -353,7 +426,8 @@ def fit_conformal_shift(y, q, w, lead_bins=LEAD_BINS):
         if len(resid) == 0:
             raise ValueError(f"в бине лидов {a}-{b} нет ни одного валидного часа")
         for qi, tau in enumerate(QUANTILES):
-            shift[bi, qi] = np.quantile(resid[:, qi], tau)
+            if qi != I_MED:
+                shift[bi, qi] = np.quantile(resid[:, qi], tau)
     return shift
 
 
@@ -685,8 +759,8 @@ def metric_table(y, mu, q, mu_clim, w, leads=(1, 3, 6, 12, 24, 48, 72, 120, 168)
 __all__ = ["ACIParams", "CENTRAL_INTERVALS", "Evaluation", "FINE_LEADS", "LEAD_BINS", "METRICS",
            "NQ", "Q", "SHARPNESS_POINTS", "SHARPNESS_RANGE", "aci_effective_level", "aci_run",
            "aci_score", "apply_adaptive", "apply_conformal", "breakdown", "by_lead",
-           "by_lead_bin", "calibrate_forecast", "conformal_table", "coverage",
+           "by_lead_bin", "calibrate_forecast", "check_median_free", "conformal_table", "coverage",
            "fit_conformal_shift", "inside", "interval_indices", "lead_bin_index", "lead_bin_of",
-           "lead_mask", "metric_table", "ordered_labels", "pair_terms", "pinball_crps",
-           "seed_spread", "sharpness_scales", "skill", "skill_per_lead", "spread",
+           "lead_mask", "metric_table", "order_around_median", "ordered_labels", "pair_terms",
+           "pinball_crps", "seed_spread", "sharpness_scales", "skill", "skill_per_lead", "spread",
            "width_at_coverage", "winkler", "wmean"]

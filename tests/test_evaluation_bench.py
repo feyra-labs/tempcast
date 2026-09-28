@@ -93,8 +93,11 @@ def _models():
 
 
 def _shift():
+    """Таблица поправок, как у подгонки: интервалы шире, поправка медианы нулевая."""
     rng = np.random.default_rng(11)
-    return np.sort(rng.normal(0.0, 0.8, (len(LEAD_BINS), NQ)), axis=-1).astype(np.float32)
+    shift = np.sort(rng.normal(0.0, 0.8, (len(LEAD_BINS), NQ)), axis=-1).astype(np.float32)
+    shift -= shift[:, 3:4]
+    return shift
 
 
 @pytest.fixture(scope="module")

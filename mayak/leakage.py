@@ -11,7 +11,8 @@
    но не в обучение и тест; история тестовых окон не заходит в обучение, валидацию
    и калибровку; история обучающих окон не выходит за обучение;
 4. конформная таблица построена только по калибровочным блокам и только на
-   валидационных станциях;
+   валидационных станциях, длины истории её окон взяты из распределения куррикулума,
+   поправка медианы равна нулю, а точность модели, на которой она подогнана, записана;
 5. чекпойнт выбран по метрике на валидационных станциях в валидационных блоках, а
    длины истории окон валидации взяты из распределения куррикулума, а не одной длиной;
 6. окна внешних станций - только в тестовом окне; внешние станции не встречаются в
@@ -20,6 +21,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -35,6 +37,7 @@ log = logging.getLogger(__name__)
 
 SELECTION_KEY = "mayak_selection"          # ключ записи о выборе чекпойнта в .ckpt
 SELECTION_TIME_KEY, CONFORMAL_TIME_KEY = "val", "calib"
+PRECISIONS = ("fp32", "int8")
 ALLOWED_ROLES = {"train": {ROLE_TRAIN}, "calib": {ROLE_VAL}}
 EXTERNAL_TIME_KEYS = {"test"}
 
@@ -269,32 +272,129 @@ def conformal_meta_path(path):
     return os.path.splitext(path)[0] + ".meta.json"
 
 
-def conformal_record(ds, checkpoint=None):
+def file_digest(path):
+    """Отпечаток содержимого файла.
+
+    Args:
+        path: путь к файлу.
+
+    Returns:
+        Первые 16 шестнадцатеричных знаков SHA-256 содержимого.
+    """
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def conformal_record(ds, checkpoint=None, precision="fp32", graphs=None):
+    """Запись о том, на чём подогнана конформная таблица.
+
+    Args:
+        ds: калибровочный набор окон.
+        checkpoint: путь к чекпойнту модели; если файл есть, пишется и его отпечаток.
+        precision: точность модели, по выходам которой подогнана таблица.
+        graphs: отпечаток графов, по которым считался прогноз; для int8 обязателен.
+
+    Returns:
+        Словарь для записи рядом с таблицей.
+
+    Raises:
+        ValueError: неизвестная точность или int8 без отпечатка графов.
+    """
+    if precision not in PRECISIONS:
+        raise ValueError(f"точность {precision!r}; допустимо {PRECISIONS}")
+    if precision == "int8" and not graphs:
+        raise ValueError("таблица для int8 подгоняется на int8-графах: нужен их отпечаток")
     stations = sorted({fp["sid"] for fp in ds.footprints()})
+    digest = file_digest(checkpoint) if checkpoint and os.path.isfile(checkpoint) else None
     return dict(station_roles=sorted(ds.station_splits), time_key=ds.time_key,
-                stations=stations, checkpoint=checkpoint, **_split_state())
+                stations=stations, checkpoint=checkpoint, checkpoint_digest=digest,
+                precision=precision, graphs=graphs, history=ds.history_spec(),
+                windows=len(ds), windows_digest=ds.fingerprint(), **_split_state())
 
 
 def save_conformal(path, shift, record):
-    """Таблица поправок + метаданные рядом (<имя>.meta.json)."""
+    """Сохраняет таблицу поправок и рядом с ней запись о подгонке.
+
+    Args:
+        path: путь к таблице, файл numpy.
+        shift: таблица поправок по бинам лидов.
+        record: запись о подгонке; ложится в файл с тем же именем и суффиксом meta.json.
+
+    Raises:
+        ValueError: таблица сдвигает медиану.
+    """
+    from mayak.metrics import check_median_free
+    check_median_free(shift)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     np.save(path, shift)
     with open(conformal_meta_path(path), "w") as f:
         json.dump(record, f, ensure_ascii=False, indent=1)
 
 
-def check_conformal(path, store):
+def load_conformal(path):
+    """Таблица поправок вместе с записью о подгонке.
+
+    Args:
+        path: путь к таблице.
+
+    Returns:
+        Пара: таблица float32 и запись о подгонке.
+
+    Raises:
+        LeakageError: рядом с таблицей нет записи о подгонке.
+        ValueError: таблица сдвигает медиану.
+    """
+    from mayak.metrics import check_median_free
     meta = conformal_meta_path(path)
-    what = f"конформная таблица {path}"
     if not os.path.exists(meta):
-        _fail(f"{what}: нет метаданных {meta} — неизвестно, на каких данных она подогнана")
+        _fail(f"конформная таблица {path}: нет метаданных {meta} — неизвестно, на каких "
+              f"данных и какой точности она подогнана")
     with open(meta) as f:
         rec = json.load(f)
+    shift = np.load(path).astype(np.float32)
+    check_median_free(shift)
+    return shift, rec
+
+
+def precision_mismatch(record, precision):
+    """Причина, по которой таблицу нельзя применять к модели заданной точности.
+
+    Args:
+        record: запись о подгонке таблицы.
+        precision: точность модели, к выходам которой таблицу собираются применить.
+
+    Returns:
+        Текст причины или None, если точности совпадают.
+    """
+    got = (record or {}).get("precision")
+    if got == precision:
+        return None
+    if got is None:
+        return (f"точность, на которой подогнана таблица, не записана; модель считает в "
+                f"{precision}")
+    return f"таблица подогнана на {got}, модель считает в {precision}"
+
+
+def check_conformal(path, store):
+    what = f"конформная таблица {path}"
+    try:
+        _shift, rec = load_conformal(path)
+    except ValueError as e:
+        _fail(f"{what}: {e}")
     if rec.get("station_roles") != [ROLE_VAL] or rec.get("time_key") != CONFORMAL_TIME_KEY:
         _fail(f"{what}: подогнана на ролях {rec.get('station_roles')} в окне "
               f"{rec.get('time_key')!r}; нужно [{ROLE_VAL!r}] / {CONFORMAL_TIME_KEY!r}")
     _check_split_state(rec, what)
     _check_station_roles(rec.get("stations", []), store, ROLE_VAL, what)
+    if (rec.get("history") or {}).get("curriculum") is None:
+        _fail(f"{what}: подогнана на окнах с одной длиной истории "
+              f"{(rec.get('history') or {}).get('L')!r}; длины истории калибровочных окон "
+              f"должны следовать куррикулуму")
+    if rec.get("precision") not in PRECISIONS:
+        _fail(f"{what}: точность модели {rec.get('precision')!r} не из {PRECISIONS}")
 
 
 def _haversine_km(lat1, lon1, lat2, lon2):

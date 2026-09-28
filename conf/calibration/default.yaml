@@ -12,3 +12,7 @@ sharpness_range: [0.25, 4.0]
 sharpness_points: 33
 aci_gamma: 0.005
 aci_max_factor: 4.0
+# калибровочный набор: шаг кандидатов, окон на станцию (null - все), сид длин истории
+fit_every_hours: 24
+fit_windows_per_station: null
+fit_seed: 0
