@@ -1,29 +1,26 @@
 """Эталонные векторы компилируемого рантайма.
 
-Эталон - Python: потоковый рантайм ``StreamingMayak``, калибровка
-``mayak.metrics``, календарь ``mayak.timeaxis``. Векторы
-генерируются на детерминированной модели (сид, все параметры «встряхнуты», чтобы нулевые
-инициализации голов, FiLM и подстройки мод не прятали ошибки), записываются в
-tests/data/runtime_golden/ и коммитятся. Рантайм на Rust (runtime-rs/tests/golden.rs)
-сверяется с ними.
+Эталон - потоковый рантайм на PyTorch, калибровка и календарь проекта. Векторы
+генерируются на детерминированной модели: сид и шум на всех параметрах, чтобы нулевые
+инициализации голов, модуляции поля и подстройки мод не прятали ошибки. Векторы
+записываются в каталог эталона и коммитятся, рантайм на Rust сверяется с ними.
 
-Состав:
-* model/                 - четыре графа ONNX, manifest.json, conformal.f32;
-* golden.json            - сценарии (события step/forecast), календарь, калибровка;
-* golden.f32             - ожидаемые квантили и входы калибровки (float32 LE);
-* state_*.bin            - состояния, записанные эталоном (формат v3).
+Состав каталога:
+* model/        - графы ONNX, манифест, конформная таблица;
+* golden.json   - сценарии из событий шага и выпуска, календарь, калибровка;
+* golden.f32    - ожидаемые квантили и входы калибровки, float32 little-endian;
+* state_*.bin   - состояния, записанные эталоном.
 
 Сценарии:
-* cold_aci  - холодный старт, конформная таблица и ACI, переход через Новый год,
-              дробные наблюдения, которые хост записывает целыми градусами и
-              процентами, значения рядом с границами физических диапазонов до и после
-              записи, половины между целыми, NaN, пропуски;
-* restart   - старт из состояния эталона с незавершёнными сутками, ACI с θ ≠ 0;
-* extremes  - полярная точка, 30 ч без данных, значения ровно на границах диапазонов,
-              разрыв календаря, без калибровки.
+* cold_aci  - холодный старт, конформная таблица и адаптивная калибровка, переход через
+              Новый год, дробные наблюдения, значения у границ физических диапазонов до и
+              после записи, половины между целыми, NaN, пропуски, простой в несколько
+              часов;
+* restart   - старт из состояния эталона, записанного после полного окна: хвост и край
+              истории заполнены, множитель калибровки не нулевой;
+* extremes  - полярная точка, долгие пустые часы, значения ровно на границах диапазонов,
+              простой в час и простой длиннее окна, без калибровки.
 """
-from __future__ import annotations
-
 import json
 import os
 
@@ -33,12 +30,11 @@ import torch
 from mayak.metrics import ACIParams, aci_run, aci_score, calibrate_forecast
 from mayak.runtime.equivalence import synthetic_series
 from mayak.runtime.streaming import StreamingMayak
-from mayak.timeaxis import window_calendar
+from mayak.timeaxis import to_utc_hour, window_calendar
 
-GOLDEN_FORMAT = 1
+GOLDEN_FORMAT = 2
 GOLDEN_SEED = 1414
 GOLDEN_PERTURB = 0.05
-YEAR_H = 365 * 24
 GOLDEN_ACI = ACIParams(target=0.10, gamma=0.05, max_factor=4.0)
 GOLDEN_SHIFT = (np.array([-0.3, -0.2, -0.08, 0.0, 0.08, 0.2, 0.3], np.float32)[None, :]
                 * np.array([1.0, 1.5, 2.0, 2.5], np.float32)[:, None]
@@ -84,14 +80,8 @@ def _obs(series, k):
     return [_f(series["x"][k, j]) if series["m"][k, j] > 0 else None for j in range(3)]
 
 
-def _fut(hoy0, horizon):
-    hoy = (hoy0 + np.arange(horizon)) % YEAR_H
-    return (hoy / 24.0).astype(np.float32), (hoy % 24).astype(np.float32)
-
-
-def _cal(hoy):
-    hoy = int(hoy) % YEAR_H
-    return _f(hoy / 24.0), _f(hoy % 24)
+def _hour(stamp):
+    return int(to_utc_hour(np.datetime64(stamp, "s")))
 
 
 class _Recorder:
@@ -102,34 +92,29 @@ class _Recorder:
         self.events = []
         self.margins = []
 
-    def step(self, obs, doy, hour):
+    def step(self, obs, hour):
         s = self.s
-        if s.aci is not None and s._pending is not None and obs[0] is not None:
-            p = s._pending
-            hit = np.flatnonzero(p["hoy"] == int(round(float(np.float32(doy)) * 24.0)))
-            if hit.size and int(hit[0]) > p["last"]:
-                sc = float(aci_score(float(np.float32(obs[0])), p["q"][int(hit[0])],
-                                     s.aci.interval))
+        p = s._pending
+        if s.aci is not None and p is not None and obs[0] is not None:
+            k = hour - p["first"]
+            if 0 <= k < len(p["q"]) and k > p["last"]:
+                sc = float(aci_score(float(np.float32(obs[0])), p["q"][k], s.aci.interval))
                 if np.isfinite(sc):
                     self.margins.append(abs(sc - np.exp(s.theta)))
-        s.step(*obs, np.float32(doy), np.float32(hour))
-        self.events.append(dict(op="step", obs=[_enc_obs(v) for v in obs], doy=_f(doy),
-                                hour=_f(hour)))
+        s.step(*obs, hour)
+        self.events.append(dict(op="step", obs=[_enc_obs(v) for v in obs], hour=int(hour)))
 
-    def forecast(self, hoy0, record=True):
-        """Выпуск; record=False - выпуск нужен только как обратная связь ACI, квантили
-        не пишутся (объём эталона), θ пишется всегда."""
-        doy, hour = _fut(hoy0, self.s.m.cfg.horizon)
-        q, _mu = self.s.forecast(doy, hour)
-        self.events.append(dict(op="forecast", fut_hoy0=int(hoy0),
-                                q=self.blob.put(q) if record else None,
+    def forecast(self, record=True):
+        """Выпуск; без записи квантилей выпуск нужен только как обратная связь
+        калибровки, множитель пишется всегда."""
+        q, _mu = self.s.forecast()
+        self.events.append(dict(op="forecast", q=self.blob.put(q) if record else None,
                                 theta=_f(self.s.theta)))
 
     def final(self):
         s = self.s
         return dict(theta=_f(s.theta), aci_updates=s.aci_updates, aci_misses=s.aci_misses,
-                    calendar_breaks=s.calendar_breaks, filled=s.filled,
-                    hours_in_day=s._hours_in_day)
+                    filled=s.filled, last_hour=s.last_hour, idle_hours=s.idle_hours)
 
 
 class _Blob:
@@ -147,53 +132,49 @@ class _Blob:
         return np.concatenate(self.parts) if self.parts else np.zeros(0, "<f4")
 
 
-def _series(n, seed, start_hoy):
-    s = synthetic_series(n, seed=seed, start_hoy=start_hoy)
-    s["hoy"] = (start_hoy + np.arange(n)) % YEAR_H
-    return s
-
-
 def scenario_cold_aci(model, blob):
     lat, lon, elev = 52.37, 4.9, -2.0
     st = StreamingMayak(model, lat, lon, elev, conformal=GOLDEN_SHIFT, aci=GOLDEN_ACI)
     rec = _Recorder(st, blob)
-    H = model.cfg.horizon
-    s = _series(330, seed=11, start_hoy=YEAR_H - 100)
+    s = synthetic_series(330, seed=11, t0=_hour("2021-12-27T20"))
     bad = {40: (75.0, None, None), 41: (None, None, -5.0), 42: (None, 250.0, None),
            43: (float("nan"), None, None), 44: (60.6, 1100.06, 100.6),
-           45: (60.4, 1100.04, 100.4), 46: (-0.5, 1013.25, 12.5)}
-    rec.forecast(s["hoy"][0])
-    for k in range(len(s["hoy"])):
+           45: (60.4, 1100.04, 100.4), 46: (-0.5, 1013.25, 12.5), 47: (-200.0, 7000.0, 300.0)}
+    skip = set(range(200, 205))
+    for k in range(330):
+        if k in skip:
+            continue
         obs = _obs(s, k)
         if k in bad:
             obs = [b if b is not None else o for b, o in zip(bad[k], obs)]
-        rec.step(obs, *_cal(s["hoy"][k]))
+        rec.step(obs, s["t0"] + k)
         if k % 6 == 5:
-            rec.forecast(s["hoy"][k] + 1, record=k % 24 == 23)
+            rec.forecast(record=k % 24 == 23)
     return dict(name="cold_aci", lat=lat, lon=lon, elev=elev, conformal=True, aci=True,
-                init_state=None, events=rec.events, final=rec.final()), rec.margins, H
+                init_state=None, events=rec.events, final=rec.final()), rec.margins
 
 
 def scenario_restart(model, blob, out_dir):
     lat, lon, elev = -33.87, 151.21, 58.0
-    s = _series(300 + 96, seed=23, start_hoy=2000)
+    pre_n = model.cfg.stream_window + 88
+    s = synthetic_series(pre_n + 100, seed=29, t0=_hour("2023-03-24T05"))
     a = StreamingMayak(model, lat, lon, elev, conformal=GOLDEN_SHIFT, aci=GOLDEN_ACI)
     pre = _Recorder(a, _Blob())
-    for k in range(300):
-        pre.step(_obs(s, k), *_cal(s["hoy"][k]))
+    for k in range(pre_n):
+        pre.step(_obs(s, k), s["t0"] + k)
         if k % 8 == 7:
-            pre.forecast(s["hoy"][k] + 1)
+            pre.forecast()
     raw = a.serialize()
     with open(os.path.join(out_dir, "state_restart.bin"), "wb") as fh:
         fh.write(raw)
     b = StreamingMayak(model, lat, lon, elev, conformal=GOLDEN_SHIFT, aci=GOLDEN_ACI)
     b.load_state(raw)
     rec = _Recorder(b, blob)
-    rec.forecast(s["hoy"][299] + 1)
-    for k in range(300, len(s["hoy"])):
-        rec.step(_obs(s, k), *_cal(s["hoy"][k]))
+    rec.forecast()
+    for k in range(pre_n, len(s["x"])):
+        rec.step(_obs(s, k), s["t0"] + k)
         if k % 12 == 11:
-            rec.forecast(s["hoy"][k] + 1)
+            rec.forecast()
     end = b.serialize()
     with open(os.path.join(out_dir, "state_restart_end.bin"), "wb") as fh:
         fh.write(end)
@@ -208,19 +189,22 @@ def scenario_extremes(model, blob):
     lat, lon, elev = 78.22, 15.65, 2000.0
     st = StreamingMayak(model, lat, lon, elev)
     rec = _Recorder(st, blob)
-    hoy = 4300
+    hour = _hour("2022-06-28T04")
     for _ in range(30):
-        rec.step([None, None, None], *_cal(hoy))
-        hoy += 1
-    rec.forecast(hoy)
+        rec.step([None, None, None], hour)
+        hour += 1
+    rec.forecast()
     edges = [(-90.0, 300.0, 0.0), (60.0, 1100.0, 100.0), (-90.0, 1100.0, 100.0),
              (60.0, 300.0, 0.0)]
     for k in range(60):
-        rec.step(list(edges[k % 4]), *_cal(hoy))
-        hoy += 1 if k != 30 else 2                        # разрыв календаря на час
-    rec.forecast(hoy)
-    rec.step([-5.0, 800.0, 55.0], *_cal(hoy))
-    rec.forecast(hoy + 1)
+        rec.step(list(edges[k % 4]), hour)
+        hour += 1 if k != 30 else 2
+    rec.forecast()
+    rec.step([-5.0, 800.0, 55.0], hour)
+    rec.forecast()
+    hour += model.cfg.stream_window + 5
+    rec.step([-4.0, 801.0, 56.0], hour)
+    rec.forecast()
     return dict(name="extremes", lat=lat, lon=lon, elev=elev, conformal=False, aci=False,
                 init_state=None, events=rec.events, final=rec.final())
 
@@ -278,14 +262,14 @@ def generate(out_dir=DEFAULT_DIR):
     with open(os.path.join(out_dir, "model", "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=1)
     blob = _Blob()
-    cold, m1, _H = scenario_cold_aci(model, blob)
+    cold, m1 = scenario_cold_aci(model, blob)
     restart, m2 = scenario_restart(model, blob, out_dir)
     extremes = scenario_extremes(model, blob)
     margins = m1 + m2
     if margins and min(margins) < MIN_ACI_MARGIN:
         raise RuntimeError(f"обратная связь ACI эталона в {min(margins):.1e} от порога e^θ: "
                            f"решение о промахе неустойчиво к float32; смените сид")
-    doc = dict(format=GOLDEN_FORMAT, seed=GOLDEN_SEED, year_hours=YEAR_H,
+    doc = dict(format=GOLDEN_FORMAT, seed=GOLDEN_SEED,
                tolerance=dict(q_abs=Q_ATOL, fresh_abs=FRESH_ATOL),
                aci_margin_min=float(min(margins)) if margins else None,
                scenarios=[cold, restart, extremes], calendar=calendar_cases(),
@@ -309,11 +293,18 @@ def take(blob, ref, shape=None):
 
 
 def replay(doc, blob, runtime_factory, horizon):
-    """Прогон сценариев эталона через любую реализацию → max|Δq| по сценариям.
+    """Прогон сценариев эталона через любую реализацию.
 
-    runtime_factory(scenario) → объект с step(T, P, RH, doy, hour) и forecast(doy, hour),
-    возвращающим квантили (H, NQ) (или пару (q, mu)); для сценария с init_state фабрика
-    сама загружает состояние.
+    Args:
+        doc: документ эталона.
+        blob: массив ожидаемых значений.
+        runtime_factory: по сценарию возвращает рантайм с методами ``step(T, P, RH,
+            hour)`` и ``forecast()``; для сценария с начальным состоянием фабрика сама
+            загружает состояние.
+        horizon: горизонт модели.
+
+    Returns:
+        Словарь: имя сценария и наибольшее расхождение квантилей с эталоном.
     """
     out = {}
     for sc in doc["scenarios"]:
@@ -321,10 +312,9 @@ def replay(doc, blob, runtime_factory, horizon):
         err = 0.0
         for ev in sc["events"]:
             if ev["op"] == "step":
-                rt.step(*(dec_obs(v) for v in ev["obs"]), np.float32(ev["doy"]),
-                        np.float32(ev["hour"]))
+                rt.step(*(dec_obs(v) for v in ev["obs"]), ev["hour"])
                 continue
-            q = rt.forecast(*_fut(ev["fut_hoy0"], horizon))
+            q = rt.forecast()
             if ev["q"] is None:
                 continue
             q = q[0] if isinstance(q, tuple) else q

@@ -1,19 +1,24 @@
-//! Хост рантайма: то же поведение, что mayak.runtime.streaming.StreamingMayak, но
-//! модель считается четырьмя графами ONNX, а всё состояние живёт в буферах этой
+//! Хост рантайма: модель считается графами ONNX, всё состояние живёт в буферах этой
 //! структуры, выделенных один раз при создании.
 //!
-//! Ответственность хоста): кольцо сырого окна и календарь, буфер энкодера
-//! (двойной буфер - вход и выход графа step меняются местами), суточный накопитель,
-//! причинный QC часа, калибровка интервалов, сериализация, откат к климатологии при сбое.
+//! Хост держит сырое окно наблюдений, кольцо вкладов часов хвоста истории в моды, кольцо
+//! строк суточного накопителя, буфер энкодера, причинный контроль качества, калибровку
+//! интервалов и сериализацию. Место часа в каждом кольце определяется абсолютным часом,
+//! поэтому указатель кольца хранить не нужно.
+//!
+//! Шаг часа - граф шага: сумма мод по хвосту истории сдвигается на час, вклад часа,
+//! вышедшего из хвоста, вычитается. Раз в сутки сумма пересчитывается точно по кольцу.
+//! Выпуск - граф выпуска: паспорт по строкам накопителя и вклад края истории, признаки
+//! которого зависят от момента выпуска. Загрузка состояния и холодный старт - граф
+//! полного окна.
 use std::path::Path;
 
-use crate::calendar::{hour_of_year, YEAR_HOURS};
+use crate::calendar::doy_hour;
 use crate::calib::{aci_score, apply_adaptive, apply_conformal, AciParams};
 use crate::graphs::{Graphs, Precision};
 use crate::manifest::{Dims, Manifest};
 use crate::qc::CausalQc;
-use crate::record::record_channel;
-use crate::state::{decode_raw, encode_raw, window_hoys, Snapshot};
+use crate::state::{to_store, Snapshot};
 use crate::{Error, Result};
 
 #[derive(Debug, Clone)]
@@ -22,9 +27,9 @@ pub struct RuntimeOptions {
     pub threads: usize,
     /// Применять конформную таблицу из манифеста.
     pub conformal: bool,
-    /// Онлайн-подстройка θ (ACI) с параметрами из манифеста.
+    /// Онлайн-подстройка множителя калибровки с параметрами из манифеста.
     pub aci: bool,
-    /// Откат к климатологии: средняя T и σ (как --clim-fallback / --sigma-fallback).
+    /// Откат к климатологии: средняя температура и разброс.
     pub clim_fallback: f32,
     pub sigma_fallback: f32,
 }
@@ -50,6 +55,9 @@ pub struct Forecast {
     pub fallback: bool,
 }
 
+/// Сколько часов между точными пересчётами суммы мод.
+pub const RESYNC_HOURS: i64 = 24;
+
 pub struct Runtime {
     pub manifest: Manifest,
     d: Dims,
@@ -58,49 +66,59 @@ pub struct Runtime {
     qc: CausalQc,
     lat: [f32; 1],
     lon: [f32; 1],
-    // признаки точки (граф init)
+    site: [f32; 3],
     loc: Vec<f32>,
     coefs: [Vec<f32>; 3],
-    z0: Vec<f32>,
-    // сырое окно (кольцо)
-    raw_x: Vec<f32>,
-    raw_m: Vec<f32>,
-    hoy_ring: Vec<i64>,
-    head: usize,
+    // сырое окно: место часа - абсолютный час по модулю длины окна
+    raw: Vec<f32>,
+    present: Vec<bool>,
+    valid: Vec<bool>,
     filled: usize,
-    // энкодер и моды: текущие буферы и буферы под выход графа
+    last_hour: Option<i64>,
+    // энкодер и сумма мод по хвосту: текущие буферы и буферы под выход графа
     enc: Vec<f32>,
     enc_next: Vec<f32>,
     modes: [Vec<f32>; 3],
     modes_next: [Vec<f32>; 3],
-    // сутки и паспорт
-    day_acc: Vec<f32>,
-    hours_in_day: usize,
-    day_summ: Vec<f32>,
-    day_mask: Vec<f32>,
-    z: Vec<f32>,
-    passport_next: [Vec<f32>; 3],
+    // кольца вкладов хвоста и строк накопителя
+    u_ring: Vec<f32>,
+    v_ring: Vec<f32>,
+    rows: Vec<f32>,
     // рабочие буферы
     ctx_x: Vec<f32>,
     ctx_m: Vec<f32>,
-    day_row: [f32; 4],
+    win_x: Vec<f32>,
+    win_m: Vec<f32>,
+    win_doy: Vec<f32>,
+    win_hour: Vec<f32>,
+    edge_x: Vec<f32>,
+    edge_m: Vec<f32>,
+    edge_doy: Vec<f32>,
+    edge_hour: Vec<f32>,
+    u_tail: Vec<f32>,
+    v_tail: Vec<f32>,
+    rows_ord: Vec<f32>,
+    u_old: Vec<f32>,
+    v_old: [f32; 1],
+    u_new: Vec<f32>,
+    v_new: [f32; 1],
+    row: [f32; 4],
     doy_fut: Vec<f32>,
     hour_fut: Vec<f32>,
     out: Forecast,
-    // календарь
-    last_hoy: Option<i64>,
-    calendar_breaks: u64,
     // калибровка
     conformal: Option<Vec<f32>>,
     aci: Option<AciParams>,
     theta: f32,
     aci_updates: u64,
     aci_misses: u64,
-    pending_hoy: Vec<i64>,
+    pending_first: i64,
     pending_q: Vec<f32>,
     pending_last: i64,
     pending: bool,
-    // откат
+    // учёт
+    idle_hours: u64,
+    loaded_site: Option<[f32; 3]>,
     clim: (f32, f32),
     pub fallbacks: u64,
 }
@@ -130,6 +148,7 @@ impl Runtime {
             _ => None,
         };
         let qc = CausalQc::new(manifest.qc.clone(), manifest.phys_bounds(), Some(elev));
+        let site = [lat as f32, lon as f32, elev as f32];
         let (lat, lon, elev) = ([lat as f32], [lon as f32], [elev as f32]);
         let mut loc = vec![0.0; d.loc_dim];
         let mut coefs = d.n_coef.map(|n| vec![0.0f32; n]);
@@ -143,6 +162,7 @@ impl Runtime {
             )?;
         }
         let (w, m, nq, h) = (d.stream_window, d.n_modes, d.n_quantiles, d.horizon);
+        let (e, t, l) = (d.stream_edge, d.stream_tail, d.history);
         let buf = d.encoder_width * d.enc_buf_len;
         let mut rt = Runtime {
             bounds: manifest.phys_bounds(),
@@ -151,31 +171,39 @@ impl Runtime {
             graphs,
             lat,
             lon,
+            site,
             loc,
             coefs,
-            z: z0.clone(),
-            z0,
-            raw_x: vec![0.0; w * 3],
-            raw_m: vec![0.0; w * 3],
-            hoy_ring: vec![0; w],
-            head: 0,
+            raw: vec![0.0; w * 3],
+            present: vec![false; w * 3],
+            valid: vec![false; w * 3],
             filled: 0,
+            last_hour: None,
             enc: vec![0.0; buf],
             enc_next: vec![0.0; buf],
             modes: [vec![0.0; m], vec![0.0; m], vec![0.0; m]],
             modes_next: [vec![0.0; m], vec![0.0; m], vec![0.0; m]],
-            day_acc: vec![0.0; 4 * 24],
-            hours_in_day: 0,
-            day_summ: vec![0.0; d.history_days * d.n_daily_summary],
-            day_mask: vec![0.0; d.history_days],
-            passport_next: [
-                vec![0.0; d.history_days * d.n_daily_summary],
-                vec![0.0; d.history_days],
-                vec![0.0; d.passport_dim],
-            ],
+            u_ring: vec![0.0; t * 2 * m],
+            v_ring: vec![0.0; t],
+            rows: vec![0.0; l * 4],
             ctx_x: vec![0.0; d.ctx * 3],
             ctx_m: vec![0.0; d.ctx * 3],
-            day_row: [0.0; 4],
+            win_x: vec![0.0; w * 3],
+            win_m: vec![0.0; w * 3],
+            win_doy: vec![0.0; w],
+            win_hour: vec![0.0; w],
+            edge_x: vec![0.0; e * 3],
+            edge_m: vec![0.0; e * 3],
+            edge_doy: vec![0.0; e],
+            edge_hour: vec![0.0; e],
+            u_tail: vec![0.0; t * 2 * m],
+            v_tail: vec![0.0; t],
+            rows_ord: vec![0.0; l * 4],
+            u_old: vec![0.0; 2 * m],
+            v_old: [0.0],
+            u_new: vec![0.0; 2 * m],
+            v_new: [0.0],
+            row: [0.0; 4],
             doy_fut: vec![0.0; h],
             hour_fut: vec![0.0; h],
             out: Forecast {
@@ -183,51 +211,49 @@ impl Runtime {
                 mu: vec![0.0; h],
                 fallback: false,
             },
-            last_hoy: None,
-            calendar_breaks: 0,
             conformal,
             aci,
             theta: 0.0,
             aci_updates: 0,
             aci_misses: 0,
-            pending_hoy: vec![0; h],
+            pending_first: 0,
             pending_q: vec![0.0; h * nq],
             pending_last: -1,
             pending: false,
+            idle_hours: 0,
+            loaded_site: None,
             clim: (opts.clim_fallback, opts.sigma_fallback),
             fallbacks: 0,
             d,
         };
         rt.reset_calibration(0.0);
-        rt.reset();
+        rt.reset(None)?;
         Ok(rt)
     }
 
-    /// Холодный старт: история пуста. θ калибровки сохраняется (он относится к прибору).
-    pub fn reset(&mut self) {
+    /// Холодный старт: окно состоит из пустых часов. Множитель калибровки сохраняется.
+    ///
+    /// `last_hour` - час, которым кончается пустое окно; None - момент ещё не известен,
+    /// окно строится при первом шаге.
+    pub fn reset(&mut self, last_hour: Option<i64>) -> Result<()> {
         self.pending = false;
         self.qc.reset();
-        for v in [
-            &mut self.raw_x,
-            &mut self.raw_m,
-            &mut self.enc,
-            &mut self.day_acc,
-            &mut self.day_summ,
-            &mut self.day_mask,
-        ] {
+        self.raw.fill(0.0);
+        self.present.fill(false);
+        self.valid.fill(false);
+        for v in [&mut self.enc, &mut self.u_ring, &mut self.v_ring, &mut self.rows] {
             v.fill(0.0);
         }
         self.modes.iter_mut().for_each(|v| v.fill(0.0));
-        self.hoy_ring.fill(0);
-        self.head = 0;
         self.filled = 0;
-        self.hours_in_day = 0;
-        self.last_hoy = None;
-        self.calendar_breaks = 0;
-        self.z.copy_from_slice(&self.z0);
+        self.last_hour = last_hour;
+        if last_hour.is_some() {
+            self.rebuild(false)?;
+        }
+        Ok(())
     }
 
-    /// Сброс адаптивной калибровки (θ и счётчики обратной связи).
+    /// Сброс адаптивной калибровки: множитель и счётчики обратной связи.
     pub fn reset_calibration(&mut self, theta: f32) {
         self.theta = match &self.aci {
             Some(a) => a.clip(theta as f64),
@@ -242,7 +268,6 @@ impl Runtime {
     pub fn conformal_applied(&self) -> bool {
         self.conformal.is_some()
     }
-
     pub fn theta(&self) -> f32 {
         self.theta
     }
@@ -252,18 +277,21 @@ impl Runtime {
     pub fn aci_misses(&self) -> u64 {
         self.aci_misses
     }
-    pub fn calendar_breaks(&self) -> u64 {
-        self.calendar_breaks
-    }
+    /// Сколько часов окна прошло после холодного старта, не больше длины окна.
     pub fn filled(&self) -> usize {
         self.filled
     }
-    /// Час года последнего шага (из потока или из загруженного состояния).
-    pub fn last_hoy(&self) -> Option<i64> {
-        self.last_hoy
+    /// Абсолютный час последнего шага, в том числе из загруженного состояния.
+    pub fn last_hour(&self) -> Option<i64> {
+        self.last_hour
     }
-    pub fn hours_in_day(&self) -> usize {
-        self.hours_in_day
+    /// Сколько пустых часов подставлено за простой в этом процессе.
+    pub fn idle_hours(&self) -> u64 {
+        self.idle_hours
+    }
+    /// Координаты и высота из загруженного состояния.
+    pub fn loaded_site(&self) -> Option<[f32; 3]> {
+        self.loaded_site
     }
     pub fn stream_window(&self) -> usize {
         self.d.stream_window
@@ -277,79 +305,169 @@ impl Runtime {
     pub fn state_nbytes(&self) -> usize {
         crate::state::nbytes(&self.d)
     }
-    /// Буфер энкодера в памяти (на диск не пишется), байт.
+    /// Буфер энкодера в памяти, байт.
     pub fn encoder_buffer_bytes(&self) -> usize {
         4 * self.enc.len()
     }
-
-    /// Новый час наблюдений. None или NaN - значения нет. Час проходит причинный QC по
-    /// кольцу прошлых сырых часов; отбракованное значение становится пропуском.
-    pub fn step(&mut self, obs: [Option<f64>; 3], doy: f32, hour: f32) -> Result<()> {
-        let (x, codes) = self.qc.push(obs);
-        let m = codes.map(|c| if c == 0 { 1.0 } else { 0.0 });
-        if self.aci.is_some() && m[0] > 0.0 {
-            self.aci_feedback(x[0] as f64, doy);
-        }
-        self.ingest(x, m, doy, hour)
+    /// Кольца и буфер энкодера в памяти, байт. На диск они не пишутся.
+    pub fn memory_bytes(&self) -> usize {
+        4 * (self.enc.len() + self.u_ring.len() + self.v_ring.len() + self.rows.len())
     }
 
-    fn check_calendar(&mut self, hoy: i64) {
-        if let Some(prev) = self.last_hoy {
-            if hoy != prev + 1 && !(hoy == 0 && YEAR_HOURS.contains(&(prev + 1))) {
-                self.calendar_breaks += 1;
-                eprintln!("mayak-rt: календарь потока не непрерывен: час года {hoy} после {prev}");
-            }
-        }
-        self.last_hoy = Some(hoy);
+    fn slot(&self, hour: i64) -> usize {
+        hour.rem_euclid(self.d.stream_window as i64) as usize
     }
 
-    fn ingest(&mut self, x: [f32; 3], m: [f32; 3], doy: f32, hour: f32) -> Result<()> {
-        let hoy = hour_of_year(doy);
-        self.check_calendar(hoy);
-        let (j, w) = (self.head, self.d.stream_window);
-        for c in 0..3 {
-            self.raw_m[j * 3 + c] = m[c];
-            self.raw_x[j * 3 + c] = if m[c] > 0.0 { x[c] } else { 0.0 };
-        }
-        self.hoy_ring[j] = hoy;
-        self.head = (j + 1) % w;
-        self.filled = (self.filled + 1).min(w);
-        self.run_step(j, None, doy, hour)?;
-        std::mem::swap(&mut self.enc, &mut self.enc_next);
-        std::mem::swap(&mut self.modes, &mut self.modes_next);
-        self.accumulate_day()
-    }
-
-    /// Граф step для часа в позиции `end` кольца. `lo` - нижняя граница окна при
-    /// восстановлении: позиции левее неё читаются как пустые, а не по кольцу.
-    fn run_step(&mut self, end: usize, lo: Option<usize>, doy: f32, hour: f32) -> Result<()> {
-        let (w, ctx) = (self.d.stream_window as i64, self.d.ctx);
-        for i in 0..ctx {
-            let p = end as i64 - (ctx as i64 - 1) + i as i64;
-            let pos = match lo {
-                Some(lo) if p < lo as i64 => None,
-                _ => Some(p.rem_euclid(w) as usize),
-            };
+    /// Значения, маски годности и календарь часов окна от `first` подряд в буферы.
+    fn window_into(&self, first: i64, x: &mut [f32], m: &mut [f32], doy: &mut [f32], hour: &mut [f32]) {
+        for (k, (dd, hh)) in doy.iter_mut().zip(hour.iter_mut()).enumerate() {
+            let h = first + k as i64;
+            let p = self.slot(h);
             for c in 0..3 {
-                let (xv, mv) = pos.map_or((0.0, 0.0), |p| (self.raw_x[p * 3 + c], self.raw_m[p * 3 + c]));
-                self.ctx_x[i * 3 + c] = xv;
-                self.ctx_m[i * 3 + c] = mv;
+                let ok = self.valid[p * 3 + c];
+                m[k * 3 + c] = ok as u8 as f32;
+                x[k * 3 + c] = if ok { self.raw[p * 3 + c] } else { 0.0 };
             }
+            (*dd, *hh) = doy_hour(h);
+        }
+    }
+
+    /// Всё модельное состояние из сырого окна одним пакетным проходом.
+    fn rebuild(&mut self, seed_qc: bool) -> Result<()> {
+        let last = self.last_hour.expect("окно без последнего часа");
+        let (w, l, t, m) = (self.d.stream_window, self.d.history, self.d.stream_tail, self.d.n_modes);
+        let first = last - w as i64 + 1;
+        let (mut x, mut mk, mut dy, mut hr) = (
+            std::mem::take(&mut self.win_x),
+            std::mem::take(&mut self.win_m),
+            std::mem::take(&mut self.win_doy),
+            std::mem::take(&mut self.win_hour),
+        );
+        self.window_into(first, &mut x, &mut mk, &mut dy, &mut hr);
+        (self.win_x, self.win_m, self.win_doy, self.win_hour) = (x, mk, dy, hr);
+        let d = &self.d;
+        let (s_w3, s_w, s11) = ([1, w, 3], [1, w], [1, 1]);
+        let s_c = d.n_coef.map(|n| [1, n]);
+        let [n_re, n_im, e] = &mut self.modes;
+        self.graphs.window.run(
+            &[
+                ("x_win", &s_w3, &self.win_x),
+                ("m_win", &s_w3, &self.win_m),
+                ("doy_win", &s_w, &self.win_doy),
+                ("hour_win", &s_w, &self.win_hour),
+                ("lat", &s11, &self.lat),
+                ("lon", &s11, &self.lon),
+                ("c_mu", &s_c[0], &self.coefs[0]),
+                ("c_sig", &s_c[1], &self.coefs[1]),
+                ("c_def", &s_c[2], &self.coefs[2]),
+            ],
+            &mut [
+                &mut self.enc,
+                &mut self.u_tail,
+                &mut self.v_tail,
+                &mut self.rows_ord,
+                n_re,
+                n_im,
+                e,
+            ],
+        )?;
+        for k in 0..t {
+            let s = (last - t as i64 + 1 + k as i64).rem_euclid(t as i64) as usize;
+            self.u_ring[s * 2 * m..(s + 1) * 2 * m].copy_from_slice(&self.u_tail[k * 2 * m..(k + 1) * 2 * m]);
+            self.v_ring[s] = self.v_tail[k];
+        }
+        for k in 0..l {
+            let s = (last - l as i64 + 1 + k as i64).rem_euclid(l as i64) as usize;
+            self.rows[s * 4..s * 4 + 4].copy_from_slice(&self.rows_ord[k * 4..k * 4 + 4]);
+        }
+        if seed_qc {
+            let n = self.qc.size().min(w);
+            let mut xs = Vec::with_capacity(n);
+            let mut ps = Vec::with_capacity(n);
+            for k in 0..n {
+                let p = self.slot(last - n as i64 + 1 + k as i64);
+                xs.push(std::array::from_fn(|c| self.raw[p * 3 + c]));
+                ps.push(std::array::from_fn(|c| self.present[p * 3 + c]));
+            }
+            self.qc.seed(&xs, &ps);
+        }
+        Ok(())
+    }
+
+    /// Новый час наблюдений. None или NaN - значения нет. Пропущенные часы между прошлым
+    /// шагом и этим заполняются пустыми, простой не короче окна - холодный старт.
+    pub fn step(&mut self, obs: [Option<f64>; 3], hour: i64) -> Result<()> {
+        match self.last_hour {
+            None => self.reset(Some(hour - 1))?,
+            Some(last) if hour <= last => {
+                return Err(Error::new(format!("час {hour} не позже последнего шага {last}")));
+            }
+            Some(last) => {
+                let gap = hour - last - 1;
+                if gap >= self.d.stream_window as i64 {
+                    eprintln!(
+                        "mayak-rt: простой {gap} ч не короче окна {} ч: холодный старт",
+                        self.d.stream_window
+                    );
+                    self.reset(Some(hour - 1))?;
+                } else {
+                    for h in (last + 1)..hour {
+                        self.push([None, None, None], h)?;
+                    }
+                }
+                self.idle_hours += gap as u64;
+            }
+        }
+        self.push(obs, hour)
+    }
+
+    fn push(&mut self, obs: [Option<f64>; 3], hour: i64) -> Result<()> {
+        let (x, codes) = self.qc.push(obs);
+        let (raw, present) = self.qc.latest();
+        if self.aci.is_some() && codes[0] == 0 {
+            self.aci_feedback(x[0] as f64, hour);
+        }
+        let p = self.slot(hour);
+        for c in 0..3 {
+            self.raw[p * 3 + c] = if present[c] { to_store(raw[c], c) } else { 0.0 };
+            self.present[p * 3 + c] = present[c];
+            self.valid[p * 3 + c] = codes[c] == 0;
+        }
+        self.ingest(hour)
+    }
+
+    /// Один час через граф шага: буфер энкодера, сумма мод, кольца.
+    fn ingest(&mut self, hour: i64) -> Result<()> {
+        self.last_hour = Some(hour);
+        self.filled = (self.filled + 1).min(self.d.stream_window);
+        let ctx = self.d.ctx;
+        let (mut x, mut mk) = (std::mem::take(&mut self.ctx_x), std::mem::take(&mut self.ctx_m));
+        let (mut dy, mut hr) = (vec![0.0; ctx], vec![0.0; ctx]);
+        self.window_into(hour - ctx as i64 + 1, &mut x, &mut mk, &mut dy, &mut hr);
+        (self.ctx_x, self.ctx_m) = (x, mk);
+        let (t, m) = (self.d.stream_tail, self.d.n_modes);
+        let slot = hour.rem_euclid(t.max(1) as i64) as usize;
+        if t > 0 {
+            self.u_old
+                .copy_from_slice(&self.u_ring[slot * 2 * m..(slot + 1) * 2 * m]);
+            self.v_old[0] = self.v_ring[slot];
         }
         let d = &self.d;
+        let (doy, hr) = doy_hour(hour);
+        let (doy, hr) = ([doy], [hr]);
         let s_ctx = [1, ctx, 3];
         let s11 = [1, 1];
         let s_c = d.n_coef.map(|n| [1, n]);
         let s_buf = [1, d.encoder_width, d.enc_buf_len];
-        let s_m = [1, d.n_modes];
-        let (doy, hour) = ([doy], [hour]);
+        let s_m = [1, m];
+        let s_u = [1, 2 * m];
         let [n_re, n_im, e] = &mut self.modes_next;
         self.graphs.step.run(
             &[
                 ("x_ctx", &s_ctx, &self.ctx_x),
                 ("m_ctx", &s_ctx, &self.ctx_m),
                 ("doy", &s11, &doy),
-                ("hour", &s11, &hour),
+                ("hour", &s11, &hr),
                 ("lat", &s11, &self.lat),
                 ("lon", &s11, &self.lon),
                 ("c_mu", &s_c[0], &self.coefs[0]),
@@ -359,56 +477,64 @@ impl Runtime {
                 ("n_re", &s_m, &self.modes[0]),
                 ("n_im", &s_m, &self.modes[1]),
                 ("e", &s_m, &self.modes[2]),
+                ("u_old", &s_u, &self.u_old),
+                ("v_old", &s11, &self.v_old),
             ],
-            &mut [&mut self.enc_next, n_re, n_im, e, &mut self.day_row],
-        )
-    }
-
-    fn accumulate_day(&mut self) -> Result<()> {
-        for r in 0..4 {
-            self.day_acc[r * 24 + self.hours_in_day] = self.day_row[r];
-        }
-        self.hours_in_day += 1;
-        if self.hours_in_day < 24 {
-            return Ok(());
-        }
-        let d = &self.d;
-        let s_loc = [1, d.loc_dim];
-        let s_acc = [1, 4, 24];
-        let s_summ = [1, d.history_days, d.n_daily_summary];
-        let s_mask = [1, d.history_days];
-        let [ds, dm, z] = &mut self.passport_next;
-        self.graphs.passport.run(
-            &[
-                ("loc", &s_loc, &self.loc),
-                ("day_acc", &s_acc, &self.day_acc),
-                ("day_summ", &s_summ, &self.day_summ),
-                ("day_mask", &s_mask, &self.day_mask),
+            &mut [
+                &mut self.enc_next,
+                n_re,
+                n_im,
+                e,
+                &mut self.u_new,
+                &mut self.v_new,
+                &mut self.row,
             ],
-            &mut [ds, dm, z],
         )?;
-        std::mem::swap(&mut self.day_summ, &mut self.passport_next[0]);
-        std::mem::swap(&mut self.day_mask, &mut self.passport_next[1]);
-        std::mem::swap(&mut self.z, &mut self.passport_next[2]);
-        self.day_acc.fill(0.0);
-        self.hours_in_day = 0;
+        std::mem::swap(&mut self.enc, &mut self.enc_next);
+        std::mem::swap(&mut self.modes, &mut self.modes_next);
+        if t > 0 {
+            self.u_ring[slot * 2 * m..(slot + 1) * 2 * m].copy_from_slice(&self.u_new);
+            self.v_ring[slot] = self.v_new[0];
+        }
+        let r = hour.rem_euclid(self.d.history as i64) as usize;
+        self.rows[r * 4..r * 4 + 4].copy_from_slice(&self.row);
+        if t > 0 && (hour + 1).rem_euclid(RESYNC_HOURS) == 0 {
+            self.resync()?;
+        }
         Ok(())
     }
 
-    fn aci_feedback(&mut self, y: f64, doy: f32) {
+    /// Точная сумма мод по кольцу вкладов хвоста вместо скользящей.
+    pub fn resync(&mut self) -> Result<()> {
+        let (t, m) = (self.d.stream_tail, self.d.n_modes);
+        let Some(last) = self.last_hour else { return Ok(()) };
+        if t == 0 {
+            return Ok(());
+        }
+        for k in 0..t {
+            let s = (last - t as i64 + 1 + k as i64).rem_euclid(t as i64) as usize;
+            self.u_tail[k * 2 * m..(k + 1) * 2 * m].copy_from_slice(&self.u_ring[s * 2 * m..(s + 1) * 2 * m]);
+            self.v_tail[k] = self.v_ring[s];
+        }
+        let (s_u, s_v) = ([1, t, 2 * m], [1, t]);
+        let [n_re, n_im, e] = &mut self.modes;
+        self.graphs.resync.run(
+            &[("u_ring", &s_u, &self.u_tail), ("v_ring", &s_v, &self.v_tail)],
+            &mut [n_re, n_im, e],
+        )
+    }
+
+    fn aci_feedback(&mut self, y: f64, hour: i64) {
         let Some(aci) = self.aci else { return };
         if !self.pending {
             return;
         }
-        let hoy = hour_of_year(doy);
-        let Some(k) = self.pending_hoy.iter().position(|&h| h == hoy) else {
-            return;
-        };
-        if (k as i64) <= self.pending_last {
+        let k = hour - self.pending_first;
+        if k < 0 || k >= self.d.horizon as i64 || k <= self.pending_last {
             return;
         }
-        self.pending_last = k as i64;
-        let nq = self.d.n_quantiles;
+        self.pending_last = k;
+        let (nq, k) = (self.d.n_quantiles, k as usize);
         let score = aci_score(
             y,
             &self.pending_q[k * nq..(k + 1) * nq],
@@ -421,29 +547,52 @@ impl Runtime {
         self.aci_misses += miss as u64;
     }
 
-    /// Выпуск прогноза на календарь горизонта. Ошибка графа или нечисловой выход -
-    /// Err; откат к климатологии делает `safe_forecast`.
-    pub fn forecast(&mut self, doy_fut: &[f32], hour_fut: &[f32]) -> Result<&Forecast> {
-        let d = &self.d;
-        let (h, nq) = (d.horizon, d.n_quantiles);
-        if doy_fut.len() != h || hour_fut.len() != h {
-            return Err(Error::new(format!(
-                "календарь горизонта длины {}, нужно {h}",
-                doy_fut.len()
-            )));
+    /// Выпуск на часы после последнего шага. Ошибка графа или нечисловой выход - Err;
+    /// откат к климатологии делает `safe_forecast`.
+    pub fn forecast(&mut self) -> Result<&Forecast> {
+        let Some(last) = self.last_hour else {
+            return Err(Error::new("нет ни одного шага: момент выпуска не определён"));
+        };
+        let (l, e, h, nq) = (self.d.history, self.d.stream_edge, self.d.horizon, self.d.n_quantiles);
+        for k in 0..l {
+            let s = (last - l as i64 + 1 + k as i64).rem_euclid(l as i64) as usize;
+            self.rows_ord[k * 4..k * 4 + 4].copy_from_slice(&self.rows[s * 4..s * 4 + 4]);
         }
-        self.doy_fut.copy_from_slice(doy_fut);
-        self.hour_fut.copy_from_slice(hour_fut);
-        let (s_loc, s11, s_z, s_m, s_h) = ([1, d.loc_dim], [1, 1], [1, d.passport_dim], [1, d.n_modes], [1, h]);
+        let (mut x, mut mk, mut dy, mut hr) = (
+            std::mem::take(&mut self.edge_x),
+            std::mem::take(&mut self.edge_m),
+            std::mem::take(&mut self.edge_doy),
+            std::mem::take(&mut self.edge_hour),
+        );
+        self.window_into(last - l as i64 + 1, &mut x, &mut mk, &mut dy, &mut hr);
+        (self.edge_x, self.edge_m, self.edge_doy, self.edge_hour) = (x, mk, dy, hr);
+        for k in 0..h {
+            (self.doy_fut[k], self.hour_fut[k]) = doy_hour(last + 1 + k as i64);
+        }
+        let d = &self.d;
+        let s11 = [1, 1];
+        let s_loc = [1, d.loc_dim];
+        let s_c = d.n_coef.map(|n| [1, n]);
+        let s_rows = [1, l, 4];
+        let s_m = [1, d.n_modes];
+        let (s_e3, s_e) = ([1, e, 3], [1, e]);
+        let s_h = [1, h];
         self.graphs.issue.run(
             &[
                 ("loc", &s_loc, &self.loc),
                 ("lat", &s11, &self.lat),
                 ("lon", &s11, &self.lon),
-                ("z", &s_z, &self.z),
+                ("c_mu", &s_c[0], &self.coefs[0]),
+                ("c_sig", &s_c[1], &self.coefs[1]),
+                ("c_def", &s_c[2], &self.coefs[2]),
+                ("rows", &s_rows, &self.rows_ord),
                 ("n_re", &s_m, &self.modes[0]),
                 ("n_im", &s_m, &self.modes[1]),
                 ("e", &s_m, &self.modes[2]),
+                ("x_edge", &s_e3, &self.edge_x),
+                ("m_edge", &s_e3, &self.edge_m),
+                ("doy_edge", &s_e, &self.edge_doy),
+                ("hour_edge", &s_e, &self.edge_hour),
                 ("doy_fut", &s_h, &self.doy_fut),
                 ("hour_fut", &s_h, &self.hour_fut),
             ],
@@ -456,9 +605,7 @@ impl Runtime {
             apply_conformal(&mut self.out.q, t, nq, self.manifest.i_med);
         }
         if self.aci.is_some() {
-            for (k, dv) in self.doy_fut.iter().enumerate() {
-                self.pending_hoy[k] = (*dv as f64 * 24.0).round_ties_even() as i64;
-            }
+            self.pending_first = last + 1;
             self.pending_q.copy_from_slice(&self.out.q);
             self.pending_last = -1;
             self.pending = true;
@@ -471,10 +618,10 @@ impl Runtime {
         Ok(&self.out)
     }
 
-    /// Выпуск со сторожевым откатом (safe_forecast): при любой ошибке - климатология
-    /// clim ± zq·σ; сбой пишется в лог и считается в `fallbacks`.
-    pub fn safe_forecast(&mut self, doy_fut: &[f32], hour_fut: &[f32]) -> &Forecast {
-        if let Err(e) = self.forecast(doy_fut, hour_fut) {
+    /// Выпуск с откатом: при любой ошибке - квантили климатологии по средней и разбросу
+    /// отката; сбой пишется в лог и считается в `fallbacks`.
+    pub fn safe_forecast(&mut self) -> &Forecast {
+        if let Err(e) = self.forecast() {
             eprintln!("mayak-rt: откат к климатологии: {e}");
             self.fallbacks += 1;
             let (mu, sig) = self.clim;
@@ -490,114 +637,51 @@ impl Runtime {
         &self.out
     }
 
-    /// Состояние в формате v3.
+    /// Состояние в байтах: заголовок и сырое окно от старых часов к новым.
     pub fn serialize(&self, out: &mut Vec<u8>) {
-        let (w, n) = (self.d.stream_window, self.filled);
-        let order = (0..w).map(|k| (self.head + k) % w);
-        let mut raw_q = Vec::with_capacity(w * 3);
-        let mut raw_m = Vec::with_capacity(w * 3);
-        for p in order {
-            for c in 0..3 {
-                let valid = self.raw_m[p * 3 + c] > 0.0;
-                let [lo, hi] = self.bounds[c];
-                raw_q.push(encode_raw(self.raw_x[p * 3 + c], valid, lo, hi));
-                raw_m.push(valid as u8);
-            }
-        }
-        let at = |back: usize| self.hoy_ring[(self.head + w - back) % w];
+        let w = self.d.stream_window;
+        let first = self.last_hour.map(|l| l - w as i64 + 1);
+        let pos = |k: usize| first.map_or(k, |f| self.slot(f + k as i64));
         let snap = Snapshot {
-            version: crate::state::VERSION,
-            filled: n,
-            hours_in_day: self.hours_in_day,
-            hoy_first: if n > 0 { at(n) } else { 0 },
-            hoy_last: if n > 0 { at(1) } else { 0 },
+            filled: self.filled,
+            last_hour: self.last_hour,
             theta: self.theta,
-            n_re: self.modes[0].clone(),
-            n_im: self.modes[1].clone(),
-            e: self.modes[2].clone(),
-            z: self.z.clone(),
-            day_summ: self.day_summ.clone(),
-            day_mask: self.day_mask.clone(),
-            raw_q,
-            raw_m,
+            site: self.site,
+            raw: (0..w)
+                .map(|k| std::array::from_fn(|c| self.raw[pos(k) * 3 + c]))
+                .collect(),
+            present: (0..w)
+                .map(|k| std::array::from_fn(|c| self.present[pos(k) * 3 + c]))
+                .collect(),
+            valid: (0..w)
+                .map(|k| std::array::from_fn(|c| self.valid[pos(k) * 3 + c]))
+                .collect(),
         };
         snap.write(out);
     }
 
-    /// Загрузка состояния и восстановление эфемерной части: буфер энкодера и
-    /// незавершённые сутки - прогоном графа step по сохранённому окну (моды не трогаются).
-    /// При ошибке рантайм остаётся в состоянии холодного старта.
+    /// Загрузка состояния и восстановление всего остального одним проходом по окну.
+    /// При ошибке рантайм остаётся в холодном старте.
     pub fn load_state(&mut self, raw: &[u8]) -> Result<()> {
-        let s = Snapshot::parse(raw, &self.d)?;
-        let hoys = window_hoys(s.filled, s.hoy_first, s.hoy_last)?;
-        self.reset();
-        let (w, n) = (self.d.stream_window, s.filled);
-        self.modes[0].copy_from_slice(&s.n_re);
-        self.modes[1].copy_from_slice(&s.n_im);
-        self.modes[2].copy_from_slice(&s.e);
-        self.z.copy_from_slice(&s.z);
-        self.day_summ.copy_from_slice(&s.day_summ);
-        self.day_mask.copy_from_slice(&s.day_mask);
-        for p in 0..w {
-            for c in 0..3 {
-                let valid = s.raw_m[p * 3 + c] > 0;
-                let [lo, hi] = self.bounds[c];
-                self.raw_m[p * 3 + c] = valid as u8 as f32;
-                // Окно хранит уже записанные прибором значения; ошибка фиксированной
-                // точки меньше половины шага записи, повторная запись возвращает их точно.
-                let v = decode_raw(s.raw_q[p * 3 + c], valid, lo, hi);
-                self.raw_x[p * 3 + c] = if valid { record_channel(v, c) } else { 0.0 };
-            }
-        }
-        for (k, h) in hoys.iter().enumerate() {
-            self.hoy_ring[w - n + k] = *h;
-        }
-        self.head = 0;
-        self.filled = n;
-        self.seed_qc();
-        self.hours_in_day = s.hours_in_day;
-        self.last_hoy = if n > 0 { Some(s.hoy_last) } else { None };
+        let s = Snapshot::parse(raw, &self.d, &self.bounds)?;
+        self.reset(None)?;
         self.reset_calibration(s.theta);
-        if let Err(e) = self.rebuild_from_window() {
-            self.reset();
-            return Err(e);
-        }
-        Ok(())
-    }
-
-    /// Кольцо QC после загрузки: значения окна, уже прошедшие QC, от старых к новым.
-    /// Отбракованные часы в нём становятся пропусками.
-    fn seed_qc(&mut self) {
-        let (w, n) = (self.d.stream_window, self.filled);
-        let mut x = Vec::with_capacity(n);
-        let mut present = Vec::with_capacity(n);
-        for p in (w - n)..w {
-            let mut v = [0.0f32; 3];
-            let mut m = [false; 3];
+        self.loaded_site = Some(s.site);
+        let Some(last) = s.last_hour else { return Ok(()) };
+        let w = self.d.stream_window;
+        self.last_hour = Some(last);
+        for k in 0..w {
+            let p = self.slot(last - w as i64 + 1 + k as i64);
             for c in 0..3 {
-                v[c] = self.raw_x[p * 3 + c];
-                m[c] = self.raw_m[p * 3 + c] > 0.0;
+                self.raw[p * 3 + c] = s.raw[k][c];
+                self.present[p * 3 + c] = s.present[k][c];
+                self.valid[p * 3 + c] = s.valid[k][c];
             }
-            x.push(v);
-            present.push(m);
         }
-        self.qc.seed(&x, &present);
-    }
-
-    fn rebuild_from_window(&mut self) -> Result<()> {
-        let (w, n, hid) = (self.d.stream_window, self.filled, self.hours_in_day);
-        for k in (w - n)..w {
-            let hoy = self.hoy_ring[k];
-            let doy = (hoy as f64 / 24.0) as f32;
-            let hour = hoy.rem_euclid(24) as f32;
-            self.run_step(k, Some(w - n), doy, hour)?;
-            std::mem::swap(&mut self.enc, &mut self.enc_next);
-            if k >= w - hid {
-                let col = k - (w - hid);
-                for r in 0..4 {
-                    self.day_acc[r * 24 + col] = self.day_row[r];
-                }
-            }
+        self.filled = s.filled;
+        if let Err(e) = self.rebuild(true) {
+            self.reset(None)?;
+            return Err(e);
         }
         Ok(())
     }

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use mayak_rt::calendar::doy_hour;
 use mayak_rt::calib::{aci_score, apply_adaptive, apply_conformal, AciParams};
-use mayak_rt::state::{Snapshot, HEADER_V3};
+use mayak_rt::state::{Snapshot, HEADER};
 use mayak_rt::{Manifest, Runtime, RuntimeOptions};
 use serde_json::Value;
 
@@ -95,27 +95,20 @@ fn scenario(g: &Golden, name: &str) -> &'static Value {
     Box::leak(Box::new(sc))
 }
 
-/// Прогон сценария → max|Δq| по записанным выпускам.
+/// Прогон сценария: наибольшее расхождение квантилей с эталоном по записанным выпускам.
 fn replay(g: &Golden, sc: &Value, rt: &mut Runtime) -> f32 {
-    let year = g.doc["year_hours"].as_i64().unwrap();
     let tol = g.doc["tolerance"]["q_abs"].as_f64().unwrap() as f32;
-    let (h, nq) = (rt.horizon(), rt.n_quantiles());
-    let (mut doy, mut hour) = (vec![0.0f32; h], vec![0.0f32; h]);
+    let nq = rt.n_quantiles();
+    let h = rt.horizon();
     let mut worst = 0.0f32;
     for (i, ev) in sc["events"].as_array().unwrap().iter().enumerate() {
         if ev["op"] == "step" {
             let o = ev["obs"].as_array().unwrap();
-            rt.step([obs(&o[0]), obs(&o[1]), obs(&o[2])], f(&ev["doy"]), f(&ev["hour"]))
+            rt.step([obs(&o[0]), obs(&o[1]), obs(&o[2])], ev["hour"].as_i64().unwrap())
                 .unwrap();
             continue;
         }
-        let h0 = ev["fut_hoy0"].as_i64().unwrap();
-        for k in 0..h {
-            let hoy = (h0 + k as i64).rem_euclid(year);
-            doy[k] = (hoy as f64 / 24.0) as f32;
-            hour[k] = (hoy % 24) as f32;
-        }
-        let fc = rt.forecast(&doy, &hour).unwrap();
+        let fc = rt.forecast().unwrap();
         assert!(!fc.fallback);
         if !ev["q"].is_null() {
             let refq = g.take(&ev["q"]);
@@ -154,10 +147,10 @@ fn replay(g: &Golden, sc: &Value, rt: &mut Runtime) -> f32 {
         "{}: число промахов ACI",
         sc["name"]
     );
-    assert_eq!(rt.calendar_breaks(), fin["calendar_breaks"].as_u64().unwrap());
     assert_eq!(rt.filled() as u64, fin["filled"].as_u64().unwrap());
-    assert_eq!(rt.hours_in_day() as u64, fin["hours_in_day"].as_u64().unwrap());
-    println!("{}: max|Δq| Rust ↔ эталон = {worst:.3e} °C", sc["name"]);
+    assert_eq!(rt.last_hour(), fin["last_hour"].as_i64());
+    assert_eq!(rt.idle_hours(), fin["idle_hours"].as_u64().unwrap());
+    println!("{}: max|Δq| Rust и эталона = {worst:.3e} °C", sc["name"]);
     worst
 }
 
@@ -169,55 +162,51 @@ fn cold_start_with_conformal_and_aci() {
 }
 
 #[test]
-fn extremes_edges_gaps_calendar_break() {
+fn extremes_edges_idle_and_long_idle() {
     let g = load();
     let sc = scenario(&g, "extremes");
     replay(&g, sc, &mut runtime(sc));
 }
 
 #[test]
-fn restart_from_python_state_restores_incomplete_day() {
+fn restart_from_python_state_with_full_window() {
     let g = load();
     let sc = scenario(&g, "restart");
     let raw = std::fs::read(golden_dir().join(sc["init_state"].as_str().unwrap())).unwrap();
     let mut rt = runtime(sc);
     rt.load_state(&raw).unwrap();
-    assert!(rt.hours_in_day() > 0, "эталон должен начинаться с незавершённых суток");
-    // Состояние Python → Rust → байты: совпадение до байта (формат v3 общий).
+    assert_eq!(
+        rt.filled(),
+        rt.stream_window(),
+        "эталон должен начинаться с полного окна"
+    );
+    // Состояние Python, затем Rust, затем байты: совпадение до байта.
     let mut back = Vec::new();
     rt.serialize(&mut back);
     assert_eq!(back, raw, "serialize(load(S)) ≠ S");
     replay(&g, sc, &mut rt);
 
-    // Конечное состояние: курсор, календарь, окно и маска - точно; числа - в допуске.
+    // Конечное состояние: заголовок до множителя калибровки и всё окно - точно.
     let end = std::fs::read(golden_dir().join(sc["final"]["state"].as_str().unwrap())).unwrap();
     rt.serialize(&mut back);
     assert_eq!(back.len(), end.len());
-    assert_eq!(back[..12], end[..12], "заголовок состояния");
+    assert_eq!(back[..16], end[..16], "заголовок состояния");
+    assert_eq!(back[HEADER..], end[HEADER..], "сырое окно и маски");
+    let bounds = rt.manifest.phys_bounds();
     let d = &rt.manifest.dims;
-    let tail = d.stream_window * 3 * 3;
-    assert_eq!(back[back.len() - tail..], end[end.len() - tail..], "сырое окно и маска");
-    let (a, b) = (Snapshot::parse(&back, d).unwrap(), Snapshot::parse(&end, d).unwrap());
-    for (x, y) in [
-        (&a.n_re, &b.n_re),
-        (&a.n_im, &b.n_im),
-        (&a.e, &b.e),
-        (&a.z, &b.z),
-        (&a.day_summ, &b.day_summ),
-    ] {
-        let scale = y.iter().fold(1.0f32, |m, v| m.max(v.abs()));
-        assert!(max_abs(x, y) <= 1e-3 * scale, "числовая часть состояния расходится");
-    }
-    assert_eq!(a.day_mask, b.day_mask);
+    let (a, b) = (
+        Snapshot::parse(&back, d, &bounds).unwrap(),
+        Snapshot::parse(&end, d, &bounds).unwrap(),
+    );
     assert!((a.theta - b.theta).abs() <= 1e-6);
-    assert_eq!(back.len(), HEADER_V3 + (end.len() - HEADER_V3));
+    assert_eq!(a.site, b.site);
 }
 
 #[test]
 fn state_size_is_pinned() {
     let m = Manifest::load(golden_dir().join("model")).unwrap();
-    assert_eq!(mayak_rt::state::nbytes(&m.dims), 3352);
-    assert_eq!(m.state.nbytes, 3352);
+    assert_eq!(mayak_rt::state::nbytes(&m.dims), 3224);
+    assert_eq!(m.state.nbytes, 3224);
 }
 
 #[test]
@@ -226,13 +215,52 @@ fn corrupted_state_is_rejected_and_leaves_cold_start() {
     let sc = scenario(&g, "restart");
     let raw = std::fs::read(golden_dir().join(sc["init_state"].as_str().unwrap())).unwrap();
     let mut rt = runtime(sc);
-    for bad in [&raw[..raw.len() - 1], &[b'X'; 3352][..]] {
+    for bad in [&raw[..raw.len() - 1], &[b'X'; 3224][..]] {
         assert!(rt.load_state(bad).is_err());
     }
     let mut v = raw.clone();
-    v[6] = 30; // часов в сутках > 23
+    v[3] = 3; // прежняя версия
+    assert!(rt.load_state(&v).is_err());
+    let mut v = raw.clone();
+    v[4..6].copy_from_slice(&5000u16.to_le_bytes()); // filled длиннее окна
     assert!(rt.load_state(&v).is_err());
     assert_eq!(rt.filled(), 0);
+    assert_eq!(rt.last_hour(), None);
+}
+
+#[test]
+fn restart_at_any_hour_continues_run() {
+    let g = load();
+    let sc = scenario(&g, "cold_aci");
+    let events = sc["events"].as_array().unwrap();
+    let mut live = runtime(sc);
+    let mut buf = Vec::new();
+    let mut back: Option<Runtime> = None;
+    for (i, ev) in events.iter().enumerate() {
+        if ev["op"] != "step" {
+            continue;
+        }
+        let o = ev["obs"].as_array().unwrap();
+        let (x, hour) = ([obs(&o[0]), obs(&o[1]), obs(&o[2])], ev["hour"].as_i64().unwrap());
+        live.step(x, hour).unwrap();
+        if let Some(b) = back.as_mut() {
+            b.step(x, hour).unwrap();
+        }
+        if i == 150 {
+            live.serialize(&mut buf);
+            let mut b = runtime(sc);
+            b.load_state(&buf).unwrap();
+            back = Some(b);
+        }
+    }
+    let mut b = back.unwrap();
+    let q1 = live.forecast().unwrap().q.clone();
+    let q2 = b.forecast().unwrap().q.clone();
+    assert!(max_abs(&q1, &q2) <= 5e-4);
+    let (mut s1, mut s2) = (Vec::new(), Vec::new());
+    live.serialize(&mut s1);
+    b.serialize(&mut s2);
+    assert_eq!(s1[HEADER..], s2[HEADER..], "окно после перезапуска расходится");
 }
 
 #[test]

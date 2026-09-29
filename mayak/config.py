@@ -299,9 +299,46 @@ class ModelConfig:
         return 16 * math.ceil(self.receptive_field / 16)
 
     @property
+    def stream_edge(self):
+        """Край окна истории, часы.
+
+        Признаки первых часов пакетного окна зависят от того, где окно начинается:
+        энкодер видит слева нули, а у каналов с лагом нет прошлого. Край - это столько
+        часов, сколько нужно рецептивному полю энкодера вместе с наибольшим лагом
+        каналов. Поток пересчитывает вклад края при каждом выпуске.
+
+        Returns:
+            Число часов, не больше длины истории.
+        """
+        return min(self.max_history, self.receptive_field - 1 + CHANNEL_MAX_LAG)
+
+    @property
+    def stream_tail(self):
+        """Хвост окна истории, часы: часы после края.
+
+        Признаки этих часов не зависят от начала окна и совпадают у пакета и потока,
+        поэтому поток держит их вклад в моды скользящей суммой.
+
+        Returns:
+            Число часов, может быть нулём.
+        """
+        return self.max_history - self.stream_edge
+
+    @property
     def stream_window(self):
-        """Длина сырого окна наблюдений в потоковом рантайме, ч (кратно 16)."""
-        return 16 * math.ceil((self.receptive_field - 1 + CHANNEL_MAX_LAG) / 16)
+        """Длина сырого окна наблюдений, которое рантайм хранит на диске, часы.
+
+        Окно вмещает всю историю модели, рецептивное поле энкодера с лагом каналов и
+        прошлое, которое нужно причинному контролю качества. Длина кратна восьми, чтобы
+        битовые маски окна занимали целое число байт.
+
+        Returns:
+            Число часов.
+        """
+        from mayak.data.qc import DEFAULT_QC
+        need = max(self.max_history, self.receptive_field - 1 + CHANNEL_MAX_LAG,
+                   DEFAULT_QC.lookback_hours + 1)
+        return 8 * math.ceil(need / 8)
 
     def to_dict(self):
         return to_jsonable(self)

@@ -3,7 +3,7 @@ name = "mayak-rt"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.88"
-description = "Потоковый рантайм МАЯК: четыре графа ONNX + хост без логики модели (блок 14)"
+description = "Потоковый рантайм МАЯК: графы ONNX и хост без логики модели"
 license = "MIT"
 publish = false
 

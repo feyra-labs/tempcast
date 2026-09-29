@@ -11,7 +11,8 @@
 * пиковая резидентная память процесса (каждая реализация - в отдельном процессе);
 * размер бинарника, размер модели fp32 и int8, размер состояния - точным числом байт;
 * расхождение выходов Rust fp32 / int8 с эталоном на тех же входах;
-* расхождение пакетного и потокового путей на --windows окнах (mayak.runtime.equivalence);
+* расхождение пакетного и потокового путей при выпусках в случайные часы длинного ряда
+  и его изменение во времени;
 * метрики fp32 против int8 на тестовой выборке (если есть --manifest с кэшем данных).
 
 Итог: out-dir/results.json и out-dir/results.md. Без --ckpt замер идёт на модели эталона
@@ -78,35 +79,29 @@ def worker(args):
     """Отдельный процесс: одна реализация на Python, замер задержек и пиковой памяти."""
     import torch
     torch.set_num_threads(1)
-    from mayak.timeaxis import from_utc_hour, doy_hour
     model = load_model(args.ckpt)
     series = np.fromfile(args.series, "<f4").reshape(-1, 3)
-    H = model.cfg.horizon
     t0 = time.perf_counter()
     if args.backend == "torch":
         from mayak.runtime.streaming import StreamingMayak
         rt = StreamingMayak(model, args.lat, args.lon, args.elev)
-        fc = lambda d, h: rt.forecast(d, h)[0]
     else:
         from mayak.runtime.graphs import GraphRuntime, OnnxBackend
         rt = GraphRuntime(OnnxBackend(args.model_dir, args.precision), model.cfg,
                           args.lat, args.lon, args.elev)
-        fc = rt.forecast
     startup_ms = (time.perf_counter() - t0) * 1e3
     start = args.start_unix_hour
     t_step, t_fc, dump = [], [], []
     for k in range(series.shape[0]):
-        d, h = doy_hour(from_utc_hour(start + k))
         obs = [None if np.isnan(v) else float(v) for v in series[k]]
         t = time.perf_counter()
-        rt.step(*obs, np.float32(d), np.float32(h))
+        rt.step(*obs, start + k)
         dt = (time.perf_counter() - t) * 1e6
         if k >= args.warmup:
             t_step.append(dt)
         if args.forecast_every and (k + 1) % args.forecast_every == 0:
-            fd, fh = doy_hour(from_utc_hour(start + k + 1 + np.arange(H)))
             t = time.perf_counter()
-            q = fc(fd.astype(np.float32), fh.astype(np.float32))
+            q = rt.forecast()[0]
             dt = (time.perf_counter() - t) * 1e6
             if k >= args.warmup:
                 t_fc.append(dt)
@@ -116,11 +111,10 @@ def worker(args):
                hours=int(series.shape[0]), step=stats_us(t_step), forecast=stats_us(t_fc),
                startup_ms=startup_ms,
                peak_rss_bytes=peak_rss_bytes())
-    if args.backend == "torch":
-        rep["state_bytes"] = len(rt.serialize())
-        t = time.perf_counter()
-        rt.load_state(rt.serialize())
-        rep["restore_ms"] = (time.perf_counter() - t) * 1e3
+    rep["state_bytes"] = len(rt.serialize())
+    t = time.perf_counter()
+    rt.load_state(rt.serialize())
+    rep["restore_ms"] = (time.perf_counter() - t) * 1e3
     print(json.dumps(rep))
 
 
@@ -157,26 +151,22 @@ def int8_metrics(args, model):
     from mayak.data.store import get_store
     from mayak.evaluate import EvalSet
     from mayak.metrics import Evaluation
-    from mayak.runtime.graphs import GraphRuntime, OnnxBackend
+    from mayak.runtime.graphs import GraphModel, OnnxBackend
     store = get_store(args.manifest)
     ds = EvalSet(store.clims(), manifest=args.manifest, time_key="test",
                  max_windows=args.max_windows)
-    backends = {p: OnnxBackend(args.model_dir, p) for p in ("fp32", "int8")}
-    qs = {p: [] for p in backends}
+    models = {p: GraphModel(OnnxBackend(args.model_dir, p), model.cfg) for p in ("fp32", "int8")}
+    qs = {p: [] for p in models}
     ys, ws, mucl, st = [], [], [], []
     meta = ds.window_meta()
     for i in range(len(ds)):
-        b = {k: (v.numpy() if torch.is_tensor(v) else v) for k, v in ds[i].items()}
-        for p, be in backends.items():
-            rt = GraphRuntime(be, model.cfg, float(b["lat"]), float(b["lon"]), float(b["elev"]))
-            for k in range(b["x_hist"].shape[0]):
-                obs = [float(b["x_hist"][k, j]) if b["mask_hist"][k, j] > 0 else None
-                       for j in range(3)]
-                rt.step(*obs, b["doy_hist"][k], b["hour_hist"][k])
-            qs[p].append(rt.forecast(b["doy_fut"], b["hour_fut"]))
-        ys.append(b["y"])
-        ws.append(b["y_mask"])
-        mucl.append(b["mu_clim_fut"])
+        b = ds[i]
+        one = {k: (v[None] if torch.is_tensor(v) else np.asarray(v)[None]) for k, v in b.items()}
+        for p, gm in models.items():
+            qs[p].append(gm(one)["q"][0].numpy())
+        ys.append(np.asarray(b["y"]))
+        ws.append(np.asarray(b["y_mask"]))
+        mucl.append(np.asarray(b["mu_clim_fut"]))
         st.append(meta["station"][i])
     out = {}
     from mayak.metrics import I_MED
@@ -230,9 +220,11 @@ def markdown(res):
               "encoder_buffer_bytes"):
         L.append(f"| {k} | {s.get(k)} |")
     eq = res["batch_stream"]
-    L += ["", f"Пакет ↔ поток: {eq['n_windows']} окон, max|Δq| = "
-              f"{eq['batch_stream_max_abs']:.2e} °C по всем лидам; после перезапуска "
-              f"{eq['restart_max_abs']:.2e} °C."]
+    L += ["", f"Пакет и поток: {eq['n_issues']} выпусков в случайные часы ряда длиной "
+              f"{eq['hours']} ч, max|Δq| = {eq['batch_stream_max_abs']:.2e} °C по всем лидам; "
+              f"после перезапуска {eq['restart_max_abs']:.2e} °C."]
+    L += ["", "| Выпуск, час ряда | max\\|Δq\\|, °C |", "|---|---|"]
+    L += [f"| {end} | {err:.2e} |" for end, err in eq["batch_stream_by_issue"]]
     if res.get("int8_metrics"):
         m = res["int8_metrics"]
         L += ["", f"fp32 против int8 на тесте ({m['n_windows']} окон, max|Δq| "
@@ -257,7 +249,7 @@ def main():
             ap.add_argument(k, type=float)
         return worker(ap.parse_args(sys.argv[2:]))
 
-    ap = argparse.ArgumentParser(description="замеры рантайма на устройстве (блок 14)")
+    ap = argparse.ArgumentParser(description="замеры рантайма на устройстве")
     ap.add_argument("--ckpt", default=None, help="чекпойнт; без него - модель эталона")
     ap.add_argument("--conformal", default=None)
     ap.add_argument("--out-dir", default="runs/bench_device")
@@ -265,7 +257,10 @@ def main():
     ap.add_argument("--hours", type=int, default=2000)
     ap.add_argument("--warmup", type=int, default=48)
     ap.add_argument("--forecast-every", type=int, default=24)
-    ap.add_argument("--windows", type=int, default=300, help="окон для пакет ↔ поток")
+    ap.add_argument("--issues", type=int, default=40,
+                    help="выпусков в случайные часы для сравнения пакета и потока")
+    ap.add_argument("--equivalence-hours", type=int, default=10_000,
+                    help="длина ряда для сравнения пакета и потока, часы")
     ap.add_argument("--manifest", default=None, help="data/manifest.csv для метрик int8")
     ap.add_argument("--max-windows", type=int, default=200)
     ap.add_argument("--lat", type=float, default=52.37)
@@ -314,7 +309,8 @@ def main():
     res = dict(device=device_info(), model=args.ckpt or "эталон (случайные веса)",
                trained=bool(args.ckpt), hours=args.hours, forecast_every=args.forecast_every,
                runs=runs, sizes=sizes,
-               batch_stream=divergence(model, args.windows, seed=args.seed))
+               batch_stream=divergence(model, args.issues, hours=args.equivalence_hours,
+                                       seed=args.seed))
     if args.manifest and os.path.exists(args.manifest):
         print("… метрики fp32 / int8", flush=True)
         res["int8_metrics"] = int8_metrics(args, model)

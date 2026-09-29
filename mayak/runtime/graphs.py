@@ -1,27 +1,22 @@
-"""МАЯК как четыре графа без состояния - контракт компилируемого рантайма.
+"""МАЯК как пять графов без состояния для компилируемого рантайма.
 
-Монолитный граф (scripts/export_onnx.py) на каждый выпуск пересчитывает всё окно
-истории. Рантайм на устройстве вызывает модель в четырёх разных ритмах, поэтому
-модель режется на четыре графа, и всё состояние ходит через их входы и выходы:
+Устройство вызывает модель в разных ритмах, поэтому модель режется на графы, а всё
+состояние ходит через их входы и выходы:
 
-* ``init``     - раз при старте: координаты → признаки точки ``loc``, коэффициенты
-  климат-поля без паспорта и паспорт холодного старта ``z0``;
-* ``step``     - раз в час: хвост сырого окна (CHANNEL_MAX_LAG + 1 ч), календарь
-  часа, буфер энкодера, накопленное состояние мод → новый буфер, новое состояние мод
-  и строка суточного накопителя (aT, dP24, vt, vp24) этого часа;
-* ``passport`` - раз в сутки: 24 строки накопителя → суточная сводка, сдвиг ряда
-  сводок, новый паспорт ``z``;
-* ``issue``    - по запросу: состояние мод, паспорт, календарь горизонта → квантили
-  модели (до калибровки).
+* ``init``   - при старте: признаки точки и коэффициенты климат-поля без паспорта;
+* ``step``   - раз в час: хвост сырого окна, календарь часа, буфер энкодера, сумма мод по
+  хвосту истории и вклад часа, который из хвоста выходит. Выход: новый буфер, новая
+  сумма, вклад этого часа в моды для кольца хоста и строка суточного накопителя;
+* ``window`` - при загрузке состояния и холодном старте: пакетный проход по всему окну.
+  Выход: буфер энкодера, вклады часов хвоста, строки накопителя и сумма мод по хвосту;
+* ``resync`` - раз в сутки: точная сумма мод по кольцу вкладов хвоста;
+* ``issue``  - по запросу: паспорт по строкам накопителя за всю историю, вклад края
+  истории пакетным проходом по его часам, выпуск квантилей до калибровки.
 
-Каждый граф - тонкая обёртка над методами MAYAK, которыми пользуются пакетный путь и
-эталонный потоковый рантайм (``StreamingMayak``): build_channels, encoder.step_shift,
-readout.step, daily_summaries, passport, issue. Своей арифметики в обёртках нет.
-
-Хост-код (Rust: runtime-rs/; его исполняемая спецификация на Python - ``GraphRuntime``)
-держит кольцо сырого окна, буфер энкодера, суточный накопитель, календарь, QC точки,
-калибровку и сериализацию. Буфер энкодера в графе хранится в хронологическом порядке
-(старший час первым) и сдвигается внутри графа - индекс кольца не нужен.
+Каждый граф - тонкая обёртка над методами модели, которыми пользуется пакетный путь.
+Своей арифметики в обёртках нет. Хост держит сырое окно, кольца вкладов и строк,
+причинный контроль качества, калибровку и сериализацию. Буфер энкодера хранится в
+хронологическом порядке и сдвигается внутри графа.
 """
 from __future__ import annotations
 
@@ -33,30 +28,36 @@ import torch
 import torch.nn as nn
 
 from mayak.astro import astro_features
-from mayak.config import CHANNEL_MAX_LAG, N_DAILY_SUMMARY
+from mayak.runtime.streaming import (CTX, RAW_CHANNELS, RESYNC_HOURS, STATE_HEADER,
+                                     STATE_VERSION, StreamingMayak, state_nbytes)
 
-GRAPH_FORMAT = 1
-GRAPH_NAMES = ("init", "step", "passport", "issue")
+GRAPH_FORMAT = 2
+GRAPH_NAMES = ("init", "step", "window", "resync", "issue")
+COEFS = ("c_mu", "c_sig", "c_def")
 GRAPH_IO = {
     "init": (("lat", "lon", "elev"),
              ("loc", "c_mu", "c_sig", "c_def", "z0")),
-    "step": (("x_ctx", "m_ctx", "doy", "hour", "lat", "lon", "c_mu", "c_sig", "c_def",
-              "enc_buf", "n_re", "n_im", "e"),
-             ("enc_buf_out", "n_re_out", "n_im_out", "e_out", "day_row")),
-    "passport": (("loc", "day_acc", "day_summ", "day_mask"),
-                 ("day_summ_out", "day_mask_out", "z")),
-    "issue": (("loc", "lat", "lon", "z", "n_re", "n_im", "e", "doy_fut", "hour_fut"),
+    "step": (("x_ctx", "m_ctx", "doy", "hour", "lat", "lon", *COEFS,
+              "enc_buf", "n_re", "n_im", "e", "u_old", "v_old"),
+             ("enc_buf_out", "n_re_out", "n_im_out", "e_out", "u", "v", "row")),
+    "window": (("x_win", "m_win", "doy_win", "hour_win", "lat", "lon", *COEFS),
+               ("enc_buf", "u_tail", "v_tail", "rows", "n_re", "n_im", "e")),
+    "resync": (("u_ring", "v_ring"),
+               ("n_re", "n_im", "e")),
+    "issue": (("loc", "lat", "lon", *COEFS, "rows", "n_re", "n_im", "e",
+               "x_edge", "m_edge", "doy_edge", "hour_edge", "doy_fut", "hour_fut"),
               ("q",)),
 }
 DAY_ROW = ("aT", "dP24", "vt", "vp24")
-CTX = CHANNEL_MAX_LAG + 1
 
 
 class _Graph(nn.Module):
-    """Обёртка в режиме eval. torch.onnx.export восстанавливает режим экспортируемого
-    модуля рекурсивно: обёртка в режиме train после экспорта переводит в train и общую
-    модель - паспорт начинает сэмплировать z, и пакетный путь перестаёт совпадать с
-    потоковым. Поэтому eval выставляется у самой обёртки."""
+    """Обёртка в режиме eval.
+
+    Экспорт восстанавливает режим экспортируемого модуля рекурсивно: обёртка в режиме
+    train после экспорта перевела бы в train и общую модель, паспорт начал бы
+    сэмплировать, и пакетный путь перестал бы совпадать с потоковым.
+    """
 
     def __init__(self, model):
         super().__init__()
@@ -69,17 +70,20 @@ class InitGraph(_Graph):
         m, D = self.m, self.m.cfg.history_days
         loc = m.loc(lat[:, 0], lon[:, 0], elev[:, 0])
         c_mu, c_sig, c_def = m.field.coefficients(loc)
-        z0, _ = m.passport(loc, loc.new_zeros(1, D, N_DAILY_SUMMARY), loc.new_zeros(1, D),
-                           sample=False)
+        z0 = m.passport_from_rows(loc, loc.new_zeros(1, D * 24, len(DAY_ROW)))
         return loc, c_mu, c_sig, c_def, z0
 
 
 class StepGraph(_Graph):
-    """Один час. Календарь хвоста окна не нужен: выход - последний момент хвоста, а
-    лаговые каналы зависят только от P и маски. doy/hour часа растягиваются на хвост."""
+    """Один час.
+
+    Календарь хвоста окна не нужен: выход считается для последнего часа хвоста, а
+    каналы с лагом зависят только от давления и маски. Календарь часа растягивается на
+    весь хвост.
+    """
 
     def forward(self, x_ctx, m_ctx, doy, hour, lat, lon, c_mu, c_sig, c_def,
-                enc_buf, n_re, n_im, e):
+                enc_buf, n_re, n_im, e, u_old, v_old):
         m = self.m
         n = x_ctx.shape[1]
         astro_h = astro_features(doy.expand(-1, n), hour.expand(-1, n), lat, lon)
@@ -87,69 +91,95 @@ class StepGraph(_Graph):
         ch, aT, vt = m.build_channels(x_ctx, m_ctx, astro_h, mu0, sg0, df0)
         dp24, vp24 = m.channel(ch, "dP24"), m.lag_valid(m_ctx[..., 1], 24)
         feat, enc_buf = m.encoder.step_shift(ch[..., -1], enc_buf)
-        n_re, n_im, e = m.readout.step((n_re, n_im, e), feat, vt[:, -1])
-        day_row = torch.stack([aT[:, -1], dp24[:, -1], vt[:, -1], vp24[:, -1]], dim=-1)
-        return enc_buf, n_re, n_im, e, day_row
+        u = m.readout.project(feat)
+        v = vt[:, -1:]
+        n_re, n_im, e = m.readout.step_window((n_re, n_im, e), u, v, u_old, v_old,
+                                              m.cfg.stream_tail)
+        row = torch.stack([aT[:, -1], dp24[:, -1], vt[:, -1], vp24[:, -1]], dim=-1)
+        return enc_buf, n_re, n_im, e, u, v, row
 
 
-class PassportGraph(_Graph):
-    def forward(self, loc, day_acc, day_summ, day_mask):
-        m = self.m
-        summ, has = m.daily_summaries(day_acc[:, 0], day_acc[:, 1], day_acc[:, 2],
-                                      day_acc[:, 3])
-        day_summ = torch.cat([day_summ[:, 1:], summ], dim=1)
-        day_mask = torch.cat([day_mask[:, 1:], has], dim=1)
-        z, _ = m.passport(loc, day_summ, day_mask, sample=False)
-        return day_summ, day_mask, z
+class WindowGraph(_Graph):
+    """Пакетный проход по всему сырому окну."""
+
+    def forward(self, x_win, m_win, doy_win, hour_win, lat, lon, c_mu, c_sig, c_def):
+        m, cfg = self.m, self.m.cfg
+        astro_h = astro_features(doy_win, hour_win, lat, lon)
+        out = m.history_pass(x_win, m_win, astro_h, (c_mu, c_sig, c_def))
+        W, T, L = x_win.shape[1], cfg.stream_tail, cfg.max_history
+        u_tail, v_tail = out["u"][:, W - T:], out["v"][:, W - T:]
+        n_re, n_im, e = m.readout.accumulate(u_tail, v_tail)
+        return out["enc_buf"], u_tail, v_tail, out["rows"][:, W - L:], n_re, n_im, e
+
+
+class ResyncGraph(_Graph):
+    def forward(self, u_ring, v_ring):
+        return self.m.readout.accumulate(u_ring, v_ring)
 
 
 class IssueGraph(_Graph):
-    def forward(self, loc, lat, lon, z, n_re, n_im, e, doy_fut, hour_fut):
+    def forward(self, loc, lat, lon, c_mu, c_sig, c_def, rows, n_re, n_im, e,
+                x_edge, m_edge, doy_edge, hour_edge, doy_fut, hour_fut):
         m = self.m
-        a_re, a_im = m.readout.normalize(n_re, n_im, e)
+        astro_e = astro_features(doy_edge, hour_edge, lat, lon)
         astro_f = astro_features(doy_fut, hour_fut, lat, lon)
-        return m.issue(loc, z, a_re, a_im, e, astro_f)["q"]
+        return m.stream_issue(loc, (c_mu, c_sig, c_def), lat, lon, rows, (n_re, n_im, e),
+                              x_edge, m_edge, astro_e, astro_f)["q"]
 
 
-GRAPH_MODULES = dict(init=InitGraph, step=StepGraph, passport=PassportGraph, issue=IssueGraph)
+GRAPH_MODULES = dict(init=InitGraph, step=StepGraph, window=WindowGraph, resync=ResyncGraph,
+                     issue=IssueGraph)
 
 
 def dims(cfg):
     """Размеры входов и выходов графов и состояния хоста для конфига модели."""
+    from mayak.config import N_DAILY_SUMMARY
     from mayak.modules.loc import LocEncoder
     loc_dim = LocEncoder(cfg.loc_freqs).out_dim
     enc_buf = (cfg.encoder_kernel - 1) * sum(cfg.encoder_dilations)
     return dict(horizon=cfg.horizon, n_quantiles=cfg.n_quantiles, n_modes=cfg.n_modes,
-                passport_dim=cfg.passport_dim, history_days=cfg.history_days,
-                n_daily_summary=N_DAILY_SUMMARY, day_row=len(DAY_ROW),
-                stream_window=cfg.stream_window, ctx=CTX, loc_dim=loc_dim,
-                encoder_width=cfg.encoder_width, enc_buf_len=enc_buf)
+                passport_dim=cfg.passport_dim, history=cfg.max_history,
+                history_days=cfg.history_days, n_daily_summary=N_DAILY_SUMMARY,
+                day_row=len(DAY_ROW), stream_window=cfg.stream_window,
+                stream_edge=cfg.stream_edge, stream_tail=cfg.stream_tail, ctx=CTX,
+                loc_dim=loc_dim, encoder_width=cfg.encoder_width, enc_buf_len=enc_buf)
 
 
 def example_inputs(model, seed=0):
-    """Правдоподобные входы всех графов (для трассировки и сверки экспорта)."""
+    """Правдоподобные входы всех графов для трассировки и сверки экспорта."""
     cfg = model.cfg
     g = torch.Generator().manual_seed(seed)
     r = lambda *s: torch.randn(*s, generator=g)
     lat, lon, elev = torch.tensor([[52.37]]), torch.tensor([[4.9]]), torch.tensor([[12.0]])
     with torch.no_grad():
-        loc, c_mu, c_sig, c_def, z0 = (t.detach() for t in InitGraph(model)(lat, lon, elev))
-    D, M, W = cfg.history_days, cfg.n_modes, cfg.encoder_width
-    Hh = cfg.horizon
-    x_ctx = torch.stack([8 + 5 * r(1, CTX), 1005 + 5 * r(1, CTX),
-                         (70 + 10 * r(1, CTX)).clamp(1, 100)], dim=-1)
-    m_ctx = (torch.rand(1, CTX, 3, generator=g) < 0.85).float()
-    hoy = 4000 + torch.arange(1, Hh + 1, dtype=torch.float32)[None]
+        loc, c_mu, c_sig, c_def, _z0 = (t.detach() for t in InitGraph(model)(lat, lon, elev))
+    coefs = (c_mu, c_sig, c_def)
+    M, W, Hh = cfg.n_modes, cfg.encoder_width, cfg.horizon
+    Wn, E, T, L = cfg.stream_window, cfg.stream_edge, cfg.stream_tail, cfg.max_history
+
+    def obs(n):
+        x = torch.stack([(8 + 5 * r(1, n)).round(), (1005 + 5 * r(1, n)),
+                         (70 + 10 * r(1, n)).clamp(1, 100).round()], dim=-1)
+        m = (torch.rand(1, n, 3, generator=g) < 0.85).float()
+        hoy = 4000 + torch.arange(n, dtype=torch.float32)[None]
+        return x * m, m, hoy / 24.0, hoy % 24
+
+    x_ctx, m_ctx, _, _ = obs(CTX)
+    x_win, m_win, d_win, h_win = obs(Wn)
+    x_edge, m_edge, d_edge, h_edge = obs(E)
+    hoy_f = 4000 + Wn + torch.arange(Hh, dtype=torch.float32)[None]
     enc_buf = 0.5 * r(1, W, sum(model.encoder.buffer_pads))
     modes = [r(1, M), r(1, M), 5 + torch.rand(1, M, generator=g)]
+    vmask = lambda *s: (torch.rand(*s, generator=g) < 0.9).float()
+    rows = torch.cat([r(1, L, 2), vmask(1, L, 2)], dim=-1)
     return dict(
         init=(lat, lon, elev),
-        step=(x_ctx * m_ctx, m_ctx, torch.tensor([[166.5]]), torch.tensor([[12.0]]),
-              lat, lon, c_mu, c_sig, c_def, enc_buf, *modes),
-        passport=(loc, torch.cat([r(1, 2, 24), (torch.rand(1, 2, 24, generator=g) < 0.8).float()],
-                                 dim=1),
-                  0.5 * r(1, D, N_DAILY_SUMMARY), (torch.rand(1, D, generator=g) < 0.9).float()),
-        issue=(loc, lat, lon, z0 + 0.3 * r(*z0.shape), *modes, hoy / 24.0, hoy % 24),
+        step=(x_ctx, m_ctx, torch.tensor([[166.5]]), torch.tensor([[12.0]]), lat, lon, *coefs,
+              enc_buf, *modes, r(1, 2 * M), vmask(1, 1)),
+        window=(x_win, m_win, d_win, h_win, lat, lon, *coefs),
+        resync=(r(1, T, 2 * M), vmask(1, T)),
+        issue=(loc, lat, lon, *coefs, rows, *modes, x_edge, m_edge, d_edge, h_edge,
+               hoy_f / 24.0, hoy_f % 24),
     )
 
 
@@ -220,7 +250,7 @@ def conformal_for_export(conformal, precision, checkpoint=None):
 
 def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset=17,
                   check_atol=1e-4, seed=0, checkpoint=None):
-    """Экспорт четырёх графов, манифеста и развёрнутой по лидам конформной таблицы.
+    """Экспорт графов, манифеста и развёрнутой по лидам конформной таблицы.
 
     Каждый граф при экспорте сверяется с PyTorch на правдоподобных входах. Входы, от
     которых граф не зависит, экспорт выбрасывает; манифест перечисляет фактические входы
@@ -236,7 +266,8 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
         aci: параметры адаптивной калибровки устройства или None.
         int8: экспортировать ещё и int8-копии графов.
         opset: версия набора операций ONNX.
-        check_atol: допустимое расхождение графа с PyTorch.
+        check_atol: допустимое расхождение графа с PyTorch в единицах масштаба выхода:
+            наибольшая разность делится на наибольший модуль выхода, но не меньше единицы.
         seed: сид правдоподобных входов для сверки.
         checkpoint: путь к экспортируемому чекпойнту для сверки с записью о подгонке
             таблицы.
@@ -254,10 +285,13 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
     from mayak.data.qc import DEFAULT_QC, PHYS
     from mayak.metrics import I_MED, conformal_table
     from mayak.provenance import provenance
-    from mayak.runtime.streaming import RAW_CHANNELS, STATE_HEADER, STATE_VERSION
 
     model = model.eval()
     cfg = model.cfg
+    if cfg.stream_tail < 1 or cfg.stream_edge < 1:
+        raise ValueError(f"история {cfg.max_history} ч не длиннее рецептивного поля энкодера "
+                         f"с лагом каналов ({cfg.stream_edge} ч): хвоста для потоковой суммы "
+                         f"нет, графы устройства для такой модели не экспортируются")
     precision = "int8" if int8 else "fp32"
     table = None
     if conformal is not None:
@@ -284,10 +318,12 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
         sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
         out = sess.run(None, {n: t.detach().numpy() for n, t in zip(names_in, inputs[name])
                               if n in used})
-        err = max(float(np.abs(o - r.detach().numpy()).max()) if o.size else 0.0
+        err = max(float(np.abs(o - r.detach().numpy()).max()
+                        / max(1.0, float(np.abs(r.detach().numpy()).max()))) if o.size else 0.0
                   for o, r in zip(out, ref))
         if err > check_atol:
-            raise RuntimeError(f"граф {name}: max|ONNX − PyTorch| = {err:.2e} > {check_atol}")
+            raise RuntimeError(f"граф {name}: расхождение ONNX и PyTorch {err:.2e} в единицах "
+                               f"масштаба выхода, допуск {check_atol}")
         checks[name] = err
         entry = dict(fp32=f"{name}.onnx", inputs=used, outputs=list(names_out),
                      shapes_in={n: list(t.shape) for n, t in zip(names_in, inputs[name])},
@@ -321,8 +357,8 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
         raw_channels=list(RAW_CHANNELS), phys={c: list(PHYS[c]) for c in RAW_CHANNELS},
         qc=dict(DEFAULT_QC.to_dict(), lookback_hours=DEFAULT_QC.lookback_hours),
         state=dict(version=STATE_VERSION, header_bytes=STATE_HEADER.itemsize,
-                   nbytes=state_nbytes(cfg)),
-        graphs=graphs, calibration=cal, export_check_max_abs=checks, opset=opset,
+                   nbytes=state_nbytes(cfg), resync_hours=RESYNC_HOURS),
+        graphs=graphs, calibration=cal, export_check_max_rel=checks, opset=opset,
         provenance=provenance())
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=1)
@@ -338,15 +374,6 @@ def quantize_graph(path):
                      extra_options={"DefaultTensorType": onnx.TensorProto.FLOAT})
     return os.path.basename(out)
 
-
-def state_nbytes(cfg):
-    from mayak.runtime.streaming import STATE_HEADER
-    M, D, W = cfg.n_modes, cfg.history_days, cfg.stream_window
-    return (STATE_HEADER.itemsize + 4 * (3 * M + cfg.passport_dim) + 2 * (D * 6 + D)
-            + 2 * W * 3 + W * 3)
-
-
-# Исполняемая спецификация хоста: та же логика, что в runtime-rs/src/runtime.rs.
 
 class TorchBackend:
     def __init__(self, model):
@@ -380,78 +407,33 @@ class OnnxBackend:
         return self.sess[name].run(None, feed)
 
 
-class GraphRuntime:
-    """Хост поверх четырёх графов: кольцо сырого окна, буфер энкодера, моды, сутки."""
+class GraphRuntime(StreamingMayak):
+    """Хост потока поверх исполнителя графов любой точности.
 
-    def __init__(self, backend, cfg, lat, lon, elev):
-        from mayak.data.qc import CausalQC
-        self.b, self.cfg = backend, cfg
-        self.qc = CausalQC(elev=elev)
-        f = lambda v: np.array([[v]], np.float32)
-        self.lat, self.lon = f(lat), f(lon)
-        self.loc, *self.coefs, self.z0 = backend.run("init", self.lat, self.lon, f(elev))
-        self.reset()
+    Логика хоста та же, что у потокового рантайма на PyTorch: отличается только
+    исполнитель графов. По умолчанию без калибровки интервалов.
 
-    def reset(self):
-        c = self.cfg
-        W, M, D = c.stream_window, c.n_modes, c.history_days
-        self.qc.reset()
-        self.raw_x = np.zeros((W, 3), np.float32)
-        self.raw_m = np.zeros((W, 3), np.float32)
-        self.head = 0
-        self.enc_buf = np.zeros((1, c.encoder_width, (c.encoder_kernel - 1)
-                                 * sum(c.encoder_dilations)), np.float32)
-        self.n_re, self.n_im, self.e = (np.zeros((1, M), np.float32) for _ in range(3))
-        self.day_summ = np.zeros((1, D, N_DAILY_SUMMARY), np.float32)
-        self.day_mask = np.zeros((1, D), np.float32)
-        self.day_acc = np.zeros((1, len(DAY_ROW), 24), np.float32)
-        self.hours_in_day = 0
-        self.z = self.z0.copy()
+    Args:
+        backend: исполнитель графов с методом ``run(name, *arrays)``.
+        cfg: конфиг модели.
+        lat: широта точки.
+        lon: долгота точки.
+        elev: высота точки, м.
+        conformal: таблица поправок или None.
+        aci: параметры адаптивной калибровки или None.
+    """
 
-    def step(self, T, P, RH, doy, hour):
-        x, codes = self.qc.push((T, P, RH))
-        self.push_checked(x, (codes == 0).astype(np.float32), doy, hour)
-
-    def push_checked(self, x, m, doy, hour):
-        """Шаг по часу, который уже прошёл контроль качества.
-
-        Args:
-            x: значения T, P, RH часа, форма (3,).
-            m: маска годности тех же каналов, форма (3,).
-            doy: день года часа.
-            hour: час суток.
-        """
-        x = np.asarray(x, np.float32)
-        m = np.asarray(m, np.float32)
-        W, j = self.cfg.stream_window, self.head
-        self.raw_x[j], self.raw_m[j] = np.where(m > 0, x, 0.0), m
-        self.head = (j + 1) % W
-        idx = (self.head - CTX + np.arange(CTX)) % W
-        f = lambda v: np.array([[v]], np.float32)
-        self.enc_buf, self.n_re, self.n_im, self.e, row = self.b.run(
-            "step", self.raw_x[idx][None], self.raw_m[idx][None], f(doy), f(hour),
-            self.lat, self.lon, *self.coefs, self.enc_buf, self.n_re, self.n_im, self.e)
-        self.day_acc[0, :, self.hours_in_day] = row[0]
-        self.hours_in_day += 1
-        if self.hours_in_day == 24:
-            self.day_summ, self.day_mask, self.z = self.b.run(
-                "passport", self.loc, self.day_acc, self.day_summ, self.day_mask)
-            self.day_acc[:] = 0.0
-            self.hours_in_day = 0
-
-    def forecast(self, doy_fut, hour_fut):
-        f = lambda a: np.asarray(a, np.float32)[None]
-        (q,) = self.b.run("issue", self.loc, self.lat, self.lon, self.z, self.n_re, self.n_im,
-                          self.e, f(doy_fut), f(hour_fut))
-        return q[0]
+    def __init__(self, backend, cfg, lat, lon, elev, conformal=None, aci=None):
+        self.m = None
+        self._setup(backend, cfg, lat, lon, elev, conformal, aci)
 
 
 class GraphModel:
     """Модель на графах с пакетным интерфейсом модели PyTorch.
 
-    Каждое окно батча проходит через свежий хост час за часом по всему буферу истории от
-    холодного старта, затем выпускается прогноз. При таком старте поток совпадает с
-    пакетом. История окна уже прошла контроль качества, поэтому хост его не повторяет.
+    Каждое окно батча проходит графом полного окна и графом выпуска так же, как
+    устройство после загрузки состояния. История окна уже прошла контроль качества,
+    поэтому он не повторяется.
 
     Args:
         backend: исполнитель графов нужной точности.
@@ -467,6 +449,24 @@ class GraphModel:
     def to(self, device):
         return self
 
+    def _one(self, lat, lon, elev, x, m, doy, hour, doy_fut, hour_fut):
+        cfg, b = self.cfg, self.backend
+        W, L, E = cfg.stream_window, cfg.max_history, cfg.stream_edge
+        f = lambda v: np.array([[v]], np.float32)
+        loc, *coefs, _ = b.run("init", f(lat), f(lon), f(elev))
+        pad = W - x.shape[0]
+        if pad < 0:
+            raise ValueError(f"история {x.shape[0]} ч длиннее окна рантайма {W} ч")
+        padf = lambda a, fill: np.concatenate([np.full((pad,) + a.shape[1:], fill, a.dtype), a])
+        xw, mw = padf(x, 0.0), padf(m, 0.0)
+        dw, hw = padf(doy, doy[0]), padf(hour, hour[0])
+        _buf, _u, _v, rows, *tail = b.run("window", xw[None], mw[None], dw[None], hw[None],
+                                           f(lat), f(lon), *coefs)
+        (q,) = b.run("issue", loc, f(lat), f(lon), *coefs, rows, *tail, xw[None, W - L:W - L + E],
+                     mw[None, W - L:W - L + E], dw[None, W - L:W - L + E],
+                     hw[None, W - L:W - L + E], doy_fut[None], hour_fut[None])
+        return q[0]
+
     def __call__(self, batch):
         """Прогноз по батчу окон.
 
@@ -480,16 +480,17 @@ class GraphModel:
         a = {k: (v.numpy() if torch.is_tensor(v) else np.asarray(v)) for k, v in batch.items()}
         qs = []
         for i in range(a["x_hist"].shape[0]):
-            rt = GraphRuntime(self.backend, self.cfg, float(a["lat"][i]), float(a["lon"][i]),
-                              float(a["elev"][i]))
-            for k in range(a["x_hist"].shape[1]):
-                rt.push_checked(a["x_hist"][i, k], a["mask_hist"][i, k], a["doy_hist"][i, k],
-                                a["hour_hist"][i, k])
-            qs.append(rt.forecast(a["doy_fut"][i], a["hour_fut"][i]))
+            m = np.asarray(a["mask_hist"][i], np.float32)
+            x = np.where(m > 0, a["x_hist"][i], 0.0).astype(np.float32)
+            qs.append(self._one(float(a["lat"][i]), float(a["lon"][i]), float(a["elev"][i]), x, m,
+                                np.asarray(a["doy_hist"][i], np.float32),
+                                np.asarray(a["hour_hist"][i], np.float32),
+                                np.asarray(a["doy_fut"][i], np.float32),
+                                np.asarray(a["hour_fut"][i], np.float32)))
         q = torch.from_numpy(np.stack(qs).astype(np.float32))
         return dict(q=q, mu=q[..., I_MED])
 
 
-__all__ = ["CTX", "DAY_ROW", "GRAPH_IO", "GRAPH_NAMES", "GraphModel", "GraphRuntime",
-           "OnnxBackend", "TorchBackend", "conformal_for_export", "dims", "example_inputs",
-           "export_graphs", "graphs_digest", "quantize_graph", "state_nbytes"]
+__all__ = ["DAY_ROW", "GRAPH_IO", "GRAPH_NAMES", "GraphModel", "GraphRuntime", "OnnxBackend",
+           "TorchBackend", "conformal_for_export", "dims", "example_inputs", "export_graphs",
+           "graphs_digest", "quantize_graph", "state_nbytes"]

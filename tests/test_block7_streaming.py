@@ -1,13 +1,15 @@
-"""ТЕсты: строго причинный инкрементальный энкодер и честный O(1) на час.
+"""Тесты: причинный инкрементальный энкодер и поток, равный пакету.
 
 Что проверяется:
-* нормализация энкодера причинна и не зависит от длины окн;
+* нормализация энкодера причинна и не зависит от длины окна;
 * потактовый шаг энкодера совпадает с пакетным проходом на всей длине окна;
 * стоимость шага не зависит от рецептивного поля, буферы - десятки КБ;
-* рецептивное поле и окно рантайма - из формулы, окно достаточно и минимально;
-* полный выпуск прогноза: пакет = поток на всех лидах, расхождение - числом;
-* перезапуск из сохранённого состояния продолжает непрерывный прогон, включая
-  незавершённые сутки; формат состояния закреплён числом байт.
+* признаки края окна зависят от начала окна, признаки хвоста - нет;
+* скользящая сумма мод равна точной сумме, пересинхронизация снимает ошибку округления;
+* полный выпуск потока равен пакетному при выпусках в случайные часы длинного ряда;
+* перезапуск в любой час продолжает непрерывный прогон, включая решения контроля
+  качества; простой заполняется пустыми часами, долгий простой - холодный старт;
+* состояние - только сырое окно, размер закреплён числом байт.
 """
 import numpy as np
 import pytest
@@ -16,21 +18,21 @@ import torch.nn as nn
 
 from mayak.config import CHANNEL_MAX_LAG, Ablations, ModelConfig
 from mayak.constants import H, L_MAX, QUANTILES
-from mayak.data.recording import record_values
 from mayak.model import MAYAK
 from mayak.modules.encoder import ChannelGroupNorm, SynopticEncoder
-from mayak.runtime.equivalence import (batch_forecast, device_mask, device_values,
-                                       divergence, feed, future_calendar_after, step_cost,
+from mayak.runtime import streaming as S
+from mayak.runtime.equivalence import (batch_forecast, divergence, feed, step_cost,
                                        stream_forecast, synthetic_series)
-from mayak.runtime.streaming import (RAW_STEP, STATE_HEADER, StreamingMayak, decode_raw,
-                                     encode_raw)
+from mayak.runtime.streaming import (STATE_HEADER, StreamingMayak, decode_window,
+                                     encode_window, to_store)
 
 LAT, LON, ELEV = 52.37, 4.9, 0.0
 RTOL_STEP = 1e-5
 EXACT_F64 = 1e-10
-ATOL_FORECAST = 1e-4
-ATOL_RESTART = 2e-3
-DEFAULT_STATE_BYTES = 3352
+ATOL_FORECAST = 5e-4
+DEFAULT_STATE_BYTES = 3224
+TINY = dict(encoder_width=16, encoder_dilations=(1, 2, 4, 8), passport_dim=8, field_hidden=24,
+            heads_hidden=16, passport_hidden=16)
 
 
 def _model(cfg=None, seed=0, perturb=True):
@@ -74,13 +76,6 @@ def _ring_diff(a, b, encoder):
     pairs = list(zip(_ring(a, encoder), _ring(b, encoder)))
     err = max((x - y).abs().max().item() for x, y in pairs) if pairs else 0.0
     return err / _scale(*(x for x, _ in pairs)) if pairs else 0.0
-
-
-def _grid(series):
-    """Ряд, записанный прибором: значения на сетке записи переживают окно на диске."""
-    s = dict(series)
-    s["x"] = np.where(series["m"] > 0, record_values(series["x"]), 0.0).astype(np.float32)
-    return s
 
 
 def test_encoder_has_no_time_axis_groupnorm(model):
@@ -214,17 +209,23 @@ def test_step_cost_vs_full_window_recompute(model, record_property):
     assert 10_000 < c["encoder_buffer_bytes"] < 100_000
 
 
-def test_receptive_field_and_window_formulas():
+def test_stream_layout_formulas():
     c = ModelConfig()
     assert c.receptive_field == 2 * sum(c.encoder_dilations) + 1 == 253
     assert SynopticEncoder(dilations=c.encoder_dilations).receptive_field == 253
-    assert c.stream_window % 16 == 0
-    assert c.stream_window >= c.receptive_field - 1 + CHANNEL_MAX_LAG
-    assert c.stream_window == 288
+    assert c.stream_edge == c.receptive_field - 1 + CHANNEL_MAX_LAG == 276
+    assert c.stream_tail == L_MAX - c.stream_edge == 396
+    assert c.stream_window == L_MAX == 672
+    assert c.stream_window % 8 == 0
+    from mayak.data.qc import DEFAULT_QC
+    assert c.stream_window > DEFAULT_QC.lookback_hours
+    long = ModelConfig(encoder_dilations=(1, 2, 4, 8, 16, 32, 64, 128, 256))
+    assert long.stream_edge == L_MAX and long.stream_tail == 0
+    assert long.stream_window >= long.receptive_field - 1 + CHANNEL_MAX_LAG
 
 
 def test_channels_have_finite_memory_of_channel_max_lag(model):
-    """Каналы в момент t зависят только от сырых часов t − CHANNEL_MAX_LAG … t."""
+    """Каналы часа зависят только от сырых часов не старше наибольшего лага."""
     s = synthetic_series(120, seed=4, p_valid=1.0)
     x = torch.from_numpy(s["x"])[None]
     mk = torch.from_numpy(s["m"])[None]
@@ -247,43 +248,85 @@ def test_channels_have_finite_memory_of_channel_max_lag(model):
     assert not torch.equal(ch(near), base)
 
 
-def test_restore_window_is_sufficient_and_minimal():
-    """По (RF − 1) + CHANNEL_MAX_LAG часам буферы восстанавливаются точно, по часу меньше - нет."""
-    cfg = ModelConfig(encoder_dilations=(1, 2))
-    m = _model(cfg)
-    s = _grid(synthetic_series(200, seed=5, p_valid=1.0))
-    live = feed(StreamingMayak(m, LAT, LON, ELEV), s, 0, 150)
-    need = cfg.receptive_field - 1 + CHANNEL_MAX_LAG
-    assert cfg.stream_window >= need
-    diffs = {}
-    for w in (cfg.stream_window, need, need - 1):
-        r = StreamingMayak(m, LAT, LON, ELEV)
-        r.load_state(live.serialize())
-        r.filled = w
-        r._rebuild_from_window()
-        diffs[w] = _ring_diff(live.enc, r.enc, m.encoder)
-    assert diffs[cfg.stream_window] < RTOL_STEP and diffs[need] < RTOL_STEP, diffs
-    assert diffs[need - 1] > 1e-3, diffs
+@pytest.mark.parametrize("n", [5, 60, 300])
+def test_forward_with_buffer_matches_prefill(model, n):
+    enc = model.encoder
+    x = torch.randn(1, model.cfg.n_channels, n, generator=torch.Generator().manual_seed(n))
+    with torch.no_grad():
+        feats, buf = enc.forward_with_buffer(x)
+        ref, st = enc.prefill(x)
+    torch.testing.assert_close(feats, ref, atol=0, rtol=0)
+    torch.testing.assert_close(buf, enc.ring_to_shift(st), atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("flag", [None, "no_solar", "no_mode_groups", "no_passport"])
-def test_full_forecast_batch_equals_stream_all_leads(flag, record_property):
+def _history(model, x, m, t0):
+    from mayak.astro import astro_features
+    from mayak.timeaxis import window_calendar
+    doy, hour = window_calendar(t0, np.arange(len(x)))
+    astro = astro_features(torch.from_numpy(doy)[None], torch.from_numpy(hour)[None],
+                           torch.tensor([[LAT]]), torch.tensor([[LON]]))
+    loc = model.loc(torch.tensor([LAT]), torch.tensor([LON]), torch.tensor([ELEV]))
+    with torch.no_grad():
+        return model.history_pass(torch.from_numpy(x)[None], torch.from_numpy(m)[None], astro,
+                                  model.field.coefficients(loc))
+
+
+def test_edge_features_depend_on_window_start_tail_features_do_not(model):
+    """Почему край пересчитывается при выпуске: у пакета признаки ранних часов окна
+    зависят от того, что было до окна, у поздних - нет."""
+    cfg = model.cfg
+    s = synthetic_series(L_MAX + 200, seed=21, p_valid=1.0)
+    x, m = s["x"], s["m"]
+    long = _history(model, x, m, s["t0"])["u"][0, 200:]
+    win = _history(model, x[200:], m[200:], s["t0"] + 200)["u"][0]
+    E = cfg.stream_edge
+    tail_err = float((long[E:] - win[E:]).abs().max())
+    edge_err = float((long[:E] - win[:E]).abs().max())
+    assert tail_err < _step_tol(long), tail_err
+    assert edge_err > 1e-2, edge_err
+    assert float((long[E - 1] - win[E - 1]).abs().max()) > 0
+
+
+def test_sliding_sum_equals_exact_sum_in_float64():
+    m = _model(ModelConfig(**TINY)).double()
+    ro = m.readout
+    M, span = ro.n_modes, 40
+    g = torch.Generator().manual_seed(5)
+    u = torch.randn(1, 300, 2 * M, generator=g, dtype=torch.float64)
+    v = (torch.rand(1, 300, generator=g) < 0.8).double()
+    state = [torch.zeros(1, M, dtype=torch.float64) for _ in range(3)]
+    for t in range(300):
+        old = t - span
+        u_old = u[:, old] if old >= 0 else torch.zeros(1, 2 * M, dtype=torch.float64)
+        v_old = v[:, old:old + 1] if old >= 0 else torch.zeros(1, 1, dtype=torch.float64)
+        state = ro.step_window(state, u[:, t], v[:, t:t + 1], u_old, v_old, span)
+        if t in (10, 39, 40, 41, 299):
+            lo = max(0, t - span + 1)
+            ref = ro.accumulate(u[:, lo:t + 1], v[:, lo:t + 1])
+            for a, b in zip(state, ref):
+                assert float((a - b).abs().max()) < EXACT_F64 * 1e2
+
+
+@pytest.mark.parametrize("flag", [None, "no_solar", "no_mode_groups", "no_passport",
+                                  "no_compression"])
+def test_full_forecast_batch_equals_stream_at_random_hours(flag, record_property):
     cfg = ModelConfig(ablations=Ablations(**({flag: True} if flag else {})))
     m = _model(cfg)
-    rep = divergence(m, n_windows=2, seed=7)
+    rep = divergence(m, n_issues=4, hours=3 * L_MAX, seed=7)
     per_lead = np.asarray(rep["batch_stream_max_abs_per_lead"])
     record_property("batch_stream_max_abs", rep["batch_stream_max_abs"])
     record_property("restart_max_abs", rep["restart_max_abs"])
     assert per_lead.shape == (H,)
+    assert all(end > L_MAX for end, _ in rep["batch_stream_by_issue"])
     assert rep["batch_stream_max_abs"] < ATOL_FORECAST, (
-        f"пакет ≠ поток: max|Δq| = {rep['batch_stream_max_abs']:.3g} °C, худший лид "
-        f"{int(per_lead.argmax()) + 1} ч")
-    assert rep["restart_max_abs"] < ATOL_RESTART
+        f"пакет и поток расходятся: max|Δq| = {rep['batch_stream_max_abs']:.3g} °C, "
+        f"худший лид {int(per_lead.argmax()) + 1} ч")
+    assert rep["restart_max_abs"] < ATOL_FORECAST
 
 
-@pytest.mark.parametrize("end", [0, 1, 100, 500])
+@pytest.mark.parametrize("end", [1, 100, 500])
 def test_full_forecast_short_history(model, end):
-    """Короткая история: поток с нуля = пакетное окно с нулями и нулевой маской."""
+    """Короткая история: поток с холодного старта равен пакетному окну с пустыми часами."""
     s = synthetic_series(600, seed=8)
     qb = batch_forecast(model, s, end, LAT, LON, ELEV)
     qs, _ = stream_forecast(model, s, end, LAT, LON, ELEV)
@@ -291,163 +334,200 @@ def test_full_forecast_short_history(model, end):
     assert np.abs(qb - qs).max() < ATOL_FORECAST
 
 
-def test_stream_equivalence_over_long_sequence(model):
-    from mayak.astro import astro_features
-    n = int(2.5 * L_MAX)
-    s = synthetic_series(n, seed=9)
-    st = StreamingMayak(model, LAT, LON, ELEV)
-    done = 0
-    for end in (L_MAX, 2 * L_MAX, n):
-        feed(st, s, done, end)
-        done = end
-        x = torch.from_numpy(device_values(s, 0, end))[None]
-        mk = torch.from_numpy(device_mask(s, 0, end, ELEV))[None]
-        astro = astro_features(torch.from_numpy(s["doy"][:end])[None],
-                               torch.from_numpy(s["hour"][:end])[None],
-                               torch.tensor([[LAT]]), torch.tensor([[LON]]))
-        with torch.no_grad():
-            mu0, sg0, df0 = model.field.evaluate(st.base_coefs, astro)
-            ch, _, vt = model.build_channels(x, mk, astro, mu0, sg0, df0)
-            feats, ref_state = model.encoder.prefill(ch)
-            a_re, a_im, e = model.readout(feats, vt)
-            s_re, s_im = model.readout.normalize(st.n_re, st.n_im, st.e)
-        assert _ring_diff(ref_state, st.enc, model.encoder) < RTOL_STEP
-        assert (s_re - a_re).abs().max() < 1e-4 and (s_im - a_im).abs().max() < 1e-4
-        assert ((st.e - e).abs() / e.abs().clamp(min=1.0)).max() < 1e-4
+def test_long_run_random_hours_error_does_not_grow(record_property):
+    """Выпуски в случайные часы ряда длиной десять тысяч часов: расхождение с пакетом
+    в допуске и не растёт со временем."""
+    m = _model(ModelConfig(**TINY))
+    rep = divergence(m, n_issues=12, hours=10_000, seed=3)
+    errs = np.array([e for _, e in rep["batch_stream_by_issue"]])
+    record_property("long_run_max_abs", rep["batch_stream_max_abs"])
+    assert rep["batch_stream_max_abs"] < ATOL_FORECAST
+    assert rep["restart_max_abs"] < ATOL_FORECAST
+    assert errs[-4:].max() <= 3 * errs[:4].max() + 1e-5, errs
 
 
-def test_warm_start_equals_stepping_with_partial_day(model):
-    L = 24 * 10 + 13
-    s = synthetic_series(L, seed=10)
-    stepped = feed(StreamingMayak(model, LAT, LON, ELEV), s, 0, L)
-    warm = StreamingMayak(model, LAT, LON, ELEV)
-    warm.warm_start(s["x"], s["m"], s["doy"], s["hour"])
-    assert warm._hours_in_day == stepped._hours_in_day == 13
-    np.testing.assert_allclose(warm._day, stepped._day, atol=1e-5)
-    assert _ring_diff(warm.enc, stepped.enc, model.encoder) < RTOL_STEP
-    cal = future_calendar_after(s, L, H)
-    np.testing.assert_allclose(warm.forecast(*cal)[0], stepped.forecast(*cal)[0],
-                               atol=ATOL_FORECAST)
-    assert warm.serialize()[:STATE_HEADER.itemsize] == stepped.serialize()[:STATE_HEADER.itemsize]
+def _mode_error(st):
+    exact = st.b.run("resync", st.u_ring[st._hours(st.tail) % st.tail][None],
+                     st.v_ring[st._hours(st.tail) % st.tail][None])
+    return max(float(np.abs(a - b).max() / max(1.0, np.abs(b).max()))
+               for a, b in zip(st.modes, exact))
 
 
-@pytest.mark.parametrize("cut", [30, 24 * 12, 24 * 12 + 13, L_MAX + 5])
-def test_restart_continues_continuous_run(model, cut):
-    """После восстановления из окна выход совпадает с непрерывным прогоном."""
-    s = _grid(synthetic_series(cut + 60, seed=11))
+def test_resync_bounds_rounding_error(monkeypatch):
+    """Без пересинхронизации ошибка скользящей суммы остаётся малой и не растёт;
+    пересинхронизация обнуляет её раз в сутки."""
+    m = _model(ModelConfig(**TINY))
+    s = synthetic_series(4000, seed=12)
+    monkeypatch.setattr(S, "RESYNC_HOURS", 10 ** 9)
+    free = StreamingMayak(m, LAT, LON, ELEV)
+    errs = []
+    for k in range(0, 4000, 500):
+        feed(free, s, k, k + 500)
+        errs.append(_mode_error(free))
+    assert max(errs) < 1e-5, errs
+    assert max(errs[-3:]) <= 3 * max(errs[:3]) + 1e-7, errs
+    monkeypatch.setattr(S, "RESYNC_HOURS", 24)
+    synced = StreamingMayak(m, LAT, LON, ELEV)
+    end = 1000 - (s["t0"] + 1000) % 24
+    feed(synced, s, 0, end)
+    assert (synced.last_hour + 1) % 24 == 0
+    assert _mode_error(synced) == 0.0
+
+
+@pytest.mark.parametrize("cut", [30, 24 * 12 + 13, L_MAX + 5, 2 * L_MAX + 17])
+def test_restart_at_any_hour_equals_continuous_run(model, cut):
+    s = synthetic_series(cut + 60, seed=11)
     live = feed(StreamingMayak(model, LAT, LON, ELEV), s, 0, cut)
     back = StreamingMayak(model, LAT, LON, ELEV)
     back.load_state(live.serialize())
-    assert back.filled == min(cut, model.cfg.stream_window)
-    assert back._hours_in_day == live._hours_in_day == cut % 24
-    np.testing.assert_allclose(back._day, live._day, atol=1e-5)
-    assert _ring_diff(live.enc, back.enc, model.encoder) < RTOL_STEP
+    assert back.filled == live.filled == min(cut, model.cfg.stream_window)
+    assert back.last_hour == live.last_hour
+    np.testing.assert_allclose(back.enc_buf, live.enc_buf, atol=1e-5 * max(1, np.abs(
+        live.enc_buf).max()))
+    order = live._hours(L_MAX) % L_MAX
+    rb, rl = back.rows[order], live.rows[order]
+    np.testing.assert_allclose(rb[24:], rl[24:], atol=1e-5)
+    np.testing.assert_allclose(rb[:24, [0, 2]], rl[:24, [0, 2]], atol=1e-5)
     done = cut
     for end in (cut, cut + 7, cut + 60):
         feed(live, s, done, end)
         feed(back, s, done, end)
         done = end
-        cal = future_calendar_after(s, end, H)
-        err = np.abs(live.forecast(*cal)[0] - back.forecast(*cal)[0]).max()
+        err = np.abs(live.forecast()[0] - back.forecast()[0]).max()
         assert err < ATOL_FORECAST, f"час {end}: max|Δq| = {err:.3g}"
-    np.testing.assert_allclose(back.day_summ.numpy(), live.day_summ.numpy(), atol=2e-3)
-    np.testing.assert_allclose(back.z.numpy(), live.z.numpy(), atol=1e-3)
+    assert back.serialize() == live.serialize()
 
 
-def test_restart_with_quantized_window_is_within_tolerance(model, record_property):
-    """На произвольных (не сеточных) данных расхождение даёт только квантование окна."""
-    s = synthetic_series(L_MAX + 50, seed=12)
-    live = feed(StreamingMayak(model, LAT, LON, ELEV), s, 0, L_MAX)
-    back = StreamingMayak(model, LAT, LON, ELEV)
-    back.load_state(live.serialize())
-    feed(live, s, L_MAX, L_MAX + 50)
-    feed(back, s, L_MAX, L_MAX + 50)
-    cal = future_calendar_after(s, L_MAX + 50, H)
-    err = float(np.abs(live.forecast(*cal)[0] - back.forecast(*cal)[0]).max())
-    record_property("restart_quantized_max_abs", err)
-    assert err < ATOL_RESTART
-
-
-def test_partial_day_survives_restart_and_completes_full(model):
-    """7.5: незавершённые сутки не теряются - сводка после перезапуска по полному дню."""
-    s = _grid(synthetic_series(24 * 6, seed=13, p_valid=1.0))
-    cut = 24 * 5 + 9
+def test_restart_keeps_quality_control_decisions(model):
+    """Кольцо контроля качества после перезапуска видит отбракованные значения так же,
+    как непрерывный прогон: решения о следующих часах не меняются."""
+    s = synthetic_series(400, seed=14, p_valid=1.0)
+    s["x"][250:330, 0] = 7.0
+    s["x"][250:330, 2] = 64.0
+    s["x"][299, 2] = -5.0
+    s["x"][298, 1] = 7000.0
+    cut = 300
     live = feed(StreamingMayak(model, LAT, LON, ELEV), s, 0, cut)
     back = StreamingMayak(model, LAT, LON, ELEV)
     back.load_state(live.serialize())
-    feed(live, s, cut, 24 * 6)
-    feed(back, s, cut, 24 * 6)
-    assert back._hours_in_day == live._hours_in_day == 0
-    frac_valid = back.day_summ[0, -1, 4].item()
-    assert frac_valid == pytest.approx(1.0)
-    np.testing.assert_allclose(back.day_summ[0, -1].numpy(), live.day_summ[0, -1].numpy(),
-                               atol=1e-4)
+    feed(live, s, cut, 400)
+    feed(back, s, cut, 400)
+    pos = live._hours(100) % live.window
+    assert np.array_equal(live.valid[pos], back.valid[pos])
+    assert live.valid[pos, 0].min() == 0, "в ряду должно быть залипание температуры"
+    assert back.serialize() == live.serialize()
+
+
+def test_idle_gap_is_filled_with_empty_hours(model):
+    s = synthetic_series(200, seed=15)
+    a = feed(StreamingMayak(model, LAT, LON, ELEV), s, 0, 120)
+    b = feed(StreamingMayak(model, LAT, LON, ELEV), s, 0, 120)
+    for k in range(120, 127):
+        b.step(None, None, None, s["t0"] + k)
+    feed(a, s, 127, 200)
+    feed(b, s, 127, 200)
+    assert a.idle_hours == 7 and b.idle_hours == 0
+    assert a.serialize() == b.serialize()
+    np.testing.assert_allclose(a.forecast()[0], b.forecast()[0], atol=1e-5)
+
+
+def test_idle_longer_than_window_is_cold_start(model):
+    p = S.ACIParams()
+    s = synthetic_series(100, seed=16)
+    a = feed(StreamingMayak(model, LAT, LON, ELEV, aci=p), s, 0, 100)
+    a.theta = 0.3
+    later = s["t0"] + 100 + model.cfg.stream_window + 3
+    a.step(8.0, 1003.0, 71.0, later)
+    fresh = StreamingMayak(model, LAT, LON, ELEV, aci=p)
+    fresh.step(8.0, 1003.0, 71.0, later)
+    assert a.filled == 1 and a.theta == pytest.approx(0.3)
+    np.testing.assert_allclose(a.raw_forecast(), fresh.raw_forecast(), atol=1e-5)
+
+
+def test_hours_must_increase_and_forecast_needs_a_step(model):
+    st = StreamingMayak(model, LAT, LON, ELEV)
+    with pytest.raises(ValueError, match="момент выпуска"):
+        st.forecast()
+    st.step(8.0, 1003.0, 71.0, 1000)
+    with pytest.raises(ValueError, match="не позже"):
+        st.step(8.0, 1003.0, 71.0, 1000)
+
+
+def test_warm_start_equals_stepping(model):
+    L = 24 * 10 + 13
+    s = synthetic_series(L, seed=10)
+    stepped = feed(StreamingMayak(model, LAT, LON, ELEV), s, 0, L)
+    warm = StreamingMayak(model, LAT, LON, ELEV)
+    warm.warm_start(s["x"], s["m"], s["t0"] + L - 1)
+    assert warm.serialize() == stepped.serialize()
+    np.testing.assert_allclose(warm.forecast()[0], stepped.forecast()[0], atol=ATOL_FORECAST)
 
 
 def test_state_size_is_pinned(model):
     st = StreamingMayak(model, LAT, LON, ELEV)
     assert st.state_nbytes == len(st.serialize()) == DEFAULT_STATE_BYTES < 4096
+    assert STATE_HEADER.itemsize == 32
     feed(st, synthetic_series(100, seed=14), 0, 100)
     assert len(st.serialize()) == DEFAULT_STATE_BYTES
 
 
-def test_serialize_roundtrip_is_stable(model):
+def test_state_header_and_roundtrip(model):
     s = synthetic_series(400, seed=15)
     st = feed(StreamingMayak(model, LAT, LON, ELEV), s, 0, 400)
     raw = st.serialize()
+    hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0]
+    assert int(hdr["last_hour"]) == s["t0"] + 399 and int(hdr["filled"]) == 400
+    assert (float(hdr["lat"]), float(hdr["lon"])) == (np.float32(LAT), np.float32(LON))
     back = StreamingMayak(model, LAT, LON, ELEV)
     back.load_state(raw)
     assert back.serialize() == raw
+    assert back.loaded_site == (np.float32(LAT), np.float32(LON), np.float32(ELEV))
+    fresh = StreamingMayak(model, LAT, LON, ELEV)
+    fresh.load_state(StreamingMayak(model, LAT, LON, ELEV).serialize())
+    assert fresh.last_hour is None
 
 
-def test_raw_window_quantization_resolution():
+def test_window_storage_is_lossless_on_record_grid():
     rng = np.random.default_rng(0)
-    x = np.stack([rng.uniform(-90, 60, 1000), rng.uniform(300, 1100, 1000),
-                  rng.uniform(0, 100, 1000)], -1).astype(np.float32)
-    m = np.ones_like(x)
-    m[::7, 1] = 0
-    d = decode_raw(encode_raw(x, m), m)
-    err = np.abs(d - x * m).max(0)
-    assert (err <= RAW_STEP / 2 + 1e-4).all()
-    assert RAW_STEP[1] < 0.02
-    assert (d[m == 0] == 0).all()
-    assert np.array_equal(encode_raw(d, m), encode_raw(x, m))
+    x = np.stack([rng.integers(-90, 61, 800), rng.integers(3000, 11001, 800) / 10.0,
+                  rng.integers(0, 101, 800)], -1).astype(np.float32)
+    present = (rng.random((800, 3)) < 0.9).astype(np.uint8)
+    valid = present * (rng.random((800, 3)) < 0.9)
+    buf = encode_window(np.where(present > 0, x, 0.0), present, valid)
+    assert len(buf) == 800 * 4 + 2 * 300
+    got, p2, v2 = decode_window(buf, 800)
+    assert np.array_equal(p2, present) and np.array_equal(v2, valid)
+    assert np.array_equal(got[present > 0], x[present > 0])
+    wild = to_store(np.array([[-200.0, 7000.0, 300.0], [75.0, -3.0, -5.0]]))
+    lo = np.array([-90.0, 300.0, 0.0])
+    hi = np.array([60.0, 1100.0, 100.0])
+    assert ((wild < lo) | (wild > hi)).all(), "значение вне диапазона остаётся вне него"
 
 
 def test_invalid_states_are_rejected(model):
     st = feed(StreamingMayak(model, LAT, LON, ELEV), synthetic_series(60, seed=16), 0, 60)
-    raw = bytearray(st.serialize())
+    raw = st.serialize()
     fresh = StreamingMayak(model, LAT, LON, ELEV)
-    with pytest.raises(ValueError, match="блока 7"):
-        fresh.load_state(bytes(3048))
+    with pytest.raises(ValueError, match="заголовка"):
+        fresh.load_state(bytes(len(raw)))
     bad = bytearray(raw)
-    bad[3] = 1
+    bad[3] = 3
     with pytest.raises(ValueError, match="версия"):
         fresh.load_state(bytes(bad))
-    hdr = np.frombuffer(bytes(raw), STATE_HEADER, count=1)[0].copy()
-    hdr["hoy_last"] = (int(hdr["hoy_last"]) + 5) % 8760
-    with pytest.raises(ValueError, match="календарь"):
-        fresh.load_state(hdr.tobytes() + bytes(raw[STATE_HEADER.itemsize:]))
-    hdr = np.frombuffer(bytes(raw), STATE_HEADER, count=1)[0].copy()
-    hdr["hours_in_day"] = 30
-    with pytest.raises(ValueError, match="курсор"):
-        fresh.load_state(hdr.tobytes() + bytes(raw[STATE_HEADER.itemsize:]))
-
-
-def test_window_calendar_across_new_year_and_leap_year():
-    for year_h in (8760, 8784):
-        n = 100
-        first = year_h - 30
-        doy, hour = StreamingMayak._window_calendar(n, first, (first + n - 1) % year_h)
-        hoy = np.rint(doy * 24).astype(int)
-        assert hoy[0] == first and hoy[29] == year_h - 1 and hoy[30] == 0 and hoy[-1] == n - 31
-        assert np.array_equal(hour, hoy % 24)
-
-
-def test_calendar_gap_is_counted(model):
-    st = StreamingMayak(model, LAT, LON, ELEV)
-    st.step(10.0, 1000.0, 70.0, np.float32(100.0), np.float32(0.0))
-    st.step(10.0, 1000.0, 70.0, np.float32(100 + 1 / 24), np.float32(1.0))
-    assert st.calendar_breaks == 0
-    st.step(10.0, 1000.0, 70.0, np.float32(100 + 3 / 24), np.float32(3.0))
-    assert st.calendar_breaks == 1
+    with pytest.raises(ValueError, match="конфигу"):
+        fresh.load_state(raw[:-1])
+    hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0].copy()
+    hdr["filled"] = 5000
+    with pytest.raises(ValueError, match="заголовок"):
+        fresh.load_state(hdr.tobytes() + raw[STATE_HEADER.itemsize:])
+    hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0].copy()
+    hdr["aci_theta"] = np.nan
+    with pytest.raises(ValueError, match="калибровки"):
+        fresh.load_state(hdr.tobytes() + raw[STATE_HEADER.itemsize:])
+    W = model.cfg.stream_window
+    body = bytearray(raw[STATE_HEADER.itemsize:])
+    off = 4 * W
+    body[off:off + S.mask_bytes(W)] = bytes(S.mask_bytes(W))
+    with pytest.raises(ValueError, match="годный час без значения"):
+        fresh.load_state(raw[:STATE_HEADER.itemsize] + bytes(body))
+    assert fresh.last_hour is None

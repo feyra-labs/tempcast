@@ -53,24 +53,82 @@ class LaplaceReadout(nn.Module):
             den = e.clamp_min(EVIDENCE_FLOOR)
         return n_re / den, n_im / den
 
-    def forward(self, feats, v):
-        tau, omega, kappa = self.constants()
+    def project(self, feats):
+        """Вклад часов в моды по признакам энкодера.
+
+        Args:
+            feats: признаки энкодера, форма (..., width).
+
+        Returns:
+            Вклад, форма (..., 2M): сначала действительные части, затем мнимые.
+        """
+        return self.proj(feats)
+
+    def accumulate(self, u, v, lag0=0):
+        """Сумма вкладов часов с затуханием и поворотом фазы к моменту выпуска.
+
+        Args:
+            u: вклады часов, форма (B, L, 2M), от старых к новым.
+            v: маска наличия температуры, форма (B, L).
+            lag0: сколько часов отделяет последний час последовательности от момента
+                выпуска.
+
+        Returns:
+            Тройка: действительная и мнимая части накопленного состояния мод и масса
+            свидетельств, каждая формы (B, M).
+        """
+        tau, omega, _ = self.constants()
         M = self.n_modes
-        Lh = feats.shape[1]
-        lag = torch.arange(Lh - 1, -1, -1, dtype=feats.dtype, device=feats.device)
+        Lh = u.shape[1]
+        lag = lag0 + torch.arange(Lh - 1, -1, -1, dtype=u.dtype, device=u.device)
         dec = torch.exp(-lag[:, None] / tau[None, :])
         ph = omega[None, :] * lag[:, None]
         kc, ks = dec * torch.cos(ph), dec * torch.sin(ph)
-        u = self.proj(feats)
         uc = u[..., :M] * v[..., None]
         us = u[..., M:] * v[..., None]
 
         n_re = torch.einsum("blm,lm->bm", uc, kc) - torch.einsum("blm,lm->bm", us, ks)
         n_im = torch.einsum("blm,lm->bm", uc, ks) + torch.einsum("blm,lm->bm", us, kc)
-
         e = torch.einsum("bl,lm->bm", v, dec)
-        a_re, a_im = self.normalize(n_re, n_im, e, kappa)
+        return n_re, n_im, e
+
+    def forward(self, feats, v):
+        n_re, n_im, e = self.accumulate(self.project(feats), v)
+        a_re, a_im = self.normalize(n_re, n_im, e)
         return a_re, a_im, e
+
+    @torch.no_grad()
+    def step_window(self, state, u_t, v_t, u_old, v_old, span):
+        """Один час скользящей суммы по последним span часам.
+
+        Вклад нового часа добавляется. Вклад часа, который выходит из окна суммы,
+        вычитается с тем затуханием и поворотом фазы, которые он успел набрать.
+
+        Args:
+            state: тройка состояния мод, каждая часть формы (B, M).
+            u_t: вклад нового часа, форма (B, 2M).
+            v_t: маска температуры нового часа, форма (B, 1).
+            u_old: вклад часа, выходящего из окна, форма (B, 2M).
+            v_old: маска температуры этого часа, форма (B, 1).
+            span: длина окна суммы, часы. При нуле сумма всегда пустая.
+
+        Returns:
+            Новая тройка состояния мод.
+        """
+        n_re, n_im, e = state
+        if span <= 0:
+            return torch.zeros_like(n_re), torch.zeros_like(n_im), torch.zeros_like(e)
+        tau, omega, _ = self.constants()
+        M = self.n_modes
+        rho = torch.exp(-1.0 / tau)
+        co, si = torch.cos(omega), torch.sin(omega)
+        rho_s = torch.exp(-float(span) / tau)
+        co_s, si_s = torch.cos(omega * float(span)), torch.sin(omega * float(span))
+        uc, us = u_t[..., :M] * v_t, u_t[..., M:] * v_t
+        oc, os_ = u_old[..., :M] * v_old, u_old[..., M:] * v_old
+        n_re2 = rho * (co * n_re - si * n_im) + uc - rho_s * (co_s * oc - si_s * os_)
+        n_im2 = rho * (si * n_re + co * n_im) + us - rho_s * (si_s * oc + co_s * os_)
+        return n_re2, n_im2, rho * e + v_t - rho_s * v_old
 
     @torch.no_grad()
     def step(self, state, feat_t, v_t):

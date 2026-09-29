@@ -845,6 +845,14 @@ class CausalQC:
                              start=n - 1)[0]
         return np.where(codes == 0, self.x[-1], 0.0).astype(np.float32), codes
 
+    def latest(self):
+        """Записанные значения и маска наличия последнего часа, до отбраковки.
+
+        Returns:
+            Пара копий: значения float32 (3,) и маска наличия uint8 (3,).
+        """
+        return self.x[-1].copy(), self.present[-1].copy()
+
 
 def code_fractions(codes, mask=None):
     """Доли часов с каждым кодом по каналам и доля валидных, если дана маска."""

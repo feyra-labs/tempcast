@@ -12,17 +12,16 @@
 //!   obs <unix_seconds> <T> <P> <RH>   значения: число, "-" (нет данных) или "nan";
 //!   forecast                          прогноз после последнего часа → строка JSON;
 //!   status                            состояние рантайма → строка JSON.
-//! Час наблюдения должен лежать на целом часе UTC. Пропущенные часы заполняются пустыми
-//! шагами (пропуск датчика - пустой шаг, а не пропуск шага), в том числе простой между
-//! перезапусками: момент последнего шага восстанавливается по часу года из состояния.
-//! После каждого obs
-//! состояние атомарно пишется в --state-dir (два чередующихся файла).
+//! Час наблюдения должен лежать на целом часе UTC и быть позже последнего шага.
+//! Пропущенные часы заполняются пустыми шагами, в том числе простой между перезапусками:
+//! абсолютный час последнего шага хранится в заголовке состояния. Простой не короче окна
+//! означает холодный старт. После каждого obs состояние атомарно пишется в --state-dir,
+//! в два чередующихся файла.
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use mayak_rt::calendar::{doy_hour, future_calendar, hour_of_year, last_hour_with_hoy};
 use mayak_rt::memory::{peak_rss_bytes, rss_bytes};
 use mayak_rt::state::Snapshot;
 use mayak_rt::store::{newer_first, StateStore};
@@ -110,41 +109,45 @@ fn parse_obs(s: &str) -> Result<Option<f64>> {
     }
 }
 
-fn forecast_json(rt: &mut Runtime, last_hour: i64) -> serde_json::Value {
-    let (h, nq) = (rt.horizon(), rt.n_quantiles());
-    let (mut doy, mut hour) = (vec![0.0; h], vec![0.0; h]);
-    future_calendar(last_hour, h, &mut doy, &mut hour);
+fn forecast_json(rt: &mut Runtime) -> serde_json::Value {
+    let nq = rt.n_quantiles();
+    let last = rt.last_hour();
     let theta = rt.theta();
-    let f = rt.safe_forecast(&doy, &hour);
+    let f = rt.safe_forecast();
     let q: Vec<&[f32]> = f.q.chunks(nq).collect();
-    json!({"after_unix_hour": last_hour, "fallback": f.fallback, "theta": theta, "mu": f.mu, "q": q})
+    json!({"after_unix_hour": last, "fallback": f.fallback, "theta": theta, "mu": f.mu, "q": q})
 }
 
-fn status_json(rt: &Runtime, last_hour: Option<i64>) -> serde_json::Value {
-    json!({"filled": rt.filled(), "hours_in_day": rt.hours_in_day(), "theta": rt.theta(),
+fn status_json(rt: &Runtime) -> serde_json::Value {
+    json!({"filled": rt.filled(), "theta": rt.theta(),
            "conformal": rt.conformal_applied(),
            "aci_updates": rt.aci_updates(), "aci_misses": rt.aci_misses(),
-           "calendar_breaks": rt.calendar_breaks(), "fallbacks": rt.fallbacks,
-           "state_bytes": rt.state_nbytes(), "last_unix_hour": last_hour,
+           "idle_hours": rt.idle_hours(), "fallbacks": rt.fallbacks,
+           "state_bytes": rt.state_nbytes(), "last_unix_hour": rt.last_hour(),
+           "memory_bytes": rt.memory_bytes(),
            "rss_bytes": rss_bytes(), "peak_rss_bytes": peak_rss_bytes()})
 }
 
 /// Файлы состояния, свежий первым: сначала по содержимому (Snapshot::parse), затем по
 /// времени изменения для тех, что не разбираются.
-fn ordered_states(store: &StateStore, dims: mayak_rt::manifest::Dims) -> Vec<(PathBuf, Vec<u8>)> {
+fn ordered_states(store: &StateStore, rt: &Runtime) -> Vec<(PathBuf, Vec<u8>)> {
+    let (dims, bounds) = (&rt.manifest.dims, rt.manifest.phys_bounds());
     let mut v: Vec<(PathBuf, Vec<u8>)> = store
         .candidates()
         .into_iter()
         .filter_map(|f| std::fs::read(&f).ok().map(|b| (f, b)))
         .collect();
-    v.sort_by(
-        |a, b| match (Snapshot::parse(&a.1, &dims), Snapshot::parse(&b.1, &dims)) {
+    v.sort_by(|a, b| {
+        match (
+            Snapshot::parse(&a.1, dims, &bounds),
+            Snapshot::parse(&b.1, dims, &bounds),
+        ) {
             (Ok(x), Ok(y)) => newer_first(&x, &y),
             (Ok(_), Err(_)) => std::cmp::Ordering::Less,
             (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
             _ => std::cmp::Ordering::Equal,
-        },
-    );
+        }
+    });
     v
 }
 
@@ -153,7 +156,7 @@ fn cmd_run(a: &Args) -> Result<()> {
     let mut store = StateStore::new(a.get("state-dir").unwrap_or("runtime"))?;
     let mut buf = Vec::new();
     let mut restored = false;
-    for (f, raw) in ordered_states(&store, rt.manifest.dims.clone()) {
+    for (f, raw) in ordered_states(&store, &rt) {
         match rt.load_state(&raw) {
             Ok(()) => {
                 eprintln!("mayak-rt: состояние восстановлено из {} ({} Б)", f.display(), raw.len());
@@ -166,8 +169,6 @@ fn cmd_run(a: &Args) -> Result<()> {
     if !restored {
         eprintln!("mayak-rt: чистый старт (история пуста)");
     }
-    // Час последнего наблюдения: после перезапуска неизвестен до первой строки obs.
-    let mut last: Option<i64> = None;
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -179,47 +180,16 @@ fn cmd_run(a: &Args) -> Result<()> {
                 if sec.rem_euclid(3600) != 0 {
                     return Err(Error::new(format!("момент {sec} не на целом часе UTC")));
                 }
-                let hour = sec.div_euclid(3600);
-                if last.is_none() && rt.filled() > 0 {
-                    last = store
-                        .load_last_hour()
-                        .filter(|l| *l < hour && Some(hour_of_year(doy_hour(*l).0)) == rt.last_hoy());
-                }
-                if last.is_none() && rt.filled() > 0 {
-                    last = last_hour_with_hoy(rt.last_hoy().unwrap_or(0), hour - 1)
-                        .filter(|l| hour - l < rt.stream_window() as i64);
-                    if last.is_none() {
-                        eprintln!(
-                            "mayak-rt: простой длиннее окна ({} ч) - чистый старт",
-                            rt.stream_window()
-                        );
-                        rt.reset();
-                    }
-                }
-                if let Some(l) = last {
-                    if hour <= l {
-                        return Err(Error::new(format!("час {hour} не позже последнего {l}")));
-                    }
-                    for gap in (l + 1)..hour {
-                        let (d, h) = doy_hour(gap);
-                        rt.step([None, None, None], d, h)?;
-                    }
-                }
-                let (d, h) = doy_hour(hour);
-                rt.step([parse_obs(t)?, parse_obs(p)?, parse_obs(rh)?], d, h)?;
-                last = Some(hour);
+                rt.step([parse_obs(t)?, parse_obs(p)?, parse_obs(rh)?], sec.div_euclid(3600))?;
                 rt.serialize(&mut buf);
                 store.save(&buf)?;
-                store.save_last_hour(hour)?;
                 Ok(json!({"ok": true}))
             })(),
-            ["forecast"] => match last {
-                Some(l) => Ok(forecast_json(&mut rt, l)),
-                None => Err(Error::new(
-                    "нет ни одного наблюдения в этом запуске: календарь горизонта не определён",
-                )),
+            ["forecast"] => match rt.last_hour() {
+                Some(_) => Ok(forecast_json(&mut rt)),
+                None => Err(Error::new("нет ни одного наблюдения: календарь горизонта не определён")),
             },
-            ["status"] => Ok(status_json(&rt, last)),
+            ["status"] => Ok(status_json(&rt)),
             [] => continue,
             _ => Err(Error::new(format!("неизвестная команда: {line}"))),
         };
@@ -267,23 +237,20 @@ fn cmd_bench(a: &Args) -> Result<()> {
     let every: usize = a.num("forecast-every", Some(24))?;
     let warmup: usize = a.num("warmup", Some(48))?;
     let (h, nq) = (rt.horizon(), rt.n_quantiles());
-    let (mut doy, mut hour) = (vec![0.0; h], vec![0.0; h]);
     let (mut t_step, mut t_fc) = (Vec::with_capacity(n), Vec::new());
     let mut dump: Vec<f32> = Vec::new();
     let obs = |v: f32| if v.is_nan() { None } else { Some(v as f64) };
     for k in 0..n {
-        let (d, hr) = doy_hour(start + k as i64);
         let row = &series[k * 3..k * 3 + 3];
         let t = Instant::now();
-        rt.step([obs(row[0]), obs(row[1]), obs(row[2])], d, hr)?;
+        rt.step([obs(row[0]), obs(row[1]), obs(row[2])], start + k as i64)?;
         let dt = t.elapsed().as_secs_f64() * 1e6;
         if k >= warmup {
             t_step.push(dt);
         }
         if every > 0 && (k + 1) % every == 0 {
-            future_calendar(start + k as i64, h, &mut doy, &mut hour);
             let t = Instant::now();
-            let f = rt.forecast(&doy, &hour)?;
+            let f = rt.forecast()?;
             let dt = t.elapsed().as_secs_f64() * 1e6;
             if k >= warmup {
                 t_fc.push(dt);
@@ -321,6 +288,7 @@ fn cmd_bench(a: &Args) -> Result<()> {
         "step": stats_us(t_step), "forecast": stats_us(t_fc),
         "startup_ms": startup_ms, "serialize_us": ser_us, "restore_ms": restore_ms,
         "state_bytes": state.len(), "encoder_buffer_bytes": rt.encoder_buffer_bytes(),
+        "memory_bytes": rt.memory_bytes(),
         "rss_before_bytes": rss0, "peak_rss_bytes": peak_rss_bytes(),
         "binary_bytes": std::env::current_exe().ok().and_then(|p| file_size(&p)),
         "model_bytes": model_bytes, "fallbacks": rt.fallbacks,
@@ -337,7 +305,9 @@ fn cmd_info(a: &Args) -> Result<()> {
     println!(
         "{}",
         json!({"dims": {"horizon": m.dims.horizon, "n_quantiles": m.dims.n_quantiles,
-        "n_modes": m.dims.n_modes, "stream_window": m.dims.stream_window, "enc_buf_len": m.dims.enc_buf_len},
+        "n_modes": m.dims.n_modes, "stream_window": m.dims.stream_window,
+        "stream_edge": m.dims.stream_edge, "stream_tail": m.dims.stream_tail,
+        "enc_buf_len": m.dims.enc_buf_len},
         "state_bytes": m.state.nbytes, "conformal": m.calibration.conformal.is_some(),
         "aci": m.calibration.aci.is_some(),
         "int8": m.graphs.values().all(|g| g.int8.is_some())})

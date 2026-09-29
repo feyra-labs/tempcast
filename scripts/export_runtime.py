@@ -1,4 +1,4 @@
-"""Экспорт модели для компилируемого рантайма: четыре графа ONNX + манифест.
+"""Экспорт модели для компилируемого рантайма: графы ONNX и манифест.
 
     python scripts/export_runtime.py --ckpt runs/mayak/stageB/best.ckpt \\
         --conformal runs/conformal_int8.npy --aci --int8 --out runtime/model
@@ -14,7 +14,7 @@ import argparse
 
 
 def main():
-    ap = argparse.ArgumentParser(description="экспорт четырёх графов ONNX для mayak-rt")
+    ap = argparse.ArgumentParser(description="экспорт графов ONNX для mayak-rt")
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out", default="runtime/model")
     ap.add_argument("--conformal", default=None,
@@ -42,8 +42,8 @@ def main():
     print("Экспортировано:", args.out)
     cal = man["calibration"]
     print(f"  конформная таблица: {cal['precision'] if cal['conformal'] else 'нет'}")
-    for name, err in man["export_check_max_abs"].items():
-        print(f"  {name:9s} max|ONNX − PyTorch| = {err:.2e}")
+    for name, err in man["export_check_max_rel"].items():
+        print(f"  {name:9s} расхождение ONNX и PyTorch в единицах масштаба выхода {err:.2e}")
     print(f"  состояние на диске: {man['state']['nbytes']} Б (v{man['state']['version']})")
 
 

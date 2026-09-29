@@ -381,10 +381,13 @@ def test_runtime_follows_model_config(flag):
                                    .astype(np.float32))
     with torch.no_grad():
         ref = m(b)
+    from mayak.timeaxis import to_utc_hour, window_calendar
+    last = int(to_utc_hour(np.datetime64("2021-04-11T00", "s"))) + L_MAX - 1
+    doy, _ = window_calendar(0, np.array([last - L_MAX + 1]))
+    assert doy[0] == b["doy_hist"][0, 0].item()
     st = StreamingMayak(m, float(b["lat"]), float(b["lon"]), float(b["elev"]))
-    st.warm_start(b["x_hist"][0].numpy(), b["mask_hist"][0].numpy(),
-                  b["doy_hist"][0].numpy(), b["hour_hist"][0].numpy())
-    q, mu = st.forecast(b["doy_fut"][0].numpy(), b["hour_fut"][0].numpy())
+    st.warm_start(b["x_hist"][0].numpy(), b["mask_hist"][0].numpy(), last)
+    q, mu = st.forecast()
     assert q.shape == (H, len(QUANTILES))
     np.testing.assert_allclose(q, ref["q"][0].numpy(), atol=1e-4)
     raw = st.serialize()
@@ -394,15 +397,20 @@ def test_runtime_follows_model_config(flag):
 
 
 def test_runtime_state_size_follows_config_and_mismatch_fails():
+    """Состояние - только сырое окно: размер зависит от длины окна, а не от размеров
+    модели."""
     from mayak.runtime.streaming import StreamingMayak
-    small = _model(ModelConfig(mode_groups=(ModeGroup("R", (3, 24)),), passport_dim=4))
+    other = _model(ModelConfig(mode_groups=(ModeGroup("R", (3, 24)),), passport_dim=4))
     big = _model()
-    s_small = StreamingMayak(small, 50.0, 5.0, 0.0).serialize()
+    short = _model(ModelConfig(max_history=336))
+    s_other = StreamingMayak(other, 50.0, 5.0, 0.0).serialize()
     s_big = StreamingMayak(big, 50.0, 5.0, 0.0).serialize()
-    assert len(s_big) - len(s_small) == 3 * 4 * (24 - 2) + 4 * (16 - 4)
-    assert len(s_big) == StreamingMayak(big, 50.0, 5.0, 0.0).state_nbytes
+    s_short = StreamingMayak(short, 50.0, 5.0, 0.0).serialize()
+    assert len(s_big) == len(s_other) == StreamingMayak(big, 50.0, 5.0, 0.0).state_nbytes
+    W = short.cfg.stream_window
+    assert W == 336 and len(s_short) == 32 + 4 * W + 2 * ((3 * W + 7) // 8)
     with pytest.raises(ValueError, match="конфигу модели"):
-        StreamingMayak(big, 50.0, 5.0, 0.0).load_state(s_small)
+        StreamingMayak(big, 50.0, 5.0, 0.0).load_state(s_short)
 
 
 def test_seeds_resolve_to_base_and_override_separately():

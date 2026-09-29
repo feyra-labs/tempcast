@@ -1,235 +1,345 @@
 """Потоковый рантайм МАЯК для устройства.
 
-Все размеры (число мод, размер паспорта, число суток сводок, длина окна) берутся из
-конфига модели (model.cfg), а не из глобальных констант: рантайм работает с любой
-конфигурацией и любой абляцией, с которой обучена модель.
+Прогноз потока равен пакетному прогнозу по последним часам истории модели при любом
+моменте выпуска. Пакетное окно истории делится на две части.
 
-Стоимость часа. step не пересчитывает энкодер по окну: каналы часа
-считаются по хвосту из CHANNEL_MAX_LAG + 1 часов, энкодер делает один потактовый шаг
-по кольцевым буферам блоков (SynopticEncoder.step), моды - один шаг O(M). Ни одна
-операция шага не зависит от длины рецептивного поля.
+* Хвост - поздние часы окна. Признаки энкодера для них не зависят от того, где окно
+  начинается, и совпадают у пакета и потока. Поток держит их вклад в моды скользящей
+  суммой: на каждом часе вклад нового часа добавляется, вклад часа, вышедшего из
+  хвоста, вычитается. Раз в сутки сумма пересчитывается точно по кольцу вкладов, чтобы
+  ошибка округления от вычитания не копилась.
+* Край - ранние часы окна. У пакета энкодер видит перед ними нули, а каналы с лагом не
+  знают часов до окна, поэтому их признаки зависят от момента выпуска. Вклад края
+  пересчитывается при каждом выпуске пакетным проходом по часам края.
 
-Состояние делится на две части.
+Паспорт тоже считается при выпуске: по кольцу строк суточного накопителя за всю
+историю, сутки заканчиваются в момент выпуска.
 
-* Персистентное (serialize / load_state): заголовок, моды
-  (n_re, n_im, e), паспорт z, суточные сводки и их маска, сырое окно наблюдений
-  (stream_window часов, фиксированная точка uint16 на канал) и его маска, курсор
-  (сколько часов окна заполнено, сколько часов накоплено в текущих сутках, час года
-  первой и последней позиции окна) и θ адаптивной калибровки (float32 в заголовке).
-* Эфемерное: кольцевые буферы энкодера, календарь окна, накопители текущих суток,
-  последний выпущенный прогноз для обратной связи калибровки, кольцо сырых часов
-  причинного QC. На диск не пишется; load_state восстанавливает его одним пакетным
-  проходом энкодера по сохранённому окну (цена платится один раз при старте). Кольцо
-  QC после загрузки заполняется значениями окна, уже прошедшими QC: отбракованные
-  часы в нём становятся пропусками, а часы старше окна в нём отсутствуют.
+Шаг часа стоит один потактовый шаг энкодера и сумма по модам; выпуск - проход энкодера
+по краю окна, суточные сводки и паспорт.
 
-QC часа. Каждый час проходит причинный QC прибора: коды нового часа считаются по
-кольцу из прошлых сырых часов той же функцией, что у истории в обучении и оценке.
-Решение о часе принимается один раз, в момент его прихода.
+Персистентное состояние - только сырое окно и заголовок. В заголовке абсолютный час
+последнего шага, число часов окна после холодного старта, множитель адаптивной
+калибровки и координаты точки, для которой состояние записано. В окне для каждого
+часа записанные прибором значения до отбраковки, маска наличия и маска годности после
+причинного контроля качества. Температура и влажность занимают по байту со знаком,
+давление - два байта в десятых гектопаскаля, маски упакованы по битам. Моды, кольца,
+буфер энкодера и кольцо контроля качества восстанавливаются из окна одним пакетным
+проходом при загрузке.
 
-Калибровка интервалов. Выпуск = квантили модели → сплит-конформная таблица →
-адаптивный множитель e^θ (mayak.metrics: та же реализация, что в оценке). θ
-подстраивается онлайн (ACIParams), если рантайм создан с
-aci: каждый валидный час T сверяется с последним выпущенным прогнозом на том лиде,
-который приходится на этот час, - прибор учится на тех интервалах, которые он
-действительно выдал. Нет прогноза, нет валидного T или лид уже проверен - нет обратной
-связи, θ не меняется: длинная серия пропусков не сдвигает и не разгоняет θ. Стоимость
-обратной связи - O(1) на час. θ относится к прибору, а не к истории: reset (холодный
-старт) его не трогает, обнуляет только reset_calibration.
+Холодный старт - это окно из пустых часов, как у пакета при короткой истории. Простой
+заполняется пустыми часами, простой не короче окна опустошает окно. Множитель
+калибровки при этом сохраняется: он относится к прибору, а не к истории.
+
+Калибровка интервалов: квантили модели, затем конформная таблица, затем адаптивный
+множитель. Множитель подстраивается онлайн, если рантайм создан с параметрами
+адаптивной калибровки: каждый валидный час температуры сверяется с последним
+выпущенным прогнозом на том лиде, который приходится на этот час.
 """
 import logging
 
 import numpy as np
-import torch
 
-from mayak.astro import astro_features
 from mayak.config import CHANNEL_MAX_LAG
 from mayak.data.qc import PHYS, CausalQC, qc_window
-from mayak.data.recording import record_values
+from mayak.data.recording import RECORD_SCALE, record_values
 from mayak.leakage import load_conformal, precision_mismatch
 from mayak.metrics import (ACIParams, aci_score, apply_adaptive, apply_conformal,
                            check_median_free)
+from mayak.timeaxis import window_calendar
 
 log = logging.getLogger(__name__)
 
 STATE_MAGIC = b"MYK"
-STATE_VERSION = 3
-_HEADER_V2 = [("magic", "S3"), ("version", "u1"), ("filled", "<u2"),
-              ("hours_in_day", "u1"), ("reserved", "u1"),
-              ("hoy_first", "<u2"), ("hoy_last", "<u2")]
-STATE_HEADER = np.dtype(_HEADER_V2 + [("aci_theta", "<f4")])
-STATE_HEADERS = {2: np.dtype(_HEADER_V2), STATE_VERSION: STATE_HEADER}
-YEAR_HOURS = (365 * 24, 366 * 24)
+STATE_VERSION = 4
+STATE_HEADER = np.dtype([("magic", "S3"), ("version", "u1"), ("filled", "<u2"),
+                         ("reserved", "<u2"), ("last_hour", "<i8"), ("aci_theta", "<f4"),
+                         ("lat", "<f4"), ("lon", "<f4"), ("elev", "<f4")])
+NO_HOUR = int(np.iinfo(np.int64).min)
+RESYNC_HOURS = 24
+CTX = CHANNEL_MAX_LAG + 1
 
 RAW_CHANNELS = ("T", "P", "RH")
-RAW_LO = np.array([PHYS[c][0] for c in RAW_CHANNELS], np.float64)
-RAW_HI = np.array([PHYS[c][1] for c in RAW_CHANNELS], np.float64)
-RAW_STEP = (RAW_HI - RAW_LO) / 65534.0
+STORE_DTYPES = (np.dtype("i1"), np.dtype("<u2"), np.dtype("i1"))
+STORE_SCALE = np.asarray(RECORD_SCALE, np.float64)
+STORE_LO = np.array([-128.0, 0.0, -128.0])
+STORE_HI = np.array([127.0, 65535.0, 127.0])
+PHYS_LO = np.array([PHYS[c][0] for c in RAW_CHANNELS], np.float32)
+PHYS_HI = np.array([PHYS[c][1] for c in RAW_CHANNELS], np.float32)
 
 
-def encode_raw(x, m):
-    q = np.rint((np.clip(np.asarray(x, np.float64), RAW_LO, RAW_HI) - RAW_LO) / RAW_STEP)
-    return np.where(np.asarray(m) > 0, q, 0).astype("<u2")
+def to_store(x):
+    """Значения на сетке хранения окна.
+
+    Сетка та же, что у записи прибора; значения за пределами типов хранения
+    обрезаются. Значение вне физического диапазона после обрезки остаётся вне него,
+    поэтому решения контроля качества по сохранённому окну не меняются.
+
+    Args:
+        x: записанные значения, форма (..., 3).
+
+    Returns:
+        Массив float32 той же формы.
+    """
+    q = np.clip(np.rint(np.asarray(x, np.float64) * STORE_SCALE), STORE_LO, STORE_HI)
+    return (q / STORE_SCALE).astype(np.float32)
 
 
-def decode_raw(q, m):
-    return ((RAW_LO + q.astype(np.float64) * RAW_STEP) * (np.asarray(m) > 0)).astype(np.float32)
+def mask_bytes(n_hours):
+    """Размер одной битовой маски окна в байтах.
+
+    Args:
+        n_hours: длина окна, часы.
+
+    Returns:
+        Число байт.
+    """
+    return (3 * n_hours + 7) // 8
 
 
-def hour_of_year(doy):
-    """doy по конвенции mayak.timeaxis (день года с нуля, с долей суток) → час года."""
-    return int(round(float(doy) * 24.0))
+def state_nbytes(cfg):
+    """Размер сериализованного состояния для конфига модели.
+
+    Args:
+        cfg: конфиг модели.
+
+    Returns:
+        Число байт.
+    """
+    W = cfg.stream_window
+    return STATE_HEADER.itemsize + W * sum(d.itemsize for d in STORE_DTYPES) + 2 * mask_bytes(W)
+
+
+def encode_window(raw, present, valid):
+    """Сырое окно в байты состояния.
+
+    Args:
+        raw: значения на сетке хранения, форма (W, 3), от старых часов к новым.
+        present: маска наличия, форма (W, 3).
+        valid: маска годности, форма (W, 3).
+
+    Returns:
+        Байты окна.
+    """
+    p = np.asarray(present) > 0
+    q = np.where(p, np.rint(np.asarray(raw, np.float64) * STORE_SCALE), 0.0)
+    parts = [q[:, c].astype(STORE_DTYPES[c]).tobytes() for c in range(3)]
+    for mk in (p, np.asarray(valid) > 0):
+        parts.append(np.packbits(mk.ravel(), bitorder="little").tobytes())
+    return b"".join(parts)
+
+
+def decode_window(buf, n_hours):
+    """Байты окна в значения и маски.
+
+    Args:
+        buf: байты окна.
+        n_hours: длина окна, часы.
+
+    Returns:
+        Тройка: значения float32 (W, 3) и маски наличия и годности uint8 (W, 3).
+    """
+    off, cols = 0, []
+    for c in range(3):
+        d = STORE_DTYPES[c]
+        q = np.frombuffer(buf, d, count=n_hours, offset=off).astype(np.float64)
+        cols.append((q / STORE_SCALE[c]).astype(np.float32))
+        off += n_hours * d.itemsize
+    masks = []
+    nb = mask_bytes(n_hours)
+    for _ in range(2):
+        bits = np.unpackbits(np.frombuffer(buf, np.uint8, count=nb, offset=off),
+                             bitorder="little")[:3 * n_hours]
+        masks.append(bits.reshape(n_hours, 3).astype(np.uint8))
+        off += nb
+    return np.stack(cols, axis=-1), masks[0], masks[1]
 
 
 class StreamingMayak:
-    def __init__(self, model, lat, lon, elev, conformal=None, aci=None):
-        """aci - ``ACIParams`` (или True - параметры по умолчанию) включает онлайн-подстройку
-        θ; None - θ фиксировано (по умолчанию 0, либо из загруженного состояния)."""
-        self.m = model.eval()
-        cfg = model.cfg
-        self.window = cfg.stream_window
-        self.n_modes, self.dz, self.n_days = cfg.n_modes, cfg.passport_dim, cfg.history_days
-        self.ctx = CHANNEL_MAX_LAG + 1
-        self.lat, self.lon, self.elev = float(lat), float(lon), float(elev)
-        self._lat_t = torch.tensor([[self.lat]])
-        self._lon_t = torch.tensor([[self.lon]])
+    """Потоковый рантайм на PyTorch.
 
+    Args:
+        model: модель в режиме eval.
+        lat: широта точки.
+        lon: долгота точки.
+        elev: высота точки, м.
+        conformal: таблица поправок, путь к ней с записью о подгонке рядом или None.
+        aci: параметры адаптивной калибровки, True для параметров по умолчанию или None,
+            если множитель калибровки не подстраивается.
+
+    Attributes:
+        last_hour: абсолютный час UTC последнего шага или None до первого шага.
+        filled: сколько часов окна прошло после холодного старта, не больше длины окна.
+        theta: множитель адаптивной калибровки в логарифме.
+        idle_hours: сколько пустых часов подставлено за простой в этом процессе.
+        loaded_site: координаты и высота из загруженного состояния или None.
+    """
+
+    def __init__(self, model, lat, lon, elev, conformal=None, aci=None):
+        from mayak.runtime.graphs import TorchBackend
+        self.m = model.eval()
+        self._setup(TorchBackend(model), model.cfg, lat, lon, elev, conformal, aci)
+
+    def _setup(self, backend, cfg, lat, lon, elev, conformal, aci):
+        self.b, self.cfg = backend, cfg
+        self.window, self.history = cfg.stream_window, cfg.max_history
+        self.edge, self.tail = cfg.stream_edge, cfg.stream_tail
+        self.horizon, self.n_modes = cfg.horizon, cfg.n_modes
+        self.lat, self.lon, self.elev = float(lat), float(lon), float(elev)
+        f = lambda v: np.array([[v]], np.float32)
+        self._lat, self._lon = f(lat), f(lon)
+        self.loc, *coefs, self.z0 = backend.run("init", self._lat, self._lon, f(elev))
+        self.coefs = coefs
         self.conformal = self._conformal(conformal)
         self.aci = ACIParams() if aci is True else aci
-        self.reset_calibration()
         self.qc = CausalQC(elev=self.elev)
-
-        with torch.no_grad():
-            self.loc = self.m.loc(torch.tensor([lat]), torch.tensor([lon]),
-                                  torch.tensor([elev]))
-            self.base_coefs = self.m.field.coefficients(self.loc)
-            tau, omega, kappa = self.m.readout.constants()
-        self.tau, self.omega, self.kappa = tau, omega, kappa
+        self.loaded_site = None
+        self.idle_hours = 0
+        self.reset_calibration()
         self.reset()
 
     def reset_calibration(self, theta=0.0):
-        """Сброс адаптивной калибровки прибора (θ и счётчики обратной связи)."""
+        """Сброс адаптивной калибровки прибора: множитель и счётчики обратной связи."""
         self.theta = float(np.float32(theta)) if self.aci is None else self.aci.clip(theta)
         self.aci_updates = 0
         self.aci_misses = 0
         self._pending = None
 
-    def reset(self):
-        """Холодный старт: история пуста (L = 0). θ калибровки сохраняется."""
+    def reset(self, last_hour=None):
+        """Холодный старт: окно состоит из пустых часов. Множитель калибровки сохраняется.
+
+        Args:
+            last_hour: час, которым заканчивается пустое окно. None - момент ещё не
+                известен, окно строится при первом шаге.
+        """
+        W, M = self.window, self.n_modes
         self._pending = None
         self.qc.reset()
-        M, W = self.n_modes, self.window
-        self.n_re = torch.zeros(1, M)
-        self.n_im = torch.zeros(1, M)
-        self.e = torch.zeros(1, M)
-        self.raw_x = np.zeros((W, 3), np.float32)
-        self.raw_m = np.zeros((W, 3), np.float32)
-        self.raw_doy = np.zeros(W, np.float32)
-        self.raw_hour = np.zeros(W, np.float32)
-        self.head = 0
+        self.raw = np.zeros((W, 3), np.float32)
+        self.present = np.zeros((W, 3), np.uint8)
+        self.valid = np.zeros((W, 3), np.uint8)
         self.filled = 0
-        self.enc = self.m.encoder.init_state(1)
-        self.day_summ = torch.zeros(1, self.n_days, 6)
-        self.day_mask = torch.zeros(1, self.n_days)
-        self._reset_day()
-        self._last_hoy = None
-        self.calendar_breaks = 0
-        self.z = self._recompute_passport()
-
-    def _reset_day(self):
-        self._day = np.zeros((4, 24), np.float32)
-        self._hours_in_day = 0
-
-    def _recompute_passport(self):
-        with torch.no_grad():
-            z, _ = self.m.passport(self.loc, self.day_summ, self.day_mask, sample=False)
-        return z
+        self.last_hour = None
+        self.modes = [np.zeros((1, M), np.float32) for _ in range(3)]
+        self.u_ring = np.zeros((self.tail, 2 * M), np.float32)
+        self.v_ring = np.zeros(self.tail, np.float32)
+        self.rows = np.zeros((self.history, 4), np.float32)
+        pads = (self.cfg.encoder_kernel - 1) * sum(self.cfg.encoder_dilations)
+        self.enc_buf = np.zeros((1, self.cfg.encoder_width, pads), np.float32)
+        if last_hour is not None:
+            self.last_hour = int(last_hour)
+            self._rebuild(seed_qc=False)
 
     @property
-    def encoder_state_nbytes(self):
-        """Размер кольцевых буферов энкодера в памяти (на диск не пишутся), байт."""
-        return self.enc.nbytes
+    def memory_nbytes(self):
+        """Размер колец и буфера энкодера в памяти, байт. На диск они не пишутся."""
+        return int(self.u_ring.nbytes + self.v_ring.nbytes + self.rows.nbytes
+                   + self.enc_buf.nbytes)
 
-    def _ordered(self, n=None):
-        """Индексы кольца для последних n часов окна в хронологическом порядке."""
-        n = self.window if n is None else n
-        return (self.head - n + np.arange(n)) % self.window
+    def _hours(self, n):
+        """Абсолютные часы последних n часов окна, от старых к новым."""
+        return self.last_hour - n + 1 + np.arange(n, dtype=np.int64)
 
-    def _channels(self, idx):
-        """Каналы энкодера по позициям окна idx → (ch, aT, vt, dP24, vp24)."""
-        x = torch.from_numpy(self.raw_x[idx])[None]
-        mk = torch.from_numpy(self.raw_m[idx])[None]
-        doy = torch.from_numpy(self.raw_doy[idx])[None]
-        hour = torch.from_numpy(self.raw_hour[idx])[None]
-        astro_h = astro_features(doy, hour, self._lat_t, self._lon_t)
-        mu0, sg0, df0 = self.m.field.evaluate(self.base_coefs, astro_h)
-        ch, aT, vt = self.m.build_channels(x, mk, astro_h, mu0, sg0, df0)
-        return ch, aT, vt, self.m.channel(ch, "dP24"), self.m.lag_valid(mk[..., 1], 24)
+    def _window_arrays(self, hours):
+        """Значения, маски годности и календарь часов окна."""
+        pos = hours % self.window
+        m = self.valid[pos].astype(np.float32)
+        x = np.where(m > 0, self.raw[pos], 0.0).astype(np.float32)
+        doy, hour = window_calendar(0, hours)
+        return x, m, doy, hour
 
-    def _check_calendar(self, doy):
-        hoy = hour_of_year(doy)
-        prev = self._last_hoy
-        if prev is not None and hoy != prev + 1 and not (hoy == 0 and prev + 1 in YEAR_HOURS):
-            self.calendar_breaks += 1
-            log.warning("календарь потока не непрерывен: час года %d после %d. Рантайм "
-                        "ждёт ровно один вызов step на час; пропуск датчика - None, "
-                        "а не пропуск шага", hoy, prev)
-        self._last_hoy = hoy
+    def _rebuild(self, seed_qc):
+        """Всё модельное состояние из сырого окна одним пакетным проходом."""
+        W = self.window
+        hours = self._hours(W)
+        x, m, doy, hour = self._window_arrays(hours)
+        enc, u, v, rows, n_re, n_im, e = self.b.run(
+            "window", x[None], m[None], doy[None], hour[None], self._lat, self._lon, *self.coefs)
+        self.enc_buf, self.modes = enc, [n_re, n_im, e]
+        if self.tail:
+            slot = hours[W - self.tail:] % self.tail
+            self.u_ring[slot], self.v_ring[slot] = u[0], v[0]
+        self.rows[hours[W - self.history:] % self.history] = rows[0]
+        if seed_qc:
+            pos = hours[-self.qc.size:] % W
+            self.qc.seed(self.raw[pos], self.present[pos])
 
-    @torch.no_grad()
-    def _ingest(self, x, m, doy, hour):
-        """Один час уже прошедших QC наблюдений: окно → каналы → энкодер → моды → сутки."""
-        self._check_calendar(doy)
-        j = self.head
-        self.raw_m[j] = m
-        self.raw_x[j] = np.where(m > 0, x, 0.0)
-        self.raw_doy[j], self.raw_hour[j] = doy, hour
-        self.head = (j + 1) % self.window
-        self.filled = min(self.window, self.filled + 1)
-
-        ch, aT, vt, dp24, vp24 = self._channels(self._ordered(self.ctx))
-        feat = self.m.encoder.step(ch[..., -1], self.enc)
-        self.n_re, self.n_im, self.e = self.m.readout.step(
-            (self.n_re, self.n_im, self.e), feat, vt[:, -1])
-        self._accumulate_day(aT[0, -1], dp24[0, -1], vt[0, -1], vp24[0, -1])
-
-    def _accumulate_day(self, aT, dp24, vt, vp24):
-        self._day[:, self._hours_in_day] = (float(aT), float(dp24), float(vt), float(vp24))
-        self._hours_in_day += 1
-        if self._hours_in_day < 24:
-            return
-        d = torch.from_numpy(self._day)
-        summ, has = self.m.daily_summaries(d[0:1], d[1:2], d[2:3], d[3:4])
-        self.day_summ = torch.cat([self.day_summ[:, 1:], summ], dim=1)
-        self.day_mask = torch.cat([self.day_mask[:, 1:], has], dim=1)
-        self.z = self._recompute_passport()
-        self._reset_day()
-
-    def step(self, T, P, RH, doy, hour):
+    def step(self, T, P, RH, hour):
         """Новый час наблюдений.
+
+        Пропущенные часы между прошлым шагом и этим заполняются пустыми. Простой не
+        короче окна - холодный старт.
 
         Args:
             T: температура; None или NaN - значения нет.
             P: давление; None или NaN - значения нет.
             RH: влажность; None или NaN - значения нет.
-            doy: день года часа с долей суток.
-            hour: час UTC.
-        """
-        xj, codes = self.qc.push((T, P, RH))
-        mj = (codes == 0).astype(np.float32)
-        if self.aci is not None and mj[0] > 0:
-            self._aci_feedback(float(xj[0]), doy)
-        self._ingest(xj, mj, doy, hour)
+            hour: абсолютный час UTC, целое число часов от эпохи.
 
-    def _aci_feedback(self, y, doy):
-        """Сверка валидного T часа с последним выпущенным прогнозом на его лиде → θ."""
+        Raises:
+            ValueError: час не позже последнего шага.
+        """
+        hour = int(hour)
+        if self.last_hour is None:
+            self.reset(hour - 1)
+        elif hour <= self.last_hour:
+            raise ValueError(f"час {hour} не позже последнего шага {self.last_hour}")
+        else:
+            gap = hour - self.last_hour - 1
+            if gap >= self.window:
+                log.info("простой %d ч не короче окна %d ч: холодный старт", gap, self.window)
+                self.reset(hour - 1)
+            for h in range(self.last_hour + 1, hour):
+                self._push((None, None, None), h)
+            self.idle_hours += gap
+        self._push((T, P, RH), hour)
+
+    def _push(self, values, hour):
+        xj, codes = self.qc.push(values)
+        raw, present = self.qc.latest()
+        valid = (codes == 0).astype(np.uint8)
+        if self.aci is not None and valid[0]:
+            self._aci_feedback(float(xj[0]), hour)
+        j = hour % self.window
+        self.raw[j] = np.where(present > 0, to_store(raw), 0.0)
+        self.present[j], self.valid[j] = present, valid
+        self._ingest(hour)
+
+    def _ingest(self, hour):
+        """Один час окна через граф шага: буфер энкодера, сумма мод, кольца."""
+        self.last_hour = hour
+        self.filled = min(self.window, self.filled + 1)
+        x, m, _, _ = self._window_arrays(self._hours(CTX))
+        doy, hr = window_calendar(0, np.array([hour]))
+        M = self.n_modes
+        if self.tail:
+            slot = hour % self.tail
+            u_old, v_old = self.u_ring[slot][None], np.array([[self.v_ring[slot]]], np.float32)
+        else:
+            u_old, v_old = np.zeros((1, 2 * M), np.float32), np.zeros((1, 1), np.float32)
+        enc, n_re, n_im, e, u, v, row = self.b.run(
+            "step", x[None], m[None], doy[None], hr[None], self._lat, self._lon, *self.coefs,
+            self.enc_buf, *self.modes, u_old, v_old)
+        self.enc_buf, self.modes = enc, [n_re, n_im, e]
+        if self.tail:
+            self.u_ring[slot], self.v_ring[slot] = u[0], v[0, 0]
+        self.rows[hour % self.history] = row[0]
+        if self.tail and (hour + 1) % RESYNC_HOURS == 0:
+            self.resync()
+
+    def resync(self):
+        """Точная сумма мод по кольцу вкладов хвоста вместо скользящей."""
+        slot = self._hours(self.tail) % self.tail
+        self.modes = list(self.b.run("resync", self.u_ring[slot][None], self.v_ring[slot][None]))
+
+    def _aci_feedback(self, y, hour):
+        """Сверка валидной температуры часа с последним выпущенным прогнозом."""
         p = self._pending
         if p is None:
             return
-        hit = np.flatnonzero(p["hoy"] == hour_of_year(doy))
-        if hit.size == 0 or int(hit[0]) <= p["last"]:
+        k = hour - p["first"]
+        if k < 0 or k >= len(p["q"]) or k <= p["last"]:
             return
-        k = int(hit[0])
         p["last"] = k
         score = float(aci_score(y, p["q"][k], self.aci.interval))
         self.theta, miss = self.aci.step(self.theta, score)
@@ -243,65 +353,67 @@ class StreamingMayak:
             return float("nan")
         return 1.0 - self.aci_misses / self.aci_updates
 
-    @torch.no_grad()
-    def warm_start(self, x_hist, mask_hist, doy_hist, hour_hist):
-        """Прогрев по сырой истории: то же состояние, что после L вызовов step.
+    def raw_forecast(self):
+        """Квантили модели до калибровки на часы после последнего шага.
 
-        Значения записываются так, как их пишет прибор, до QC, как при почасовом приходе.
+        Returns:
+            Массив float32 формы (H, число квантилей).
+
+        Raises:
+            ValueError: не было ни одного шага, момент выпуска не определён.
+        """
+        if self.last_hour is None:
+            raise ValueError("нет ни одного шага: момент выпуска не определён")
+        L, E = self.history, self.edge
+        hours = self._hours(L)
+        rows = self.rows[hours % L][None]
+        xe, me, de, he = self._window_arrays(hours[:E])
+        df, hf = window_calendar(0, self.last_hour + 1 + np.arange(self.horizon))
+        (q,) = self.b.run("issue", self.loc, self._lat, self._lon, *self.coefs, rows,
+                          *self.modes, xe[None], me[None], de[None], he[None], df[None],
+                          hf[None])
+        return q[0]
+
+    def forecast(self):
+        """Выпуск на часы после последнего шага.
+
+        Returns:
+            Пара: квантили float32 формы (H, число квантилей) и медиана формы (H,).
+        """
+        q = self.raw_forecast()
+        if self.conformal is not None:
+            q = apply_conformal(q, self.conformal)
+        if self.aci is not None:
+            self._pending = dict(first=self.last_hour + 1, q=np.array(q, np.float32), last=-1)
+        return apply_adaptive(q, self.theta)
+
+    def warm_start(self, x_hist, mask_hist, last_hour):
+        """Прогрев по сырой истории: то же состояние, что после шага по каждому часу.
+
+        Значения записываются так, как их пишет прибор, и проходят причинный контроль
+        качества по всей переданной истории.
 
         Args:
             x_hist: сырые значения, форма (L, 3).
             mask_hist: маска наличия, форма (L, 3).
-            doy_hist: день года каждого часа с долей суток, форма (L,).
-            hour_hist: час UTC каждого часа, форма (L,).
+            last_hour: абсолютный час UTC последнего часа истории.
         """
         self.reset()
-        present = np.asarray(mask_hist, np.float32)
-        x_hist = np.asarray(x_hist, np.float32).reshape(-1, 3)
-        present = present * np.isfinite(x_hist)
-        raw_x = np.where(present > 0, record_values(np.where(present > 0, x_hist, 0.0)),
-                         0.0).astype(np.float32)
-        mk = present
-        if len(raw_x):
-            mk, _ = qc_window(raw_x, present, elev=self.elev)
-            self.qc.seed(raw_x, present)
-        x = np.where(mk > 0, raw_x, 0.0).astype(np.float32)
-        doy = np.asarray(doy_hist, np.float32)
-        hour = np.asarray(hour_hist, np.float32)
-        L = x.shape[0]
-        if L == 0:
+        x = np.asarray(x_hist, np.float32).reshape(-1, 3)
+        present = ((np.asarray(mask_hist) > 0) & np.isfinite(x)).astype(np.uint8)
+        n = x.shape[0]
+        if n == 0:
             return
-        take = min(self.window, L)
-        self.raw_x[:take], self.raw_m[:take] = x[-take:], mk[-take:]
-        self.raw_doy[:take], self.raw_hour[:take] = doy[-take:], hour[-take:]
-        self.head, self.filled = take % self.window, take
-        self._last_hoy = hour_of_year(doy[-1])
-
-        xt, mt = torch.from_numpy(x)[None], torch.from_numpy(mk)[None]
-        astro_h = astro_features(torch.from_numpy(doy)[None], torch.from_numpy(hour)[None],
-                                 self._lat_t, self._lon_t)
-        mu0, sg0, df0 = self.m.field.evaluate(self.base_coefs, astro_h)
-        ch, aT, vt = self.m.build_channels(xt, mt, astro_h, mu0, sg0, df0)
-        dp24, vp24 = self.m.channel(ch, "dP24"), self.m.lag_valid(mt[..., 1], 24)
-
-        feats, self.enc = self.m.encoder.prefill(ch)
-        state = (self.n_re, self.n_im, self.e)
-        for k in range(L):
-            state = self.m.readout.step(state, feats[:, k], vt[:, k])
-        self.n_re, self.n_im, self.e = state
-
-        D = L // 24
-        if D:
-            summ, has = self.m.daily_summaries(aT[:, :D * 24], dp24[:, :D * 24],
-                                               vt[:, :D * 24], vp24[:, :D * 24])
-            self.day_summ = torch.cat([self.day_summ, summ], dim=1)[:, -self.n_days:]
-            self.day_mask = torch.cat([self.day_mask, has], dim=1)[:, -self.n_days:]
-        r = L - D * 24
-        if r:
-            self._day[:, :r] = torch.stack([aT[0, -r:], dp24[0, -r:], vt[0, -r:],
-                                            vp24[0, -r:]]).numpy()
-        self._hours_in_day = r
-        self.z = self._recompute_passport()
+        raw = np.where(present > 0, record_values(np.where(present > 0, x, 0.0)), 0.0)
+        valid, _ = qc_window(raw, present, elev=self.elev)
+        take = min(self.window, n)
+        self.last_hour = int(last_hour)
+        pos = self._hours(take) % self.window
+        self.raw[pos] = np.where(present > 0, to_store(raw), 0.0)[-take:]
+        self.present[pos] = present[-take:]
+        self.valid[pos] = (valid[-take:] > 0).astype(np.uint8)
+        self.filled = take
+        self._rebuild(seed_qc=True)
 
     @staticmethod
     def _conformal(conformal):
@@ -329,150 +441,90 @@ class StreamingMayak:
             return None
         return shift
 
-    @torch.no_grad()
-    def forecast(self, doy_fut, hour_fut):
-        a_re, a_im = self.m.readout.normalize(self.n_re, self.n_im, self.e)
-        doy = torch.as_tensor(doy_fut, dtype=torch.float32)[None]
-        hour = torch.as_tensor(hour_fut, dtype=torch.float32)[None]
-        astro_f = astro_features(doy, hour, self._lat_t, self._lon_t)
-        out = self.m.issue(self.loc, self.z, a_re, a_im, self.e, astro_f)
-        q = out["q"][0].numpy()
-        if self.conformal is not None:
-            q = apply_conformal(q, self.conformal)
-        if self.aci is not None:
-            hoy = np.rint(np.asarray(doy_fut, np.float64).ravel() * 24.0).astype(np.int64)
-            self._pending = dict(hoy=hoy, q=np.array(q, np.float32), last=-1)
-        return apply_adaptive(q, self.theta)
-
-    def serialize(self):
-        idx = self._ordered()
-        n = self.filled
-        hdr = np.zeros((), STATE_HEADER)
-        hdr["magic"], hdr["version"] = STATE_MAGIC, STATE_VERSION
-        hdr["filled"], hdr["hours_in_day"] = n, self._hours_in_day
-        hdr["aci_theta"] = self.theta
-        if n:
-            hdr["hoy_first"] = hour_of_year(self.raw_doy[idx[-n]]) % 65536
-            hdr["hoy_last"] = hour_of_year(self.raw_doy[idx[-1]]) % 65536
-        return b"".join([
-            hdr.tobytes(),
-            self.n_re.numpy().astype(np.float32).tobytes(),
-            self.n_im.numpy().astype(np.float32).tobytes(),
-            self.e.numpy().astype(np.float32).tobytes(),
-            self.z.numpy().astype(np.float32).tobytes(),
-            self.day_summ.numpy().astype(np.float16).tobytes(),
-            self.day_mask.numpy().astype(np.float16).tobytes(),
-            encode_raw(self.raw_x[idx], self.raw_m[idx]).tobytes(),
-            (self.raw_m[idx] > 0).astype(np.uint8).tobytes(),
-        ])
-
     @property
     def state_nbytes(self):
         """Размер сериализованного состояния для конфига этой модели, байт."""
-        M, D, W = self.n_modes, self.n_days, self.window
-        return STATE_HEADER.itemsize + 4 * (3 * M + self.dz) + 2 * (D * 6 + D) + 2 * W * 3 + W * 3
+        return state_nbytes(self.cfg)
+
+    def serialize(self):
+        """Состояние в байтах: заголовок и сырое окно от старых часов к новым."""
+        W = self.window
+        hdr = np.zeros((), STATE_HEADER)
+        hdr["magic"], hdr["version"] = STATE_MAGIC, STATE_VERSION
+        hdr["filled"] = self.filled
+        hdr["last_hour"] = NO_HOUR if self.last_hour is None else self.last_hour
+        hdr["aci_theta"] = self.theta
+        hdr["lat"], hdr["lon"], hdr["elev"] = self.lat, self.lon, self.elev
+        pos = np.arange(W) if self.last_hour is None else self._hours(W) % W
+        return hdr.tobytes() + encode_window(self.raw[pos], self.present[pos], self.valid[pos])
 
     def load_state(self, raw):
-        """Состояние с диска + восстановление эфемерной части одним проходом по окну.
+        """Состояние с диска и восстановление всего остального одним проходом по окну.
 
-        Читаются версии 3 (текущая) и 2 (до блока 13, без θ): для v2 θ = 0.
+        Args:
+            raw: байты состояния.
+
+        Raises:
+            ValueError: байты не состояние этого формата, не подходят конфигу модели или
+                повреждены. Рантайм тогда остаётся в холодном старте.
         """
         raw = bytes(raw)
         if len(raw) < len(STATE_MAGIC) + 1 or raw[:len(STATE_MAGIC)] != STATE_MAGIC:
-            raise ValueError("не состояние МАЯК формата v2+ (нет заголовка); состояния, "
-                             "записанные до блока 7, не поддерживаются - нужен чистый старт")
+            raise ValueError("не состояние МАЯК: нет заголовка")
         version = raw[len(STATE_MAGIC)]
-        hdr_t = STATE_HEADERS.get(version)
-        if hdr_t is None:
-            raise ValueError(f"версия состояния {version}, рантайм читает "
-                             f"{sorted(STATE_HEADERS)}")
-        expected = self.state_nbytes - STATE_HEADER.itemsize + hdr_t.itemsize
-        if len(raw) != expected:
-            raise ValueError(f"состояние {len(raw)} Б не соответствует конфигу модели "
-                             f"(ожидалось {expected} Б для версии {version})")
-        hdr = np.frombuffer(raw, hdr_t, count=1)[0]
-        theta = float(hdr["aci_theta"]) if "aci_theta" in hdr_t.names else 0.0
-        if not np.isfinite(theta):
-            raise ValueError(f"повреждённое θ калибровки в состоянии: {theta}")
         if version != STATE_VERSION:
-            log.info("состояние версии %d без θ калибровки: θ = 0", version)
-        filled, hid = int(hdr["filled"]), int(hdr["hours_in_day"])
-        if filled > self.window or hid > 23 or hid > filled:
-            raise ValueError(f"повреждённый курсор состояния: filled={filled}, "
-                             f"часов в сутках {hid}, окно {self.window}")
-        doy, hour = self._window_calendar(filled, int(hdr["hoy_first"]), int(hdr["hoy_last"]))
-
-        off = hdr_t.itemsize
-
-        def take(shape, dtype):
-            nonlocal off
-            cnt = int(np.prod(shape))
-            arr = np.frombuffer(raw, dtype=dtype, count=cnt, offset=off).reshape(shape).copy()
-            off += cnt * np.dtype(dtype).itemsize
-            return arr
-
-        M, D, W = self.n_modes, self.n_days, self.window
+            raise ValueError(f"версия состояния {version}, рантайм читает {STATE_VERSION}; "
+                             f"прежние версии не хранят сырое окно целиком, нужен холодный "
+                             f"старт")
+        if len(raw) != self.state_nbytes:
+            raise ValueError(f"состояние {len(raw)} Б не соответствует конфигу модели "
+                             f"(ожидалось {self.state_nbytes} Б)")
+        hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0]
+        theta, filled, last = float(hdr["aci_theta"]), int(hdr["filled"]), int(hdr["last_hour"])
+        W = self.window
+        if not np.isfinite(theta):
+            raise ValueError(f"повреждённый множитель калибровки в состоянии: {theta}")
+        if filled > W or (last == NO_HOUR and filled):
+            raise ValueError(f"повреждённый заголовок состояния: filled={filled}, окно {W}, "
+                             f"последний час {last}")
+        x, present, valid = decode_window(raw[STATE_HEADER.itemsize:], W)
+        if np.any(valid > present):
+            raise ValueError("повреждённое окно: годный час без значения")
+        ok = valid > 0
+        if np.any(ok & ((x < PHYS_LO) | (x > PHYS_HI))):
+            raise ValueError("повреждённое окно: годное значение вне физического диапазона")
         self.reset()
-        self.n_re = torch.from_numpy(take((1, M), np.float32))
-        self.n_im = torch.from_numpy(take((1, M), np.float32))
-        self.e = torch.from_numpy(take((1, M), np.float32))
-        self.z = torch.from_numpy(take((1, self.dz), np.float32))
-        self.day_summ = torch.from_numpy(take((1, D, 6), np.float16).astype(np.float32))
-        self.day_mask = torch.from_numpy(take((1, D), np.float16).astype(np.float32))
-        q = take((W, 3), "<u2")
-        self.raw_m = take((W, 3), np.uint8).astype(np.float32)
-        self.raw_x = np.where(self.raw_m > 0, record_values(decode_raw(q, self.raw_m)),
-                              0.0).astype(np.float32)
-        self.raw_doy[W - filled:], self.raw_hour[W - filled:] = doy, hour
-        self.head, self.filled = 0, filled
-        idx = self._ordered(filled)
-        self.qc.seed(self.raw_x[idx], self.raw_m[idx])
-        self._hours_in_day = hid
-        self._last_hoy = int(hdr["hoy_last"]) if filled else None
         self.reset_calibration(theta)
-        self._rebuild_from_window()
-
-    @staticmethod
-    def _window_calendar(n, hoy_first, hoy_last):
-        """Календарь n последних часов окна по часу года первой и последней позиции.
-
-        Часы окна идут подряд, поэтому hoy_first + n − 1 − hoy_last равно нулю без
-        перехода через Новый год и длине года в часах (8760 или 8784) с переходом.
-        """
-        if n == 0:
-            return np.zeros(0, np.float32), np.zeros(0, np.float32)
-        span = hoy_first + n - 1 - hoy_last
-        if span != 0 and span not in YEAR_HOURS:
-            raise ValueError(f"календарь окна несогласован: час года {hoy_first} … "
-                             f"{hoy_last} на {n} ч")
-        hoy = hoy_first + np.arange(n, dtype=np.int64)
-        if span:
-            hoy = np.where(hoy >= span, hoy - span, hoy)
-        return (hoy / 24.0).astype(np.float32), (hoy % 24).astype(np.float32)
-
-    @torch.no_grad()
-    def _rebuild_from_window(self):
-        """Кольцевые буферы энкодера и накопители текущих суток по сохранённому окну.
-
-        Буферы после часа t зависят только от последних (RF − 1) + CHANNEL_MAX_LAG часов
-        (см. ModelConfig.stream_window).
-        """
-        n = self.filled
-        if n == 0:
+        self.loaded_site = (float(hdr["lat"]), float(hdr["lon"]), float(hdr["elev"]))
+        if last == NO_HOUR:
             return
-        ch, aT, vt, dp24, vp24 = self._channels(self._ordered(n))
-        _, self.enc = self.m.encoder.prefill(ch)
-        h = self._hours_in_day
-        if h:
-            self._day[:, :h] = torch.stack([aT[0, -h:], dp24[0, -h:], vt[0, -h:],
-                                            vp24[0, -h:]]).numpy()
+        self.last_hour = last
+        pos = self._hours(W) % W
+        self.raw[pos], self.present[pos], self.valid[pos] = x, present, valid
+        self.filled = filled
+        self._rebuild(seed_qc=True)
 
 
-def safe_forecast(stream, doy_fut, hour_fut, mu_clim_fut, sigma_clim):
+def safe_forecast(stream, mu_clim_fut, sigma_clim):
+    """Выпуск с откатом к климатологии при любой ошибке.
+
+    Args:
+        stream: потоковый рантайм.
+        mu_clim_fut: климатическое среднее на часах горизонта, форма (H,).
+        sigma_clim: климатический разброс.
+
+    Returns:
+        Пара: квантили и медиана.
+    """
     try:
-        return stream.forecast(doy_fut, hour_fut)
+        return stream.forecast()
     except Exception:
         from mayak.baselines import quantiles_from_normal
         mu = np.asarray(mu_clim_fut, np.float32)
         q = quantiles_from_normal(mu, np.full(mu.shape[-1], sigma_clim, np.float32))
         return q, mu
+
+
+__all__ = ["CTX", "NO_HOUR", "RAW_CHANNELS", "RESYNC_HOURS", "STATE_HEADER", "STATE_VERSION",
+           "StreamingMayak", "decode_window", "encode_window", "mask_bytes", "safe_forecast",
+           "state_nbytes", "to_store"]

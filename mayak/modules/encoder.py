@@ -126,6 +126,26 @@ class SynopticEncoder(nn.Module):
             h = b(h)
         return h.transpose(1, 2)
 
+    def forward_with_buffer(self, x):
+        """Пакетный проход по отрезку и буфер потактового шага после его последнего часа.
+
+        Буфер каждого блока - последние входы этого блока в хронологическом порядке;
+        если отрезок короче буфера, слева стоят нули, как у холодного старта.
+
+        Args:
+            x: каналы, форма (B, n_ch, L).
+
+        Returns:
+            Пара: признаки формы (B, L, width) и буфер формы (B, width, сумма длин
+            буферов блоков).
+        """
+        h = self.stem(x)
+        parts = []
+        for b in self.blocks:
+            parts.append(F.pad(h, (b.pad, 0))[..., -b.pad:])
+            h = b(h)
+        return h.transpose(1, 2), torch.cat(parts, dim=-1)
+
     def init_state(self, batch_size=1):
         """Состояние до первого шага: нулевые буферы ≡ левое дополнение нулями."""
         p = self.stem.weight

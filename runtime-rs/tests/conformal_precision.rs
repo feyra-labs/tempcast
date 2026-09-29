@@ -44,8 +44,8 @@ fn runtime(dir: &Path, precision: Precision, conformal: bool) -> Runtime {
     Runtime::new(dir, LAT, LON, 0.0, &opts).unwrap()
 }
 
-/// Час года первого наблюдения и число часов наблюдений перед выпуском.
-const START_HOY: usize = 2400;
+/// Абсолютный час первого наблюдения и число часов наблюдений перед выпуском.
+const START_HOUR: i64 = 455_000;
 const HOURS: usize = 30;
 
 /// Допуск между выпусками двух независимых рантаймов на одних и тех же графах. Сборки
@@ -53,23 +53,14 @@ const HOURS: usize = 30;
 /// рантаймов сравниваются с допуском, а до бита - только то, что считается в одном месте.
 const SESSION_ATOL: f32 = 1e-4;
 
-fn day_of_year(hoy: usize) -> f32 {
-    (hoy as f64 / 24.0) as f32
-}
-
 /// Выпуск после непрерывной серии часовых наблюдений: квантили всех лидов подряд.
 fn issue(rt: &mut Runtime) -> Vec<f32> {
     for k in 0..HOURS {
-        let hoy = START_HOY + k;
         let obs = [Some(8.0 + 0.3 * k as f64), Some(1011.0), Some(72.0)];
-        rt.step(obs, day_of_year(hoy), (hoy % 24) as f32).unwrap();
+        rt.step(obs, START_HOUR + k as i64).unwrap();
     }
-    assert_eq!(rt.calendar_breaks(), 0, "серия наблюдений должна быть непрерывной");
-    let first = START_HOY + HOURS;
-    let h = rt.horizon();
-    let doy: Vec<f32> = (0..h).map(|k| day_of_year(first + k)).collect();
-    let hour: Vec<f32> = (0..h).map(|k| ((first + k) % 24) as f32).collect();
-    rt.forecast(&doy, &hour).unwrap().q.clone()
+    assert_eq!(rt.idle_hours(), 0, "серия наблюдений должна быть непрерывной");
+    rt.forecast().unwrap().q.clone()
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {

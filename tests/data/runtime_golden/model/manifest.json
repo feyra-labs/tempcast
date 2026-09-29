@@ -1,5 +1,5 @@
 {
- "format": 1,
+ "format": 2,
  "model_config": {
   "arch": "mayak",
   "horizon": 168,
@@ -135,10 +135,13 @@
   "n_quantiles": 7,
   "n_modes": 24,
   "passport_dim": 16,
+  "history": 672,
   "history_days": 28,
   "n_daily_summary": 6,
   "day_row": 4,
-  "stream_window": 288,
+  "stream_window": 672,
+  "stream_edge": 276,
+  "stream_tail": 396,
   "ctx": 25,
   "loc_dim": 98,
   "encoder_width": 64,
@@ -246,9 +249,10 @@
   "lookback_hours": 78
  },
  "state": {
-  "version": 3,
-  "header_bytes": 16,
-  "nbytes": 3352
+  "version": 4,
+  "header_bytes": 32,
+  "nbytes": 3224,
+  "resync_hours": 24
  },
  "graphs": {
   "init": {
@@ -317,14 +321,18 @@
     "enc_buf",
     "n_re",
     "n_im",
-    "e"
+    "e",
+    "u_old",
+    "v_old"
    ],
    "outputs": [
     "enc_buf_out",
     "n_re_out",
     "n_im_out",
     "e_out",
-    "day_row"
+    "u",
+    "v",
+    "row"
    ],
    "shapes_in": {
     "x_ctx": [
@@ -381,6 +389,14 @@
     "e": [
      1,
      24
+    ],
+    "u_old": [
+     1,
+     48
+    ],
+    "v_old": [
+     1,
+     1
     ]
    },
    "shapes_out": {
@@ -401,57 +417,150 @@
      1,
      24
     ],
-    "day_row": [
+    "u": [
+     1,
+     48
+    ],
+    "v": [
+     1,
+     1
+    ],
+    "row": [
      1,
      4
     ]
    }
   },
-  "passport": {
-   "fp32": "passport.onnx",
+  "window": {
+   "fp32": "window.onnx",
    "inputs": [
-    "day_acc",
-    "day_summ",
-    "day_mask"
+    "x_win",
+    "m_win",
+    "doy_win",
+    "hour_win",
+    "lat",
+    "lon",
+    "c_mu",
+    "c_sig",
+    "c_def"
    ],
    "outputs": [
-    "day_summ_out",
-    "day_mask_out",
-    "z"
+    "enc_buf",
+    "u_tail",
+    "v_tail",
+    "rows",
+    "n_re",
+    "n_im",
+    "e"
    ],
    "shapes_in": {
-    "loc": [
+    "x_win": [
      1,
-     98
+     672,
+     3
     ],
-    "day_acc": [
+    "m_win": [
      1,
-     4,
-     24
+     672,
+     3
     ],
-    "day_summ": [
+    "doy_win": [
      1,
-     28,
-     6
+     672
     ],
-    "day_mask": [
+    "hour_win": [
      1,
-     28
+     672
+    ],
+    "lat": [
+     1,
+     1
+    ],
+    "lon": [
+     1,
+     1
+    ],
+    "c_mu": [
+     1,
+     36
+    ],
+    "c_sig": [
+     1,
+     21
+    ],
+    "c_def": [
+     1,
+     21
     ]
    },
    "shapes_out": {
-    "day_summ_out": [
+    "enc_buf": [
      1,
-     28,
-     6
+     64,
+     252
     ],
-    "day_mask_out": [
+    "u_tail": [
      1,
-     28
+     396,
+     48
     ],
-    "z": [
+    "v_tail": [
      1,
-     16
+     396
+    ],
+    "rows": [
+     1,
+     672,
+     4
+    ],
+    "n_re": [
+     1,
+     24
+    ],
+    "n_im": [
+     1,
+     24
+    ],
+    "e": [
+     1,
+     24
+    ]
+   }
+  },
+  "resync": {
+   "fp32": "resync.onnx",
+   "inputs": [
+    "u_ring",
+    "v_ring"
+   ],
+   "outputs": [
+    "n_re",
+    "n_im",
+    "e"
+   ],
+   "shapes_in": {
+    "u_ring": [
+     1,
+     396,
+     48
+    ],
+    "v_ring": [
+     1,
+     396
+    ]
+   },
+   "shapes_out": {
+    "n_re": [
+     1,
+     24
+    ],
+    "n_im": [
+     1,
+     24
+    ],
+    "e": [
+     1,
+     24
     ]
    }
   },
@@ -461,10 +570,17 @@
     "loc",
     "lat",
     "lon",
-    "z",
+    "c_mu",
+    "c_sig",
+    "c_def",
+    "rows",
     "n_re",
     "n_im",
     "e",
+    "x_edge",
+    "m_edge",
+    "doy_edge",
+    "hour_edge",
     "doy_fut",
     "hour_fut"
    ],
@@ -484,9 +600,22 @@
      1,
      1
     ],
-    "z": [
+    "c_mu": [
      1,
-     16
+     36
+    ],
+    "c_sig": [
+     1,
+     21
+    ],
+    "c_def": [
+     1,
+     21
+    ],
+    "rows": [
+     1,
+     672,
+     4
     ],
     "n_re": [
      1,
@@ -499,6 +628,24 @@
     "e": [
      1,
      24
+    ],
+    "x_edge": [
+     1,
+     276,
+     3
+    ],
+    "m_edge": [
+     1,
+     276,
+     3
+    ],
+    "doy_edge": [
+     1,
+     276
+    ],
+    "hour_edge": [
+     1,
+     276
     ],
     "doy_fut": [
      1,
@@ -531,21 +678,22 @@
    ]
   }
  },
- "export_check_max_abs": {
+ "export_check_max_rel": {
   "init": 5.960464477539063e-08,
-  "step": 4.76837158203125e-06,
-  "passport": 3.725290298461914e-08,
-  "issue": 2.384185791015625e-06
+  "step": 7.759543905194732e-07,
+  "window": 6.052756589269848e-07,
+  "resync": 4.0613949181533826e-07,
+  "issue": 3.290097367880662e-07
  },
  "opset": 17,
  "provenance": {
   "git": {
-   "commit": "ca30c7b2ca03b4da148776ca11b35d76a6d0db0e",
+   "commit": "c5d3bc1ef26f365eb0b4f6380b99f6ae6e299a56",
    "dirty": true
   },
   "versions": {
    "python": "3.12.3",
-   "mayak": "0.1.0",
+   "mayak": null,
    "torch": "2.14.0",
    "pytorch-lightning": "2.6.6",
    "numpy": "2.4.4",

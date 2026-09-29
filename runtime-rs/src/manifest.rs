@@ -9,7 +9,7 @@ use crate::graphs::Precision;
 use crate::qc::QcConfig;
 use crate::{Error, Result};
 
-pub const FORMAT: u32 = 1;
+pub const FORMAT: u32 = 2;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Dims {
@@ -17,10 +17,11 @@ pub struct Dims {
     pub n_quantiles: usize,
     pub n_modes: usize,
     pub passport_dim: usize,
-    pub history_days: usize,
-    pub n_daily_summary: usize,
+    pub history: usize,
     pub day_row: usize,
     pub stream_window: usize,
+    pub stream_edge: usize,
+    pub stream_tail: usize,
     pub ctx: usize,
     pub loc_dim: usize,
     pub encoder_width: usize,
@@ -59,6 +60,7 @@ pub struct StateInfo {
     pub version: u8,
     pub header_bytes: usize,
     pub nbytes: usize,
+    pub resync_hours: i64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -106,15 +108,32 @@ impl Manifest {
                 self.raw_channels
             )));
         }
-        if d.ctx > d.stream_window || d.day_row != 4 || d.stream_window == 0 {
+        if d.ctx > d.stream_window
+            || d.day_row != 4
+            || d.history > d.stream_window
+            || !d.history.is_multiple_of(24)
+            || d.stream_edge + d.stream_tail != d.history
+            || d.stream_tail == 0
+            || d.stream_edge == 0
+        {
             return Err(Error::new("манифест: размеры окна несогласованы"));
         }
-        for g in ["init", "step", "passport", "issue"] {
+        if self.state.resync_hours != crate::runtime::RESYNC_HOURS {
+            return Err(Error::new(format!(
+                "манифест: пересчёт мод каждые {} ч, рантайм пересчитывает каждые {} ч",
+                self.state.resync_hours,
+                crate::runtime::RESYNC_HOURS
+            )));
+        }
+        for g in ["init", "step", "window", "resync", "issue"] {
             if !self.graphs.contains_key(g) {
                 return Err(Error::new(format!("манифест: нет графа {g}")));
             }
         }
-        if self.state.version != crate::state::VERSION || self.state.nbytes != crate::state::nbytes(d) {
+        if self.state.version != crate::state::VERSION
+            || self.state.nbytes != crate::state::nbytes(d)
+            || self.state.header_bytes != crate::state::HEADER
+        {
             return Err(Error::new(format!(
                 "манифест: формат состояния v{} на {} Б, рантайм пишет v{} на {} Б",
                 self.state.version,

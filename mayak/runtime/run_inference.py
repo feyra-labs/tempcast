@@ -1,9 +1,9 @@
 """Пример сквозного инференса МАЯК на устройстве (потоковый путь A):
 загрузка модели и конформной таблицы → восстановление состояния после ребута →
 почасовые шаги по данным датчиков → выпуск прогноза → атомарное сохранение
-состояния (3352 Б для конфига по умолчанию, < 4 КБ). После загрузки кольцевые буферы
-энкодера и незавершённые сутки восстанавливаются одним проходом по сохранённому окну;
-несовместимое или повреждённое состояние - чистый старт с записью в лог.
+состояния (3224 Б для конфига по умолчанию). Состояние - сырое окно наблюдений и
+заголовок; всё остальное восстанавливается одним проходом по окну; несовместимое или
+повреждённое состояние - чистый старт с записью в лог.
 QC точки и watchdog-фолбэк — внутри StreamingMayak/safe_forecast.
 
 С ``--aci`` прибор подстраивает ширину интервалов по своим промахам: каждый
@@ -20,7 +20,7 @@ import numpy as np
 
 from mayak.constants import H
 from mayak.runtime.streaming import StreamingMayak, safe_forecast
-from mayak.timeaxis import future_calendar, utc_to_doy_hour
+from mayak.timeaxis import to_utc_hour
 
 STATE_FILES = ["runtime/state_a.bin", "runtime/state_b.bin"]
 
@@ -95,22 +95,22 @@ def main():
     if not st:
         print("Чистый старт (история пуста, L=0). Первый прогноз = климат-поле + паспорт.")
         # Если есть сохранённая история первого включения — можно прогреться:
-        # stream.warm_start(x_hist, mask_hist, doy_hist, hour_hist)
+        # stream.warm_start(x_hist, mask_hist, last_hour)
 
     now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
     for k in range(48):
         ts = now - timedelta(hours=48 - k)
-        doy, hour = utc_to_doy_hour(ts)
+        hour = int(to_utc_hour(ts))
+        if stream.last_hour is not None and hour <= stream.last_hour:
+            continue
         T, P, RH = read_sensors(ts)
-        stream.step(T, P, RH, doy, hour)
+        stream.step(T, P, RH, hour)
         if aci is not None:
-            stream.forecast(*future_calendar(ts, H))
+            stream.forecast()
         save_state(stream, k)
 
-    last_obs = now - timedelta(hours=1)
-    doy_f, hour_f = future_calendar(last_obs, H)
     mu_clim_fb = np.full(H, args.clim_fallback, np.float32)
-    q, mu = safe_forecast(stream, doy_f, hour_f, mu_clim_fb, args.sigma_fallback)
+    q, mu = safe_forecast(stream, mu_clim_fb, args.sigma_fallback)
 
     for h in (1, 24, 72, 168):
         j = h - 1

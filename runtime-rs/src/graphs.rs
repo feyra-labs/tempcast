@@ -1,4 +1,4 @@
-//! Четыре графа ONNX (init, step, passport, issue) поверх ONNX Runtime.
+//! Графы ONNX (init, step, window, resync, issue) поверх ONNX Runtime.
 //!
 //! Входы подаются по именам и без копирования (TensorRef на срезы хоста); графу
 //! подаются только те входы, которые в нём остались после экспорта (манифест
@@ -106,7 +106,8 @@ impl Graph {
 pub struct Graphs {
     pub init: Graph,
     pub step: Graph,
-    pub passport: Graph,
+    pub window: Graph,
+    pub resync: Graph,
     pub issue: Graph,
 }
 
@@ -115,7 +116,8 @@ impl Graphs {
         Ok(Graphs {
             init: Graph::open(m, "init", precision, threads)?,
             step: Graph::open(m, "step", precision, threads)?,
-            passport: Graph::open(m, "passport", precision, threads)?,
+            window: Graph::open(m, "window", precision, threads)?,
+            resync: Graph::open(m, "resync", precision, threads)?,
             issue: Graph::open(m, "issue", precision, threads)?,
         })
     }

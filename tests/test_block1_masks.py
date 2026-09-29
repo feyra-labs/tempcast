@@ -389,6 +389,7 @@ def test_streaming_daily_summaries_match_batch():
     from mayak.astro import astro_features
     from mayak.model import MAYAK
     from mayak.runtime.streaming import StreamingMayak
+    from mayak.timeaxis import to_utc_hour, window_calendar
     torch.manual_seed(0)
     model = MAYAK().eval()
     lat, lon, elev = 50.0, 5.0, 10.0
@@ -402,12 +403,12 @@ def test_streaming_daily_summaries_match_batch():
     vT[24:48] = False
     vP = np.ones(n, bool)
     vP[50:60] = False
-    doy = (100 + np.arange(n) / 24).astype(np.float32)
-    hour = (np.arange(n) % 24).astype(np.float32)
+    t0 = int(to_utc_hour(np.datetime64("2021-04-11T00", "s")))
+    doy, hour = window_calendar(t0, np.arange(n))
 
     stream = StreamingMayak(model, lat, lon, elev)
     for k in range(n):
-        stream.step(T[k] if vT[k] else None, P[k] if vP[k] else None, RH[k], doy[k], hour[k])
+        stream.step(T[k] if vT[k] else None, P[k] if vP[k] else None, RH[k], t0 + k)
 
     x = torch.tensor(record_values(np.stack([np.where(vT, T, 0), np.where(vP, P, 0), RH], -1)),
                      dtype=torch.float32)[None]
@@ -419,10 +420,13 @@ def test_streaming_daily_summaries_match_batch():
         mu0, sg0, df0 = model.field.evaluate(model.field.coefficients(loc), astro)
         ch, aT, vt = model.build_channels(x, mk, astro, mu0, sg0, df0)
         summ, has = model.daily_summaries(aT, ch[:, 3], vt, model.lag_valid(mk[..., 1], 24))
+        rows = torch.from_numpy(stream.rows[stream._hours(n) % stream.history])[None]
+        s_summ, s_has = model.daily_summaries(rows[..., 0], rows[..., 1], rows[..., 2],
+                                              rows[..., 3])
 
-    assert torch.equal(stream.day_mask[:, -3:], has)
+    assert torch.equal(s_has, has)
     assert has[0, 1] == 0
-    assert torch.allclose(stream.day_summ[:, -3:], summ, atol=1e-5)
+    assert torch.allclose(s_summ, summ, atol=1e-5)
 
 
 def test_seasonal_naive_never_uses_invalid_values():

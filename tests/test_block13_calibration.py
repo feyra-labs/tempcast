@@ -36,14 +36,13 @@ from mayak.data.splits import ROLE_TEST, ROLE_TRAIN
 from mayak.metrics import (I_HI90, I_LO90, I_MED, LEAD_BINS, NQ, ACIParams, Evaluation,
                            aci_effective_level, aci_run, aci_score, apply_adaptive,
                            apply_conformal, calibrate_forecast, inside, width_at_coverage)
-from mayak.runtime.equivalence import feed, future_calendar_after, synthetic_series
-from mayak.runtime.streaming import (STATE_HEADER, STATE_HEADERS, STATE_VERSION,
-                                     StreamingMayak)
+from mayak.runtime.equivalence import feed, synthetic_series
+from mayak.runtime.streaming import STATE_HEADER, STATE_VERSION, StreamingMayak
 
 REPO = Path(__file__).resolve().parents[1]
 Z = norm.ppf(np.asarray(QUANTILES, np.float64))
 LAT, LON, ELEV = 52.37, 4.9, 0.0
-DEFAULT_STATE_BYTES = 3352
+DEFAULT_STATE_BYTES = 3224
 N_HOURS = 12_000
 
 
@@ -272,7 +271,7 @@ def test_runtime_theta_matches_offline_run(model):
             y = float(record_values(s["x"][k])[0]) if s["m"][k, 0] > 0 else float("nan")
             scores.append(float(aci_score(y, st._pending["q"][0], p.interval)))
         feed(st, s, k, k + 1)
-        q, _ = st.forecast(*future_calendar_after(s, k + 1, H))
+        q, _ = st.forecast()
         assert np.isfinite(q).all() and (np.diff(q, axis=-1) >= 0).all()
     r = aci_run(scores, p)
     assert st.theta == r["theta_end"] != 0.0
@@ -287,9 +286,8 @@ def test_runtime_forecast_equals_single_implementation(model):
     raw = feed(StreamingMayak(model, LAT, LON, ELEV), s, 0, 80)
     cal = feed(StreamingMayak(model, LAT, LON, ELEV, conformal=shift), s, 0, 80)
     cal.reset_calibration(0.25)
-    cal_doy = future_calendar_after(s, 80, H)
-    q_raw, _ = raw.forecast(*cal_doy)
-    q, mu = cal.forecast(*cal_doy)
+    q_raw, _ = raw.forecast()
+    q, mu = cal.forecast()
     ref_q, ref_mu = calibrate_forecast(q_raw, shift, cal.theta)
     assert np.array_equal(q, ref_q) and np.array_equal(mu, ref_mu)
 
@@ -299,7 +297,7 @@ def test_runtime_without_aci_never_moves_theta(model):
     st = StreamingMayak(model, LAT, LON, ELEV)
     for k in range(60):
         feed(st, s, k, k + 1)
-        st.forecast(*future_calendar_after(s, k + 1, H))
+        st.forecast()
     assert st.theta == 0.0 and st.aci_updates == 0 and st._pending is None
 
 
@@ -309,13 +307,13 @@ def test_runtime_long_gap_freezes_theta(model):
     s = synthetic_series(700, seed=7, p_valid=1.0)
     st = feed(StreamingMayak(model, LAT, LON, ELEV, aci=p), s, 0, 48)
     st.reset_calibration(0.3)
-    st.forecast(*future_calendar_after(s, 48, H))
+    st.forecast()
     for k in range(48, 600):
-        st.step(None, float(s["x"][k, 1]), float(s["x"][k, 2]), s["doy"][k], s["hour"][k])
+        st.step(None, float(s["x"][k, 1]), float(s["x"][k, 2]), s["t0"] + k)
     assert st.theta == pytest.approx(0.3, abs=1e-7) and st.aci_updates == 0
     feed(st, s, 600, 650)
     assert st.aci_updates == 0, "лиды старого прогноза давно прошли"
-    q, _ = st.forecast(*future_calendar_after(s, 650, H))
+    q, _ = st.forecast()
     assert np.isfinite(q).all() and (np.diff(q, axis=-1) >= 0).all()
     feed(st, s, 650, 670)
     assert st.aci_updates == int((s["m"][650:670, 0] > 0).sum()) > 0
@@ -325,12 +323,13 @@ def test_runtime_each_lead_is_checked_once_and_in_order(model):
     p = ACIParams(gamma=0.05)
     s = synthetic_series(300, seed=8, p_valid=1.0)
     st = feed(StreamingMayak(model, LAT, LON, ELEV, aci=p), s, 0, 24)
-    st.forecast(*future_calendar_after(s, 24, H))
+    st.forecast()
     valid = s["m"][:, 0] > 0
     feed(st, s, 24, 24 + 30)
     n30 = int(valid[24:54].sum())
     assert st.aci_updates == n30
-    st.step(float(s["x"][30, 0]), None, None, s["doy"][30], s["hour"][30])
+    with pytest.raises(ValueError, match="не позже"):
+        st.step(float(s["x"][30, 0]), None, None, s["t0"] + 30)
     assert st.aci_updates == n30
     feed(st, s, 54, 300)
     assert st.aci_updates == int(valid[24:24 + H].sum()), "каждый лид - не больше одного раза"
@@ -342,30 +341,29 @@ def test_runtime_constant_misses_hit_the_bound(model):
     s = synthetic_series(100, seed=9, p_valid=1.0)
     st = feed(StreamingMayak(model, LAT, LON, ELEV, aci=p), s, 0, 48)
     for k in range(48, 100):
-        st.forecast(*future_calendar_after(s, k, H))
+        st.forecast()
         q0 = st._pending["q"][0]
         med, d = float(q0[I_MED]), float(q0[I_HI90] - q0[I_MED])
         T = min(med + 6.0 * d + 0.5, 59.0)
-        st.step(T, float(s["x"][k, 1]), float(s["x"][k, 2]), s["doy"][k], s["hour"][k])
+        st.step(T, float(s["x"][k, 1]), float(s["x"][k, 2]), s["t0"] + k)
     assert st.theta == p.theta_max
-    q, _ = st.forecast(*future_calendar_after(s, 100, H))
+    q, _ = st.forecast()
     assert np.isfinite(q).all() and (np.diff(q, axis=-1) >= 0).all()
 
 
-def test_state_v3_is_pinned_and_carries_theta(model):
-    assert STATE_VERSION == 3 and STATE_HEADER.itemsize == 16
+def test_state_is_pinned_and_carries_theta(model):
+    assert STATE_VERSION == 4 and STATE_HEADER.itemsize == 32
     s = synthetic_series(100, seed=10)
     st = feed(StreamingMayak(model, LAT, LON, ELEV, aci=True), s, 0, 100)
     st.reset_calibration(0.3141)
     raw = st.serialize()
     assert len(raw) == st.state_nbytes == DEFAULT_STATE_BYTES < 4096
     hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0]
-    assert int(hdr["version"]) == 3 and float(hdr["aci_theta"]) == st.theta
+    assert int(hdr["version"]) == 4 and float(hdr["aci_theta"]) == st.theta
     back = StreamingMayak(model, LAT, LON, ELEV)
     back.load_state(raw)
     assert back.theta == st.theta and back.serialize() == raw
-    cal = future_calendar_after(s, 100, H)
-    np.testing.assert_allclose(back.forecast(*cal)[0], st.forecast(*cal)[0], atol=1e-4)
+    np.testing.assert_allclose(back.forecast()[0], st.forecast()[0], atol=1e-4)
 
 
 def test_theta_survives_restart_and_reset_keeps_it(model):
@@ -374,14 +372,14 @@ def test_theta_survives_restart_and_reset_keeps_it(model):
     live = StreamingMayak(model, LAT, LON, ELEV, aci=p)
     for k in range(120):
         feed(live, s, k, k + 1)
-        live.forecast(*future_calendar_after(s, k + 1, H))
+        live.forecast()
     back = StreamingMayak(model, LAT, LON, ELEV, aci=p)
     back.load_state(live.serialize())
     assert back.theta == live.theta != 0.0
     for st in (live, back):
         for k in range(120, 220):
             feed(st, s, k, k + 1)
-            st.forecast(*future_calendar_after(s, k + 1, H))
+            st.forecast()
     assert back.theta == pytest.approx(live.theta, abs=1e-6)
     theta = live.theta
     live.reset()
@@ -390,25 +388,18 @@ def test_theta_survives_restart_and_reset_keeps_it(model):
     assert live.theta == 0.0 and live.aci_updates == 0
 
 
-def test_state_v2_is_read_with_zero_theta(model):
+def test_older_state_versions_need_cold_start(model):
+    """Прежние версии состояния не хранят сырое окно целиком: они не читаются, рантайм
+    остаётся в холодном старте с тем множителем калибровки, что был."""
     s = synthetic_series(90, seed=12)
-    st = feed(StreamingMayak(model, LAT, LON, ELEV), s, 0, 90)
-    raw = st.serialize()
-    hdr3 = np.frombuffer(raw, STATE_HEADER, count=1)[0]
-    hdr2 = np.zeros((), STATE_HEADERS[2])
-    for name in STATE_HEADERS[2].names:
-        hdr2[name] = hdr3[name]
-    hdr2["version"] = 2
-    v2 = hdr2.tobytes() + raw[STATE_HEADER.itemsize:]
-    assert len(v2) == DEFAULT_STATE_BYTES - 4
+    raw = bytearray(feed(StreamingMayak(model, LAT, LON, ELEV), s, 0, 90).serialize())
     back = StreamingMayak(model, LAT, LON, ELEV)
     back.reset_calibration(0.7)
-    back.load_state(v2)
-    assert back.theta == 0.0
-    cal = future_calendar_after(s, 90, H)
-    np.testing.assert_allclose(back.forecast(*cal)[0], st.forecast(*cal)[0], atol=1e-4)
-    with pytest.raises(ValueError, match="Б"):
-        back.load_state(v2 + b"\0")
+    for version in (2, 3):
+        raw[3] = version
+        with pytest.raises(ValueError, match="версия"):
+            back.load_state(bytes(raw))
+    assert back.theta == pytest.approx(0.7) and back.last_hour is None
 
 
 def test_corrupted_theta_is_rejected(model):
@@ -416,7 +407,7 @@ def test_corrupted_theta_is_rejected(model):
     raw = st.serialize()
     hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0].copy()
     hdr["aci_theta"] = np.nan
-    with pytest.raises(ValueError, match="θ"):
+    with pytest.raises(ValueError, match="калибровки"):
         st.load_state(hdr.tobytes() + raw[STATE_HEADER.itemsize:])
 
 
