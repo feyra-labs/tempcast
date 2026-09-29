@@ -370,13 +370,15 @@ def _rset(base, name, level, qc="device", params=None):
 @pytest.mark.parametrize("name", ALL)
 def test_zero_level_dataset_equals_eval_set(base, name, qc):
     """Нулевой параметр на полном пути (сценарий → инвариант → QC → батч): тот же батч,
-    что у EvalSet, до бита - включая пересчитанную по истории недавнюю аномалию."""
+    что у EvalSet, до бита - включая пересчитанную по истории недавнюю аномалию.
+    Добавляется только эталон скилла, и на нулевом уровне он равен климатологии."""
     ds = _rset(base, name, 0.0, qc=qc)
     for i in range(len(base)):
         a, b = base[i], ds[i]
-        assert set(a) == set(b)
+        assert set(b) == set(a) | {"mu_ref_fut"}
         for k in a:
             assert torch.equal(torch.as_tensor(a[k]), torch.as_tensor(b[k])), (name, k, i)
+        assert torch.equal(b["mu_ref_fut"], a["mu_clim_fut"]), name
 
 
 def test_input_failure_keeps_target_on_the_full_path(base):
@@ -387,6 +389,8 @@ def test_input_failure_keeps_target_on_the_full_path(base):
             for k in ("y", "y_mask", "mu_clim_fut", "norm_scale", "doy_fut", "hour_fut",
                       "sigma_clim"):
                 assert torch.equal(a[k], b[k]), (name, k)
+            assert torch.equal(b["mu_ref_fut"], a["mu_clim_fut"]), \
+                f"{name}: цель не искажена, значит и эталон скилла не искажён"
 
 
 def test_invariant_holds_after_every_scenario_and_level(base):
@@ -440,26 +444,42 @@ def test_device_qc_catches_frozen_sensor(base):
 class _Anchored(torch.nn.Module):
     """Модели с известным поведением, выход как у МАЯК (mu, q).
 
-    mode = clim  - ровно климатология (якорь без аномалии);
-    mode = mask  - якорь + затухающая аномалия по валидным часам;
-    mode = blind - то же, но аномалия - среднее последних 24 ч истории без маски:
-                   невалидные часы читаются как 0 °C.
+    mode = clim   - ровно климатология станции, без аномалии;
+    mode = ref    - ровно эталон скилла набора: климатология того же прибора; где
+                    эталона нет, климатология станции;
+    mode = aware  - знает свойства своего прибора: прогноз mask, построенный от эталона
+                    того же прибора, а недавняя аномалия отсчитана от сдвинутого уровня;
+    mode = mask   - климатология плюс затухающая аномалия по валидным часам;
+    mode = biased - климатология со сдвигом bias; история не читается вовсе, поэтому
+                    при любом отказе входа прогноз тот же, что без истории;
+    mode = blind  - климатология плюс аномалия по последним 72 ч истории, где пропуски
+                    читаются как 0 °C. Если в этих часах нет ни одного валидного, модель
+                    честно выдаёт климатологию: холодный старт у неё не хуже климатологии,
+                    а портится она только при частичной потере данных.
     """
 
-    def __init__(self, mode):
+    def __init__(self, mode, bias=0.0):
         super().__init__()
-        self.mode = mode
+        self.mode, self.bias = mode, float(bias)
 
     def forward(self, b):
         muc = b["mu_clim_fut"]
-        if self.mode == "clim":
-            a = torch.zeros_like(muc[:, 0])
-        elif self.mode == "mask":
+        if self.mode in ("ref", "aware"):
+            muc = b.get("mu_ref_fut", muc)
+        a = torch.zeros_like(muc[:, 0])
+        if self.mode == "mask":
             a = b["a_recent"]
-        else:
-            a = b["x_hist"][:, -24:, 0].mean(1) - muc[:, :24].mean(1)
+        elif self.mode == "aware":
+            a = b["a_recent"] - (muc - b["mu_clim_fut"])[:, 0] * b["a_recent_ok"]
+        elif self.mode == "biased":
+            a = torch.full_like(a, self.bias)
+        elif self.mode == "blind":
+            has = b["mask_hist"][:, -72:, 0].sum(1) > 0
+            blind = b["x_hist"][:, -72:, 0].mean(1) - muc[:, :24].mean(1)
+            a = torch.where(has, blind, a)
         h = torch.arange(1, H + 1, dtype=muc.dtype)
-        mu = muc + torch.exp(-h / 24.0)[None] * a[:, None]
+        decay = torch.ones(H) if self.mode == "biased" else torch.exp(-h / 24.0)
+        mu = muc + decay[None] * a[:, None]
         q = mu[..., None] + b["sigma_clim"][:, None, None] * torch.as_tensor(ZQ)
         return {"mu": mu, "q": q}
 
@@ -481,31 +501,57 @@ def _sweep(base, models, names, **kw):
     return cfg, robustness_sweep(models, base, cfg, statistical=False)
 
 
+GUARDED_INPUT = tuple(n for n, r in SCENARIO_RULES.items()
+                      if r.kind == SCENARIO_INPUT and r.guard)
+
+
 @pytest.fixture(scope="module")
-def clim_rows(base):
-    return _sweep(base, {"МАЯК": _Anchored("clim")}, ALL)
+def ref_rows(base):
+    return _sweep(base, {"МАЯК": _Anchored("ref"), "клим": _Anchored("clim")}, ALL)
 
 
-def test_climatology_passes_guard_in_every_scenario(clim_rows):
-    """Модель, равная своему якорю, - нижняя граница архитектуры: её скилл ровно 0 во
-    всех сценариях, в том числе там, где искажена цель. Иначе знаменатель скилла
-    посчитан не на тех же парах или эталон искажён вместе с целью."""
+def test_reference_model_scores_zero_in_every_scenario(ref_rows):
+    """Модель, выдающая сам эталон скилла, - нижняя граница архитектуры: её скилл ровно
+    0 во всех сценариях, в том числе там, где искажена цель. Иначе знаменатель скилла
+    посчитан не на тех же парах, что числитель."""
     from mayak.robustness import check_skill_guard
-    cfg, rows = clim_rows
-    assert {r["scenario"] for r in rows} == set(ALL)
-    for r in rows:
+    cfg, rows = ref_rows
+    mine = [r for r in rows if r["model"] == "МАЯК"]
+    assert {r["scenario"] for r in mine} == set(ALL)
+    for r in mine:
         assert r["Skill"] == pytest.approx(0.0, abs=1e-9), (r["scenario"], r["level"])
+        assert r["Skill_L0"] == pytest.approx(0.0, abs=1e-9)
     n = check_skill_guard(rows, cfg.skill_tolerance, cfg.guard_models)
-    assert n == sum(1 for r in rows if r["guard"])
+    assert n == sum(1 for r in mine if r["guard"])
+
+
+def test_instrument_fault_no_longer_improves_skill_of_climatology(ref_rows):
+    """Климатология станции ничего не знает о приборе. Против эталона того же прибора
+    её скилл в сценариях, искажающих цель, падает ниже нуля; при эталоне без искажения
+    он был бы ровно 0 и рос бы вместе с поломкой. В отказе входа он по-прежнему 0."""
+    _cfg_, rows = ref_rows
+    clim = [r for r in rows if r["model"] == "клим"]
+    top = {sc.name: max(sc.levels) for sc in _short(ALL)}
+    for r in clim:
+        if r["target"] and r["level"] == top[r["scenario"]]:
+            assert r["Skill"] < 0, (r["scenario"], r["level"], r["lead"], r["Skill"])
+        elif not r["target"] or r["level"] == 0:
+            assert r["Skill"] == pytest.approx(0.0, abs=1e-9), (r["scenario"], r["level"])
 
 
 def test_guard_catches_mask_blind_model_and_passes_mask_aware(base):
+    """Слепая к маске модель при полной потере истории выдаёт климатологию, поэтому её
+    холодный старт не хуже климатологии и пол проверки не опускается. Ловится она на
+    частичной потере данных, где читает пропуски как 0 °C."""
     from mayak.robustness import RobustnessError, check_skill_guard, skill_violations
     cfg, rows = _sweep(base, {"МАЯК": _Anchored("mask"), "слепая": _Anchored("blind")},
                        AVAILABILITY)
     check_skill_guard(rows, cfg.skill_tolerance, ("МАЯК",))
     good = [r for r in rows if r["model"] == "МАЯК" and r["level"] == 0 and r["lead"] == 1]
     assert all(r["Skill"] > 0.2 for r in good), "якорная модель с маской полезна на чистых данных"
+    blind = [r for r in rows if r["model"] == "слепая"]
+    assert all(r["Skill_L0"] == pytest.approx(0.0, abs=1e-9) for r in blind)
+    assert all(r["floor"] == pytest.approx(-cfg.skill_tolerance) for r in blind)
     bad = skill_violations(rows, cfg.skill_tolerance, ("слепая",))
     assert bad and all(r["level"] > 0 for r in bad), "нарушение - только под деградацией"
     assert {"dropout", "gap"} <= {r["scenario"] for r in bad}
@@ -513,32 +559,146 @@ def test_guard_catches_mask_blind_model_and_passes_mask_aware(base):
         check_skill_guard(rows, cfg.skill_tolerance, ("слепая",))
 
 
-def test_guard_is_never_vacuous(clim_rows):
+def test_model_that_always_gives_its_cold_start_passes_every_level(base):
+    """Модель со сдвинутым полем при любом отказе входа выдаёт свой прогноз без истории.
+    Её скилл везде ниже климатологии больше чем на допуск: прежнее правило отбраковало
+    бы её на каждом уровне. Пол холодного старта пропускает её: деградации нет."""
+    from mayak.robustness import check_skill_guard, skill_violations
+    cfg, rows = _sweep(base, {"МАЯК": _Anchored("biased", bias=2.0)}, GUARDED_INPUT)
+    assert {r["scenario"] for r in rows} == set(GUARDED_INPUT)
+    for r in rows:
+        assert r["Skill"] == pytest.approx(r["Skill_L0"], abs=1e-12), (r["scenario"], r["level"])
+        assert r["Skill"] < -cfg.skill_tolerance, "холодный старт хуже климатологии"
+        assert r["floor"] == pytest.approx(r["Skill_L0"] - cfg.skill_tolerance)
+    assert not skill_violations(rows, cfg.skill_tolerance)
+    assert check_skill_guard(rows, cfg.skill_tolerance) == len(rows)
+
+
+def test_floor_follows_cold_start_only_when_it_is_worse_than_climatology():
+    """Хороший холодный старт не ужесточает проверку, плохой - ослабляет её ровно до
+    себя; свойство прибора пола холодного старта не получает."""
+    from mayak.robustness import skill_floor
+    tol = 0.05
+    assert skill_floor(dict(kind=SCENARIO_INPUT, Skill_L0=0.3), tol) == pytest.approx(-0.05)
+    assert skill_floor(dict(kind=SCENARIO_INPUT, Skill_L0=0.0), tol) == pytest.approx(-0.05)
+    assert skill_floor(dict(kind=SCENARIO_INPUT, Skill_L0=-0.2), tol) == pytest.approx(-0.25)
+    assert skill_floor(dict(kind=SCENARIO_INSTRUMENT, Skill_L0=-0.2), tol) == \
+        pytest.approx(-0.05)
+    for missing in (dict(), dict(Skill_L0=float("nan")), dict(Skill_L0=None)):
+        assert skill_floor(dict(kind=SCENARIO_INPUT, **missing), tol) == pytest.approx(-0.05), \
+            "без измерения холодного старта порог строгий, а не пустой"
+
+
+def test_violation_uses_floor_of_its_own_row():
+    from mayak.robustness import RobustnessError, check_skill_guard, skill_violations
+    row = dict(set="internal", scenario="gap", level_label="48", model="МАЯК", lead=24,
+               guard=True, kind=SCENARIO_INPUT, Skill=-0.22, Skill_L0=-0.2)
+    assert not skill_violations([row], 0.05)
+    worse = dict(row, Skill=-0.26)
+    assert skill_violations([worse], 0.05) == [worse]
+    with pytest.raises(RobustnessError, match="порог -25.0%"):
+        check_skill_guard([row, worse], 0.05)
+    instr = dict(row, scenario="offset", kind=SCENARIO_INSTRUMENT)
+    assert skill_violations([instr], 0.05) == [instr], "у прибора пола холодного старта нет"
+
+
+def test_guard_is_never_vacuous(ref_rows):
     from mayak.robustness import RobustnessError, check_skill_guard
-    _cfg_, rows = clim_rows
+    _cfg_, rows = ref_rows
     with pytest.raises(RobustnessError, match="пуста"):
         check_skill_guard(rows, 0.05, ("нет такой модели",))
     with pytest.raises(RobustnessError, match="пуста"):
         check_skill_guard([dict(r, guard=False) for r in rows], 0.05, ("МАЯК",))
 
 
+@pytest.mark.parametrize("name, level", [("offset", 2.0), ("offset", 0.5), ("scale", 0.1),
+                                         ("drift", 0.2), ("offset_input", 2.0),
+                                         ("drift_input", 0.2), ("noise", 2.0)])
+def test_same_instrument_reference_follows_the_target_transform(base, name, level):
+    """Эталон скилла искажается тем же преобразованием, что цель: плюс смещение, умножение
+    на масштаб, плюс текущее смещение дрейфа. Если цель не искажена, эталон равен
+    климатологии станции."""
+    ds = _rset(base, name, level)
+    for i in range(len(base)):
+        a, b = base[i], ds[i]
+        muc = a["mu_clim_fut"].numpy().astype(np.float64)
+        ref = b["mu_ref_fut"].numpy().astype(np.float64)
+        L = int(b["hist_len"])
+        want = {"offset": muc + level, "scale": muc * (1.0 + level),
+                "drift": muc + drift_offset(L, level)}.get(name, muc)
+        np.testing.assert_allclose(ref, want, atol=1e-4)
+        assert torch.equal(b["mu_clim_fut"], a["mu_clim_fut"]), "вход модели не искажается"
+
+
+def test_perfect_forecast_of_distorted_target_has_skill_one(base):
+    """Смещение на целое число градусов b и прогноз «исходная цель плюс b»: запись
+    прибора совпадает с ним точно, и скилл относительно эталона того же прибора равен 1.
+    Сам эталон как прогноз даёт скилл 0."""
+    from mayak.evaluate import collect_predictions, evaluation_for
+    from mayak.robustness import reference_aux
+    b = 2.0
+    _p0, aux0 = collect_predictions({}, _rset(base, "offset", 0.0))
+    _p, aux = collect_predictions({}, _rset(base, "offset", b))
+    ok = aux["y_mask"] > 0
+    np.testing.assert_array_equal(aux["y"][ok], aux0["y"][ok] + b)
+    np.testing.assert_allclose(aux["mu_ref"], aux["mu_clim"] + b, atol=1e-4)
+
+    def spread(mu):
+        return mu[..., None] + aux["sigma_clim"][:, None, None] * np.asarray(ZQ, np.float32)
+
+    perfect = (aux0["y"] + b).astype(np.float32)
+    ev = evaluation_for(dict(mu=perfect, q=spread(perfect)), reference_aux(aux))
+    assert ev.summary()["pooled"]["Skill"] == pytest.approx(1.0)
+    ev_ref = evaluation_for(dict(mu=aux["mu_ref"], q=spread(aux["mu_ref"])), reference_aux(aux))
+    assert ev_ref.summary()["pooled"]["Skill"] == pytest.approx(0.0, abs=1e-9)
+    assert reference_aux(aux0)["mu_clim"] is aux0["mu_ref"]
+
+
+def test_reference_aux_leaves_sets_without_reference_alone(base):
+    from mayak.evaluate import collect_predictions
+    from mayak.robustness import reference_aux
+    _p, aux = collect_predictions({}, base.with_history(0))
+    assert "mu_ref" not in aux and reference_aux(aux) is aux
+
+
 def test_unnoticed_offset_is_reported_but_not_asserted(base):
-    """Незамеченное смещение прибора: скилл падает (модель не может знать о смещении),
-    но утверждение его не проверяет. То же смещение как свойство прибора - проверяет."""
+    """Незамеченное смещение прибора: даже модель, знающая свойства своего прибора,
+    теряет скилл - цель не искажена, а история сдвинута. Проверка этот вариант не
+    смотрит. То же смещение как свойство прибора - смотрит, и модель его проходит."""
     from mayak.robustness import (RobustnessError, check_skill_guard, robustness_sweep,
                                   skill_violations)
     specs = (ScenarioSpec("offset", (0.0, 5.0)), ScenarioSpec("offset_input", (0.0, 5.0)))
     cfg = _cfg(scenarios=specs)
-    rows = robustness_sweep({"МАЯК": _Anchored("mask")}, base, cfg, statistical=False)
+    rows = robustness_sweep({"МАЯК": _Anchored("aware")}, base, cfg, statistical=False)
     inp = [r for r in rows
            if r["scenario"] == "offset_input" and r["level"] == 5 and r["lead"] == 1]
     assert inp[0]["Skill"] < -cfg.skill_tolerance
     assert not skill_violations(rows, cfg.skill_tolerance)
     check_skill_guard(rows, cfg.skill_tolerance)
     cfg_g = _cfg(scenarios=(ScenarioSpec("offset_input", (0.0, 5.0), guard=True),))
-    rows_g = robustness_sweep({"МАЯК": _Anchored("mask")}, base, cfg_g, statistical=False)
+    rows_g = robustness_sweep({"МАЯК": _Anchored("aware")}, base, cfg_g, statistical=False)
     with pytest.raises(RobustnessError, match="offset_input"):
         check_skill_guard(rows_g, cfg_g.skill_tolerance)
+
+
+def test_model_that_forgets_instrument_offset_fails_the_guard(base):
+    """Модель, которая принимает смещение прибора за погодную аномалию и забывает его
+    за сутки, против эталона того же прибора проверку не проходит на длинных лидах.
+    При эталоне без искажения её скилл там был бы около нуля, и проверка бы молчала.
+    Модель, которая держит смещение на всём горизонте, проходит на тех же окнах."""
+    from mayak.robustness import RobustnessError, check_skill_guard, robustness_sweep
+    cfg = _cfg(scenarios=(ScenarioSpec("offset", (0.0, 5.0)),))
+    rows = robustness_sweep({"МАЯК": _Anchored("mask"), "знающая": _Anchored("aware")}, base,
+                            cfg, statistical=False)
+    far = [r for r in rows if r["model"] == "МАЯК" and r["level"] == 5 and r["lead"] == 24]
+    assert far[0]["Skill"] < -0.5
+    with pytest.raises(RobustnessError, match="offset = 5"):
+        check_skill_guard(rows, cfg.skill_tolerance, ("МАЯК",))
+    check_skill_guard(rows, cfg.skill_tolerance, ("знающая",))
+    aware = {(r["level"], r["lead"]): r["Skill"] for r in rows if r["model"] == "знающая"}
+    for h in cfg.leads:
+        assert aware[(5.0, h)] == pytest.approx(aware[(0.0, h)], abs=0.02), \
+            "целое смещение не меняет скилл модели, которая его учитывает"
 
 
 def test_rows_carry_ci_distortion_and_excess(base):
@@ -562,18 +722,49 @@ def test_rows_carry_ci_distortion_and_excess(base):
         if r["level"] == 0:
             assert r["dMAE"] == 0.0
         assert r["excess"] == pytest.approx(r["dMAE"] - r["distortion"])
+        assert np.isfinite(r["Skill_L0"]), "холодный старт посчитан для каждой модели"
+        assert r["floor"] <= -cfg.skill_tolerance + 1e-12
     for r in rows:
         if r["model"] == "МАЯК" and r["scenario"] == "offset":
             assert r["excess"] <= 1e-5, "климатология не может расти быстрее искажения"
+        if r["model"] == "Климатология" and r["scenario"] == "offset" and r["level"] == 3.0:
+            assert r["Skill"] < 0, "статистическая климатология о смещении прибора не знает"
 
 
-def test_results_and_plots_are_written(clim_rows, tmp_path):
+def test_cold_start_rows_measure_the_same_windows_without_history(base):
+    """Холодный старт - те же окна и та же цель без истории; эталон скилла - климатология
+    станции. Сценарий полной потери истории даёт ровно тот же скилл."""
+    from mayak.robustness import cold_start_sweep, robustness_sweep
+    cfg = _cfg(scenarios=(ScenarioSpec("history", (0.0, float(L_MAX))),), bootstrap=20)
+    models = {"МАЯК": _Anchored("mask"), "сдвиг": _Anchored("biased", bias=1.0)}
+    cold = cold_start_sweep(models, base, cfg, statistical=False)
+    assert {(r["model"], r["lead"]) for r in cold} == {(m, h) for m in models for h in cfg.leads}
+    for r in cold:
+        assert r["history"] == 0 and r["set"] == "internal"
+        assert 10 <= r["n_windows"] <= len(base) and "Skill_lo" in r
+    by = {(r["model"], r["lead"]): r["Skill"] for r in cold}
+    assert all(by[("МАЯК", h)] == pytest.approx(0.0, abs=1e-9) for h in cfg.leads)
+    assert all(by[("сдвиг", h)] < -0.05 for h in cfg.leads)
+    rows = robustness_sweep(models, base, cfg, statistical=False, cold=cold)
+    for r in rows:
+        assert r["Skill_L0"] == by[(r["model"], r["lead"])]
+        if r["level"] == L_MAX:
+            assert r["Skill"] == pytest.approx(r["Skill_L0"], abs=1e-12)
+    again = robustness_sweep(models, base, cfg, statistical=False)
+    assert [r["Skill_L0"] for r in again] == [r["Skill_L0"] for r in rows], \
+        "без готовых строк холодный старт считается внутри прогона тем же способом"
+
+
+def test_results_and_plots_are_written(ref_rows, tmp_path):
     from mayak.robustness import plot_all, save_results
-    cfg, rows = clim_rows
-    pj, pc = save_results(rows, tmp_path, cfg, meta=dict(ckpt="x"))
+    cfg, rows = ref_rows
+    cold = [dict(set="internal", model="МАЯК", lead=1, history=0, Skill=float("nan"))]
+    pj, pc = save_results(rows, tmp_path, cfg, meta=dict(ckpt="x"), cold_start=cold)
     blob = json.loads(Path(pj).read_text(encoding="utf-8"),
                       parse_constant=lambda c: pytest.fail(f"{c} в JSON"))
     assert len(blob["rows"]) == len(rows) and blob["violations"] == []
+    assert blob["cold_start"] == [dict(cold[0], Skill=None)]
+    assert all("Skill_L0" in r and "floor" in r for r in blob["rows"])
     assert RobustnessConfig.from_dict(blob["config"]) == cfg
     with open(pc, encoding="utf-8") as f:
         assert len(list(csv.DictReader(f))) == len(rows)
@@ -604,3 +795,101 @@ def test_module_help(monkeypatch, capsys):
     with pytest.raises(SystemExit) as e:
         runpy.run_module("mayak.robustness", run_name="__main__", alter_sys=True)
     assert e.value.code == 0 and "usage" in capsys.readouterr().out
+
+
+TINY_MODEL = dict(encoder_width=16, encoder_dilations=(1, 2, 4, 8), passport_dim=8,
+                  passport_hidden=16, field_hidden=24, heads_hidden=16, loc_freqs=8)
+TINY_STEPS = (20, 30)
+
+
+@pytest.fixture(scope="module")
+def tiny_ckpt(manifest, store, tmp_path_factory):
+    """Уменьшенный МАЯК, обученный здесь же обычным протоколом за несколько десятков
+    шагов: этап без истории, затем полный куррикулум."""
+    from mayak.config import ModelConfig
+    from mayak.protocol import Protocol, Stage, run_protocol
+    proto = Protocol(stages=(Stage("A", "L0", TINY_STEPS[0]), Stage("B", "full", TINY_STEPS[1])),
+                     batch_size=8, windows_per_epoch=64, num_workers=0, seed=0,
+                     precision="32", val_every=10)
+    out = tmp_path_factory.mktemp("runs12")
+    journal = run_protocol("mayak", manifest, proto, out_root=str(out), accelerator="cpu",
+                           model_config=ModelConfig(**TINY_MODEL),
+                           data_config=dict(val_windows_per_station=2),
+                           enable_progress_bar=False)
+    return journal["final_ckpt"]
+
+
+def _tiny_config(path):
+    """Короткий конфиг сценариев: по одному сценарию полной потери истории каждого вида,
+    частичная потеря, шум и смещение прибора; два лида, без бутстрапа."""
+    cfg = RobustnessConfig(windows_per_station=3, leads=(1, 24), bootstrap=0, scenarios=(
+        dict(name="dropout", levels=(0.0, 0.5, 1.0)),
+        dict(name="gap", levels=(0, 24, L_MAX)),
+        dict(name="history", levels=(0, 336, L_MAX)),
+        dict(name="noise", levels=(0.0, 1.0)),
+        dict(name="offset", levels=(0.0, 2.0)),
+        dict(name="offset_input", levels=(0.0, 2.0))))
+    path.write_text(yaml.safe_dump(json.loads(json.dumps(cfg.to_dict())), allow_unicode=True),
+                    encoding="utf-8")
+    return cfg
+
+
+def test_trained_tiny_model_through_the_command_line(tiny_ckpt, manifest, tmp_path, capsys):
+    """Полный путь на обученной модели без внешних артефактов: командная строка, отчёт,
+    JSON. Холодный старт посчитан по каждому лиду; каждая строка отказа входа несёт его
+    скилл и свой порог; три пути к полной потере истории дают ровно скилл холодного
+    старта и потому никогда не нарушают проверку; нарушения в JSON - ровно те, что
+    находит проверка по строкам."""
+    from mayak.robustness import main, skill_floor, skill_violations
+    cfg = _tiny_config(tmp_path / "tiny.yaml")
+    out = tmp_path / "out"
+    main(["--ckpt", tiny_ckpt, "--manifest", manifest, "--config", str(tmp_path / "tiny.yaml"),
+          "--no-statistical", "--report-only", "--out-dir", str(out)])
+    text = capsys.readouterr().out
+    assert "холодный старт" in text and ("пройдена" in text or "НАРУШЕНИЕ" in text)
+    blob = json.loads((out / "robustness.json").read_text(encoding="utf-8"))
+    assert RobustnessConfig.from_dict(blob["config"]) == cfg
+    cold = {(r["model"], r["lead"]): r["Skill"] for r in blob["cold_start"]}
+    assert set(cold) == {("МАЯК", h) for h in cfg.leads}
+    assert all(v is not None for v in cold.values())
+    rows = [{k: (float("nan") if v is None else v) for k, v in r.items()} for r in blob["rows"]]
+    assert {r["scenario"] for r in rows} == {sc.name for sc in cfg.scenarios}
+    for r in rows:
+        assert r["Skill_L0"] == pytest.approx(cold[(r["model"], r["lead"])], abs=1e-12)
+        assert r["floor"] == pytest.approx(skill_floor(r, cfg.skill_tolerance))
+        if r["kind"] == SCENARIO_INPUT:
+            assert r["floor"] == pytest.approx(min(0.0, r["Skill_L0"]) - cfg.skill_tolerance)
+        full_loss = (r["scenario"] == "dropout" and r["level"] == 1.0) or \
+            (r["scenario"] in ("gap", "history") and r["level"] == L_MAX)
+        if full_loss:
+            assert r["Skill"] == pytest.approx(r["Skill_L0"], abs=1e-6), r["scenario"]
+            assert r["Skill"] >= r["floor"]
+    bad = skill_violations(rows, cfg.skill_tolerance, cfg.guard_models)
+    key = lambda r: (r["scenario"], r["level"], r["lead"])
+    assert sorted(map(key, blob["violations"])) == sorted(map(key, bad))
+    assert (out / "robustness_internal_summary_skill24.png").stat().st_size > 0
+
+
+def test_trained_tiny_model_giving_its_cold_start_passes_the_guard(tiny_ckpt, base):
+    """Обученная модель, которой всегда подают вход без истории, при любом отказе входа
+    выдаёт свой прогноз холодного старта и проходит проверку на всех уровнях, какой бы
+    ни был этот холодный старт."""
+    from mayak.lit import load_model
+    from mayak.robustness import check_skill_guard, skill_violations
+
+    class ColdOnly(torch.nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+
+        def forward(self, b):
+            return self.model(dict(b, x_hist=torch.zeros_like(b["x_hist"]),
+                                   mask_hist=torch.zeros_like(b["mask_hist"]),
+                                   hist_len=torch.zeros_like(b["hist_len"])))
+
+    names = ("dropout", "gap", "noise", "spikes", "freeze", "drop_channel", "history")
+    cfg, rows = _sweep(base, {"МАЯК": ColdOnly(load_model(tiny_ckpt))}, names)
+    for r in rows:
+        assert r["Skill"] == pytest.approx(r["Skill_L0"], abs=1e-6), (r["scenario"], r["level"])
+    assert not skill_violations(rows, cfg.skill_tolerance)
+    assert check_skill_guard(rows, cfg.skill_tolerance) == len(rows)

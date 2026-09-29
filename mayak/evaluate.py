@@ -77,6 +77,7 @@ _AUX_KEYS = (("y", "y"), ("y_mask", "y_mask"), ("mu_clim", "mu_clim_fut"),
              ("a_recent", "a_recent"), ("a_recent_ok", "a_recent_ok"),
              ("sigma_clim", "sigma_clim"), ("x_hist", "x_hist"),
              ("mask_hist", "mask_hist"))
+_OPTIONAL_AUX_KEYS = (("mu_ref", "mu_ref_fut"),)
 
 
 @torch.no_grad()
@@ -95,7 +96,8 @@ def gather_all(named, dataset, device="cpu", batch_size=128):
     Returns:
         Пара: словарь из имени модели в её медиану формы (N, H) и квантили формы
         (N, H, 7), и словарь с целью, маской цели, климатологией на горизонте, недавней
-        аномалией, климатологическим масштабом и историей окон.
+        аномалией, климатологическим масштабом и историей окон. Если набор окон даёт
+        отдельный эталон скилла, он лежит в том же словаре под ключом mu_ref.
     """
     for m in named.values():
         m.eval().to(device)
@@ -104,6 +106,9 @@ def gather_all(named, dataset, device="cpu", batch_size=128):
     for b in DataLoader(dataset, batch_size=batch_size):
         for k, src in _AUX_KEYS:
             acc[k].append(b[src].numpy())
+        for k, src in _OPTIONAL_AUX_KEYS:
+            if src in b:
+                acc.setdefault(k, []).append(b[src].numpy())
         if not named:
             continue
         bb = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}

@@ -220,6 +220,38 @@ def apply_scenario(w: AugWindow, name, level, rng, params=None):
     return w
 
 
+def instrument_reference(name, level, w: AugWindow, mu_clim, rng, params=None):
+    """Эталон скилла на горизонте: климатология, записанная тем же прибором, что цель.
+
+    Если сценарий искажает цель, эталон искажается тем же преобразованием. Иначе
+    знаменатель скилла растёт вместе с поломкой прибора, и скилл улучшается оттого, что
+    прибор сломан. Преобразование не описывается отдельно, его выполняет сам сценарий:
+    он применяется к пробному окну с той же длиной истории и теми же метаданными, пустой
+    историей и климатологией на месте цели. Если сценарий цель не трогает, эталон равен
+    климатологии.
+
+    Args:
+        name: имя сценария.
+        level: уровень сценария.
+        w: окно до применения сценария; из него берутся длина истории и метаданные.
+        mu_clim: климатология на часах горизонта, форма (H,).
+        rng: генератор случайных чисел сценария, заведённый так же, как для цели.
+        params: параметры сценария; None значит значения по умолчанию.
+
+    Returns:
+        Эталон формы (H,), float32. До целых градусов он не округляется: это среднее,
+        а не отдельная запись прибора.
+    """
+    ref = np.array(mu_clim, np.float32)
+    if not SCENARIOS[name].rule.target:
+        return ref
+    probe = AugWindow(x=np.zeros_like(w.x), m=np.zeros_like(w.m), y=ref,
+                      y_mask=np.ones(ref.shape, np.float32), L=w.L, hour=w.hour,
+                      lat=w.lat, lon=w.lon, elev=w.elev, qc_elev=w.qc_elev)
+    apply_scenario(probe, name, level, rng, params)
+    return probe.y
+
+
 def level_label(name, level):
     """Подпись уровня для таблиц и осей."""
     if name == "drop_channel":
@@ -230,5 +262,5 @@ def level_label(name, level):
 
 
 __all__ = ["DITHER_SCENARIOS", "DROP_CHANNEL_LABELS", "SCENARIOS", "ScenarioDef",
-           "apply_scenario", "dither_rng", "drift_offset", "level_label", "scenario_rng",
-           "variants_of"]
+           "apply_scenario", "dither_rng", "drift_offset", "instrument_reference", "level_label",
+           "scenario_rng", "variants_of"]
