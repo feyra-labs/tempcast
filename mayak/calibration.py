@@ -52,7 +52,7 @@ KIND_NARROW, KIND_WIDE = "узкий интервал", "широкий инте
 KIND_BELOW, KIND_ABOVE = "факт ниже интервала", "факт выше интервала"
 ONE_SIDED = 2.0 / 3.0
 META_KEYS = ("station", "role", "zone", "season", "history", "history_label", "hist_valid",
-             "has_pressure", "report_class", "elev_gap", "t")
+             "has_pressure", "elev_gap", "train_distance", "t")
 FORMAT_VERSION = 1
 
 
@@ -127,15 +127,16 @@ def coverage_strata(meta, external=False):
         Словарь из имени разреза в пару: метки окон формы (N,) и порядок меток, в
         котором разрез показывается; None значит алфавитный порядок.
     """
-    from mayak.evaluate import HIST_VALID_BINS, bin_label
+    from mayak.evaluate import HIST_VALID_BINS, TRAIN_DISTANCE_DIM, bin_label
+    from mayak.external import TRAIN_DISTANCE_ORDER
     hist, hist_order = history_strata(meta)
     hvalid = np.array([bin_label(float(v), HIST_VALID_BINS) for v in meta["hist_valid"]], object)
     keys = {"роль станции": meta.get("role"), "зона Кёппена": meta.get("zone"),
             HISTORY_DIM: hist, "валидность истории": hvalid,
-            "частота отчётности": meta.get("report_class"),
+            TRAIN_DISTANCE_DIM: meta.get("train_distance"),
             "Δ высоты станция−ЦМР": meta.get("elev_gap"),
             "канал давления": meta.get("has_pressure")}
-    orders = {HISTORY_DIM: hist_order}
+    orders = {HISTORY_DIM: hist_order, TRAIN_DISTANCE_DIM: TRAIN_DISTANCE_ORDER}
     dims = COVERAGE_DIMS_EXTERNAL if external else COVERAGE_DIMS_INTERNAL
     return {d: (np.asarray(keys[d], object), orders.get(d)) for d in dims
             if keys.get(d) is not None}

@@ -20,8 +20,9 @@ from mayak.data.qc import QCCode, station_pressure_expected
 from mayak.data.splits import (EXTERNAL_MIN_TRAIN_YEARS, ROLE_EXTERNAL, ROLE_TEST, ROLE_TRAIN,
                                ROLE_VAL, assign_roles, full_years,
                                min_hours_for_train_years, time_layout)
-from mayak.leakage import (SELECTION_KEY, LeakageError, check_external, check_windows,
-                           conformal_meta_path, run_checklist)
+from mayak.leakage import (SELECTION_KEY, LeakageError, check_external,
+                           check_external_calendar, check_windows, conformal_meta_path,
+                           external_first_hour, run_checklist, train_last_hour)
 from mayak.metrics import NQ, Evaluation
 from mayak.timeaxis import to_utc_hour
 
@@ -155,13 +156,37 @@ def test_tolerance_bounds_are_inclusive():
     _eq_nan(s.T, [0.0, 1.0])
 
 
-@pytest.mark.parametrize("every, cls", [(1, "1ч"), (3, "3ч"), (6, "6ч"), (4, "иное")])
-def test_sparse_reporting_leaves_holes_and_is_classified(every, cls):
+@pytest.mark.parametrize("every", [1, 3, 4, 6])
+def test_sparse_reporting_leaves_holes_and_step_is_measured(every):
     rows = [(60 * k, 5.0 + 0.1 * k, NAN, NAN, 0) for k in range(0, 240, every)]
     s = G.hourly_station(_obs(rows))
     assert s.valid[:, 0].sum() == len(rows)
     assert G.report_step(s.valid[:, 0]) == every
-    assert G.report_class(G.report_step(s.valid[:, 0])) == cls
+
+
+def test_report_step_ignores_single_gaps_and_is_zero_without_pairs():
+    m = np.ones(500)
+    m[[10, 11, 50, 200, 201, 202]] = 0
+    assert G.report_step(m) == 1, "отдельные пропуски не меняют шаг почасовой станции"
+    assert G.report_step(np.zeros(100)) == 0
+    one = np.zeros(100)
+    one[40] = 1
+    assert G.report_step(one) == 0
+
+
+@pytest.mark.parametrize("step, frac, start", [
+    (1, 0.9, None),
+    (1, 0.3, "валидной T"),
+    (3, 0.33, "шаг отчётности 3 ч"),
+    (2, 0.9, "шаг отчётности 2 ч"),
+    (0, 0.0, "валидной T"),
+])
+def test_reporting_exclusion_names_the_root_cause(step, frac, start):
+    reason = G.reporting_exclusion(step, frac, 0.5)
+    if start is None:
+        assert reason is None
+    else:
+        assert reason.startswith(start), reason
 
 
 def test_humidity_uses_the_models_formula_and_constants(sample):
@@ -236,9 +261,14 @@ def _synthetic(n, seed, lon=LON):
     return abs_h, T, Td, P
 
 
-def _write_psv(root, sid, n, seed, drop=None, flag_hours=()):
-    """Годовые PSV-файлы GHCNh синтетической станции (отчёты ровно в :00)."""
+def _write_psv(root, sid, n, seed, drop=None, flag_hours=(), t_hours=None):
+    """Годовые PSV-файлы GHCNh синтетической станции (отчёты ровно в :00).
+
+    t_hours - часы ряда, в которые станция передала температуру; None - во все часы.
+    """
     abs_h, T, Td, P = _synthetic(n, seed)
+    if t_hours is not None:
+        T = np.where(np.isin(np.arange(n), list(t_hours)), T, np.nan)
     keep = np.ones(n, bool) if drop is None else ~drop(abs_h)
     ts = pd.to_datetime(abs_h * 3600, unit="s")
     q = np.where(np.isin(np.arange(n), list(flag_hours)), "3", "5")
@@ -281,8 +311,9 @@ def external(tmp_path_factory):
     _write_psv(raw, "EXT_SHORT", N_SHORT, 3)
     _write_psv(raw, "EXT_GAPPY", N_LONG, 4, drop=_no_february)
     _write_psv(raw, "EXT_3H", N_LONG, 5, drop=lambda h: np.arange(len(h)) % 3 != 0)
+    _write_psv(raw, "EXT_ONE_T", N_SHORT, 6, t_hours=(0,))
     stations = pd.DataFrame(dict(id=["EXT_LONG", "EXT_LONG2", "EXT_SHORT", "EXT_GAPPY", "EXT_NONE",
-                                     "EXT_3H"],
+                                     "EXT_3H", "EXT_ONE_T"],
                                  lat=50.0, lon=LON, elev=STATION_ELEV, name="x"))
     dem = lambda lat, lon: 100.0
     koppen = lambda lat, lon: "Cfb"
@@ -325,6 +356,9 @@ def test_builder_writes_store_contract_and_manifest(external):
     assert rep["EXT_NONE"]["status"] == "excluded" and "нет скачанных" in rep["EXT_NONE"]["reason"]
     assert rep["EXT_3H"]["status"] == "excluded" and rep["EXT_3H"]["report_every"] == 3
     assert "шаг отчётности 3 ч" in rep["EXT_3H"]["reason"], "только почасовые приборы"
+    one = rep["EXT_ONE_T"]
+    assert one["status"] == "excluded" and one["report_every"] == 0
+    assert one["reason"].startswith("валидной T"), "при шаге 0 причина - мало температуры"
     r = rows["EXT_LONG"]
     assert r["split"] == ROLE_EXTERNAL and r["koppen"] == "Cfb"
     assert r["elev"] == 100.0 and r["dem_elev"] == 100.0, "высота модели - из ЦМР"
@@ -457,9 +491,78 @@ def test_check_external_passes_on_clean_pipeline(main_store, external):
     ext = S.get_store(external["manifest"])
     rep = check_external(main_store, ext)
     assert rep["external_stations"] == 2
-    assert rep["near_train"] == 2, "обучающие точки в паре км: диагностика, не ошибка"
+    assert rep["train_distance"] == {"<25 км": 2}, "близость - сводка и разрез, не ошибка"
+    assert rep["calendar"]["margin_hours"] > 0
     summary = run_checklist(ext, external_store=ext)
     assert summary["external"]["external_stations"] == 2
+    assert summary["external"]["calendar"] is None, "без обучающих станций сравнивать не с чем"
+
+
+def _shift_train(store, hours):
+    """Копия набора, где ряды обучающих станций сдвинуты по календарю на hours часов."""
+    out = _clone(store)
+    for s in out.stations.values():
+        if s["role"] == ROLE_TRAIN:
+            s["t0"] = int(s["t0"]) + int(hours)
+    return out
+
+
+def test_check_external_rejects_calendar_overlap(main_store, external):
+    ext = S.get_store(external["manifest"])
+    first, last = external_first_hour(ext), train_last_hour(main_store)
+    assert last < first
+    touching = _shift_train(main_store, first - last - 1)
+    assert check_external_calendar(touching, ext)["margin_hours"] == 0
+    check_external(touching, ext)
+    overlap = _shift_train(main_store, first - last)
+    with pytest.raises(LeakageError, match="по календарю"):
+        check_external(overlap, ext)
+    with pytest.raises(LeakageError, match="по календарю"):
+        run_checklist(overlap, external_store=ext)
+
+
+def test_external_first_hour_covers_history_and_qc_context(external):
+    from mayak.data.qc import DEFAULT_QC
+    ext = S.get_store(external["manifest"])
+    s = ext.stations["EXT_LONG"]
+    test_lo = time_layout(s["N"]).span("test")[0]
+    first = external_first_hour(S.get_store(external["manifest"]))
+    starts = {sid: int(v["t0"]) + time_layout(v["N"]).span("test")[0]
+              for sid, v in ext.stations.items()}
+    assert first == min(starts.values()) - L_MAX - DEFAULT_QC.lookback_hours
+    assert int(s["t0"]) + test_lo - first >= L_MAX
+
+
+class _Points:
+    """Набор из одних записей станций: роль, координаты, начало и длина ряда."""
+
+    def __init__(self, stations):
+        self.stations = stations
+
+    def by_role(self, role):
+        return [s for s in self.stations.values() if s["role"] == role]
+
+
+def _period(first_day, last_day, role, lat=50.0, lon=LON):
+    t0 = int(to_utc_hour(datetime(first_day.year, first_day.month, first_day.day)))
+    return dict(t0=t0, N=((last_day - first_day).days + 1) * 24, role=role, lat=lat, lon=lon)
+
+
+@pytest.mark.parametrize("years, ok", [((2016, 2025), True), ((2015, 2024), True),
+                                       ((2014, 2023), False)])
+def test_default_training_period_precedes_external_test(years, ok):
+    """Реанализ по умолчанию - 10 лет до конца 2025 года; внешний ряд - годы GHCNh."""
+    from datetime import date
+
+    from mayak.data.era5 import default_period
+    start, end = default_period()
+    train = _Points({"p": _period(start, end, ROLE_TRAIN)})
+    ext = _Points({"e": _period(date(years[0], 1, 1), date(years[1], 12, 31), ROLE_EXTERNAL)})
+    if ok:
+        assert check_external_calendar(train, ext)["margin_hours"] > 0
+    else:
+        with pytest.raises(LeakageError):
+            check_external_calendar(train, ext)
 
 
 def _clone(store):
@@ -509,11 +612,17 @@ def test_eval_set_meta_has_external_slices(external):
     from mayak.evaluate import EvalSet, external_breakdowns
     store = S.get_store(external["manifest"])
     ds = EvalSet(store.clims(), station_splits=(ROLE_EXTERNAL,), manifest=external["manifest"],
-                 time_key="test", every_hours=48)
+                 time_key="test", every_hours=48,
+                 train_km={"EXT_LONG": 3.0, "EXT_LONG2": 150.0})
     assert len(ds) > 0
     meta = ds.window_meta()
     assert all(len(v) == len(ds) for v in meta.values())
-    assert set(meta["report_class"]) == {"1ч"}
+    assert "report_class" not in meta, "во внешнем тесте только почасовые станции"
+    by_station = dict(zip(meta["station"], meta["train_distance"]))
+    assert by_station == {"EXT_LONG": "<25 км", "EXT_LONG2": "100-300 км"}
+    plain = EvalSet(store.clims(), station_splits=(ROLE_EXTERNAL,),
+                    manifest=external["manifest"], time_key="test", every_hours=48)
+    assert set(plain.window_meta()["train_distance"]) == {"нет данных"}
     assert set(meta["elev_gap"]) == {"|Δh| <50 м"}, "120 − 100 = 20 м"
     assert set(meta["has_pressure"]) == {PRESSURE_YES}
     run_checklist(store, datasets=[ds])
@@ -525,9 +634,31 @@ def test_eval_set_meta_has_external_slices(external):
                     mu_clim=y + rng.normal(0, 3, (n, H)), w=np.ones((n, H)),
                     station=meta["station"])
     out = external_breakdowns(ev, meta, leads=[24], min_windows=1, min_stations=1)
-    assert set(out) == {"валидность истории", "частота отчётности", "Δ высоты станция−ЦМР",
-                        "канал давления"}
+    assert set(out) == {"валидность истории", "расстояние до обучающей точки",
+                        "Δ высоты станция−ЦМР", "канал давления"}
     assert all(rows for rows in out.values())
+    assert list(out["расстояние до обучающей точки"]) == ["<25 км", "100-300 км"], \
+        "бины идут по возрастанию расстояния"
+
+
+@pytest.mark.parametrize("km, label", [(0.0, "<25 км"), (24.99, "<25 км"), (25.0, "25-100 км"),
+                                       (99.9, "25-100 км"), (100.0, "100-300 км"),
+                                       (300.0, "≥300 км"), (5000.0, "≥300 км"),
+                                       (None, "нет данных"), (float("nan"), "нет данных")])
+def test_train_distance_labels(km, label):
+    from mayak.external import train_distance_label
+    assert train_distance_label(km) == label
+
+
+def test_nearest_train_km_uses_only_training_points():
+    from mayak.external import nearest_train_km
+    main = _Points({"a": dict(role=ROLE_TRAIN, lat=51.0, lon=LON),
+                    "b": dict(role=ROLE_TRAIN, lat=60.0, lon=LON),
+                    "v": dict(role=ROLE_VAL, lat=50.0, lon=LON)})
+    ext = _Points({"e": dict(role=ROLE_EXTERNAL, lat=50.0, lon=LON)})
+    km = nearest_train_km(main, ext)["e"]
+    assert km == pytest.approx(111.2, abs=0.5), "градус широты, валидационная точка не в счёт"
+    assert nearest_train_km(_Points({}), ext) == {}
 
 
 def test_elevation_gap_labels():

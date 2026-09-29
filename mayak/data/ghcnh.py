@@ -271,9 +271,16 @@ def hourly_station(obs: pd.DataFrame, tol_minutes=20) -> HourlySeries:
 
 
 def report_step(mask_T) -> int:
-    """Типичный шаг отчётности станции, ч: мода интервалов между валидными часами T.
+    """Шаг отчётности станции: самый частый интервал между валидными часами температуры.
 
-    0 - меньше двух валидных часов.
+    Отдельные пропуски на шаг не влияют: у почасовой станции с дырами самый частый
+    интервал всё равно один час.
+
+    Args:
+        mask_T: наличие температуры по часам ряда, форма (N,).
+
+    Returns:
+        Шаг в часах; ноль, если валидных часов меньше двух.
     """
     idx = np.flatnonzero(np.asarray(mask_T) > 0)
     if idx.size < 2:
@@ -283,15 +290,33 @@ def report_step(mask_T) -> int:
     return int(vals[np.argmax(cnt)])
 
 
-# Шаг отчётности прибора проекта, ч. Станции с другим типичным шагом во внешний тест
-# не входят: интерполяция подменила бы наблюдения выдуманными значениями.
 REPORT_EVERY_HOURS = 1
-REPORT_CLASSES = {1: "1ч", 3: "3ч", 6: "6ч"}
 
 
-def report_class(step) -> str:
-    """Шаг отчётности → класс «1ч» / «3ч» / «6ч» / «иное»."""
-    return REPORT_CLASSES.get(int(step), "иное")
+def reporting_exclusion(step, valid_frac_T, min_valid_frac_T=0.5):
+    """Причина исключения станции по шагу отчётности и доле валидной температуры.
+
+    Шаг отчётности проверяется раньше доли валидной температуры: у трёхчасовой станции
+    валидна лишь треть часов, и настоящая причина её исключения в шаге. Исключение из
+    этого порядка - шаг ноль. Он означает, что валидных часов температуры меньше двух,
+    и тогда первопричина в нехватке температуры, а не в расписании отчётов.
+
+    Args:
+        step: шаг отчётности станции, ч.
+        valid_frac_T: доля часов ряда с валидной температурой.
+        min_valid_frac_T: наименьшая допустимая доля валидной температуры.
+
+    Returns:
+        Текст причины или None, если станция проходит обе проверки.
+    """
+    low_T = valid_frac_T < min_valid_frac_T
+    low_T_reason = f"валидной T {valid_frac_T:.1%} < {min_valid_frac_T:.0%}"
+    if step == 0 and low_T:
+        return low_T_reason
+    if step != REPORT_EVERY_HOURS:
+        return (f"шаг отчётности {step} ч: проект работает с приборами, отчитывающимися раз "
+                f"в {REPORT_EVERY_HOURS} ч")
+    return low_T_reason if low_T else None
 
 
 STATION_LIST_FWF = dict(colspecs=[(0, 11), (12, 20), (21, 30), (31, 37), (38, 40), (41, 71),
@@ -341,18 +366,30 @@ def station_files(raw_dir, sid):
 
 def build_external_dataset(raw_dir, out_dir, stations, dem, koppen, tol_minutes=20,
                            min_train_years=None, min_valid_frac_T=0.5):
-    """Скачанные файлы GHCNh → каталог набора внешнего теста.
+    """Собирает каталог набора внешнего теста из скачанных файлов GHCNh.
 
-    stations - таблица ``read_station_list`` (id, lat, lon, elev, name);
-    dem      - функция (lat, lon) → высота из ЦМР, м, или None;
-    koppen   - функция (lat, lon) → полная зона Кёппена.
-    Пишет ``<out>/stations/<id>.npz`` (контракт ``mayak.data.store``),
-    ``<out>/manifest.csv`` (роль external_test; elev - из ЦМР, station_elev - из
-    списка станций) и ``<out>/selection_report.csv`` с причиной по каждой станции.
-    Предотбор здесь грубый (длина ряда, доля валидной T и почасовая отчётность: типичный
-    шаг между отчётами T ровно час); окончательный отбор -
-    правила QC при сборке кэша, в том числе «≥ min_train_years полных лет в
-    обучающем окне» для роли external_test.
+    Предотбор здесь грубый: длина ряда, шаг отчётности и доля валидной температуры.
+    Станция проходит, только если самый частый интервал между её отчётами температуры
+    по всему скачанному ряду равен одному часу; отдельные пропуски на это не влияют.
+    Окончательный отбор делают правила QC при сборке кэша, в том числе требование
+    полных лет в обучающем окне станции.
+
+    Args:
+        raw_dir: каталог скачанных файлов, по подкаталогу на станцию.
+        out_dir: каталог набора.
+        stations: таблица станций с колонками id, lat, lon, elev, name.
+        dem: функция от широты и долготы, возвращает высоту из цифровой модели
+            рельефа в метрах или None.
+        koppen: функция от широты и долготы, возвращает полную зону Кёппена.
+        tol_minutes: допуск от целого часа, мин.
+        min_train_years: полных лет в обучающем окне; None - значение проекта.
+        min_valid_frac_T: наименьшая доля часов ряда с валидной температурой.
+
+    Returns:
+        Пара: строки манифеста включённых станций и строки отчёта отбора по всем
+        станциям. В каталог пишутся файлы станций, манифест с ролью внешнего теста
+        (высота модели из цифровой модели рельефа, заявленная высота отдельно) и отчёт
+        отбора с причиной по каждой станции.
     """
     from mayak.data.splits import EXTERNAL_MIN_TRAIN_YEARS, ROLE_EXTERNAL, \
         min_hours_for_train_years
@@ -377,11 +414,9 @@ def build_external_dataset(raw_dir, out_dir, stations, dem, koppen, tol_minutes=
             if series.n < need_hours:
                 raise ValueError(f"ряд {series.n} ч < {need_hours} ч "
                                  f"(≥ {years} лет в обучающем окне)")
-            if rec["report_every"] != REPORT_EVERY_HOURS:
-                raise ValueError(f"шаг отчётности {rec['report_every']} ч: проект работает с "
-                                 f"приборами, отчитывающимися раз в {REPORT_EVERY_HOURS} ч")
-            if rec["T_valid"] < min_valid_frac_T:
-                raise ValueError(f"валидной T {rec['T_valid']:.1%} < {min_valid_frac_T:.0%}")
+            reason = reporting_exclusion(rec["report_every"], rec["T_valid"], min_valid_frac_T)
+            if reason:
+                raise ValueError(reason)
             h = dem(st.lat, st.lon)
             if h is None or not np.isfinite(h):
                 raise ValueError("нет высоты из ЦМР в точке станции")
@@ -413,5 +448,5 @@ def build_external_dataset(raw_dir, out_dir, stations, dem, koppen, tol_minutes=
 __all__ = ["build_external_dataset", "station_files", "ELEMENTS", "GHCNH_PARSER_VERSION",
            "HourlySeries", "IGNORED_ELEMENTS",
            "QUALITY_POLICY_VERSION", "REPORT_EVERY_HOURS", "hourly_station", "nearest_to_hour",
-           "quality_flagged", "quality_flags", "read_ghcnh", "read_station_list", "report_class",
-           "report_step"]
+           "quality_flagged", "quality_flags", "read_ghcnh", "read_station_list",
+           "reporting_exclusion", "report_step"]

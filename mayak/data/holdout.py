@@ -186,6 +186,9 @@ class EvalSet(Dataset):
         target_mask: правило годности цели.
         curriculum: имя куррикулума, по которому у каждого окна выбирается своя длина.
         history_seed: сид выбора длин по куррикулуму.
+        train_km: расстояние каждой станции набора до ближайшей обучающей точки, км,
+            словарь по id станции; None значит расстояния не посчитаны, и метка
+            расстояния у всех окон - пометка об отсутствии данных.
 
     Attributes:
         items: пары из станции и часа начала горизонта.
@@ -198,7 +201,8 @@ class EvalSet(Dataset):
     def __init__(self, clims, station_splits=("train", "unseen_test"),
                  manifest="data/manifest.csv", time_key="test",
                  every_hours=72, L=None, max_windows=6000, windows_per_station=None,
-                 target_mask=DEFAULT_TARGET_MASK, curriculum=None, history_seed=0):
+                 target_mask=DEFAULT_TARGET_MASK, curriculum=None, history_seed=0,
+                 train_km=None):
         if L is not None and curriculum is not None:
             raise ValueError("длина истории задаётся либо одним числом, либо куррикулумом")
         split_of = {r["id"]: r.get("split") for r in read_manifest(manifest)}
@@ -223,6 +227,7 @@ class EvalSet(Dataset):
         self.L = L
         self.curriculum = curriculum
         self.history_seed = int(history_seed)
+        self.train_km = dict(train_km) if train_km else None
         if curriculum is None:
             self.requested = [L] * len(self.items)
         else:
@@ -293,7 +298,8 @@ class EvalSet(Dataset):
         if getattr(self, "_attrs", None) is None:
             from mayak.external import station_attributes
             sids = {sid for sid, _t in self.items}
-            self._attrs = station_attributes({sid: self.clims[sid] for sid in sids})
+            self._attrs = station_attributes({sid: self.clims[sid] for sid in sids},
+                                             train_km=self.train_km)
         return self._attrs
 
     def window_meta(self):
@@ -304,13 +310,14 @@ class EvalSet(Dataset):
 
         Returns:
             Словарь массивов по окнам: станция, роль, зона, сезон, длина истории и её
-            метка, доля валидных часов истории, наличие давления, класс отчётности, разница
-            высот и час начала горизонта. Час начала нужен офлайн-прогону адаптивной
-            калибровки: она идёт по окнам станции в порядке времени.
+            метка, доля валидных часов истории, наличие давления, разница высот,
+            расстояние до ближайшей обучающей точки и час начала горизонта. Час начала
+            нужен офлайн-прогону адаптивной калибровки: она идёт по окнам станции в
+            порядке времени.
         """
         label = history_bin_label if self.curriculum is not None else history_label
         sid_a, role, zone, season, hist, hvalid = [], [], [], [], [], []
-        has_p, rep, egap = [], [], []
+        has_p, dist, egap = [], [], []
         attrs = self.station_attrs()
         for i, (sid, t) in enumerate(self.items):
             s = self.clims[sid]
@@ -325,15 +332,15 @@ class EvalSet(Dataset):
             hvalid.append(float((m > 0).mean()) if L > 0 else 0.0)
             mp = s["mask"][t - L:t, 1] if L > 0 else np.zeros(0, np.float32)
             has_p.append(PRESSURE_YES if (mp > 0).any() else PRESSURE_NO)
-            rep.append(attrs[sid]["report_class"])
+            dist.append(attrs[sid]["train_distance_label"])
             egap.append(attrs[sid]["elev_gap_label"])
         return dict(station=np.array(sid_a, object), role=np.array(role, object),
                     zone=np.array(zone, object), season=np.array(season, object),
                     history=np.array(hist, np.int64),
                     history_label=np.array([label(v) for v in hist], object),
                     hist_valid=np.array(hvalid, np.float64),
-                    has_pressure=np.array(has_p, object), report_class=np.array(rep, object),
-                    elev_gap=np.array(egap, object),
+                    has_pressure=np.array(has_p, object), elev_gap=np.array(egap, object),
+                    train_distance=np.array(dist, object),
                     t=np.array([t for _sid, t in self.items], np.int64))
 
     def raw_window(self, i):

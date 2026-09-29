@@ -17,7 +17,8 @@
    длины истории окон валидации взяты из распределения куррикулума, а не одной длиной;
 6. окна внешних станций - только в тестовом окне; внешние станции не встречаются в
    основном наборе под другой ролью, в записи о выборе чекпойнта и в метаданных
-   конформной таблицы.
+   конформной таблицы; самый поздний час обучающих окон основного набора раньше
+   самого раннего часа, который читают тестовые окна внешнего набора.
 """
 from __future__ import annotations
 
@@ -32,6 +33,7 @@ from mayak.constants import H
 from mayak.data.splits import (BLOCK_KEYS, HISTORY_FORBIDDEN, MIN_BLOCK_HOURS, MIN_GAP_HOURS,
                                ROLE_EXTERNAL, ROLE_TRAIN, ROLE_VAL, TIME_KEYS,
                                TIME_LAYOUT, layout_fingerprint, time_layout)
+from mayak.timeaxis import from_utc_hour
 
 log = logging.getLogger(__name__)
 
@@ -397,31 +399,102 @@ def check_conformal(path, store):
         _fail(f"{what}: точность модели {rec.get('precision')!r} не из {PRECISIONS}")
 
 
-def _haversine_km(lat1, lon1, lat2, lon2):
-    p1, p2 = np.radians(lat1), np.radians(lat2)
-    dp, dl = p2 - p1, np.radians(np.asarray(lon2) - np.asarray(lon1))
-    a = np.sin(dp / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2
-    return 2 * 6371.0 * np.arcsin(np.sqrt(np.clip(a, 0.0, 1.0)))
+def train_last_hour(store):
+    """Самый поздний час, который читают обучающие окна основного набора.
+
+    Обучающие окна берутся только со станций с ролью обучения и целиком лежат в их
+    обучающем временном окне, поэтому самый поздний час - последний час этого окна.
+
+    Args:
+        store: основной набор.
+
+    Returns:
+        Час от эпохи UTC или None, если в наборе нет обучающих станций.
+    """
+    ends = [int(s["t0"]) + time_layout(s["N"]).span("train")[1] - 1
+            for s in store.by_role(ROLE_TRAIN)]
+    return max(ends) if ends else None
 
 
-def nearest_train_km(store, external_store):
-    """{id внешней станции: расстояние до ближайшей обучающей точки, км}."""
-    tr = store.by_role(ROLE_TRAIN)
-    if not tr:
-        return {}
-    lat = np.array([s["lat"] for s in tr])
-    lon = np.array([s["lon"] for s in tr])
-    return {sid: float(_haversine_km(s["lat"], s["lon"], lat, lon).min())
-            for sid, s in external_store.stations.items()}
+def external_first_hour(external_store):
+    """Самый ранний час, который читают тестовые окна внешнего набора.
+
+    Считается по самому раннему окну каждой станции: горизонт с первого часа
+    тестового окна, полная история и часы перед ней, которые смотрит причинный QC.
+
+    Args:
+        external_store: набор внешнего теста.
+
+    Returns:
+        Час от эпохи UTC или None, если набор пуст.
+    """
+    from mayak.data.dataset import footprint
+    starts = []
+    for s in external_store.stations.values():
+        lay = time_layout(s["N"])
+        lo, _hi = footprint(lay.span("test")[0], None, lay.history_floor("test"))
+        starts.append(int(s["t0"]) + int(lo))
+    return min(starts) if starts else None
 
 
-def check_external(store, external_store, checkpoints=(), conformal=None, near_km=10.0):
+def _utc_text(hour):
+    return str(from_utc_hour(hour)) + ":00 UTC"
+
+
+def check_external_calendar(store, external_store):
+    """Тестовые окна внешнего набора не пересекаются по календарю с обучением.
+
+    Иначе модель проверялась бы на тех же днях погоды, по которым училась в соседних
+    точках реанализа. Сравниваются абсолютные часы, а не индексы рядов: ряды станций
+    двух наборов начинаются в разные дни.
+
+    Args:
+        store: основной набор.
+        external_store: набор внешнего теста.
+
+    Returns:
+        Словарь с последним часом обучения и первым часом внешнего теста, текстом;
+        None, если в основном наборе нет обучающих станций и сравнивать не с чем.
+
+    Raises:
+        LeakageError: обучение заканчивается не раньше начала внешнего теста.
+    """
+    last, first = train_last_hour(store), external_first_hour(external_store)
+    if last is None or first is None:
+        return None
+    if last >= first:
+        _fail(f"внешний тест пересекается с обучением по календарю: обучающие окна "
+              f"основного набора читают часы до {_utc_text(last)}, а тестовые окна внешнего "
+              f"начинаются с {_utc_text(first)}; скачайте внешний набор за более поздний "
+              f"период или сдвиньте период обучения раньше")
+    return dict(train_last=_utc_text(last), external_first=_utc_text(first),
+                margin_hours=int(first - last - 1))
+
+
+def check_external(store, external_store, checkpoints=(), conformal=None):
     """Внешний тест изолирован от обучения, выбора чекпойнта и калибровки.
 
-    store - основной набор (обучение, валидация, калибровка, внутренний тест);
-    external_store - набор внешнего теста. Возвращает сводку, в том числе число
-    внешних станций ближе near_km к обучающей точке.
+    Близость внешней станции к обучающей точке ошибкой не считается: она показывается
+    отдельным разрезом оценки, а здесь попадает только в сводку.
+
+    Args:
+        store: основной набор: обучение, валидация, калибровка, внутренний тест.
+        external_store: набор внешнего теста.
+        checkpoints: пути чекпойнтов, записи о выборе которых проверяются.
+        conformal: путь конформной таблицы, метаданные которой проверяются; None значит
+            без таблицы.
+
+    Returns:
+        Сводка: число внешних станций, чекпойнтов, наличие таблицы, календарный запас
+        между обучением и внешним тестом, число внешних станций по бинам расстояния до
+        обучающей точки и медиана этого расстояния.
+
+    Raises:
+        LeakageError: набор пуст; станция не из роли внешнего теста или встречается в
+            основном наборе под другой ролью; внешняя станция участвовала в выборе
+            чекпойнта или в подгонке таблицы; тест пересекается с обучением по календарю.
     """
+    from mayak.external import nearest_train_km, train_distance_label
     ext = external_store.stations
     if not ext:
         _fail("внешний тест: пустой набор станций")
@@ -447,14 +520,16 @@ def check_external(store, external_store, checkpoints=(), conformal=None, near_k
         hit = sorted(ext_ids & set(rec.get("stations", [])))
         if hit or ROLE_EXTERNAL in rec.get("station_roles", []):
             _fail(f"конформная таблица {conformal}: подогнана с участием внешнего теста {hit[:5]}")
+    calendar = check_external_calendar(store, external_store)
     dist = nearest_train_km(store, external_store)
-    close = sorted(sid for sid, d in dist.items() if d < near_km)
+    by_bin = {}
+    for km in dist.values():
+        name = train_distance_label(km)
+        by_bin[name] = by_bin.get(name, 0) + 1
     summary = dict(external_stations=len(ext), checkpoints=len(checkpoints),
-                   conformal=bool(conformal), near_train=len(close), near_km=near_km,
+                   conformal=bool(conformal), calendar=calendar, train_distance=by_bin,
                    median_nearest_train_km=float(np.median(list(dist.values()))) if dist else None)
     log.info("внешний тест изолирован: %s", summary)
-    if close:
-        log.info("внешние станции ближе %.0f км к обучающей точке: %s", near_km, close[:20])
     return summary
 
 

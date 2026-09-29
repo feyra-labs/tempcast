@@ -46,6 +46,7 @@ HISTORY_LEADS = (24, 72, 168)
 BREAKDOWN_LEAD = 24
 
 MAIN_MODEL = "МАЯК"
+TRAIN_DISTANCE_DIM = "расстояние до обучающей точки"
 CLIMATOLOGY, DAMPED, SEASONAL = "Климатология", "Damped persistence", "Seasonal-naive 24ч"
 HISTORY_FREE = (CLIMATOLOGY,)
 
@@ -336,11 +337,29 @@ def all_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS, min_stations=M
 
 def external_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS,
                         min_stations=MIN_STATIONS, ci=False, **kw):
+    """Разрезы, которые есть только у внешнего теста.
+
+    Разреза по шагу отчётности нет: во внешний тест входят только почасовые станции.
+
+    Args:
+        ev: оценка одной модели.
+        meta: метаданные тех же окон.
+        leads: лиды, на которых считаются метрики.
+        min_windows: страта с меньшим числом окон не показывается.
+        min_stations: страта с меньшим числом станций не показывается.
+        ci: считать интервалы бутстрапа по станциям.
+        **kw: параметры бутстрапа.
+
+    Returns:
+        Словарь из имени разреза в словарь из метки страты в её сводку.
+    """
+    from mayak.external import TRAIN_DISTANCE_ORDER
     hvalid = np.array([bin_label(float(v), HIST_VALID_BINS) for v in meta["hist_valid"]], object)
     kwargs = dict(leads=leads, min_windows=min_windows, min_stations=min_stations, ci=ci, **kw)
     return {
         "валидность истории": breakdown(ev, hvalid, **kwargs),
-        "частота отчётности": breakdown(ev, meta["report_class"], **kwargs),
+        TRAIN_DISTANCE_DIM: breakdown(ev, meta["train_distance"], order=TRAIN_DISTANCE_ORDER,
+                                      **kwargs),
         "Δ высоты станция−ЦМР": breakdown(ev, meta["elev_gap"], **kwargs),
         "канал давления": breakdown(ev, meta["has_pressure"], **kwargs),
     }
@@ -1078,17 +1097,18 @@ def evaluate_external(named, external_manifest, store, grid=HISTORY_GRID, r_damp
     """
     from mayak.data.splits import ROLE_EXTERNAL, ROLE_TEST
     from mayak.data.store import get_store
-    from mayak.external import print_transfer, transfer_table
+    from mayak.external import nearest_train_km, print_transfer, transfer_table
     from mayak.leakage import check_external, run_checklist
     ext_store = get_store(external_manifest)
     ds = EvalSet(ext_store.clims(), station_splits=(ROLE_EXTERNAL,), manifest=external_manifest,
-                 time_key="test")
+                 time_key="test", train_km=nearest_train_km(store, ext_store))
     run_checklist(ext_store, datasets=[ds])
-    check_external(store, ext_store, checkpoints=checkpoints, conformal=conformal)
+    summary = check_external(store, ext_store, checkpoints=checkpoints, conformal=conformal)
     kw = bootstrap if ci else {}
 
     print(f"\n########## ВНЕШНИЙ ТЕСТ: {len(ext_store.stations)} станций, "
           f"окон {len(ds)} ##########")
+    print_external_isolation(summary)
     res = evaluate_set(named, ds, grid=grid, r_damped=r_damped, shift=shift, ci=ci,
                        bootstrap=bootstrap, external=True)
     print_evaluation(res, bootstrap)
@@ -1114,6 +1134,26 @@ def evaluate_external(named, external_manifest, store, grid=HISTORY_GRID, r_damp
                 print_transfer(tbl, title=f"\n=== Перенос: {name}, внешний против внутреннего "
                                           f"({tag}); Δ = внешний − внутренний ===")
     return res, ds, transfer
+
+
+def print_external_isolation(summary):
+    """Печатает календарный запас внешнего теста и число его станций по расстоянию.
+
+    Число станций печатается по всем бинам, даже если в таблице разреза бин скрыт
+    порогом по числу станций.
+
+    Args:
+        summary: сводка проверки изоляции внешнего теста.
+    """
+    from mayak.external import NO_DATA, TRAIN_DISTANCE_ORDER
+    cal = summary.get("calendar")
+    if cal:
+        print(f"  обучение до {cal['train_last']}, внешний тест с {cal['external_first']}, "
+              f"запас {cal['margin_hours']} ч")
+    counts = summary.get("train_distance") or {}
+    names = TRAIN_DISTANCE_ORDER + ((NO_DATA,) if counts.get(NO_DATA) else ())
+    cells = [f"{name}: {counts.get(name, 0)}" for name in names]
+    print("  внешних станций по расстоянию до обучающей точки: " + ", ".join(cells))
 
 
 def save_bench(res, out_dir, set_name, shift=None, info=None):

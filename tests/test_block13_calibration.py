@@ -82,7 +82,8 @@ def _dataset(n_st=40, per=12, spacing=72, sigma=None, bias=None, seed=0, horizon
                 history=rng.choice([0, 12, 100, 500], n).astype(np.int64),
                 hist_valid=rng.uniform(0.3, 1.0, n),
                 has_pressure=np.full(n, "есть давление", object),
-                report_class=np.full(n, "1ч", object), elev_gap=np.full(n, "|Δh| <50 м", object),
+                train_distance=np.full(n, "<25 км", object),
+                elev_gap=np.full(n, "|Δh| <50 м", object),
                 t=np.tile(np.arange(per, dtype=np.int64) * spacing, n_st))
     aux = dict(y=y, y_mask=np.ones_like(y), mu_clim=mu + rng.normal(0, 3, (n, horizon)),
                meta=meta)
@@ -522,7 +523,8 @@ def test_small_strata_are_dropped_and_external_dims_used():
     assert rep["dims"]["зона Кёппена"] == {}, "по 5 станций в зоне - меньше порога"
     assert list(coverage_strata(aux["meta"], external=True)) == list(COVERAGE_DIMS_EXTERNAL)
     ext = coverage_report(ev, aux["meta"], _cfg(bootstrap=0), external=True)
-    assert "роль станции" not in ext["dims"] and "частота отчётности" in ext["dims"]
+    assert "роль станции" not in ext["dims"] and "расстояние до обучающей точки" in ext["dims"]
+    assert "частота отчётности" not in ext["dims"], "во внешнем тесте только почасовые станции"
 
 
 def test_served_pairs_follow_time_and_next_issue():

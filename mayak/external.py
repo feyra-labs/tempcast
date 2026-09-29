@@ -1,7 +1,7 @@
 """Внешний тест на наблюдениях реальной сети: атрибуты станций и сопоставление с внутренним.
 
-* атрибуты станции для разрезов, специфичных для внешнего теста: шаг отчётности
-  (по обучающему окну станции), разность «заявленная высота − высота из ЦМР»;
+* атрибуты станции для разрезов, специфичных для внешнего теста: разность «заявленная
+  высота − высота из ЦМР» и расстояние до ближайшей обучающей точки;
 * transfer_table — прямое сопоставление «внутренний тест против внешнего» по
   одинаковым лидам на общих зонах, с интервалом для разности: станции обоих наборов
   ресэмплируются независимо (блочный бутстрап по станциям, как везде в проекте).
@@ -10,22 +10,19 @@ from __future__ import annotations
 
 import numpy as np
 
-from mayak.data.ghcnh import report_class, report_step
-from mayak.data.splits import time_layout
+from mayak.data.era5 import haversine_km
+from mayak.data.splits import ROLE_TRAIN
 from mayak.metrics import METRICS, quantile_ci
 from mayak.zones import koppen_group, normalize_zone
 
 ELEV_GAP_BINS = ((0.0, 50.0, "|Δh| <50 м"), (50.0, 150.0, "|Δh| 50-150 м"),
                  (150.0, 300.0, "|Δh| 150-300 м"), (300.0, np.inf, "|Δh| ≥300 м"))
+TRAIN_DISTANCE_BINS = ((0.0, 25.0, "<25 км"), (25.0, 100.0, "25-100 км"),
+                       (100.0, 300.0, "100-300 км"), (300.0, np.inf, "≥300 км"))
+TRAIN_DISTANCE_ORDER = tuple(name for _lo, _hi, name in TRAIN_DISTANCE_BINS)
 NO_DATA = "нет данных"
 TRANSFER_METRICS = ("Skill", "MAE", "CRPS", "PICP90")
 TRANSFER_LEADS = (1, 6, 24, 72, 168)
-
-
-def station_report_class(s):
-    """Класс шага отчётности станции по маске T в её обучающем окне."""
-    lo, hi = time_layout(s["N"]).span("train")
-    return report_class(report_step(s["mask"][lo:hi, 0]))
 
 
 def elev_gap(s):
@@ -46,13 +43,63 @@ def elev_gap_label(gap):
     return NO_DATA
 
 
-def station_attributes(stations):
-    """{id: dict(report_class, elev_gap, elev_gap_label)} для набора станций."""
+def nearest_train_km(store, external_store):
+    """Расстояние от каждой внешней станции до ближайшей обучающей точки.
+
+    Args:
+        store: основной набор; обучающие точки - его станции с ролью обучения.
+        external_store: набор внешнего теста.
+
+    Returns:
+        Словарь из id внешней станции в расстояние по поверхности Земли, км. Пустой,
+        если в основном наборе нет обучающих станций.
+    """
+    train = store.by_role(ROLE_TRAIN)
+    if not train:
+        return {}
+    lat = np.array([s["lat"] for s in train], np.float64)
+    lon = np.array([s["lon"] for s in train], np.float64)
+    return {sid: float(haversine_km(s["lat"], s["lon"], lat, lon).min())
+            for sid, s in external_store.stations.items()}
+
+
+def train_distance_label(km):
+    """Бин расстояния до ближайшей обучающей точки.
+
+    Args:
+        km: расстояние, км; None, если оно не посчитано.
+
+    Returns:
+        Имя бина или пометка об отсутствии данных.
+    """
+    if km is None or not np.isfinite(km):
+        return NO_DATA
+    for lo, hi, name in TRAIN_DISTANCE_BINS:
+        if lo <= float(km) < hi:
+            return name
+    return NO_DATA
+
+
+def station_attributes(stations, train_km=None):
+    """Атрибуты станций для разрезов внешнего теста.
+
+    Args:
+        stations: словарь из id станции в её запись.
+        train_km: словарь из id станции в расстояние до ближайшей обучающей точки,
+            км; None, если расстояния не посчитаны. Тогда метка расстояния у всех
+            станций - пометка об отсутствии данных.
+
+    Returns:
+        Словарь из id станции в словарь: разность высот и её бин, расстояние до
+        обучающей точки и его бин.
+    """
+    train_km = train_km or {}
     out = {}
     for sid, s in stations.items():
         g = elev_gap(s)
-        out[sid] = dict(report_class=station_report_class(s), elev_gap=g,
-                        elev_gap_label=elev_gap_label(g))
+        km = train_km.get(sid)
+        out[sid] = dict(elev_gap=g, elev_gap_label=elev_gap_label(g), train_km=km,
+                        train_distance_label=train_distance_label(km))
     return out
 
 
@@ -129,5 +176,6 @@ def print_transfer(tbl, metrics=TRANSFER_METRICS, title=""):
             print(line)
 
 
-__all__ = ["ELEV_GAP_BINS", "common_zones", "elev_gap", "elev_gap_label", "print_transfer",
-           "station_attributes", "station_report_class", "transfer_table", "zone_keys"]
+__all__ = ["ELEV_GAP_BINS", "NO_DATA", "TRAIN_DISTANCE_BINS", "TRAIN_DISTANCE_ORDER",
+           "common_zones", "elev_gap", "elev_gap_label", "nearest_train_km", "print_transfer",
+           "station_attributes", "train_distance_label", "transfer_table", "zone_keys"]

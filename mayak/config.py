@@ -1204,7 +1204,8 @@ class RobustnessConfig:
 
 COVERAGE_DIMS_INTERNAL = ("роль станции", "зона Кёппена", "длина истории", "валидность истории")
 COVERAGE_DIMS_EXTERNAL = ("зона Кёппена", "длина истории", "валидность истории",
-                          "частота отчётности", "Δ высоты станция−ЦМР", "канал давления")
+                          "расстояние до обучающей точки", "Δ высоты станция−ЦМР",
+                          "канал давления")
 COVERAGE_DIMS = tuple(dict.fromkeys(COVERAGE_DIMS_INTERNAL + COVERAGE_DIMS_EXTERNAL))
 CALIBRATION_NOMINALS = (0.8, 0.9)
 
