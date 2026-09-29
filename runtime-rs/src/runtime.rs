@@ -11,9 +11,18 @@
 //! Выпуск - граф выпуска: паспорт по строкам накопителя и вклад края истории, признаки
 //! которого зависят от момента выпуска. Загрузка состояния и холодный старт - граф
 //! полного окна.
+//!
+//! Момент выпуска - последний шаг. До первого шага его задаёт вызывающий по часам
+//! устройства, и прогноз строится по пустому окну, которое этим часом кончается; окно
+//! и счётчики при этом не меняются.
+//!
+//! Откат. Граф старта возвращает таблицу климатологии точки: среднее и масштаб
+//! климат-поля с паспортом холодного старта на каждый час года. Если выпуск не удался
+//! или дал нечисловые квантили, прогноз - квантили нормального распределения с этими
+//! средним и масштабом на часах горизонта.
 use std::path::Path;
 
-use crate::calendar::doy_hour;
+use crate::calendar::{doy_hour, hour_of_year, HOURS_OF_YEAR};
 use crate::calib::{aci_score, apply_adaptive, apply_conformal, AciParams};
 use crate::graphs::{Graphs, Precision};
 use crate::manifest::{Dims, Manifest};
@@ -29,9 +38,6 @@ pub struct RuntimeOptions {
     pub conformal: bool,
     /// Онлайн-подстройка множителя калибровки с параметрами из манифеста.
     pub aci: bool,
-    /// Откат к климатологии: средняя температура и разброс.
-    pub clim_fallback: f32,
-    pub sigma_fallback: f32,
 }
 
 impl Default for RuntimeOptions {
@@ -41,18 +47,18 @@ impl Default for RuntimeOptions {
             threads: 1,
             conformal: true,
             aci: false,
-            clim_fallback: 10.0,
-            sigma_fallback: 4.0,
         }
     }
 }
 
-/// Последний выпуск: квантили (horizon × NQ), медиана и признак отката.
+/// Последний выпуск: квантили по лидам подряд, медиана, признак отката и час, после
+/// которого начинается горизонт.
 #[derive(Debug, Clone)]
 pub struct Forecast {
     pub q: Vec<f32>,
     pub mu: Vec<f32>,
     pub fallback: bool,
+    pub after_hour: i64,
 }
 
 /// Сколько часов между точными пересчётами суммы мод.
@@ -69,6 +75,9 @@ pub struct Runtime {
     site: [f32; 3],
     loc: Vec<f32>,
     coefs: [Vec<f32>; 3],
+    // таблица климатологии точки для отката: по значению на каждый час года
+    clim_mu: Vec<f32>,
+    clim_sig: Vec<f32>,
     // сырое окно: место часа - абсолютный час по модулю длины окна
     raw: Vec<f32>,
     present: Vec<bool>,
@@ -119,7 +128,6 @@ pub struct Runtime {
     // учёт
     idle_hours: u64,
     loaded_site: Option<[f32; 3]>,
-    clim: (f32, f32),
     pub fallbacks: u64,
 }
 
@@ -153,13 +161,22 @@ impl Runtime {
         let mut loc = vec![0.0; d.loc_dim];
         let mut coefs = d.n_coef.map(|n| vec![0.0f32; n]);
         let mut z0 = vec![0.0; d.passport_dim];
+        let mut clim_mu = vec![0.0; HOURS_OF_YEAR];
+        let mut clim_sig = vec![0.0; HOURS_OF_YEAR];
         {
             let s11: &[usize] = &[1, 1];
             let [c0, c1, c2] = &mut coefs;
             graphs.init.run(
                 &[("lat", s11, &lat), ("lon", s11, &lon), ("elev", s11, &elev)],
-                &mut [&mut loc, c0, c1, c2, &mut z0],
+                &mut [&mut loc, c0, c1, c2, &mut z0, &mut clim_mu, &mut clim_sig],
             )?;
+        }
+        let good = clim_mu.iter().all(|v| v.is_finite()) && clim_sig.iter().all(|v| v.is_finite() && *v > 0.0);
+        if !good {
+            return Err(Error::new(
+                "граф старта: таблица климатологии точки негодна (нечисловые значения или \
+                 неположительный масштаб); это ошибка конфигурации модели или координат",
+            ));
         }
         let (w, m, nq, h) = (d.stream_window, d.n_modes, d.n_quantiles, d.horizon);
         let (e, t, l) = (d.stream_edge, d.stream_tail, d.history);
@@ -174,6 +191,8 @@ impl Runtime {
             site,
             loc,
             coefs,
+            clim_mu,
+            clim_sig,
             raw: vec![0.0; w * 3],
             present: vec![false; w * 3],
             valid: vec![false; w * 3],
@@ -210,6 +229,7 @@ impl Runtime {
                 q: vec![0.0; h * nq],
                 mu: vec![0.0; h],
                 fallback: false,
+                after_hour: 0,
             },
             conformal,
             aci,
@@ -222,7 +242,6 @@ impl Runtime {
             pending: false,
             idle_hours: 0,
             loaded_site: None,
-            clim: (opts.clim_fallback, opts.sigma_fallback),
             fallbacks: 0,
             d,
         };
@@ -247,8 +266,8 @@ impl Runtime {
         self.modes.iter_mut().for_each(|v| v.fill(0.0));
         self.filled = 0;
         self.last_hour = last_hour;
-        if last_hour.is_some() {
-            self.rebuild(false)?;
+        if let Some(last) = last_hour {
+            self.rebuild_at(last, false)?;
         }
         Ok(())
     }
@@ -309,9 +328,20 @@ impl Runtime {
     pub fn encoder_buffer_bytes(&self) -> usize {
         4 * self.enc.len()
     }
-    /// Кольца и буфер энкодера в памяти, байт. На диск они не пишутся.
+    /// Кольца, буфер энкодера и таблица климатологии в памяти, байт. На диск они не
+    /// пишутся: всё восстанавливается из окна и графа старта.
     pub fn memory_bytes(&self) -> usize {
-        4 * (self.enc.len() + self.u_ring.len() + self.v_ring.len() + self.rows.len())
+        4 * (self.enc.len()
+            + self.u_ring.len()
+            + self.v_ring.len()
+            + self.rows.len()
+            + self.clim_mu.len()
+            + self.clim_sig.len())
+    }
+
+    /// Момент выпуска: последний шаг, а до первого шага - текущий час устройства.
+    pub fn issue_hour(&self, now_hour: Option<i64>) -> Option<i64> {
+        self.last_hour.or(now_hour)
     }
 
     fn slot(&self, hour: i64) -> usize {
@@ -332,9 +362,9 @@ impl Runtime {
         }
     }
 
-    /// Всё модельное состояние из сырого окна одним пакетным проходом.
-    fn rebuild(&mut self, seed_qc: bool) -> Result<()> {
-        let last = self.last_hour.expect("окно без последнего часа");
+    /// Всё модельное состояние из сырого окна, которое кончается часом `last`, одним
+    /// пакетным проходом.
+    fn rebuild_at(&mut self, last: i64, seed_qc: bool) -> Result<()> {
         let (w, l, t, m) = (self.d.stream_window, self.d.history, self.d.stream_tail, self.d.n_modes);
         let first = last - w as i64 + 1;
         let (mut x, mut mk, mut dy, mut hr) = (
@@ -396,7 +426,8 @@ impl Runtime {
 
     /// Новый час наблюдений. None или NaN - значения нет. Пропущенные часы между прошлым
     /// шагом и этим заполняются пустыми, простой не короче окна - холодный старт.
-    pub fn step(&mut self, obs: [Option<f64>; 3], hour: i64) -> Result<()> {
+    /// Возвращает коды причинного контроля качества этого часа.
+    pub fn step(&mut self, obs: [Option<f64>; 3], hour: i64) -> Result<[u8; 3]> {
         match self.last_hour {
             None => self.reset(Some(hour - 1))?,
             Some(last) if hour <= last => {
@@ -421,7 +452,7 @@ impl Runtime {
         self.push(obs, hour)
     }
 
-    fn push(&mut self, obs: [Option<f64>; 3], hour: i64) -> Result<()> {
+    fn push(&mut self, obs: [Option<f64>; 3], hour: i64) -> Result<[u8; 3]> {
         let (x, codes) = self.qc.push(obs);
         let (raw, present) = self.qc.latest();
         if self.aci.is_some() && codes[0] == 0 {
@@ -433,7 +464,8 @@ impl Runtime {
             self.present[p * 3 + c] = present[c];
             self.valid[p * 3 + c] = codes[c] == 0;
         }
-        self.ingest(hour)
+        self.ingest(hour)?;
+        Ok(codes)
     }
 
     /// Один час через граф шага: буфер энкодера, сумма мод, кольца.
@@ -547,12 +579,20 @@ impl Runtime {
         self.aci_misses += miss as u64;
     }
 
-    /// Выпуск на часы после последнего шага. Ошибка графа или нечисловой выход - Err;
-    /// откат к климатологии делает `safe_forecast`.
-    pub fn forecast(&mut self) -> Result<&Forecast> {
-        let Some(last) = self.last_hour else {
-            return Err(Error::new("нет ни одного шага: момент выпуска не определён"));
+    /// Выпуск на часы после момента выпуска. `now_hour` - текущий час по часам
+    /// устройства, нужен только до первого шага. Ошибка графа или нечисловой выход -
+    /// Err; откат к климатологии делает выпуск с откатом.
+    pub fn forecast(&mut self, now_hour: Option<i64>) -> Result<&Forecast> {
+        let Some(last) = self.issue_hour(now_hour) else {
+            return Err(Error::new(
+                "нет ни одного шага и не задан текущий час: момент выпуска не определён",
+            ));
         };
+        if self.last_hour.is_none() {
+            // окно пусто: модельное состояние пустого окна, которое кончается часом
+            // выпуска; первый шаг всё равно начнёт с холодного старта
+            self.rebuild_at(last, false)?;
+        }
         let (l, e, h, nq) = (self.d.history, self.d.stream_edge, self.d.horizon, self.d.n_quantiles);
         for k in 0..l {
             let s = (last - l as i64 + 1 + k as i64).rem_euclid(l as i64) as usize;
@@ -615,26 +655,43 @@ impl Runtime {
             self.out.mu[k] = self.out.q[k * nq + self.manifest.i_med];
         }
         self.out.fallback = false;
+        self.out.after_hour = last;
         Ok(&self.out)
     }
 
-    /// Выпуск с откатом: при любой ошибке - квантили климатологии по средней и разбросу
-    /// отката; сбой пишется в лог и считается в `fallbacks`.
-    pub fn safe_forecast(&mut self) -> &Forecast {
-        if let Err(e) = self.forecast() {
+    /// Откат: квантили нормального распределения по таблице климатологии точки на часах
+    /// после `last`.
+    pub fn climatology(&mut self, last: i64) -> &Forecast {
+        let nq = self.d.n_quantiles;
+        for k in 0..self.d.horizon {
+            let i = hour_of_year(last + 1 + k as i64);
+            let (mu, sig) = (self.clim_mu[i], self.clim_sig[i]);
+            self.out.mu[k] = mu;
+            for (j, z) in self.manifest.zq.iter().enumerate() {
+                self.out.q[k * nq + j] = mu + z * sig;
+            }
+        }
+        self.out.fallback = true;
+        self.out.after_hour = last;
+        &self.out
+    }
+
+    /// Выпуск с откатом: при любой ошибке выпуска - климатология точки; сбой пишется в
+    /// лог и считается в `fallbacks`. Err только если момент выпуска не определён.
+    pub fn safe_forecast(&mut self, now_hour: Option<i64>) -> Result<&Forecast> {
+        let err = match self.forecast(now_hour) {
+            Ok(_) => None,
+            Err(e) => Some(e),
+        };
+        if let Some(e) = err {
+            let Some(last) = self.issue_hour(now_hour) else {
+                return Err(e);
+            };
             eprintln!("mayak-rt: откат к климатологии: {e}");
             self.fallbacks += 1;
-            let (mu, sig) = self.clim;
-            let nq = self.d.n_quantiles;
-            for k in 0..self.d.horizon {
-                self.out.mu[k] = mu;
-                for (i, z) in self.manifest.zq.iter().enumerate() {
-                    self.out.q[k * nq + i] = mu + z * sig;
-                }
-            }
-            self.out.fallback = true;
+            self.climatology(last);
         }
-        &self.out
+        Ok(&self.out)
     }
 
     /// Состояние в байтах: заголовок и сырое окно от старых часов к новым.
@@ -679,7 +736,7 @@ impl Runtime {
             }
         }
         self.filled = s.filled;
-        if let Err(e) = self.rebuild(true) {
+        if let Err(e) = self.rebuild_at(last, true) {
             self.reset(None)?;
             return Err(e);
         }

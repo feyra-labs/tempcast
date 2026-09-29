@@ -2,7 +2,6 @@
 //!
 //!   mayak-rt run   --model DIR --lat 52.37 --lon 4.9 [--elev -2] [--state-dir runtime]
 //!                  [--aci] [--no-conformal] [--int8] [--threads 1]
-//!                  [--clim-fallback 10] [--sigma-fallback 4]
 //!   mayak-rt bench --model DIR --lat .. --lon .. --series FILE --start-unix-hour H
 //!                  [--forecast-every 24] [--warmup 48] [--int8] [--out bench.json]
 //!                  [--dump-q q.f32]
@@ -10,22 +9,25 @@
 //!
 //! `run` читает stdin построчно:
 //!   obs <unix_seconds> <T> <P> <RH>   значения: число, "-" (нет данных) или "nan";
-//!   forecast                          прогноз после последнего часа → строка JSON;
-//!   status                            состояние рантайма → строка JSON.
+//!   forecast [<unix_seconds>]         прогноз после последнего часа, строка JSON;
+//!   status                            состояние рантайма, строка JSON.
 //! Час наблюдения должен лежать на целом часе UTC и быть позже последнего шага.
 //! Пропущенные часы заполняются пустыми шагами, в том числе простой между перезапусками:
 //! абсолютный час последнего шага хранится в заголовке состояния. Простой не короче окна
 //! означает холодный старт. После каждого obs состояние атомарно пишется в --state-dir,
-//! в два чередующихся файла.
+//! в два чередующихся файла; при старте свежий файл выбирается по содержимому.
+//! До первого наблюдения прогноз выпускается после текущего часа по часам устройства;
+//! секунды в команде forecast заменяют часы устройства. Любой сбой выпуска заменяется
+//! климатологией точки. Если модель не поднялась, в том числе не удался расчёт
+//! климатологии точки при старте, процесс завершается с кодом 1.
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use mayak_rt::memory::{peak_rss_bytes, rss_bytes};
-use mayak_rt::state::Snapshot;
-use mayak_rt::store::{newer_first, StateStore};
-use mayak_rt::{Error, Precision, Result, Runtime, RuntimeOptions};
+use mayak_rt::store::StateStore;
+use mayak_rt::{Error, Host, Precision, Result, Runtime, RuntimeOptions};
 use serde_json::json;
 
 struct Args {
@@ -83,8 +85,6 @@ impl Args {
             threads: self.num("threads", Some(1))?,
             conformal: !self.flag("no-conformal"),
             aci: self.flag("aci"),
-            clim_fallback: self.num("clim-fallback", Some(10.0))?,
-            sigma_fallback: self.num("sigma-fallback", Some(4.0))?,
         })
     }
     fn runtime(&self) -> Result<Runtime> {
@@ -98,104 +98,18 @@ impl Args {
     }
 }
 
-fn parse_obs(s: &str) -> Result<Option<f64>> {
-    match s {
-        "-" | "" => Ok(None),
-        "nan" | "NaN" => Ok(Some(f64::NAN)),
-        v => v
-            .parse()
-            .map(Some)
-            .map_err(|_| Error::new(format!("значение наблюдения не число: {v}"))),
-    }
-}
-
-fn forecast_json(rt: &mut Runtime) -> serde_json::Value {
-    let nq = rt.n_quantiles();
-    let last = rt.last_hour();
-    let theta = rt.theta();
-    let f = rt.safe_forecast();
-    let q: Vec<&[f32]> = f.q.chunks(nq).collect();
-    json!({"after_unix_hour": last, "fallback": f.fallback, "theta": theta, "mu": f.mu, "q": q})
-}
-
-fn status_json(rt: &Runtime) -> serde_json::Value {
-    json!({"filled": rt.filled(), "theta": rt.theta(),
-           "conformal": rt.conformal_applied(),
-           "aci_updates": rt.aci_updates(), "aci_misses": rt.aci_misses(),
-           "idle_hours": rt.idle_hours(), "fallbacks": rt.fallbacks,
-           "state_bytes": rt.state_nbytes(), "last_unix_hour": rt.last_hour(),
-           "memory_bytes": rt.memory_bytes(),
-           "rss_bytes": rss_bytes(), "peak_rss_bytes": peak_rss_bytes()})
-}
-
-/// Файлы состояния, свежий первым: сначала по содержимому (Snapshot::parse), затем по
-/// времени изменения для тех, что не разбираются.
-fn ordered_states(store: &StateStore, rt: &Runtime) -> Vec<(PathBuf, Vec<u8>)> {
-    let (dims, bounds) = (&rt.manifest.dims, rt.manifest.phys_bounds());
-    let mut v: Vec<(PathBuf, Vec<u8>)> = store
-        .candidates()
-        .into_iter()
-        .filter_map(|f| std::fs::read(&f).ok().map(|b| (f, b)))
-        .collect();
-    v.sort_by(|a, b| {
-        match (
-            Snapshot::parse(&a.1, dims, &bounds),
-            Snapshot::parse(&b.1, dims, &bounds),
-        ) {
-            (Ok(x), Ok(y)) => newer_first(&x, &y),
-            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
-            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
-            _ => std::cmp::Ordering::Equal,
-        }
-    });
-    v
-}
-
 fn cmd_run(a: &Args) -> Result<()> {
-    let mut rt = a.runtime()?;
-    let mut store = StateStore::new(a.get("state-dir").unwrap_or("runtime"))?;
-    let mut buf = Vec::new();
-    let mut restored = false;
-    for (f, raw) in ordered_states(&store, &rt) {
-        match rt.load_state(&raw) {
-            Ok(()) => {
-                eprintln!("mayak-rt: состояние восстановлено из {} ({} Б)", f.display(), raw.len());
-                restored = true;
-                break;
-            }
-            Err(e) => eprintln!("mayak-rt: состояние {} не принято: {e}", f.display()),
-        }
-    }
-    if !restored {
-        eprintln!("mayak-rt: чистый старт (история пуста)");
-    }
+    let rt = a.runtime()?;
+    let store = StateStore::new(a.get("state-dir").unwrap_or("runtime"))?;
+    let mut host = Host::new(rt, Some(store));
+    host.restore();
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
-        let line = line?;
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        let reply = match parts.as_slice() {
-            ["obs", ts, t, p, rh] => (|| -> Result<serde_json::Value> {
-                let sec: i64 = ts.parse().map_err(|_| Error::new(format!("время не число: {ts}")))?;
-                if sec.rem_euclid(3600) != 0 {
-                    return Err(Error::new(format!("момент {sec} не на целом часе UTC")));
-                }
-                rt.step([parse_obs(t)?, parse_obs(p)?, parse_obs(rh)?], sec.div_euclid(3600))?;
-                rt.serialize(&mut buf);
-                store.save(&buf)?;
-                Ok(json!({"ok": true}))
-            })(),
-            ["forecast"] => match rt.last_hour() {
-                Some(_) => Ok(forecast_json(&mut rt)),
-                None => Err(Error::new("нет ни одного наблюдения: календарь горизонта не определён")),
-            },
-            ["status"] => Ok(status_json(&rt)),
-            [] => continue,
-            _ => Err(Error::new(format!("неизвестная команда: {line}"))),
-        };
-        let v = reply.unwrap_or_else(|e| json!({"error": e.to_string()}));
-        writeln!(out, "{v}")?;
-        out.flush()?;
+        if let Some(v) = host.handle(&line?) {
+            writeln!(out, "{v}")?;
+            out.flush()?;
+        }
     }
     Ok(())
 }
@@ -250,7 +164,7 @@ fn cmd_bench(a: &Args) -> Result<()> {
         }
         if every > 0 && (k + 1) % every == 0 {
             let t = Instant::now();
-            let f = rt.forecast()?;
+            let f = rt.forecast(None)?;
             let dt = t.elapsed().as_secs_f64() * 1e6;
             if k >= warmup {
                 t_fc.push(dt);

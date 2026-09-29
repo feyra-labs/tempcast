@@ -6,9 +6,12 @@
   PyTorch - на модели по умолчанию и на каждой абляции, дольше полного окна;
 * экспорт не меняет режим модели (регрессия: после экспорта модель оставалась в train);
 * манифест согласован с конфигом, QC, форматом состояния;
-* эталонные векторы не устарели относительно текущего кода: сценарии, состояния,
-  календарь и калибровка воспроизводятся заново;
-* закоммиченные графы эталона совпадают с моделью эталона;
+* эталонные сценарии хоста не устарели относительно текущего кода: хост на Python
+  проходит их на модели PyTorch и на закоммиченных графах fp32 и int8 с допусками хоста
+  на Rust;
+* эталон покрывает длинный прогон с простоями и перезапусками, коды контроля качества,
+  запись половин, редкую отчётность, int8, откат, прогноз без наблюдений, смену
+  координат и выбор файла состояния;
 * состояние эталона - сырое окно, которое читается и пишется без изменений.
 """
 import json
@@ -123,6 +126,8 @@ def test_manifest_contract(model, tmp_path):
                                                                   cfg.stream_tail,
                                                                   cfg.max_history)
     assert d["enc_buf_len"] == sum(model.encoder.buffer_pads)
+    assert d["hours_of_year"] == 8784
+    assert man["graphs"]["init"]["outputs"][-2:] == ["clim_mu", "clim_sig"]
     assert man["state"]["nbytes"] == state_nbytes(cfg) == 3224
     assert man["state"]["nbytes"] == StreamingMayak(model, LAT, LON, ELEV).state_nbytes
     assert {c: tuple(v) for c, v in man["phys"].items()} == {c: PHYS[c] for c in ("T", "P", "RH")}
@@ -133,41 +138,86 @@ def test_manifest_contract(model, tmp_path):
     np.testing.assert_array_equal(table, conformal_table(G.GOLDEN_SHIFT, cfg.horizon))
 
 
-def _stream_factory(model):
-    def make(sc):
-        s = StreamingMayak(model, sc["lat"], sc["lon"], sc["elev"],
-                           conformal=G.GOLDEN_SHIFT if sc["conformal"] else None,
-                           aci=G.GOLDEN_ACI if sc["aci"] else None)
-        if sc["init_state"]:
-            with open(os.path.join(GOLDEN, sc["init_state"]), "rb") as fh:
-                s.load_state(fh.read())
-        make.last = s
-        return s
-    return make
+def _scenario(doc, name):
+    return next(s for s in doc["scenarios"] if s["name"] == name)
 
 
-def test_golden_is_fresh(model, golden):
-    """Эталон воспроизводится текущим кодом. Упало - поведение эталона изменилось:
-    пересоздать scripts/make_runtime_golden.py и прогнать cargo test."""
+def _replay(model, golden, name, state_dir, onnx):
+    from mayak.metrics import I_MED
     doc, blob = golden
+    sc = _scenario(doc, name)
+    make = lambda s, site: G.scenario_runtime(model, GOLDEN, s, site, onnx=onnx)
+    return sc, G.replay_scenario(sc, blob, make, str(state_dir), GOLDEN, model.cfg.n_quantiles,
+                                 I_MED)
+
+
+@pytest.mark.parametrize("name", G.SCENARIOS)
+def test_golden_is_fresh(model, golden, name, tmp_path):
+    """Эталон воспроизводится текущим кодом хоста. Упало - поведение эталона изменилось:
+    пересоздать эталон скриптом и прогнать cargo test."""
+    sc, err = _replay(model, golden, name, tmp_path, onnx=False)
+    tol = G.Q_ATOL_INT8 if sc["precision"] == "int8" else G.FRESH_ATOL
+    assert err <= tol, f"{name}: эталон устарел, max|Δq| = {err:.2e}"
+
+
+@pytest.mark.parametrize("name", G.SCENARIOS)
+def test_python_host_on_exported_graphs(model, golden, name, tmp_path):
+    """Хост на Python поверх закоммиченных графов проходит те же сценарии, что хост на
+    Rust, с теми же допусками."""
+    sc, err = _replay(model, golden, name, tmp_path, onnx=True)
+    tol = G.Q_ATOL_INT8 if sc["precision"] == "int8" else G.Q_ATOL
+    assert err <= tol, f"{name}: графы эталона расходятся с эталоном: {err:.2e}"
+
+
+def _lines(sc, kind):
+    return [e for e in sc["events"] if e["op"] == "cmd" and e["line"].split()[0] == kind]
+
+
+def test_golden_covers_device_cases(golden):
+    doc, _ = golden
     assert doc["format"] == G.GOLDEN_FORMAT and doc["seed"] == G.GOLDEN_SEED
-    make = _stream_factory(model)
-    for sc in doc["scenarios"]:
-        one = dict(doc, scenarios=[sc])
-        err = G.replay(one, blob, make, model.cfg.horizon)[sc["name"]]
-        assert err <= G.FRESH_ATOL, f"{sc['name']}: эталон устарел, max|Δq| = {err:.2e}"
-        s, fin = make.last, sc["final"]
-        assert (s.aci_updates, s.aci_misses, s.filled, s.last_hour, s.idle_hours) == (
-            fin["aci_updates"], fin["aci_misses"], fin["filled"], fin["last_hour"],
-            fin["idle_hours"])
-        assert abs(s.theta - fin["theta"]) <= 1e-6
+    assert tuple(s["name"] for s in doc["scenarios"]) == G.SCENARIOS
     assert doc["aci_margin_min"] >= G.MIN_ACI_MARGIN
+    W = ModelConfig().stream_window
+
+    long = _scenario(doc, "long")
+    hours = [int(e["line"].split()[1]) // 3600 for e in _lines(long, "obs")]
+    gaps = np.diff(hours)
+    assert hours[-1] - hours[0] >= 2000 and len(hours) >= 2000
+    assert gaps.max() > W and ((gaps > 1) & (gaps <= W)).any()
+    assert sum(e["op"] == "restart" for e in long["events"]) >= 4
+
+    seen = 0
+    for e in _lines(_scenario(doc, "qc"), "obs"):
+        for c in e["expect"]["codes"]:
+            seen |= c
+    assert seen & (4 | 32 | 64) == 4 | 32 | 64, "выброс, залипание, давление на уровне моря"
+
+    halves = [float(v) for e in _lines(_scenario(doc, "rounding"), "obs")
+              for v in e["line"].split()[2:] if v not in ("-", "nan")]
+    assert any(v < 0 and v % 1 == 0.5 for v in halves)
+    sparse = [int(e["line"].split()[1]) // 3600 for e in _lines(_scenario(doc, "sparse"), "obs")]
+    assert {2, 3} <= set(np.diff(sparse).tolist())
+    assert _scenario(doc, "int8")["precision"] == "int8"
+
+    fb = _scenario(doc, "fallback")
+    assert fb["model"] == "model_nan"
+    assert all(e["expect"]["fallback"] for e in _lines(fb, "forecast"))
+    assert len(_lines(fb, "forecast")[0]["line"].split()) == 2, "откат до первого наблюдения"
+    no_obs = _lines(_scenario(doc, "no_obs"), "forecast")
+    assert not no_obs[0]["expect"]["fallback"] and len(no_obs[0]["line"].split()) == 2
+    shift = _scenario(doc, "site_shift")
+    assert any(e["op"] == "restart" and e["site"] for e in shift["events"])
+    order = _scenario(doc, "store_order")
+    newer = max(order["init_files"], key=lambda f: f["mtime"])
+    assert order["events"][0]["expect"]["restored"] != newer["as"], \
+        "свежее состояние выбирается по содержимому, а не по времени изменения"
 
 
 def test_golden_state_is_raw_window(model, golden):
     doc, _ = golden
-    sc = next(s for s in doc["scenarios"] if s["name"] == "restart")
-    with open(os.path.join(GOLDEN, sc["init_state"]), "rb") as fh:
+    sc = _scenario(doc, "restart")
+    with open(os.path.join(GOLDEN, sc["init_files"][0]["file"]), "rb") as fh:
         raw = fh.read()
     s = StreamingMayak(model, sc["lat"], sc["lon"], sc["elev"], aci=G.GOLDEN_ACI)
     s.load_state(raw)
@@ -177,27 +227,17 @@ def test_golden_state_is_raw_window(model, golden):
     assert len(raw) == 3224
 
 
-def test_golden_onnx_matches_golden_model(model, golden):
-    """Закоммиченные графы - это графы модели эталона (сценарий без калибровки)."""
-    doc, blob = golden
-    be = OnnxBackend(os.path.join(GOLDEN, "model"))
-
-    def make(sc):
-        rt = GraphRuntime(be, model.cfg, sc["lat"], sc["lon"], sc["elev"],
-                          conformal=G.GOLDEN_SHIFT if sc["conformal"] else None,
-                          aci=G.GOLDEN_ACI if sc["aci"] else None)
-        if sc["init_state"]:
-            with open(os.path.join(GOLDEN, sc["init_state"]), "rb") as fh:
-                rt.load_state(fh.read())
-        return rt
-
-    for name in ("extremes", "restart"):
-        sc = next(s for s in doc["scenarios"] if s["name"] == name)
-        err = G.replay(dict(doc, scenarios=[sc]), blob, make, model.cfg.horizon)[name]
-        assert err <= G.Q_ATOL, f"{name}: графы эталона расходятся с моделью: {err:.2e}"
+def test_nan_model_reuses_golden_graphs():
     with open(os.path.join(GOLDEN, "model", "manifest.json"), encoding="utf-8") as fh:
-        man = json.load(fh)
-    assert ModelConfig.from_dict(man["model_config"]) == model.cfg
+        base = json.load(fh)
+    with open(os.path.join(GOLDEN, "model_nan", "manifest.json"), encoding="utf-8") as fh:
+        nan = json.load(fh)
+    for name, g in nan["graphs"].items():
+        if name == "issue":
+            assert g["fp32"] == "issue_nan.onnx" and g["inputs"] == ["loc"]
+        else:
+            assert g["fp32"] == "../model/" + base["graphs"][name]["fp32"]
+    assert nan["dims"] == base["dims"]
 
 
 def test_golden_calendar_and_calibration_are_fresh(model, golden):

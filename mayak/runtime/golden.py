@@ -1,38 +1,46 @@
-"""Эталонные векторы компилируемого рантайма.
+"""Эталонные сценарии хоста устройства.
 
-Эталон - потоковый рантайм на PyTorch, калибровка и календарь проекта. Векторы
-генерируются на детерминированной модели: сид и шум на всех параметрах, чтобы нулевые
-инициализации голов, модуляции поля и подстройки мод не прятали ошибки. Векторы
-записываются в каталог эталона и коммитятся, рантайм на Rust сверяется с ними.
+Эталон записывает хост на Python: строки протокола, ответы на них, перезапуски и
+состояние на диске. Хост на Rust и хост на Python поверх графов экспорта проходят те же
+сценарии и должны дать те же ответы: коды контроля качества, моменты выпуска, признаки
+отката, множитель калибровки, сводку и квантили в пределах допуска. Так две реализации
+сверяются через тот интерфейс, которым пользуется устройство.
+
+Модель эталона детерминированная: сид и шум на всех параметрах, чтобы нулевые
+инициализации голов, модуляции поля и подстройки мод не прятали ошибки.
 
 Состав каталога:
-* model/        - графы ONNX, манифест, конформная таблица;
-* golden.json   - сценарии из событий шага и выпуска, календарь, калибровка;
-* golden.f32    - ожидаемые квантили и входы калибровки, float32 little-endian;
-* state_*.bin   - состояния, записанные эталоном.
+* model/      - графы ONNX fp32 и int8, манифест, конформная таблица;
+* model_nan/  - та же модель, но граф выпуска возвращает нечисловые квантили; остальные
+                файлы берутся из соседнего каталога;
+* golden.json - сценарии, календарь, калибровка;
+* golden.f32  - ожидаемые квантили и входы калибровки, float32 little-endian;
+* state_*.bin - состояния: начальные файлы сценариев и ожидаемые состояния.
 
-Сценарии:
-* cold_aci  - холодный старт, конформная таблица и адаптивная калибровка, переход через
-              Новый год, дробные наблюдения, значения у границ физических диапазонов до и
-              после записи, половины между целыми, NaN, пропуски, простой в несколько
-              часов;
-* restart   - старт из состояния эталона, записанного после полного окна: хвост и край
-              истории заполнены, множитель калибровки не нулевой;
-* extremes  - полярная точка, долгие пустые часы, значения ровно на границах диапазонов,
-              простой в час и простой длиннее окна, без калибровки.
+События сценария:
+* ``restart`` - новый процесс хоста с тем же каталогом состояния, при желании с новыми
+  координатами; ожидается имя восстановленного файла или его отсутствие;
+* ``cmd``     - строка протокола и ожидаемый ответ;
+* ``state``   - сверка состояния рантайма с файлом эталона до байта, кроме множителя
+  калибровки, который сверяется с допуском.
 """
 import json
 import os
+import shutil
+import tempfile
 
 import numpy as np
 import torch
 
+from mayak.data.qc import station_pressure_expected
+from mayak.data.recording import record_channel
 from mayak.metrics import ACIParams, aci_run, aci_score, calibrate_forecast
 from mayak.runtime.equivalence import synthetic_series
-from mayak.runtime.streaming import StreamingMayak
-from mayak.timeaxis import to_utc_hour, window_calendar
+from mayak.runtime.host import Host, StateStore
+from mayak.runtime.streaming import STATE_HEADER, StreamingMayak
+from mayak.timeaxis import hour_of_year, to_utc_hour, window_calendar
 
-GOLDEN_FORMAT = 2
+GOLDEN_FORMAT = 3
 GOLDEN_SEED = 1414
 GOLDEN_PERTURB = 0.05
 GOLDEN_ACI = ACIParams(target=0.10, gamma=0.05, max_factor=4.0)
@@ -40,13 +48,21 @@ GOLDEN_SHIFT = (np.array([-0.3, -0.2, -0.08, 0.0, 0.08, 0.2, 0.3], np.float32)[N
                 * np.array([1.0, 1.5, 2.0, 2.5], np.float32)[:, None]
                 + np.array([0.0, 0.0, 0.0, 0.0, 0.05, 0.05, 0.1], np.float32))
 MIN_ACI_MARGIN = 1e-3
+MAX_VARIANTS = 20
 Q_ATOL = 5e-4
+Q_ATOL_INT8 = 2e-2
 FRESH_ATOL = 2e-4
+THETA_ATOL = 1e-6
+MTIME_BASE = 1_700_000_000
 DEFAULT_DIR = os.path.join("tests", "data", "runtime_golden")
+STATUS_KEYS = ("filled", "theta", "conformal", "aci_updates", "aci_misses", "idle_hours",
+               "fallbacks", "state_bytes", "last_unix_hour", "memory_bytes")
+SCENARIOS = ("cold_aci", "restart", "extremes", "long", "qc", "rounding", "sparse", "int8",
+             "fallback", "no_obs", "site_shift", "store_order")
 
 
 def golden_model(cfg=None):
-    """Детерминированная модель эталона: сид + шум на всех параметрах."""
+    """Детерминированная модель эталона: сид и шум на всех параметрах."""
     from mayak.model import MAYAK
     torch.manual_seed(GOLDEN_SEED)
     m = MAYAK(cfg).eval()
@@ -57,64 +73,33 @@ def golden_model(cfg=None):
 
 
 def _f(x):
-    """float32 → float Python (repr JSON однозначно возвращает то же float32)."""
+    """Число float32 как float Python: JSON возвращает то же float32."""
     return float(np.float32(x))
 
 
-def _enc_obs(v):
-    """Наблюдение → JSON: число, null (нет данных) или "nan" (NaN от датчика)."""
+def _num(v):
+    """Значение наблюдения в строке протокола."""
     if v is None:
-        return None
-    return "nan" if v != v else float(v)
-
-
-def dec_obs(v):
-    return float("nan") if v == "nan" else v
-
-
-def _enc_score(v):
-    return "nan" if np.isnan(v) else ("inf" if np.isinf(v) else float(v))
-
-
-def _obs(series, k):
-    return [_f(series["x"][k, j]) if series["m"][k, j] > 0 else None for j in range(3)]
+        return "-"
+    if v != v:
+        return "nan"
+    return repr(float(v))
 
 
 def _hour(stamp):
     return int(to_utc_hour(np.datetime64(stamp, "s")))
 
 
-class _Recorder:
-    """Прогон эталона по событиям с записью ожидаемых значений."""
+def _obs(series, k):
+    return [_f(series["x"][k, j]) if series["m"][k, j] > 0 else None for j in range(3)]
 
-    def __init__(self, stream, blob):
-        self.s, self.blob = stream, blob
-        self.events = []
-        self.margins = []
 
-    def step(self, obs, hour):
-        s = self.s
-        p = s._pending
-        if s.aci is not None and p is not None and obs[0] is not None:
-            k = hour - p["first"]
-            if 0 <= k < len(p["q"]) and k > p["last"]:
-                sc = float(aci_score(float(np.float32(obs[0])), p["q"][k], s.aci.interval))
-                if np.isfinite(sc):
-                    self.margins.append(abs(sc - np.exp(s.theta)))
-        s.step(*obs, hour)
-        self.events.append(dict(op="step", obs=[_enc_obs(v) for v in obs], hour=int(hour)))
+def _enc_score(v):
+    return "nan" if np.isnan(v) else ("inf" if np.isinf(v) else float(v))
 
-    def forecast(self, record=True):
-        """Выпуск; без записи квантилей выпуск нужен только как обратная связь
-        калибровки, множитель пишется всегда."""
-        q, _mu = self.s.forecast()
-        self.events.append(dict(op="forecast", q=self.blob.put(q) if record else None,
-                                theta=_f(self.s.theta)))
 
-    def final(self):
-        s = self.s
-        return dict(theta=_f(s.theta), aci_updates=s.aci_updates, aci_misses=s.aci_misses,
-                    filled=s.filled, last_hour=s.last_hour, idle_hours=s.idle_hours)
+def _no_clock():
+    raise RuntimeError("в эталоне часы устройства не используются: момент задаётся командой")
 
 
 class _Blob:
@@ -131,104 +116,520 @@ class _Blob:
     def array(self):
         return np.concatenate(self.parts) if self.parts else np.zeros(0, "<f4")
 
+    def mark(self):
+        return len(self.parts), self.n
 
-def scenario_cold_aci(model, blob):
-    lat, lon, elev = 52.37, 4.9, -2.0
-    st = StreamingMayak(model, lat, lon, elev, conformal=GOLDEN_SHIFT, aci=GOLDEN_ACI)
-    rec = _Recorder(st, blob)
-    s = synthetic_series(330, seed=11, t0=_hour("2021-12-27T20"))
-    bad = {40: (75.0, None, None), 41: (None, None, -5.0), 42: (None, 250.0, None),
-           43: (float("nan"), None, None), 44: (60.6, 1100.06, 100.6),
-           45: (60.4, 1100.04, 100.4), 46: (-0.5, 1013.25, 12.5), 47: (-200.0, 7000.0, 300.0)}
-    skip = set(range(200, 205))
-    for k in range(330):
-        if k in skip:
+    def rollback(self, mark):
+        del self.parts[mark[0]:]
+        self.n = mark[1]
+
+
+def scenario_runtime(model, golden_dir, sc, site, onnx=False):
+    """Рантайм сценария для хоста на Python.
+
+    Args:
+        model: модель эталона.
+        golden_dir: каталог эталона.
+        sc: сценарий.
+        site: широта, долгота и высота.
+        onnx: всегда брать графы экспорта; иначе сценарий fp32 на основной модели идёт
+            через модель PyTorch.
+
+    Returns:
+        Потоковый рантайм.
+    """
+    from mayak.runtime.graphs import runtime_from_export
+    if onnx or sc["model"] != "model" or sc["precision"] != "fp32":
+        return runtime_from_export(os.path.join(golden_dir, sc["model"]), *site,
+                                   precision=sc["precision"], conformal=sc["conformal"],
+                                   aci=sc["aci"])
+    return StreamingMayak(model, *site, conformal=GOLDEN_SHIFT if sc["conformal"] else None,
+                          aci=GOLDEN_ACI if sc["aci"] else None)
+
+
+def place_init_files(sc, golden_dir, state_dir):
+    """Начальные файлы состояния сценария с заданным порядком времени изменения."""
+    for f in sc["init_files"]:
+        dst = os.path.join(state_dir, f["as"])
+        shutil.copyfile(os.path.join(golden_dir, f["file"]), dst)
+        t = MTIME_BASE + f["mtime"]
+        os.utime(dst, (t, t))
+
+
+class _Session:
+    """Прогон сценария хостом на Python с записью ожидаемых ответов."""
+
+    def __init__(self, sc, make, golden_dir, blob):
+        self.sc, self.make, self.golden_dir, self.blob = sc, make, golden_dir, blob
+        self.dir = tempfile.mkdtemp(prefix=f"golden_{sc['name']}_")
+        place_init_files(sc, golden_dir, self.dir)
+        self.site = (sc["lat"], sc["lon"], sc["elev"])
+        self.host = None
+        self.margins = []
+
+    def close(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def restart(self, site=None):
+        if site is not None:
+            self.site = tuple(float(v) for v in site)
+        self.host = Host(self.make(self.sc, self.site), StateStore(self.dir), clock=_no_clock)
+        got = self.host.restore()
+        got = None if got is None else os.path.basename(got)
+        self.sc["events"].append(dict(op="restart", site=None if site is None else list(site),
+                                      expect=dict(restored=got)))
+        return got
+
+    def _margin(self, value, hour):
+        rt = self.host.rt
+        p = rt._pending
+        if rt.aci is None or p is None or value is None or value != value:
+            return
+        k = hour - p["first"]
+        if 0 <= k < len(p["q"]) and k > p["last"]:
+            y = float(record_channel(value, 0))
+            sc = float(aci_score(y, p["q"][k], rt.aci.interval))
+            if np.isfinite(sc):
+                self.margins.append(abs(sc - np.exp(rt.theta)))
+
+    def cmd(self, line, record=True):
+        parts = line.split()
+        if parts[0] == "obs" and len(parts) == 5 and int(parts[1]) % 3600 == 0:
+            v = parts[2]
+            self._margin(None if v == "-" else float(v), int(parts[1]) // 3600)
+        reply = self.host.handle(line)
+        if "error" in reply:
+            exp = dict(error=True)
+        elif parts[0] == "obs":
+            exp = dict(ok=True, codes=reply["codes"])
+        elif parts[0] == "forecast":
+            q = np.asarray(reply["q"], np.float32)
+            exp = dict(after_unix_hour=reply["after_unix_hour"], fallback=reply["fallback"],
+                       theta=_f(reply["theta"]), q=self.blob.put(q) if record else None)
+        else:
+            exp = {k: reply[k] for k in STATUS_KEYS}
+        self.sc["events"].append(dict(op="cmd", line=line, expect=exp))
+        return reply
+
+    def obs(self, values, hour):
+        return self.cmd(f"obs {int(hour) * 3600} " + " ".join(_num(v) for v in values))
+
+    def forecast(self, record=True, at=None):
+        line = "forecast" if at is None else f"forecast {int(at)}"
+        return self.cmd(line, record)
+
+    def status(self):
+        return self.cmd("status")
+
+    def state(self, name):
+        with open(os.path.join(self.golden_dir, name), "wb") as fh:
+            fh.write(self.host.rt.serialize())
+        self.sc["events"].append(dict(op="state", file=name))
+
+
+def _scenario(name, lat, lon, elev, model="model", precision="fp32", conformal=False,
+              aci=False, init_files=()):
+    return dict(name=name, model=model, precision=precision, lat=lat, lon=lon, elev=elev,
+                conformal=conformal, aci=aci, init_files=list(init_files), events=[])
+
+
+def _run(sc, make, golden_dir, blob, body):
+    ses = _Session(sc, make, golden_dir, blob)
+    try:
+        body(ses)
+    finally:
+        ses.close()
+    return sc, ses.margins
+
+
+def scenario_cold_aci(make, out, blob, variant=0):
+    """Холодный старт с калибровкой, переход через Новый год, края диапазонов, половины
+    между целыми, NaN, пропуски, простой в несколько часов, ошибочные команды."""
+    sc = _scenario("cold_aci", 52.37, 4.9, -2.0, conformal=True, aci=True)
+
+    def body(ses):
+        ses.restart()
+        s = synthetic_series(330, seed=11 + 100 * variant, t0=_hour("2021-12-27T20"))
+        bad = {40: (75.0, None, None), 41: (None, None, -5.0), 42: (None, 250.0, None),
+               43: (float("nan"), None, None), 44: (60.6, 1100.06, 100.6),
+               45: (60.4, 1100.04, 100.4), 46: (-0.5, 1013.25, 12.5),
+               47: (-200.0, 7000.0, 300.0)}
+        skip = set(range(200, 205))
+        for k in range(330):
+            if k in skip:
+                continue
+            obs = _obs(s, k)
+            if k in bad:
+                obs = [b if b is not None else o for b, o in zip(bad[k], obs)]
+            ses.obs(obs, s["t0"] + k)
+            if k == 3:
+                ses.cmd(f"obs {(s['t0'] + k) * 3600 + 1800} 1 1000 50")
+                ses.cmd(f"obs {(s['t0'] + k) * 3600} 1 1000 50")
+                ses.cmd(f"obs {(s['t0'] + k + 1) * 3600} 1 x 50")
+                ses.cmd("predict")
+            if k % 6 == 5:
+                ses.forecast(record=k % 24 == 23)
+        ses.status()
+    return _run(sc, make, out, blob, body)
+
+
+def scenario_restart(make, out, blob, variant=0):
+    """Старт из состояния после полного окна: прогноз сразу, без новых наблюдений."""
+    sc = _scenario("restart", -33.87, 151.21, 58.0, conformal=True, aci=True,
+                   init_files=[dict(file="state_restart.bin", **{"as": "state_a.bin"},
+                                    mtime=0)])
+    pre_sc = dict(sc, name="restart_pre", init_files=[], events=[])
+    s = None
+    margins = []
+
+    def pre_body(ses):
+        nonlocal s
+        ses.restart()
+        n = ses.host.rt.window + 88
+        s = synthetic_series(n + 100, seed=29 + 100 * variant, t0=_hour("2023-03-24T05"))
+        for k in range(n):
+            ses.obs(_obs(s, k), s["t0"] + k)
+            if k % 8 == 7:
+                ses.forecast(record=False)
+        with open(os.path.join(out, "state_restart.bin"), "wb") as fh:
+            fh.write(ses.host.rt.serialize())
+        ses.sc["_n"] = n
+
+    _, m_pre = _run(pre_sc, make, out, _Blob(), pre_body)
+    margins += m_pre
+    n = pre_sc["_n"]
+
+    def body(ses):
+        got = ses.restart()
+        if got != "state_a.bin":
+            raise RuntimeError("эталон рестарта не восстановил начальное состояние")
+        ses.forecast()
+        for k in range(n, len(s["x"])):
+            ses.obs(_obs(s, k), s["t0"] + k)
+            if k % 12 == 11:
+                ses.forecast()
+        ses.state("state_restart_end.bin")
+        ses.status()
+    sc, m = _run(sc, make, out, blob, body)
+    return sc, margins + m
+
+
+def scenario_extremes(make, out, blob, variant=0):
+    """Полярная точка, долгие пустые часы, значения ровно на границах диапазонов, простой
+    в час и простой длиннее окна, без калибровки."""
+    sc = _scenario("extremes", 78.22, 15.65, 2000.0)
+
+    def body(ses):
+        ses.restart()
+        W = ses.host.rt.window
+        hour = _hour("2022-06-28T04")
+        for _ in range(30):
+            ses.obs([None, None, None], hour)
+            hour += 1
+        ses.forecast()
+        edges = [(-90.0, 300.0, 0.0), (60.0, 1100.0, 100.0), (-90.0, 1100.0, 100.0),
+                 (60.0, 300.0, 0.0)]
+        for k in range(60):
+            ses.obs(list(edges[k % 4]), hour)
+            hour += 1 if k != 30 else 2
+        ses.forecast()
+        ses.obs([-5.0, 800.0, 55.0], hour)
+        ses.forecast()
+        hour += W + 5
+        ses.obs([-4.0, 801.0, 56.0], hour)
+        ses.forecast()
+        ses.status()
+    return _run(sc, make, out, blob, body)
+
+
+def scenario_long(make, out, blob, variant=0):
+    """Длинный прогон: выпуски в случайные часы, простой короче и длиннее окна,
+    перезапуски в произвольные часы, в том числе посреди простоя."""
+    sc = _scenario("long", 55.75, 37.62, 150.0, conformal=True, aci=True)
+    rng = np.random.default_rng(GOLDEN_SEED + 1 + variant)
+
+    def body(ses):
+        ses.restart()
+        W = ses.host.rt.window
+        n = 3000
+        s = synthetic_series(n, seed=37 + 100 * variant, t0=_hour("2022-10-01T00"))
+        skip = set(range(700, 730)) | set(range(1400, 1400 + W + 50))
+        restarts = set(int(k) for k in rng.choice(np.arange(100, n - 100), 3, replace=False))
+        restarts.add(1500)
+        for k in range(n):
+            if k in restarts:
+                ses.restart()
+                ses.forecast()
+            if k in skip:
+                continue
+            ses.obs(_obs(s, k), s["t0"] + k)
+            if rng.random() < 0.12:
+                ses.forecast(record=bool(rng.random() < 0.12))
+            if k % 500 == 499:
+                ses.status()
+        ses.forecast()
+        ses.state("state_long_end.bin")
+        ses.status()
+    return _run(sc, make, out, blob, body)
+
+
+def scenario_qc(make, out, blob, variant=0):
+    """Коды причинного контроля качества: выбросы, возврат к прежнему уровню, скачок,
+    залипание, насыщение влажности, давление на уровне моря вместо станционного."""
+    elev = 800.0
+    sc = _scenario("qc", 46.95, 7.45, elev)
+
+    def body(ses):
+        ses.restart()
+        n = 720
+        rng = np.random.default_rng(5)
+        k = np.arange(n)
+        T = 9 + 5 * np.cos(2 * np.pi * ((k % 24) - 15) / 24) + 0.4 * rng.standard_normal(n)
+        P = station_pressure_expected(elev) + 3 * np.sin(k / 40) + 0.2 * rng.standard_normal(n)
+        RH = np.clip(65 - 2 * (T - 9) + 3 * rng.standard_normal(n), 5, 99)
+        T[150] += 25
+        T[220:223] += 18
+        T[300:] += 14
+        P[350] -= 30
+        T[400:440], RH[400:440] = T[400], RH[400]
+        P[450:500] = P[450]
+        RH[520:610] = 100.0
+        P[620:] += 1013.25 - station_pressure_expected(elev)
+        t0 = _hour("2023-05-02T00")
+        seen = 0
+        for i in range(n):
+            reply = ses.obs([float(T[i]), float(P[i]), float(RH[i])], t0 + i)
+            for c in reply["codes"]:
+                seen |= int(c)
+            if i % 100 == 99:
+                ses.forecast()
+        ses.status()
+        need = 4 | 32 | 64
+        if seen & need != need:
+            raise RuntimeError(f"сценарий кодов не породил выброс, залипание и давление на "
+                               f"уровне моря: встреченные коды {seen:#x}")
+    return _run(sc, make, out, blob, body)
+
+
+def scenario_rounding(make, out, blob, variant=0):
+    """Запись при поступлении: значения ровно посередине между целыми, в том числе
+    отрицательные, давление посередине между десятыми, значения у границ диапазонов."""
+    sc = _scenario("rounding", 60.17, 24.94, 20.0)
+
+    def body(ses):
+        ses.restart()
+        T = [0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 12.5, -12.5, 0.49999, -0.50001, 3.5, -3.5,
+             60.5, 61.5, -90.5, -89.5]
+        RH = [50.5, 51.5, 0.5, 99.5, 100.5, -0.5, 49.5, 48.5, 60.49999, 60.50001, 1.5, 2.5,
+              101.5, -1.5, 70.5, 71.5]
+        P = [1013.25, 1013.35, 1013.45, 999.95, 1000.05, 1013.15, 1012.85, 1011.75, 1011.65,
+             1010.55, 1009.45, 1008.35, 1100.05, 1100.04, 299.95, 299.96]
+        hour = _hour("2023-01-10T00")
+        for rep in range(4):
+            for i in range(len(T)):
+                ses.obs([T[i] + rep, P[i], RH[i]], hour)
+                hour += 1
+        ses.forecast()
+        ses.state("state_rounding_end.bin")
+        ses.status()
+    return _run(sc, make, out, blob, body)
+
+
+def scenario_sparse(make, out, blob, variant=0):
+    """Отчёты каждый второй, затем каждый третий час: пропуски заполняются пустыми."""
+    sc = _scenario("sparse", 40.42, -3.70, 650.0, conformal=True)
+
+    def body(ses):
+        ses.restart()
+        s = synthetic_series(900, seed=31, t0=_hour("2022-07-01T00"), p_valid=1.0)
+        for k in range(900):
+            step = 2 if k < 450 else 3
+            if k % step:
+                continue
+            ses.obs(_obs(s, k), s["t0"] + k)
+            if k % 48 == 0:
+                ses.forecast()
+        ses.status()
+    return _run(sc, make, out, blob, body)
+
+
+def scenario_int8(make, out, blob, variant=0):
+    """int8-графы со своим допуском. Конформная таблица подогнана на fp32 и поэтому не
+    применяется."""
+    sc = _scenario("int8", -33.87, 151.21, 58.0, precision="int8", conformal=True)
+
+    def body(ses):
+        ses.restart()
+        s = synthetic_series(500, seed=41, t0=_hour("2024-02-20T00"))
+        for k in range(500):
+            if k == 260:
+                ses.restart()
+                ses.forecast()
+            ses.obs(_obs(s, k), s["t0"] + k)
+            if k % 50 == 49:
+                ses.forecast()
+        ses.status()
+    return _run(sc, make, out, blob, body)
+
+
+def scenario_fallback(make, out, blob, variant=0):
+    """Откат: граф выпуска возвращает нечисловые квантили. Точка в Якутии, январь."""
+    sc = _scenario("fallback", 62.03, 129.73, 100.0, model="model_nan", conformal=True)
+
+    def body(ses):
+        ses.restart()
+        t0 = _hour("2025-01-15T06")
+        ses.forecast(at=t0 * 3600 + 1234)
+        s = synthetic_series(30, seed=43, t0=t0 + 1)
+        for k in range(30):
+            ses.obs([-38.0 + 0.3 * k, 1030.0, 70.0], s["t0"] + k)
+        ses.forecast()
+        ses.status()
+        ses.restart()
+        ses.forecast()
+        ses.status()
+    return _run(sc, make, out, blob, body)
+
+
+def scenario_no_obs(make, out, blob, variant=0):
+    """Прогноз до первого наблюдения по часам устройства: пустое окно, не откат."""
+    sc = _scenario("no_obs", -33.92, 18.42, 10.0, conformal=True, aci=True)
+
+    def body(ses):
+        ses.restart()
+        t = _hour("2024-11-03T09") * 3600 + 777
+        ses.forecast(at=t)
+        ses.status()
+        ses.restart()
+        ses.forecast(at=t + 5 * 3600)
+        s = synthetic_series(12, seed=47, t0=t // 3600 + 5)
+        for k in range(12):
+            ses.obs(_obs(s, k), s["t0"] + k)
+        ses.forecast()
+        ses.status()
+    return _run(sc, make, out, blob, body)
+
+
+def scenario_site_shift(make, out, blob, variant=0):
+    """Перезапуск с уточнёнными координатами: 0.3 градуса и 42 м. Окно сохраняется, всё
+    модельное состояние пересчитывается для новой точки."""
+    sc = _scenario("site_shift", 52.37, 4.9, -2.0, conformal=True, aci=True)
+
+    def body(ses):
+        ses.restart()
+        s = synthetic_series(360, seed=51 + 100 * variant, t0=_hour("2023-09-01T00"))
+        for k in range(300):
+            ses.obs(_obs(s, k), s["t0"] + k)
+            if k % 24 == 23:
+                ses.forecast(record=k % 96 == 95)
+        ses.restart(site=(52.67, 5.2, 40.0))
+        ses.forecast()
+        for k in range(300, 360):
+            ses.obs(_obs(s, k), s["t0"] + k)
+        ses.forecast()
+        ses.status()
+    return _run(sc, make, out, blob, body)
+
+
+def scenario_store_order(make, out, blob, variant=0):
+    """Выбор свежего состояния по содержимому. Старое состояние с полным окном изменено
+    позже, новое состояние после холодного старта изменено раньше; выбирается новое."""
+    sc = _scenario("store_order", 59.91, 10.75, 20.0,
+                   init_files=[dict(file="state_order_old.bin", mtime=100,
+                                    **{"as": "state_a.bin"}),
+                               dict(file="state_order_new.bin", mtime=0,
+                                    **{"as": "state_b.bin"})])
+    pre_sc = dict(sc, name="store_order_pre", init_files=[], events=[])
+    last = {}
+
+    def pre_body(ses):
+        ses.restart()
+        rt = ses.host.rt
+        W = rt.window
+        s = synthetic_series(W + 30, seed=61, t0=_hour("2024-04-01T00"))
+        for k in range(W + 30):
+            rt.step(*_obs(s, k), s["t0"] + k)
+        with open(os.path.join(out, "state_order_old.bin"), "wb") as fh:
+            fh.write(rt.serialize())
+        h = rt.last_hour + W + 20
+        for k in range(6):
+            rt.step(5.0 + k, 1001.0, 60.0, h + k)
+        with open(os.path.join(out, "state_order_new.bin"), "wb") as fh:
+            fh.write(rt.serialize())
+        last["hour"] = rt.last_hour
+
+    _run(pre_sc, make, out, _Blob(), pre_body)
+
+    def body(ses):
+        if ses.restart() != "state_b.bin":
+            raise RuntimeError("эталон порядка файлов выбрал не то состояние")
+        ses.forecast()
+        for k in range(1, 4):
+            ses.obs([6.0 + k, 1002.0, 61.0], last["hour"] + k)
+        ses.restart()
+        ses.forecast()
+        ses.status()
+    return _run(sc, make, out, blob, body)
+
+
+def write_nan_model(out_dir):
+    """Каталог модели, граф выпуска которой всегда возвращает нечисловые квантили.
+
+    Остальные графы и конформная таблица берутся из соседнего каталога модели.
+    """
+    import onnx
+    from onnx import TensorProto, helper, numpy_helper
+    src = os.path.join(out_dir, "model")
+    dst = os.path.join(out_dir, "model_nan")
+    os.makedirs(dst, exist_ok=True)
+    with open(os.path.join(src, "manifest.json"), encoding="utf-8") as fh:
+        man = json.load(fh)
+    d = man["dims"]
+    q = np.full((1, d["horizon"], d["n_quantiles"]), np.nan, np.float32)
+    node = helper.make_node("Constant", [], ["q"], value=numpy_helper.from_array(q, "q_nan"))
+    graph = helper.make_graph(
+        [node], "issue_nan",
+        [helper.make_tensor_value_info("loc", TensorProto.FLOAT, [1, d["loc_dim"]])],
+        [helper.make_tensor_value_info("q", TensorProto.FLOAT, list(q.shape))])
+    proto = helper.make_model(graph, opset_imports=[helper.make_opsetid("", man["opset"])])
+    proto.ir_version = 8
+    onnx.save(proto, os.path.join(dst, "issue_nan.onnx"))
+    for name, g in man["graphs"].items():
+        if name == "issue":
+            g.update(fp32="issue_nan.onnx", inputs=["loc"])
+            if "int8" in g:
+                g["int8"] = "issue_nan.onnx"
             continue
-        obs = _obs(s, k)
-        if k in bad:
-            obs = [b if b is not None else o for b, o in zip(bad[k], obs)]
-        rec.step(obs, s["t0"] + k)
-        if k % 6 == 5:
-            rec.forecast(record=k % 24 == 23)
-    return dict(name="cold_aci", lat=lat, lon=lon, elev=elev, conformal=True, aci=True,
-                init_state=None, events=rec.events, final=rec.final()), rec.margins
-
-
-def scenario_restart(model, blob, out_dir):
-    lat, lon, elev = -33.87, 151.21, 58.0
-    pre_n = model.cfg.stream_window + 88
-    s = synthetic_series(pre_n + 100, seed=29, t0=_hour("2023-03-24T05"))
-    a = StreamingMayak(model, lat, lon, elev, conformal=GOLDEN_SHIFT, aci=GOLDEN_ACI)
-    pre = _Recorder(a, _Blob())
-    for k in range(pre_n):
-        pre.step(_obs(s, k), s["t0"] + k)
-        if k % 8 == 7:
-            pre.forecast()
-    raw = a.serialize()
-    with open(os.path.join(out_dir, "state_restart.bin"), "wb") as fh:
-        fh.write(raw)
-    b = StreamingMayak(model, lat, lon, elev, conformal=GOLDEN_SHIFT, aci=GOLDEN_ACI)
-    b.load_state(raw)
-    rec = _Recorder(b, blob)
-    rec.forecast()
-    for k in range(pre_n, len(s["x"])):
-        rec.step(_obs(s, k), s["t0"] + k)
-        if k % 12 == 11:
-            rec.forecast()
-    end = b.serialize()
-    with open(os.path.join(out_dir, "state_restart_end.bin"), "wb") as fh:
-        fh.write(end)
-    fin = rec.final()
-    fin["state"] = "state_restart_end.bin"
-    return dict(name="restart", lat=lat, lon=lon, elev=elev, conformal=True, aci=True,
-                init_state="state_restart.bin", events=rec.events,
-                final=fin), pre.margins + rec.margins
-
-
-def scenario_extremes(model, blob):
-    lat, lon, elev = 78.22, 15.65, 2000.0
-    st = StreamingMayak(model, lat, lon, elev)
-    rec = _Recorder(st, blob)
-    hour = _hour("2022-06-28T04")
-    for _ in range(30):
-        rec.step([None, None, None], hour)
-        hour += 1
-    rec.forecast()
-    edges = [(-90.0, 300.0, 0.0), (60.0, 1100.0, 100.0), (-90.0, 1100.0, 100.0),
-             (60.0, 300.0, 0.0)]
-    for k in range(60):
-        rec.step(list(edges[k % 4]), hour)
-        hour += 1 if k != 30 else 2
-    rec.forecast()
-    rec.step([-5.0, 800.0, 55.0], hour)
-    rec.forecast()
-    hour += model.cfg.stream_window + 5
-    rec.step([-4.0, 801.0, 56.0], hour)
-    rec.forecast()
-    return dict(name="extremes", lat=lat, lon=lon, elev=elev, conformal=False, aci=False,
-                init_state=None, events=rec.events, final=rec.final())
+        g["fp32"] = "../model/" + g["fp32"]
+        if "int8" in g:
+            g["int8"] = "../model/" + g["int8"]
+    if man["calibration"].get("conformal"):
+        man["calibration"]["conformal"] = "../model/" + man["calibration"]["conformal"]
+    with open(os.path.join(dst, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(man, fh, ensure_ascii=False, indent=1)
 
 
 def calendar_cases():
     """Часы от эпохи вокруг границ годов, включая 2000 (високосный) и 2100 (нет)."""
-    from mayak.timeaxis import to_utc_hour
     pts = ["1970-01-01T00", "1999-12-31T23", "2000-02-28T12", "2000-12-31T23",
            "2023-12-31T20", "2024-02-28T22", "2024-12-31T23", "2025-06-15T11",
            "2100-02-28T23", "2100-12-31T23"]
     base = [int(to_utc_hour(np.datetime64(p, "s"))) for p in pts]
     hours = sorted({h + d for h in base for d in (-1, 0, 1, 2)})
     doy, hr = window_calendar(0, np.array(hours, np.int64))
-    return dict(unix_hours=hours, doy=[_f(v) for v in doy], hour=[_f(v) for v in hr])
+    how = hour_of_year(np.array(hours, np.int64))
+    return dict(unix_hours=hours, doy=[_f(v) for v in doy], hour=[_f(v) for v in hr],
+                hour_of_year=[int(v) for v in how])
 
 
 def calibration_cases(model, blob):
-    """Калибровка как отдельный узел: calibrate_forecast и aci_run эталона."""
+    """Калибровка как отдельный узел: поправка квантилей и онлайн-подстройка множителя."""
     rng = np.random.default_rng(GOLDEN_SEED)
     H = model.cfg.horizon
     cases = []
     for theta, conf in ((0.0, True), (0.37, True), (-0.52, True), (0.37, False)):
         q = np.sort(rng.normal(0.0, 3.0, (H, len(model.cfg.quantiles))), axis=-1)
-        q[5, 2] = q[5, 4] + 0.5                          # немонотонный вход
+        q[5, 2] = q[5, 4] + 0.5
         q = q.astype(np.float32)
         out, _mu = calibrate_forecast(q, GOLDEN_SHIFT if conf else None, _f(theta))
         cases.append(dict(q=blob.put(q), theta=_f(theta), conformal=conf,
@@ -243,7 +644,7 @@ def calibration_cases(model, blob):
                theta_end=_f(run["theta_end"]))
     ys = rng.normal(0.0, 4.0, 64)
     qs = np.sort(rng.normal(0.0, 3.0, (64, len(model.cfg.quantiles))), axis=-1).astype(np.float32)
-    qs[3] = qs[3, 3]                                     # вырожденный интервал
+    qs[3] = qs[3, 3]
     ys[7] = qs[7, 3]
     sc = aci_score(ys.astype(np.float32).astype(np.float64), qs, GOLDEN_ACI.interval)
     score = dict(y=[_f(v) for v in ys], q=blob.put(qs),
@@ -251,28 +652,59 @@ def calibration_cases(model, blob):
     return dict(cases=cases, aci=aci, score=score)
 
 
+BUILDERS = (scenario_cold_aci, scenario_restart, scenario_extremes, scenario_long,
+            scenario_qc, scenario_rounding, scenario_sparse, scenario_int8, scenario_fallback,
+            scenario_no_obs, scenario_site_shift, scenario_store_order)
+
+
 def generate(out_dir=DEFAULT_DIR):
-    """Полная генерация эталона → golden.json. Модель и графы - в out_dir/model."""
-    from mayak.runtime.graphs import export_graphs
+    """Полная генерация эталона: графы, сценарии, состояния, календарь, калибровка.
+
+    Args:
+        out_dir: каталог эталона.
+
+    Returns:
+        Документ эталона.
+
+    Raises:
+        RuntimeError: решение о промахе калибровки в каком-то сценарии слишком близко к
+            порогу и неустойчиво к float32, или сценарий не проверяет то, ради чего он
+            написан.
+    """
+    from mayak.runtime.graphs import export_graphs, quantize_graph
     os.makedirs(out_dir, exist_ok=True)
     model = golden_model()
-    manifest = export_graphs(model, os.path.join(out_dir, "model"), conformal=GOLDEN_SHIFT,
-                             aci=GOLDEN_ACI)
+    mdir = os.path.join(out_dir, "model")
+    manifest = export_graphs(model, mdir, conformal=GOLDEN_SHIFT, aci=GOLDEN_ACI)
+    # int8-копии добавляются к экспорту fp32: таблица эталона подогнана на fp32, и на
+    # int8-графах хост обязан её не применять.
+    for name, g in manifest["graphs"].items():
+        g["int8"] = g["fp32"] if name == "init" else quantize_graph(os.path.join(mdir, g["fp32"]))
     manifest["provenance"].pop("created_utc", None)
     with open(os.path.join(out_dir, "model", "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=1)
-    blob = _Blob()
-    cold, m1 = scenario_cold_aci(model, blob)
-    restart, m2 = scenario_restart(model, blob, out_dir)
-    extremes = scenario_extremes(model, blob)
-    margins = m1 + m2
-    if margins and min(margins) < MIN_ACI_MARGIN:
-        raise RuntimeError(f"обратная связь ACI эталона в {min(margins):.1e} от порога e^θ: "
-                           f"решение о промахе неустойчиво к float32; смените сид")
-    doc = dict(format=GOLDEN_FORMAT, seed=GOLDEN_SEED,
-               tolerance=dict(q_abs=Q_ATOL, fresh_abs=FRESH_ATOL),
+    write_nan_model(out_dir)
+    make = lambda sc, site: scenario_runtime(model, out_dir, sc, site)
+    blob, scenarios, margins = _Blob(), [], []
+    for build in BUILDERS:
+        # Ряд сценария с калибровкой подбирается так, чтобы ни одно решение о промахе не
+        # лежало у самого порога: иначе разница float32 двух реализаций его переворачивает.
+        for variant in range(MAX_VARIANTS):
+            mark = blob.mark()
+            sc, m = build(make, out_dir, blob, variant)
+            if not m or min(m) >= MIN_ACI_MARGIN:
+                break
+            blob.rollback(mark)
+        else:
+            raise RuntimeError(f"{sc['name']}: обратная связь ACI в {min(m):.1e} от порога "
+                               f"при всех {MAX_VARIANTS} вариантах ряда")
+        scenarios.append(sc)
+        margins += m
+    doc = dict(format=GOLDEN_FORMAT, seed=GOLDEN_SEED, mtime_base=MTIME_BASE,
+               tolerance=dict(q_abs=Q_ATOL, q_abs_int8=Q_ATOL_INT8, fresh_abs=FRESH_ATOL,
+                              theta_abs=THETA_ATOL),
                aci_margin_min=float(min(margins)) if margins else None,
-               scenarios=[cold, restart, extremes], calendar=calendar_cases(),
+               scenarios=scenarios, calendar=calendar_cases(),
                calibration=calibration_cases(model, blob))
     blob.array().astype("<f4").tofile(os.path.join(out_dir, "golden.f32"))
     with open(os.path.join(out_dir, "golden.json"), "w", encoding="utf-8") as fh:
@@ -292,37 +724,107 @@ def take(blob, ref, shape=None):
     return a.reshape(shape) if shape is not None else a
 
 
-def replay(doc, blob, runtime_factory, horizon):
-    """Прогон сценариев эталона через любую реализацию.
+class GoldenMismatch(AssertionError):
+    """Ответ хоста расходится с эталоном не в пределах допуска, а по существу."""
 
-    Args:
-        doc: документ эталона.
-        blob: массив ожидаемых значений.
-        runtime_factory: по сценарию возвращает рантайм с методами ``step(T, P, RH,
-            hour)`` и ``forecast()``; для сценария с начальным состоянием фабрика сама
-            загружает состояние.
-        horizon: горизонт модели.
+
+def _check(ok, sc, i, what):
+    if not ok:
+        raise GoldenMismatch(f"{sc['name']}: событие {i}: {what}")
+
+
+def compare_state(got, ref, theta_atol=THETA_ATOL):
+    """Совпадение двух состояний: заголовок и окно до байта, множитель с допуском.
 
     Returns:
-        Словарь: имя сценария и наибольшее расхождение квантилей с эталоном.
+        Пустая строка при совпадении или описание расхождения.
     """
-    out = {}
-    for sc in doc["scenarios"]:
-        rt = runtime_factory(sc)
-        err = 0.0
-        for ev in sc["events"]:
-            if ev["op"] == "step":
-                rt.step(*(dec_obs(v) for v in ev["obs"]), ev["hour"])
-                continue
-            q = rt.forecast()
-            if ev["q"] is None:
-                continue
-            q = q[0] if isinstance(q, tuple) else q
-            ref = take(blob, ev["q"], (horizon, -1))
-            err = max(err, float(np.abs(np.asarray(q) - ref).max()))
-        out[sc["name"]] = err
-    return out
+    if len(got) != len(ref):
+        return f"размер {len(got)} Б против {len(ref)} Б"
+    if got[:16] != ref[:16]:
+        return "заголовок до множителя калибровки"
+    ha = np.frombuffer(got, STATE_HEADER, count=1)[0]
+    hb = np.frombuffer(ref, STATE_HEADER, count=1)[0]
+    if abs(float(ha["aci_theta"]) - float(hb["aci_theta"])) > theta_atol:
+        return f"множитель калибровки {ha['aci_theta']} против {hb['aci_theta']}"
+    if got[20:] != ref[20:]:
+        return "координаты или сырое окно"
+    return ""
 
 
-__all__ = ["DEFAULT_DIR", "FRESH_ATOL", "GOLDEN_ACI", "GOLDEN_SHIFT", "Q_ATOL", "generate",
-           "dec_obs", "golden_model", "load", "replay", "take"]
+def replay_scenario(sc, blob, make, state_dir, golden_dir, n_quantiles, i_med,
+                    theta_atol=THETA_ATOL):
+    """Прогон сценария эталона хостом на Python.
+
+    Args:
+        sc: сценарий эталона.
+        blob: массив ожидаемых значений.
+        make: по сценарию и координатам возвращает рантайм.
+        state_dir: пустой каталог состояния.
+        golden_dir: каталог эталона.
+        n_quantiles: число квантилей.
+        i_med: номер медианы среди квантилей.
+        theta_atol: допуск множителя калибровки.
+
+    Returns:
+        Наибольшее расхождение квантилей с эталоном.
+
+    Raises:
+        GoldenMismatch: расхождение не в квантилях: коды, моменты, откат, сводка,
+            выбранный файл состояния или состояние на диске.
+    """
+    place_init_files(sc, golden_dir, state_dir)
+    site = (sc["lat"], sc["lon"], sc["elev"])
+    host, worst = None, 0.0
+    for i, ev in enumerate(sc["events"]):
+        if ev["op"] == "restart":
+            if ev["site"] is not None:
+                site = tuple(ev["site"])
+            host = Host(make(sc, site), StateStore(state_dir), clock=_no_clock)
+            got = host.restore()
+            got = None if got is None else os.path.basename(got)
+            _check(got == ev["expect"]["restored"], sc, i,
+                   f"восстановлен {got}, эталон {ev['expect']['restored']}")
+            continue
+        if ev["op"] == "state":
+            with open(os.path.join(golden_dir, ev["file"]), "rb") as fh:
+                why = compare_state(host.rt.serialize(), fh.read(), theta_atol)
+            _check(not why, sc, i, f"состояние: {why}")
+            continue
+        line, exp = ev["line"], ev["expect"]
+        reply = host.handle(line)
+        if exp.get("error"):
+            _check("error" in reply, sc, i, f"{line}: ожидалась ошибка, ответ {reply}")
+            continue
+        _check("error" not in reply, sc, i, f"{line}: {reply.get('error')}")
+        kind = line.split()[0]
+        if kind == "obs":
+            _check(reply["codes"] == exp["codes"], sc, i,
+                   f"коды {reply['codes']} против {exp['codes']}")
+        elif kind == "forecast":
+            _check(reply["after_unix_hour"] == exp["after_unix_hour"], sc, i,
+                   f"момент выпуска {reply['after_unix_hour']} против {exp['after_unix_hour']}")
+            _check(reply["fallback"] == exp["fallback"], sc, i, "признак отката")
+            _check(abs(reply["theta"] - exp["theta"]) <= theta_atol, sc, i,
+                   f"множитель {reply['theta']} против {exp['theta']}")
+            q = np.asarray(reply["q"], np.float32)
+            _check(np.array_equal(np.asarray(reply["mu"], np.float32), q[:, i_med]), sc, i,
+                   "медиана не равна среднему квантилю")
+            _check(bool(np.all(np.diff(q, axis=-1) >= 0)), sc, i, "квантили не монотонны")
+            if exp["q"] is not None:
+                ref = take(blob, exp["q"], (-1, n_quantiles))
+                worst = max(worst, float(np.abs(q - ref).max()))
+        else:
+            for k, v in exp.items():
+                if k == "theta":
+                    _check(abs(reply[k] - v) <= theta_atol, sc, i, f"сводка {k}")
+                else:
+                    _check(reply[k] == v, sc, i, f"сводка {k}: {reply[k]} против {v}")
+    return worst
+
+
+__all__ = ["DEFAULT_DIR", "FRESH_ATOL", "GOLDEN_ACI", "GOLDEN_FORMAT", "GOLDEN_SHIFT",
+           "GoldenMismatch", "MIN_ACI_MARGIN", "Q_ATOL", "Q_ATOL_INT8", "SCENARIOS",
+           "STATUS_KEYS", "THETA_ATOL", "calendar_cases", "calibration_cases",
+           "compare_state", "generate", "golden_model", "load", "place_init_files",
+           "replay_scenario", "scenario_runtime", "take"]

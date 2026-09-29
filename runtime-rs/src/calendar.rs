@@ -39,7 +39,17 @@ pub fn doy_hour(unix_hour: i64) -> (f32, f32) {
     ((sec / 86400.0) as f32, ((sec % 86400.0) / 3600.0) as f32)
 }
 
-/// Календарь горизонта: часы last_obs + 1 … last_obs + horizon (timeaxis.future_calendar).
+/// Число часов високосного года: длина таблицы климатологии точки.
+pub const HOURS_OF_YEAR: usize = 366 * 24;
+
+/// Номер часа от начала года UTC: от 0 до 8783 в високосном году, до 8759 в обычном.
+pub fn hour_of_year(unix_hour: i64) -> usize {
+    let days = unix_hour.div_euclid(24);
+    let start = days_from_civil(year_of_days(days), 1, 1) * 24;
+    (unix_hour - start) as usize
+}
+
+/// Календарь горизонта: часы после последнего наблюдения, по одному на лид.
 pub fn future_calendar(last_obs_hour: i64, horizon: usize, doy: &mut [f32], hour: &mut [f32]) {
     for h in 0..horizon {
         let (d, hr) = doy_hour(last_obs_hour + 1 + h as i64);
@@ -60,5 +70,14 @@ mod tests {
         let dec31_2100 = days_from_civil(2100, 12, 31) * 24;
         assert_eq!(doy_hour(dec31_2100).0, 364.0);
         assert_eq!(year_of_days(days_from_civil(2000, 2, 29)), 2000);
+    }
+
+    #[test]
+    fn hour_of_year_covers_leap_years() {
+        assert_eq!(hour_of_year(0), 0);
+        assert_eq!(hour_of_year(days_from_civil(2024, 12, 31) * 24 + 23), HOURS_OF_YEAR - 1);
+        assert_eq!(hour_of_year(days_from_civil(2025, 12, 31) * 24 + 23), 8759);
+        assert_eq!(hour_of_year(days_from_civil(2025, 1, 1) * 24), 0);
+        assert_eq!(hour_of_year(days_from_civil(1969, 12, 31) * 24 + 5), 8759 - 18);
     }
 }

@@ -9,7 +9,7 @@ use crate::graphs::Precision;
 use crate::qc::QcConfig;
 use crate::{Error, Result};
 
-pub const FORMAT: u32 = 2;
+pub const FORMAT: u32 = 3;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Dims {
@@ -27,6 +27,8 @@ pub struct Dims {
     pub encoder_width: usize,
     pub enc_buf_len: usize,
     pub n_coef: [usize; 3],
+    /// Длина таблицы климатологии точки, которую возвращает граф старта.
+    pub hours_of_year: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -117,6 +119,13 @@ impl Manifest {
             || d.stream_edge == 0
         {
             return Err(Error::new("манифест: размеры окна несогласованы"));
+        }
+        if d.hours_of_year != crate::calendar::HOURS_OF_YEAR {
+            return Err(Error::new(format!(
+                "манифест: таблица климатологии на {} ч, рантайм ищет по {} ч года",
+                d.hours_of_year,
+                crate::calendar::HOURS_OF_YEAR
+            )));
         }
         if self.state.resync_hours != crate::runtime::RESYNC_HOURS {
             return Err(Error::new(format!(

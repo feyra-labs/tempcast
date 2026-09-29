@@ -35,8 +35,19 @@
 множитель. Множитель подстраивается онлайн, если рантайм создан с параметрами
 адаптивной калибровки: каждый валидный час температуры сверяется с последним
 выпущенным прогнозом на том лиде, который приходится на этот час.
+
+Момент выпуска - последний шаг. До первого шага, в том числе после старта без
+состояния, момент выпуска задаёт вызывающий по часам устройства, и прогноз строится по
+пустому окну, которое этим часом заканчивается. Само состояние при этом не меняется.
+
+Откат. При старте граф точки возвращает таблицу климатологии: среднее и масштаб
+климат-поля с паспортом холодного старта на каждый час года. Если выпуск не удался или
+дал нечисловые квантили, прогноз - квантили нормального распределения с этими средним
+и масштабом на часах горизонта. Таблица своя у каждой точки, поэтому откат - это
+климатология той точки, где стоит прибор.
 """
 import logging
+from typing import NamedTuple
 
 import numpy as np
 
@@ -44,9 +55,9 @@ from mayak.config import CHANNEL_MAX_LAG
 from mayak.data.qc import PHYS, CausalQC, qc_window
 from mayak.data.recording import RECORD_SCALE, record_values
 from mayak.leakage import load_conformal, precision_mismatch
-from mayak.metrics import (ACIParams, aci_score, apply_adaptive, apply_conformal,
-                           check_median_free)
-from mayak.timeaxis import window_calendar
+from mayak.metrics import (ACIParams, aci_score, apply_adaptive, check_median_free,
+                           conformal_table, order_around_median)
+from mayak.timeaxis import hour_of_year, window_calendar
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +77,101 @@ STORE_LO = np.array([-128.0, 0.0, -128.0])
 STORE_HI = np.array([127.0, 65535.0, 127.0])
 PHYS_LO = np.array([PHYS[c][0] for c in RAW_CHANNELS], np.float32)
 PHYS_HI = np.array([PHYS[c][1] for c in RAW_CHANNELS], np.float32)
+HOURS_OF_YEAR = 366 * 24
+
+
+class StateSnapshot(NamedTuple):
+    """Разобранное состояние с диска.
+
+    Attributes:
+        filled: сколько часов окна прошло после холодного старта.
+        last_hour: абсолютный час последнего шага или None, если шагов не было.
+        theta: множитель адаптивной калибровки в логарифме.
+        site: широта, долгота и высота, для которых записано окно.
+        raw: значения на сетке хранения, форма (W, 3), от старых часов к новым.
+        present: маска наличия, форма (W, 3).
+        valid: маска годности, форма (W, 3).
+    """
+    filled: int
+    last_hour: int | None
+    theta: float
+    site: tuple
+    raw: np.ndarray
+    present: np.ndarray
+    valid: np.ndarray
+
+
+def parse_state(raw, window):
+    """Разбор байт состояния с проверками целостности.
+
+    Args:
+        raw: байты состояния.
+        window: длина окна модели, часы.
+
+    Returns:
+        Разобранное состояние.
+
+    Raises:
+        ValueError: байты не состояние этого формата, не подходят длине окна или
+            повреждены.
+    """
+    raw = bytes(raw)
+    if len(raw) < len(STATE_MAGIC) + 1 or raw[:len(STATE_MAGIC)] != STATE_MAGIC:
+        raise ValueError("не состояние МАЯК: нет заголовка")
+    version = raw[len(STATE_MAGIC)]
+    if version != STATE_VERSION:
+        raise ValueError(f"версия состояния {version}, рантайм читает {STATE_VERSION}; "
+                         f"прежние версии не хранят сырое окно целиком, нужен холодный "
+                         f"старт")
+    want = window_nbytes(window)
+    if len(raw) != want:
+        raise ValueError(f"состояние {len(raw)} Б не соответствует конфигу модели "
+                         f"(ожидалось {want} Б)")
+    hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0]
+    theta, filled, last = float(hdr["aci_theta"]), int(hdr["filled"]), int(hdr["last_hour"])
+    if not np.isfinite(theta):
+        raise ValueError(f"повреждённый множитель калибровки в состоянии: {theta}")
+    if filled > window or (last == NO_HOUR and filled):
+        raise ValueError(f"повреждённый заголовок состояния: filled={filled}, окно {window}, "
+                         f"последний час {last}")
+    x, present, valid = decode_window(raw[STATE_HEADER.itemsize:], window)
+    if np.any(valid > present):
+        raise ValueError("повреждённое окно: годный час без значения")
+    ok = valid > 0
+    if np.any(ok & ((x < PHYS_LO) | (x > PHYS_HI))):
+        raise ValueError("повреждённое окно: годное значение вне физического диапазона")
+    site = (float(hdr["lat"]), float(hdr["lon"]), float(hdr["elev"]))
+    return StateSnapshot(filled, None if last == NO_HOUR else last, theta, site, x, present,
+                         valid)
+
+
+def check_climatology(clim_mu, clim_sig):
+    """Проверка таблицы климатологии точки, которую вернул граф старта.
+
+    Без годной таблицы откат невозможен, поэтому негодная таблица - ошибка
+    конфигурации, а не повод работать дальше.
+
+    Args:
+        clim_mu: среднее климат-поля на каждый час года.
+        clim_sig: масштаб климат-поля на каждый час года.
+
+    Returns:
+        Пара массивов float32 формы (8784,).
+
+    Raises:
+        RuntimeError: таблица не той длины, с нечисловыми значениями или с
+            неположительным масштабом.
+    """
+    mu = np.asarray(clim_mu, np.float32).ravel()
+    sig = np.asarray(clim_sig, np.float32).ravel()
+    if mu.size != HOURS_OF_YEAR or sig.size != HOURS_OF_YEAR:
+        raise RuntimeError(f"граф старта: таблица климатологии на {mu.size} и {sig.size} ч, "
+                           f"нужно {HOURS_OF_YEAR}; графы экспортированы другой версией")
+    if not (np.all(np.isfinite(mu)) and np.all(np.isfinite(sig)) and np.all(sig > 0)):
+        raise RuntimeError("граф старта: таблица климатологии точки негодна (нечисловые "
+                           "значения или неположительный масштаб); это ошибка конфигурации "
+                           "модели или координат")
+    return mu, sig
 
 
 def to_store(x):
@@ -97,6 +203,19 @@ def mask_bytes(n_hours):
     return (3 * n_hours + 7) // 8
 
 
+def window_nbytes(window):
+    """Размер сериализованного состояния для длины окна.
+
+    Args:
+        window: длина окна, часы.
+
+    Returns:
+        Число байт.
+    """
+    W = int(window)
+    return STATE_HEADER.itemsize + W * sum(d.itemsize for d in STORE_DTYPES) + 2 * mask_bytes(W)
+
+
 def state_nbytes(cfg):
     """Размер сериализованного состояния для конфига модели.
 
@@ -106,8 +225,7 @@ def state_nbytes(cfg):
     Returns:
         Число байт.
     """
-    W = cfg.stream_window
-    return STATE_HEADER.itemsize + W * sum(d.itemsize for d in STORE_DTYPES) + 2 * mask_bytes(W)
+    return window_nbytes(cfg.stream_window)
 
 
 def encode_window(raw, present, valid):
@@ -173,6 +291,9 @@ class StreamingMayak:
         theta: множитель адаптивной калибровки в логарифме.
         idle_hours: сколько пустых часов подставлено за простой в этом процессе.
         loaded_site: координаты и высота из загруженного состояния или None.
+        clim_mu: среднее климат-поля точки на каждый час года, для отката.
+        clim_sig: масштаб климат-поля точки на каждый час года, для отката.
+        fallbacks: сколько выпусков в этом процессе заменено откатом.
     """
 
     def __init__(self, model, lat, lon, elev, conformal=None, aci=None):
@@ -188,13 +309,18 @@ class StreamingMayak:
         self.lat, self.lon, self.elev = float(lat), float(lon), float(elev)
         f = lambda v: np.array([[v]], np.float32)
         self._lat, self._lon = f(lat), f(lon)
-        self.loc, *coefs, self.z0 = backend.run("init", self._lat, self._lon, f(elev))
-        self.coefs = coefs
+        self.loc, c_mu, c_sig, c_def, self.z0, clim_mu, clim_sig = backend.run(
+            "init", self._lat, self._lon, f(elev))
+        self.coefs = [c_mu, c_sig, c_def]
+        self.clim_mu, self.clim_sig = check_climatology(clim_mu, clim_sig)
+        from mayak.baselines.statistical import ZQ
+        self.zq = np.asarray(ZQ, np.float32)
         self.conformal = self._conformal(conformal)
         self.aci = ACIParams() if aci is True else aci
         self.qc = CausalQC(elev=self.elev)
         self.loaded_site = None
         self.idle_hours = 0
+        self.fallbacks = 0
         self.reset_calibration()
         self.reset()
 
@@ -232,9 +358,12 @@ class StreamingMayak:
 
     @property
     def memory_nbytes(self):
-        """Размер колец и буфера энкодера в памяти, байт. На диск они не пишутся."""
+        """Размер колец, буфера энкодера и таблицы климатологии в памяти, байт.
+
+        На диск ничего из этого не пишется: всё восстанавливается из окна и графа старта.
+        """
         return int(self.u_ring.nbytes + self.v_ring.nbytes + self.rows.nbytes
-                   + self.enc_buf.nbytes)
+                   + self.enc_buf.nbytes + self.clim_mu.nbytes + self.clim_sig.nbytes)
 
     def _hours(self, n):
         """Абсолютные часы последних n часов окна, от старых к новым."""
@@ -248,13 +377,18 @@ class StreamingMayak:
         doy, hour = window_calendar(0, hours)
         return x, m, doy, hour
 
+    def _window_pass(self, x, m, hours):
+        """Пакетный проход графом полного окна по часам окна."""
+        doy, hour = window_calendar(0, hours)
+        return self.b.run("window", x[None], m[None], doy[None], hour[None], self._lat,
+                          self._lon, *self.coefs)
+
     def _rebuild(self, seed_qc):
         """Всё модельное состояние из сырого окна одним пакетным проходом."""
         W = self.window
         hours = self._hours(W)
-        x, m, doy, hour = self._window_arrays(hours)
-        enc, u, v, rows, n_re, n_im, e = self.b.run(
-            "window", x[None], m[None], doy[None], hour[None], self._lat, self._lon, *self.coefs)
+        x, m, _, _ = self._window_arrays(hours)
+        enc, u, v, rows, n_re, n_im, e = self._window_pass(x, m, hours)
         self.enc_buf, self.modes = enc, [n_re, n_im, e]
         if self.tail:
             slot = hours[W - self.tail:] % self.tail
@@ -276,6 +410,9 @@ class StreamingMayak:
             RH: влажность; None или NaN - значения нет.
             hour: абсолютный час UTC, целое число часов от эпохи.
 
+        Returns:
+            Коды причинного контроля качества этого часа, uint8 формы (3,).
+
         Raises:
             ValueError: час не позже последнего шага.
         """
@@ -292,7 +429,7 @@ class StreamingMayak:
             for h in range(self.last_hour + 1, hour):
                 self._push((None, None, None), h)
             self.idle_hours += gap
-        self._push((T, P, RH), hour)
+        return self._push((T, P, RH), hour)
 
     def _push(self, values, hour):
         xj, codes = self.qc.push(values)
@@ -304,6 +441,7 @@ class StreamingMayak:
         self.raw[j] = np.where(present > 0, to_store(raw), 0.0)
         self.present[j], self.valid[j] = present, valid
         self._ingest(hour)
+        return codes
 
     def _ingest(self, hour):
         """Один час окна через граф шага: буфер энкодера, сумма мод, кольца."""
@@ -353,39 +491,119 @@ class StreamingMayak:
             return float("nan")
         return 1.0 - self.aci_misses / self.aci_updates
 
-    def raw_forecast(self):
-        """Квантили модели до калибровки на часы после последнего шага.
+    def issue_hour(self, now_hour=None):
+        """Момент выпуска: последний шаг, а до первого шага - текущий час устройства.
+
+        Args:
+            now_hour: текущий абсолютный час UTC по часам устройства или None.
+
+        Returns:
+            Абсолютный час, после которого начинается горизонт.
+
+        Raises:
+            ValueError: шагов не было и текущий час не задан.
+        """
+        if self.last_hour is not None:
+            return self.last_hour
+        if now_hour is None:
+            raise ValueError("нет ни одного шага и не задан текущий час: момент выпуска не "
+                             "определён")
+        return int(now_hour)
+
+    def _empty_history(self, last):
+        """Строки накопителя, сумма мод и край истории пустого окна, которое кончается
+        часом last. Состояние рантайма не меняется."""
+        W, L, E = self.window, self.history, self.edge
+        hours = last - W + 1 + np.arange(W, dtype=np.int64)
+        zeros = np.zeros((W, 3), np.float32)
+        _enc, _u, _v, rows, n_re, n_im, e = self._window_pass(zeros, zeros, hours)
+        de, he = window_calendar(0, hours[W - L:W - L + E])
+        return rows, [n_re, n_im, e], (zeros[:E], zeros[:E], de, he)
+
+    def raw_forecast(self, now_hour=None):
+        """Квантили модели до калибровки на часы после момента выпуска.
+
+        Args:
+            now_hour: текущий абсолютный час UTC по часам устройства; нужен только до
+                первого шага, тогда прогноз строится по пустому окну.
 
         Returns:
             Массив float32 формы (H, число квантилей).
 
         Raises:
-            ValueError: не было ни одного шага, момент выпуска не определён.
+            ValueError: момент выпуска не определён.
+            FloatingPointError: выход графа выпуска не конечен.
         """
-        if self.last_hour is None:
-            raise ValueError("нет ни одного шага: момент выпуска не определён")
+        last = self.issue_hour(now_hour)
         L, E = self.history, self.edge
-        hours = self._hours(L)
-        rows = self.rows[hours % L][None]
-        xe, me, de, he = self._window_arrays(hours[:E])
-        df, hf = window_calendar(0, self.last_hour + 1 + np.arange(self.horizon))
+        if self.last_hour is None:
+            rows, modes, (xe, me, de, he) = self._empty_history(last)
+        else:
+            hours = self._hours(L)
+            rows, modes = self.rows[hours % L][None], self.modes
+            xe, me, de, he = self._window_arrays(hours[:E])
+        df, hf = window_calendar(0, last + 1 + np.arange(self.horizon))
         (q,) = self.b.run("issue", self.loc, self._lat, self._lon, *self.coefs, rows,
-                          *self.modes, xe[None], me[None], de[None], he[None], df[None],
-                          hf[None])
+                          *modes, xe[None], me[None], de[None], he[None], df[None], hf[None])
+        if not np.all(np.isfinite(q)):
+            raise FloatingPointError("выход графа выпуска не конечен")
         return q[0]
 
-    def forecast(self):
-        """Выпуск на часы после последнего шага.
+    def forecast(self, now_hour=None):
+        """Выпуск на часы после момента выпуска.
+
+        Args:
+            now_hour: текущий абсолютный час UTC по часам устройства; нужен только до
+                первого шага.
 
         Returns:
             Пара: квантили float32 формы (H, число квантилей) и медиана формы (H,).
         """
-        q = self.raw_forecast()
+        q = self.raw_forecast(now_hour)
         if self.conformal is not None:
-            q = apply_conformal(q, self.conformal)
+            q = order_around_median(q + self.conformal)
         if self.aci is not None:
-            self._pending = dict(first=self.last_hour + 1, q=np.array(q, np.float32), last=-1)
+            self._pending = dict(first=self.issue_hour(now_hour) + 1,
+                                 q=np.array(q, np.float32), last=-1)
         return apply_adaptive(q, self.theta)
+
+    def climatology_forecast(self, last):
+        """Откат: квантили нормального распределения по таблице климатологии точки.
+
+        Args:
+            last: абсолютный час, после которого начинается горизонт.
+
+        Returns:
+            Пара: квантили float32 формы (H, число квантилей) и медиана формы (H,).
+        """
+        idx = hour_of_year(int(last) + 1 + np.arange(self.horizon, dtype=np.int64))
+        mu, sig = self.clim_mu[idx], self.clim_sig[idx]
+        q = mu[:, None] + self.zq[None, :] * sig[:, None]
+        return q.astype(np.float32), mu.copy()
+
+    def safe_forecast(self, now_hour=None):
+        """Выпуск, а при любой ошибке выпуска - откат к климатологии точки.
+
+        Args:
+            now_hour: текущий абсолютный час UTC по часам устройства; нужен только до
+                первого шага.
+
+        Returns:
+            Тройка: квантили формы (H, число квантилей), медиана формы (H,) и признак
+            отката.
+
+        Raises:
+            ValueError: момент выпуска не определён, откатываться не к чему.
+        """
+        try:
+            q, mu = self.forecast(now_hour)
+            return q, mu, False
+        except Exception as e:
+            last = self.issue_hour(now_hour)
+            log.warning("откат к климатологии: %s", e)
+            self.fallbacks += 1
+            q, mu = self.climatology_forecast(last)
+            return q, mu, True
 
     def warm_start(self, x_hist, mask_hist, last_hour):
         """Прогрев по сырой истории: то же состояние, что после шага по каждому часу.
@@ -415,31 +633,31 @@ class StreamingMayak:
         self.filled = take
         self._rebuild(seed_qc=True)
 
-    @staticmethod
-    def _conformal(conformal):
+    def _conformal(self, conformal):
         """Таблица поправок, которую можно применять к выходам этой модели.
 
         Модель здесь считает во fp32. Таблица, подогнанная на другой точности, не
         применяется, причина пишется в лог.
 
         Args:
-            conformal: None, путь к таблице с записью о подгонке рядом или сама таблица.
+            conformal: None, путь к таблице с записью о подгонке рядом или сама таблица по
+                бинам лидов.
 
         Returns:
-            Таблица float32 или None.
+            Таблица float32, развёрнутая по лидам, формы (H, число квантилей), или None.
         """
         if conformal is None:
             return None
         if not isinstance(conformal, str):
             shift = np.asarray(conformal, np.float32)
             check_median_free(shift)
-            return shift
+            return conformal_table(shift, self.horizon)
         shift, rec = load_conformal(conformal)
         why = precision_mismatch(rec, "fp32")
         if why:
             log.warning("конформная таблица %s не применяется: %s", conformal, why)
             return None
-        return shift
+        return conformal_table(shift, self.horizon)
 
     @property
     def state_nbytes(self):
@@ -468,63 +686,25 @@ class StreamingMayak:
             ValueError: байты не состояние этого формата, не подходят конфигу модели или
                 повреждены. Рантайм тогда остаётся в холодном старте.
         """
-        raw = bytes(raw)
-        if len(raw) < len(STATE_MAGIC) + 1 or raw[:len(STATE_MAGIC)] != STATE_MAGIC:
-            raise ValueError("не состояние МАЯК: нет заголовка")
-        version = raw[len(STATE_MAGIC)]
-        if version != STATE_VERSION:
-            raise ValueError(f"версия состояния {version}, рантайм читает {STATE_VERSION}; "
-                             f"прежние версии не хранят сырое окно целиком, нужен холодный "
-                             f"старт")
-        if len(raw) != self.state_nbytes:
-            raise ValueError(f"состояние {len(raw)} Б не соответствует конфигу модели "
-                             f"(ожидалось {self.state_nbytes} Б)")
-        hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0]
-        theta, filled, last = float(hdr["aci_theta"]), int(hdr["filled"]), int(hdr["last_hour"])
-        W = self.window
-        if not np.isfinite(theta):
-            raise ValueError(f"повреждённый множитель калибровки в состоянии: {theta}")
-        if filled > W or (last == NO_HOUR and filled):
-            raise ValueError(f"повреждённый заголовок состояния: filled={filled}, окно {W}, "
-                             f"последний час {last}")
-        x, present, valid = decode_window(raw[STATE_HEADER.itemsize:], W)
-        if np.any(valid > present):
-            raise ValueError("повреждённое окно: годный час без значения")
-        ok = valid > 0
-        if np.any(ok & ((x < PHYS_LO) | (x > PHYS_HI))):
-            raise ValueError("повреждённое окно: годное значение вне физического диапазона")
+        snap = parse_state(raw, self.window)
         self.reset()
-        self.reset_calibration(theta)
-        self.loaded_site = (float(hdr["lat"]), float(hdr["lon"]), float(hdr["elev"]))
-        if last == NO_HOUR:
+        self.reset_calibration(snap.theta)
+        self.loaded_site = snap.site
+        if snap.last_hour is None:
             return
-        self.last_hour = last
+        W = self.window
+        self.last_hour = snap.last_hour
         pos = self._hours(W) % W
-        self.raw[pos], self.present[pos], self.valid[pos] = x, present, valid
-        self.filled = filled
-        self._rebuild(seed_qc=True)
+        self.raw[pos], self.present[pos], self.valid[pos] = snap.raw, snap.present, snap.valid
+        self.filled = snap.filled
+        try:
+            self._rebuild(seed_qc=True)
+        except Exception:
+            self.reset()
+            raise
 
 
-def safe_forecast(stream, mu_clim_fut, sigma_clim):
-    """Выпуск с откатом к климатологии при любой ошибке.
-
-    Args:
-        stream: потоковый рантайм.
-        mu_clim_fut: климатическое среднее на часах горизонта, форма (H,).
-        sigma_clim: климатический разброс.
-
-    Returns:
-        Пара: квантили и медиана.
-    """
-    try:
-        return stream.forecast()
-    except Exception:
-        from mayak.baselines import quantiles_from_normal
-        mu = np.asarray(mu_clim_fut, np.float32)
-        q = quantiles_from_normal(mu, np.full(mu.shape[-1], sigma_clim, np.float32))
-        return q, mu
-
-
-__all__ = ["CTX", "NO_HOUR", "RAW_CHANNELS", "RESYNC_HOURS", "STATE_HEADER", "STATE_VERSION",
-           "StreamingMayak", "decode_window", "encode_window", "mask_bytes", "safe_forecast",
-           "state_nbytes", "to_store"]
+__all__ = ["CTX", "HOURS_OF_YEAR", "NO_HOUR", "RAW_CHANNELS", "RESYNC_HOURS", "STATE_HEADER",
+           "STATE_VERSION", "StateSnapshot", "StreamingMayak", "check_climatology",
+           "decode_window", "encode_window", "mask_bytes", "parse_state", "state_nbytes",
+           "to_store", "window_nbytes"]

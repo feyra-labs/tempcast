@@ -3,7 +3,9 @@
 Устройство вызывает модель в разных ритмах, поэтому модель режется на графы, а всё
 состояние ходит через их входы и выходы:
 
-* ``init``   - при старте: признаки точки и коэффициенты климат-поля без паспорта;
+* ``init``   - при старте: признаки точки, коэффициенты климат-поля без паспорта и
+  таблица климатологии точки для отката: среднее и масштаб климат-поля с паспортом
+  холодного старта на каждый час високосного года;
 * ``step``   - раз в час: хвост сырого окна, календарь часа, буфер энкодера, сумма мод по
   хвосту истории и вклад часа, который из хвоста выходит. Выход: новый буфер, новая
   сумма, вклад этого часа в моды для кольца хоста и строка суточного накопителя;
@@ -31,12 +33,13 @@ from mayak.astro import astro_features
 from mayak.runtime.streaming import (CTX, RAW_CHANNELS, RESYNC_HOURS, STATE_HEADER,
                                      STATE_VERSION, StreamingMayak, state_nbytes)
 
-GRAPH_FORMAT = 2
+GRAPH_FORMAT = 3
 GRAPH_NAMES = ("init", "step", "window", "resync", "issue")
 COEFS = ("c_mu", "c_sig", "c_def")
+HOURS_OF_YEAR = 366 * 24
 GRAPH_IO = {
     "init": (("lat", "lon", "elev"),
-             ("loc", "c_mu", "c_sig", "c_def", "z0")),
+             ("loc", "c_mu", "c_sig", "c_def", "z0", "clim_mu", "clim_sig")),
     "step": (("x_ctx", "m_ctx", "doy", "hour", "lat", "lon", *COEFS,
               "enc_buf", "n_re", "n_im", "e", "u_old", "v_old"),
              ("enc_buf_out", "n_re_out", "n_im_out", "e_out", "u", "v", "row")),
@@ -65,13 +68,44 @@ class _Graph(nn.Module):
         self.eval()
 
 
+def year_calendar():
+    """Календарь всех часов високосного года в конвенции проекта.
+
+    Номер часа в таблице климатологии совпадает с номером часа от начала года, поэтому
+    таблица подходит и обычному году: его часы просто не доходят до последних суток.
+
+    Returns:
+        Пара массивов float32 формы (8784,): день года с долей суток и час UTC.
+    """
+    sec = np.arange(HOURS_OF_YEAR, dtype=np.int64) * 3600
+    return (sec / 86400.0).astype(np.float32), ((sec % 86400) / 3600.0).astype(np.float32)
+
+
 class InitGraph(_Graph):
+    """Старт устройства: всё, что зависит только от точки.
+
+    Таблица климатологии - то, что выдаёт модель при пустой истории без мод и поправки:
+    климат-поле с паспортом холодного старта. Хост берёт из неё среднее и масштаб по
+    часу года, когда выпуск не удался, и своей арифметики модели не делает.
+    """
+
+    def __init__(self, model):
+        super().__init__(model)
+        doy, hour = year_calendar()
+        self.register_buffer("year_doy", torch.from_numpy(doy)[None], persistent=False)
+        self.register_buffer("year_hour", torch.from_numpy(hour)[None], persistent=False)
+
     def forward(self, lat, lon, elev):
         m, D = self.m, self.m.cfg.history_days
         loc = m.loc(lat[:, 0], lon[:, 0], elev[:, 0])
         c_mu, c_sig, c_def = m.field.coefficients(loc)
         z0 = m.passport_from_rows(loc, loc.new_zeros(1, D * 24, len(DAY_ROW)))
-        return loc, c_mu, c_sig, c_def, z0
+        # Календарь года привязан к входу нулевым слагаемым: иначе экспорт развернул бы
+        # все его производные в константы и граф вырос бы в несколько раз.
+        zero = lat * 0.0
+        astro = astro_features(self.year_doy + zero, self.year_hour + zero, lat, lon)
+        clim_mu, clim_sig, _ = m.field.evaluate(m.field.coefficients(loc, z0), astro)
+        return loc, c_mu, c_sig, c_def, z0, clim_mu, clim_sig
 
 
 class StepGraph(_Graph):
@@ -142,7 +176,8 @@ def dims(cfg):
                 history_days=cfg.history_days, n_daily_summary=N_DAILY_SUMMARY,
                 day_row=len(DAY_ROW), stream_window=cfg.stream_window,
                 stream_edge=cfg.stream_edge, stream_tail=cfg.stream_tail, ctx=CTX,
-                loc_dim=loc_dim, encoder_width=cfg.encoder_width, enc_buf_len=enc_buf)
+                loc_dim=loc_dim, encoder_width=cfg.encoder_width, enc_buf_len=enc_buf,
+                hours_of_year=HOURS_OF_YEAR)
 
 
 def example_inputs(model, seed=0):
@@ -152,7 +187,7 @@ def example_inputs(model, seed=0):
     r = lambda *s: torch.randn(*s, generator=g)
     lat, lon, elev = torch.tensor([[52.37]]), torch.tensor([[4.9]]), torch.tensor([[12.0]])
     with torch.no_grad():
-        loc, c_mu, c_sig, c_def, _z0 = (t.detach() for t in InitGraph(model)(lat, lon, elev))
+        loc, c_mu, c_sig, c_def, *_ = (t.detach() for t in InitGraph(model)(lat, lon, elev))
     coefs = (c_mu, c_sig, c_def)
     M, W, Hh = cfg.n_modes, cfg.encoder_width, cfg.horizon
     Wn, E, T, L = cfg.stream_window, cfg.stream_edge, cfg.stream_tail, cfg.max_history
@@ -329,7 +364,9 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
                      shapes_in={n: list(t.shape) for n, t in zip(names_in, inputs[name])},
                      shapes_out={n: list(r.shape) for n, r in zip(names_out, ref)})
         if int8:
-            entry["int8"] = quantize_graph(path)
+            # Граф старта выполняется один раз, а таблица отката не должна зависеть от
+            # квантования, поэтому его int8-копия - тот же граф fp32.
+            entry["int8"] = entry["fp32"] if name == "init" else quantize_graph(path)
         graphs[name] = entry
 
     model.train(was_training)
@@ -428,6 +465,92 @@ class GraphRuntime(StreamingMayak):
         self._setup(backend, cfg, lat, lon, elev, conformal, aci)
 
 
+def manifest_conformal(manifest, model_dir, precision):
+    """Развёрнутая по лидам конформная таблица экспорта для графов заданной точности.
+
+    Таблица, подогнанная на другой точности или без записанной точности, не
+    применяется: вместо неё возвращается причина для лога.
+
+    Args:
+        manifest: манифест экспорта.
+        model_dir: каталог экспорта.
+        precision: точность графов, fp32 или int8.
+
+    Returns:
+        Пара: таблица float32 формы (H, число квантилей) или None и причина или None.
+
+    Raises:
+        ValueError: таблица не того размера или сдвигает медиану.
+    """
+    from mayak.metrics import I_MED
+    cal = manifest["calibration"]
+    if not cal.get("conformal"):
+        return None, None
+    d = manifest["dims"]
+    table = np.fromfile(os.path.join(model_dir, cal["conformal"]), "<f4")
+    if table.size != d["horizon"] * d["n_quantiles"]:
+        raise ValueError(f"{cal['conformal']}: {4 * table.size} Б, ожидалось "
+                         f"{4 * d['horizon'] * d['n_quantiles']}")
+    table = table.reshape(d["horizon"], d["n_quantiles"])
+    if np.any(table[:, I_MED] != 0.0):
+        raise ValueError(f"{cal['conformal']}: поправка медианы не нулевая - таблица сдвигает "
+                         f"точечный прогноз; подгоните таблицу заново")
+    have = cal.get("precision")
+    if have == precision:
+        return table, None
+    if have is None:
+        return None, (f"точность конформной таблицы не записана в манифесте, графы считают в "
+                      f"{precision}: таблица не применяется")
+    return None, (f"конформная таблица подогнана на {have}, графы считают в {precision}: "
+                  f"таблица не применяется")
+
+
+def runtime_from_export(model_dir, lat, lon, elev, precision="fp32", threads=1, conformal=True,
+                        aci=False):
+    """Хост потока на графах экспорта - те же входы, что у рантайма устройства.
+
+    Args:
+        model_dir: каталог экспорта с графами и манифестом.
+        lat: широта точки.
+        lon: долгота точки.
+        elev: высота точки, м.
+        precision: точность графов, fp32 или int8.
+        threads: число потоков исполнителя графов.
+        conformal: применять конформную таблицу экспорта, если она подходит графам.
+        aci: подстраивать множитель калибровки с параметрами из манифеста.
+
+    Returns:
+        Хост потока на графах.
+
+    Raises:
+        ValueError: калибровка включена, а её параметров в манифесте нет.
+        RuntimeError: граф старта не дал годной таблицы климатологии.
+    """
+    import logging
+    from mayak.config import ModelConfig
+    from mayak.metrics import ACIParams
+    backend = OnnxBackend(model_dir, precision, threads)
+    man = backend.manifest
+    table = None
+    if conformal:
+        table, why = manifest_conformal(man, model_dir, precision)
+        if why:
+            logging.getLogger(__name__).warning(why)
+    params = None
+    if aci:
+        a = man["calibration"].get("aci")
+        if a is None:
+            raise ValueError("ACI включена, но параметров ACI в манифесте нет")
+        params = ACIParams(target=a["target"], gamma=a["gamma"], max_factor=a["max_factor"])
+        if list(params.interval) != list(a["interval"]):
+            raise ValueError(f"манифест: интервал ACI {a['interval']} не соответствует цели "
+                             f"{a['target']}")
+    rt = GraphRuntime(backend, ModelConfig.from_dict(man["model_config"]), lat, lon, elev,
+                      aci=params)
+    rt.conformal = table
+    return rt
+
+
 class GraphModel:
     """Модель на графах с пакетным интерфейсом модели PyTorch.
 
@@ -453,7 +576,7 @@ class GraphModel:
         cfg, b = self.cfg, self.backend
         W, L, E = cfg.stream_window, cfg.max_history, cfg.stream_edge
         f = lambda v: np.array([[v]], np.float32)
-        loc, *coefs, _ = b.run("init", f(lat), f(lon), f(elev))
+        loc, *coefs = b.run("init", f(lat), f(lon), f(elev))[:4]
         pad = W - x.shape[0]
         if pad < 0:
             raise ValueError(f"история {x.shape[0]} ч длиннее окна рантайма {W} ч")
@@ -491,6 +614,7 @@ class GraphModel:
         return dict(q=q, mu=q[..., I_MED])
 
 
-__all__ = ["DAY_ROW", "GRAPH_IO", "GRAPH_NAMES", "GraphModel", "GraphRuntime", "OnnxBackend",
-           "TorchBackend", "conformal_for_export", "dims", "example_inputs", "export_graphs",
-           "graphs_digest", "quantize_graph", "state_nbytes"]
+__all__ = ["DAY_ROW", "GRAPH_IO", "GRAPH_NAMES", "HOURS_OF_YEAR", "GraphModel", "GraphRuntime",
+           "OnnxBackend", "TorchBackend", "conformal_for_export", "dims", "example_inputs",
+           "export_graphs", "graphs_digest", "manifest_conformal", "quantize_graph",
+           "runtime_from_export", "state_nbytes", "year_calendar"]

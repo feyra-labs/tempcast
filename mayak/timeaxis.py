@@ -58,6 +58,23 @@ def from_utc_hour(t_h) -> np.ndarray:
     return _EPOCH_H + np.asarray(t_h, dtype=np.int64).astype("timedelta64[h]")
 
 
+def hour_of_year(t_h):
+    """Номер часа от начала года UTC.
+
+    Високосный год даёт номера от 0 до 8783, обычный от 0 до 8759. Номер однозначно
+    задаёт календарь часа, из которого считается климат-поле: день года и час суток.
+
+    Args:
+        t_h: абсолютные часы UTC, целые часы от эпохи; число или массив.
+
+    Returns:
+        Массив int64 той же формы.
+    """
+    t = from_utc_hour(t_h)
+    start = t.astype("datetime64[Y]").astype("datetime64[h]")
+    return (t - start).astype(np.int64)
+
+
 def window_calendar(t0_utc_h: int, idx):
     ts = from_utc_hour(int(t0_utc_h) + np.asarray(idx, dtype=np.int64))
     doy, hour = doy_hour(ts)

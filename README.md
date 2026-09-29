@@ -480,9 +480,9 @@ python -m mayak.knockout --ckpt runs/mayak/stageB/best.ckpt
 # экспорт (ONNX/int8 + копия конформной таблицы рядом с моделью)
 python scripts/export_onnx.py --ckpt runs/mayak/stageB/best.ckpt --out runtime/mayak.onnx
 
-# потоковый инференс: восстановление состояния → почасовые шаги → выпуск прогноза
-python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt \
-    --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2 --aci
+# хост устройства на Python: тот же протокол, состояние и откат, что у mayak-rt
+echo "forecast" | python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt \
+    --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2 --state-dir runtime --aci
 ```
 
 Рабочий вариант для прибора - компилируемый рантайм `runtime-rs` (один бинарник, ONNX

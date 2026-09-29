@@ -257,7 +257,7 @@
  },
  "graphs": {
   "init": {
-   "fp32": "init.onnx",
+   "fp32": "../model/init.onnx",
    "inputs": [
     "lat",
     "lon",
@@ -316,10 +316,10 @@
      8784
     ]
    },
-   "int8": "init.onnx"
+   "int8": "../model/init.onnx"
   },
   "step": {
-   "fp32": "step.onnx",
+   "fp32": "../model/step.onnx",
    "inputs": [
     "x_ctx",
     "m_ctx",
@@ -442,10 +442,10 @@
      4
     ]
    },
-   "int8": "step_int8.onnx"
+   "int8": "../model/step_int8.onnx"
   },
   "window": {
-   "fp32": "window.onnx",
+   "fp32": "../model/window.onnx",
    "inputs": [
     "x_win",
     "m_win",
@@ -539,10 +539,10 @@
      24
     ]
    },
-   "int8": "window_int8.onnx"
+   "int8": "../model/window_int8.onnx"
   },
   "resync": {
-   "fp32": "resync.onnx",
+   "fp32": "../model/resync.onnx",
    "inputs": [
     "u_ring",
     "v_ring"
@@ -577,27 +577,12 @@
      24
     ]
    },
-   "int8": "resync_int8.onnx"
+   "int8": "../model/resync_int8.onnx"
   },
   "issue": {
-   "fp32": "issue.onnx",
+   "fp32": "issue_nan.onnx",
    "inputs": [
-    "loc",
-    "lat",
-    "lon",
-    "c_mu",
-    "c_sig",
-    "c_def",
-    "rows",
-    "n_re",
-    "n_im",
-    "e",
-    "x_edge",
-    "m_edge",
-    "doy_edge",
-    "hour_edge",
-    "doy_fut",
-    "hour_fut"
+    "loc"
    ],
    "outputs": [
     "q"
@@ -678,11 +663,11 @@
      7
     ]
    },
-   "int8": "issue_int8.onnx"
+   "int8": "issue_nan.onnx"
   }
  },
  "calibration": {
-  "conformal": "conformal.f32",
+  "conformal": "../model/conformal.f32",
   "precision": "fp32",
   "aci": {
    "target": 0.1,

@@ -60,7 +60,7 @@ fn issue(rt: &mut Runtime) -> Vec<f32> {
         rt.step(obs, START_HOUR + k as i64).unwrap();
     }
     assert_eq!(rt.idle_hours(), 0, "серия наблюдений должна быть непрерывной");
-    rt.forecast().unwrap().q.clone()
+    rt.forecast(None).unwrap().q.clone()
 }
 
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
