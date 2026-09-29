@@ -128,7 +128,7 @@ impl Snapshot {
         let t: Vec<f32> = raw[off..off + w].iter().map(|b| *b as i8 as f32).collect();
         off += w;
         let p: Vec<f32> = raw[off..off + 2 * w]
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .map(|c| (u16::from_le_bytes([c[0], c[1]]) as f64 / STORE_SCALE[1]) as f32)
             .collect();
         off += 2 * w;
