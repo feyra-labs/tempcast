@@ -337,7 +337,11 @@ fn corrupted_state_is_rejected_and_leaves_cold_start() {
     let g = load();
     let sc = g.scenario("restart");
     let raw = fs::read(golden_dir().join(sc["init_files"][0]["file"].as_str().unwrap())).unwrap();
-    let site = [sc["lat"], sc["lon"], sc["elev"]].map(|v| v.as_f64().unwrap());
+    let site = [
+        sc["lat"].as_f64().unwrap(),
+        sc["lon"].as_f64().unwrap(),
+        sc["elev"].as_f64().unwrap(),
+    ];
     let mut rt = runtime(sc, site);
     for bad in [&raw[..raw.len() - 1], &[b'X'; 3224][..]] {
         assert!(rt.load_state(bad).is_err());
