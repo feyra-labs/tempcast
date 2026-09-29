@@ -145,7 +145,11 @@ fn replay(g: &Golden, name: &str) -> f32 {
     let tol = g.tol(if int8 { "q_abs_int8" } else { "q_abs" });
     let theta_tol = g.tol("theta_abs");
     let dir = state_dir(g, sc);
-    let mut site = [sc["lat"], sc["lon"], sc["elev"]].map(|v| v.as_f64().unwrap());
+    let mut site = [
+        sc["lat"].as_f64().unwrap(),
+        sc["lon"].as_f64().unwrap(),
+        sc["elev"].as_f64().unwrap(),
+    ];
     let mut h: Option<Host> = None;
     let mut worst = 0.0f32;
     for (i, ev) in sc["events"].as_array().unwrap().iter().enumerate() {
@@ -308,7 +312,11 @@ fn python_state_roundtrips_byte_exact() {
     let g = load();
     let sc = g.scenario("restart");
     let raw = fs::read(golden_dir().join(sc["init_files"][0]["file"].as_str().unwrap())).unwrap();
-    let site = [sc["lat"], sc["lon"], sc["elev"]].map(|v| v.as_f64().unwrap());
+    let site = [
+        sc["lat"].as_f64().unwrap(),
+        sc["lon"].as_f64().unwrap(),
+        sc["elev"].as_f64().unwrap(),
+    ];
     let mut rt = runtime(sc, site);
     rt.load_state(&raw).unwrap();
     assert_eq!(rt.filled(), rt.stream_window(), "эталон должен начинаться с полного окна");
