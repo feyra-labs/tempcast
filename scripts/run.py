@@ -25,6 +25,22 @@ def to_run_config(cfg):
     return RunConfig.from_dict(d)
 
 
+def to_launch(cfg):
+    """Настройки раздельного запуска этапов из секции run.
+
+    Интерполяции секции не разрешаются: имя прогона зависит от выбора Hydra, а
+    настройкам запуска оно не нужно.
+
+    Args:
+        cfg: конфиг Hydra.
+
+    Returns:
+        Настройки запуска.
+    """
+    from mayak.stages import launch_from_config
+    return launch_from_config(OmegaConf.to_container(cfg.run, resolve=False))
+
+
 @hydra.main(config_path="../conf", config_name="config", version_base="1.3")
 def main(cfg: DictConfig):
     import logging
@@ -35,13 +51,17 @@ def main(cfg: DictConfig):
 
     log = logging.getLogger(__name__)
     rc = to_run_config(cfg)
+    launch = to_launch(cfg)
     out_dir = HydraConfig.get().runtime.output_dir
     journal = run_experiment(rc, out_root=os.path.dirname(out_dir),
-                             tag=os.path.basename(out_dir), accelerator=cfg.run.accelerator)
+                             tag=os.path.basename(out_dir), accelerator=cfg.run.accelerator,
+                             launch=launch)
     for st in journal["stages"]:
         log.info("лучшая модель этапа %s: %s", st["name"], st["best_ckpt"])
+        if st.get("report"):
+            log.info("отчёт о поле этапа %s: %s", st["name"], st["report"])
     log.info("итоговый чекпойнт: %s", journal["final_ckpt"])
-    return journal["stages"][-1]["best_score"]
+    return journal["stages"][-1]["best_score"] if journal["stages"] else None
 
 
 if __name__ == "__main__":

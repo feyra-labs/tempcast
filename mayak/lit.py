@@ -19,7 +19,7 @@ import copy
 
 import pytorch_lightning as L
 import torch
-from pytorch_lightning.callbacks import Callback
+from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 
 from mayak.baselines import DLinear, GRUSeq2Seq, LRUForecaster, PatchTST
 from mayak.config import DataConfig, RunConfig, model_config_for
@@ -28,6 +28,7 @@ from mayak.leakage import SELECTION_KEY, selection_record
 from mayak.loss import forecast_loss, forecast_terms, masked_mean
 from mayak.model import MAYAK
 from mayak.protocol import ARCH_NAMES, DEFAULT_PROTOCOL, Protocol, ProtocolError
+from mayak.stages import STAGE_KEY
 
 LEADS = [1, 3, 6, 12, 24, 48, 72, 120, 168]
 RUN_KEY = "mayak_run"
@@ -138,6 +139,34 @@ class SelectionProvenance(Callback):
                   if k.startswith("val/")}
         checkpoint[SELECTION_KEY] = selection_record(trainer.datamodule.val_ds, monitor,
                                                      scores=scores)
+
+
+class StageProvenance(Callback):
+    """Кладёт в каждый сохраняемый чекпойнт запись об этапе.
+
+    В записи имя и номер этапа в протоколе, ключ кэша данных, каталог и журнал прогона,
+    чекпойнт, с которого этап стартовал, число шагов пробного запуска и шаг сохранения.
+    По этой записи следующий этап проверяет, что стартует с совместимой точки.
+
+    Args:
+        record: запись об этапе без шага сохранения.
+    """
+
+    def __init__(self, record):
+        self.record = dict(record)
+
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        checkpoint[STAGE_KEY] = dict(self.record, step=int(trainer.global_step))
+
+
+class CandidateCheckpoint(ModelCheckpoint):
+    """Сохранение чекпойнта после каждой валидации этапа.
+
+    Сохранение идёт в конце прохода валидации, пока в модели стоят усреднённые веса,
+    поэтому кандидат несёт те же веса, что увидела валидация. Отдельный класс нужен,
+    чтобы состояние этого сохранения хранилось в чекпойнте отдельно от состояния выбора
+    лучшего.
+    """
 
 
 class EMA:

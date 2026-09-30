@@ -16,6 +16,20 @@ run:
   # имя прогона: архитектура, вариант абляции, базовый сид
   tag: ${model.arch}-${hydra:runtime.choices.ablation}-s${train.seed}
   accelerator: gpu
+  # Раздельный запуск этапов; в протокол не входит и на сравнение моделей не влияет.
+  # Этапы этого запуска подряд в порядке протокола, например [A] или [B]; null - все.
+  stages: null
+  # Чекпойнт предыдущего этапа, с которого стартует первый запускаемый этап, если он в
+  # протоколе не первый. Выбирает человек по отчёту о поле.
+  init_from: null
+  # Порог отношения MSE поля к MSE климатологии на валидационных станциях при L=0:
+  # выше порога этап B не начинается. Спецификация требует 1.05; null - только отчёт.
+  require_gate: null
+  # Пробный запуск последнего этапа: столько первых шагов при полном расписании.
+  probe_steps: null
+  # Этапы, у которых чекпойнт сохраняется после каждой валидации; null - этап холодного
+  # старта, [] - ни один.
+  candidates: null
 
 hydra:
   job:
@@ -39,6 +53,8 @@ hydra:
         python scripts/run.py -m ablation=none,no_anchor,no_compression train.seed=0
         python scripts/run.py -m train.seed=0,1,2
         python scripts/run.py augment=soft          # профиль аугментаций
+        python scripts/run.py run.stages=[A]        # только этап A, затем отчёт о поле
+        python scripts/run.py run.stages=[B] run.init_from=<чекпойнт этапа A>
 
       Hydra: python scripts/run.py --hydra-help
     template: |

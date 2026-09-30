@@ -20,6 +20,29 @@ from mayak.data.splits import ROLE_VAL
 from mayak.data.store import get_store
 
 
+def validation_set(store, manifest, data_cfg, curriculum):
+    """Набор окон валидации этапа.
+
+    Окна валидационных станций в валидационном окне, с каждой станции одинаковое число.
+    Длина истории каждого окна выбирается из распределения куррикулума этапа генератором с
+    фиксированным сидом. Один и тот же набор служит выбору чекпойнта и отчёту о нём.
+
+    Args:
+        store: набор станций.
+        manifest: путь к манифесту с ролями станций.
+        data_cfg: конфиг данных.
+        curriculum: имя куррикулума этапа.
+
+    Returns:
+        Набор окон валидации.
+    """
+    c = data_cfg
+    return EvalSet(store.clims(), station_splits=(ROLE_VAL,), manifest=manifest, time_key="val",
+                   every_hours=c.val_every_hours, max_windows=None,
+                   windows_per_station=c.val_windows_per_station, target_mask=c.target_mask,
+                   curriculum=curriculum, history_seed=c.val_seed)
+
+
 class MayakData(L.LightningDataModule):
     def __init__(self, manifest="data/manifest.csv", curriculum="full",
                  batch_size=256, windows_per_epoch=200_000,
@@ -44,11 +67,7 @@ class MayakData(L.LightningDataModule):
                                       zone_weighting=c.zone_weighting,
                                       zone_weight_cap=c.zone_weight_cap)
         self.store = store
-        self.val_ds = EvalSet(store.clims(), station_splits=(ROLE_VAL,), manifest=h.manifest,
-                              time_key="val", every_hours=c.val_every_hours, max_windows=None,
-                              windows_per_station=c.val_windows_per_station,
-                              target_mask=c.target_mask, curriculum=h.curriculum,
-                              history_seed=c.val_seed)
+        self.val_ds = validation_set(store, h.manifest, c, h.curriculum)
 
     def train_dataloader(self):
         h = self.hparams

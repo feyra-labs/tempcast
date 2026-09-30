@@ -590,3 +590,21 @@ def test_stage_b_starts_from_stage_a_weights(runs):
     lit.load_state_dict(a["state_dict"])
     for k, v in a["state_dict"].items():
         assert torch.equal(lit.state_dict()[k], v)
+
+
+def test_every_architecture_gets_a_stage_a_report(runs):
+    """Отчёт о поле после этапа A считается одинаково для всех архитектур."""
+    from mayak.stage_report import read_report
+    _, res = runs
+    for arch in ARCH_NAMES:
+        a, b = res[arch]["journal"]["stages"]
+        rep = read_report(a["report"])
+        assert rep["arch"] == arch and rep["val_set"]["fingerprint"] == a["val_set"]
+        assert [e["step"] for e in rep["candidates"]] == [c["step"] for c in a["candidates"]]
+        assert sum(e["is_best"] for e in rep["candidates"]) == 1
+        for e in rep["candidates"]:
+            assert e["mse_ratio"] is not None and e["mse_ratio"] > 0, arch
+            assert 0.0 <= e["picp90"] <= 1.0, arch
+        assert a["report_best"]["mse_ratio"] == pytest.approx(
+            next(e for e in rep["candidates"] if e["is_best"])["mse_ratio"])
+        assert "report" not in b and b["init_from"]["digest"] == a["best_digest"]
