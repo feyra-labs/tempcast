@@ -52,7 +52,7 @@ impl StateStore {
     where
         F: Fn(&[u8]) -> Result<Option<i64>>,
     {
-        let mut v: Vec<((u8, Reverse<i64>), PathBuf, Vec<u8>)> = self
+        let mut v = self
             .candidates()
             .into_iter()
             .filter_map(|f| fs::read(&f).ok().map(|b| (f, b)))
@@ -64,7 +64,8 @@ impl StateStore {
                 };
                 (key, f, b)
             })
-            .collect();
+            .collect::<Vec<_>>();
+
         v.sort_by_key(|a| a.0);
         v.into_iter().map(|(_, f, b)| (f, b)).collect()
     }

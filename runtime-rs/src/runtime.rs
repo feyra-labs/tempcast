@@ -679,10 +679,7 @@ impl Runtime {
     /// Выпуск с откатом: при любой ошибке выпуска - климатология точки; сбой пишется в
     /// лог и считается в `fallbacks`. Err только если момент выпуска не определён.
     pub fn safe_forecast(&mut self, now_hour: Option<i64>) -> Result<&Forecast> {
-        let err = match self.forecast(now_hour) {
-            Ok(_) => None,
-            Err(e) => Some(e),
-        };
+        let err = self.forecast(now_hour).err();
         if let Some(e) = err {
             let Some(last) = self.issue_hour(now_hour) else {
                 return Err(e);
