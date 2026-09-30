@@ -133,7 +133,10 @@ fn assert_state(rt: &Runtime, file: &Path, theta_tol: f32, what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: размер состояния");
     assert_eq!(got[..16], want[..16], "{what}: заголовок состояния");
     let th = |b: &[u8]| f32::from_le_bytes([b[16], b[17], b[18], b[19]]);
-    assert!((th(&got) - th(&want)).abs() <= theta_tol, "{what}: множитель калибровки");
+    assert!(
+        (th(&got) - th(&want)).abs() <= theta_tol,
+        "{what}: множитель калибровки"
+    );
     assert_eq!(got[20..HEADER], want[20..HEADER], "{what}: координаты");
     assert_eq!(got[HEADER..], want[HEADER..], "{what}: сырое окно и маски");
 }
@@ -164,7 +167,11 @@ fn replay(g: &Golden, name: &str) -> f32 {
                 let got = next
                     .restore()
                     .map(|p| p.file_name().unwrap().to_string_lossy().into_owned());
-                assert_eq!(got.as_deref(), ev["expect"]["restored"].as_str(), "{at}: восстановлен не тот файл");
+                assert_eq!(
+                    got.as_deref(),
+                    ev["expect"]["restored"].as_str(),
+                    "{at}: восстановлен не тот файл"
+                );
                 h = Some(next);
             }
             "state" => {
@@ -177,7 +184,10 @@ fn replay(g: &Golden, name: &str) -> f32 {
                 let reply = host.handle(line).unwrap();
                 let exp = &ev["expect"];
                 if exp.get("error").is_some() {
-                    assert!(reply.get("error").is_some(), "{at}: {line}: ожидалась ошибка, ответ {reply}");
+                    assert!(
+                        reply.get("error").is_some(),
+                        "{at}: {line}: ожидалась ошибка, ответ {reply}"
+                    );
                     continue;
                 }
                 assert!(reply.get("error").is_none(), "{at}: {line}: {reply}");
@@ -186,7 +196,10 @@ fn replay(g: &Golden, name: &str) -> f32 {
                     "forecast" => {
                         assert_eq!(reply["after_unix_hour"], exp["after_unix_hour"], "{at}: момент выпуска");
                         assert_eq!(reply["fallback"], exp["fallback"], "{at}: признак отката");
-                        assert!((f(&reply["theta"]) - f(&exp["theta"])).abs() <= theta_tol, "{at}: множитель");
+                        assert!(
+                            (f(&reply["theta"]) - f(&exp["theta"])).abs() <= theta_tol,
+                            "{at}: множитель"
+                        );
                         let rows = reply["q"].as_array().unwrap();
                         let nq = rows[0].as_array().unwrap().len();
                         let q: Vec<f32> = rows.iter().flat_map(|r| r.as_array().unwrap().iter().map(f)).collect();
@@ -319,7 +332,11 @@ fn python_state_roundtrips_byte_exact() {
     ];
     let mut rt = runtime(sc, site);
     rt.load_state(&raw).unwrap();
-    assert_eq!(rt.filled(), rt.stream_window(), "эталон должен начинаться с полного окна");
+    assert_eq!(
+        rt.filled(),
+        rt.stream_window(),
+        "эталон должен начинаться с полного окна"
+    );
     let mut back = Vec::new();
     rt.serialize(&mut back);
     assert_eq!(back, raw, "состояние после загрузки и записи изменилось");

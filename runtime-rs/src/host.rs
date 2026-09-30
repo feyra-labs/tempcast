@@ -128,8 +128,10 @@ impl Host {
         let theta = self.rt.theta();
         let f = self.rt.safe_forecast(now)?;
         let q: Vec<&[f32]> = f.q.chunks(nq).collect();
-        Ok(json!({"after_unix_hour": f.after_hour, "fallback": f.fallback, "theta": theta,
-                  "mu": f.mu, "q": q}))
+        Ok(
+            json!({"after_unix_hour": f.after_hour, "fallback": f.fallback, "theta": theta,
+                  "mu": f.mu, "q": q}),
+        )
     }
 
     fn status(&self) -> Value {

@@ -116,7 +116,8 @@ mod tests {
     fn put(path: &Path, bytes: &[u8], mtime: u64) {
         fs::write(path, bytes).unwrap();
         let f = File::options().write(true).open(path).unwrap();
-        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(mtime)).unwrap();
+        f.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(mtime))
+            .unwrap();
     }
 
     fn state(h: i64) -> Vec<u8> {
@@ -126,7 +127,9 @@ mod tests {
     }
 
     fn names(v: &[(PathBuf, Vec<u8>)]) -> Vec<String> {
-        v.iter().map(|(f, _)| f.file_name().unwrap().to_string_lossy().into_owned()).collect()
+        v.iter()
+            .map(|(f, _)| f.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
