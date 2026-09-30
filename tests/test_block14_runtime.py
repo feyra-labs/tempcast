@@ -5,13 +5,13 @@
 * графы (PyTorch и ONNX) в хосте на графах совпадают с потоковым рантаймом на
   PyTorch - на модели по умолчанию и на каждой абляции, дольше полного окна;
 * экспорт не меняет режим модели (регрессия: после экспорта модель оставалась в train);
-* манифест согласован с конфигом, QC, форматом состояния;
+* манифест согласован с конфигом, QC, форматом состояния и порогами смены точки;
 * эталонные сценарии хоста не устарели относительно текущего кода: хост на Python
   проходит их на модели PyTorch и на закоммиченных графах fp32 и int8 с допусками хоста
   на Rust;
 * эталон покрывает длинный прогон с простоями и перезапусками, коды контроля качества,
-  запись половин, редкую отчётность, int8, откат, прогноз без наблюдений, смену
-  координат и выбор файла состояния;
+  запись половин, редкую отчётность, int8, откат, прогноз без наблюдений, уточнение
+  координат, перенос прибора и выбор файла состояния;
 * состояние эталона - сырое окно, которое читается и пишется без изменений.
 """
 import json
@@ -133,6 +133,10 @@ def test_manifest_contract(model, tmp_path):
     assert {c: tuple(v) for c, v in man["phys"].items()} == {c: PHYS[c] for c in ("T", "P", "RH")}
     np.testing.assert_array_equal(np.float32(man["zq"]), ZQ)
     assert ModelConfig.from_dict(man["model_config"]) == cfg
+    from mayak.config import RuntimeConfig
+    from mayak.runtime.graphs import GRAPH_FORMAT
+    assert man["format"] == GRAPH_FORMAT == 4
+    assert RuntimeConfig.from_dict(man["runtime"]) == RuntimeConfig()
     table = np.fromfile(tmp_path / "m" / "conformal.f32", "<f4").reshape(cfg.horizon, -1)
     from mayak.metrics import conformal_table
     np.testing.assert_array_equal(table, conformal_table(G.GOLDEN_SHIFT, cfg.horizon))
@@ -208,6 +212,13 @@ def test_golden_covers_device_cases(golden):
     assert not no_obs[0]["expect"]["fallback"] and len(no_obs[0]["line"].split()) == 2
     shift = _scenario(doc, "site_shift")
     assert any(e["op"] == "restart" and e["site"] for e in shift["events"])
+    reloc = _lines(_scenario(doc, "relocation"), "status")
+    changes = [e["expect"]["site_change"] for e in reloc]
+    assert {"refined", "moved", "same"} <= set(changes), "уточнение, перенос и та же точка"
+    first_moved = reloc[changes.index("moved")]["expect"]
+    assert first_moved["filled"] == 0 and first_moved["theta"] == 0.0
+    assert any(e["expect"]["codes"][1] & 64 for e in _lines(_scenario(doc, "relocation"), "obs")), \
+        "после уточнения высоты давление на уровне моря решается по новой высоте"
     order = _scenario(doc, "store_order")
     newer = max(order["init_files"], key=lambda f: f["mtime"])
     assert order["events"][0]["expect"]["restored"] != newer["as"], \

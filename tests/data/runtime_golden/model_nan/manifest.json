@@ -1,5 +1,5 @@
 {
- "format": 3,
+ "format": 4,
  "model_config": {
   "arch": "mayak",
   "horizon": 168,
@@ -679,6 +679,11 @@
    ]
   }
  },
+ "runtime": {
+  "site_max_dlat_deg": 0.5,
+  "site_max_dlon_deg": 0.5,
+  "site_max_delev_m": 100.0
+ },
  "export_check_max_rel": {
   "init": 4.172325134277344e-07,
   "step": 7.759543905194732e-07,
@@ -689,7 +694,7 @@
  "opset": 17,
  "provenance": {
   "git": {
-   "commit": "11d2c635babb78e73e744a41121062570e24a5df",
+   "commit": "2d5d0b6cd3dcdbcad2739e10f9bc77661b4a2058",
    "dirty": true
   },
   "versions": {

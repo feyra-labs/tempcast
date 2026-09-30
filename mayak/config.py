@@ -14,6 +14,9 @@
   пороги страт, бутстрап, критерий условной поправки, сетка кривой «острота против
   покрытия», параметры адаптивной калибровки на устройстве. Читается
   mayak.calibration и рантаймом, в обучение не входит.
+* RuntimeConfig - параметры хоста устройства вне модели: пороги, в пределах которых
+  смена координат и высоты при перезапуске считается уточнением метаданных, а не
+  переносом прибора. Пишется в манифест графов, в обучение не входит.
 
 RunConfig собирает три части в один объект - его полностью разрешённая форма
 пишется рядом с чекпойнтом и внутри него.
@@ -1352,13 +1355,48 @@ class CalibrationConfig:
         return cls(**_strict_kwargs(cls, d, "calibration"))
 
 
+@dataclass(frozen=True)
+class RuntimeConfig:
+    """Параметры хоста устройства, которые не относятся к модели.
+
+    Состояние на диске помнит координаты и высоту, для которых оно записано. Если при
+    перезапуске они отличаются от текущих не больше порогов, это уточнение метаданных:
+    окно сохраняется и пересчитывается для новой точки. Больше любого порога - прибор
+    перенесён, окно и калибровка начинаются заново. Пороги взяты по порядку дрожания
+    метаданных в аугментациях обучения.
+
+    Attributes:
+        site_max_dlat_deg: наибольшая разница широты для уточнения, градусы.
+        site_max_dlon_deg: наибольшая разница долготы по кратчайшей дуге для
+            уточнения, градусы.
+        site_max_delev_m: наибольшая разница высоты для уточнения, метры.
+    """
+    site_max_dlat_deg: float = 0.5
+    site_max_dlon_deg: float = 0.5
+    site_max_delev_m: float = 100.0
+
+    def __post_init__(self):
+        for f in fields(self):
+            v = float(getattr(self, f.name))
+            if not (math.isfinite(v) and v >= 0.0):
+                raise ConfigError(f"runtime.{f.name} = {v}: нужно конечное число не меньше нуля")
+            object.__setattr__(self, f.name, v)
+
+    def to_dict(self):
+        return to_jsonable(self)
+
+    @classmethod
+    def from_dict(cls, d=None):
+        return cls(**_strict_kwargs(cls, d, "runtime"))
+
+
 __all__ = ["ABLATION_NAMES", "AUGMENT_PROB_FIELDS", "AUGMENT_PROFILES", "Ablations",
            "AugmentConfig", "CALIBRATION_NOMINALS", "CHANNEL_MAX_LAG", "COVERAGE_DIMS",
            "COVERAGE_DIMS_EXTERNAL", "COVERAGE_DIMS_INTERNAL", "CalibrationConfig", "ConfigError",
            "DEFAULT_MODE_GROUPS",
            "DLinearConfig", "DataConfig", "ENCODER_CHANNELS", "GRUConfig", "LRUConfig",
            "LRU_SCANS", "MODEL_CONFIGS", "ModeGroup", "ModelConfig", "PatchTSTConfig",
-           "DEFAULT_SCENARIOS", "ROBUSTNESS_QC", "RobustnessConfig", "RunConfig",
+           "DEFAULT_SCENARIOS", "ROBUSTNESS_QC", "RobustnessConfig", "RunConfig", "RuntimeConfig",
            "SCENARIO_INPUT", "SCENARIO_INSTRUMENT", "SCENARIO_RULES", "SOLAR_CHANNELS",
            "ScenarioRule", "ScenarioSpec", "Seeds", "TrainConfig",
            "check_pipeline_compat", "default_scenarios", "model_config_for",

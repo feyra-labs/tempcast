@@ -36,6 +36,13 @@
 адаптивной калибровки: каждый валидный час температуры сверяется с последним
 выпущенным прогнозом на том лиде, который приходится на этот час.
 
+Смена точки. Состояние помнит координаты и высоту, для которых оно записано. При загрузке
+они сравниваются с текущими. Сдвиг в пределах порогов рантайма - уточнение метаданных:
+окно сохраняется, всё модельное состояние восстанавливается из него уже для новой точки,
+множитель калибровки сохраняется, в лог пишется предупреждение. Сдвиг больше порога -
+прибор перенесён: окно опустошается, множитель калибровки обнуляется, абсолютный час
+последнего шага сохраняется. Контроль качества новых часов всегда берёт текущую высоту.
+
 Момент выпуска - последний шаг. До первого шага, в том числе после старта без
 состояния, момент выпуска задаёт вызывающий по часам устройства, и прогноз строится по
 пустому окну, которое этим часом заканчивается. Само состояние при этом не меняется.
@@ -57,6 +64,8 @@ from mayak.data.recording import RECORD_SCALE, record_values
 from mayak.leakage import load_conformal, precision_mismatch
 from mayak.metrics import (ACIParams, aci_score, apply_adaptive, apply_conformal,
                            check_median_free)
+from mayak.runtime.site import (SITE_MOVED, SITE_REFINED, as_site, describe_gap,
+                                load_runtime_config, site_change)
 from mayak.timeaxis import hour_of_year, window_calendar
 
 log = logging.getLogger(__name__)
@@ -284,6 +293,8 @@ class StreamingMayak:
         conformal: таблица поправок, путь к ней с записью о подгонке рядом или None.
         aci: параметры адаптивной калибровки, True для параметров по умолчанию или None,
             если множитель калибровки не подстраивается.
+        runtime_cfg: параметры хоста с порогами смены точки или None - конфиг рантайма
+            по умолчанию.
 
     Attributes:
         last_hour: абсолютный час UTC последнего шага или None до первого шага.
@@ -291,17 +302,19 @@ class StreamingMayak:
         theta: множитель адаптивной калибровки в логарифме.
         idle_hours: сколько пустых часов подставлено за простой в этом процессе.
         loaded_site: координаты и высота из загруженного состояния или None.
+        site_change: исход сравнения точки загруженного состояния с текущей: та же
+            точка, уточнение или перенос; None, если состояние не загружалось.
         clim_mu: среднее климат-поля точки на каждый час года, для отката.
         clim_sig: масштаб климат-поля точки на каждый час года, для отката.
         fallbacks: сколько выпусков в этом процессе заменено откатом.
     """
 
-    def __init__(self, model, lat, lon, elev, conformal=None, aci=None):
+    def __init__(self, model, lat, lon, elev, conformal=None, aci=None, runtime_cfg=None):
         from mayak.runtime.graphs import TorchBackend
         self.m = model.eval()
-        self._setup(TorchBackend(model), model.cfg, lat, lon, elev, conformal, aci)
+        self._setup(TorchBackend(model), model.cfg, lat, lon, elev, conformal, aci, runtime_cfg)
 
-    def _setup(self, backend, cfg, lat, lon, elev, conformal, aci):
+    def _setup(self, backend, cfg, lat, lon, elev, conformal, aci, runtime_cfg=None):
         self.b, self.cfg = backend, cfg
         self.window, self.history = cfg.stream_window, cfg.max_history
         self.edge, self.tail = cfg.stream_edge, cfg.stream_tail
@@ -318,7 +331,9 @@ class StreamingMayak:
         self.conformal = self._conformal(conformal)
         self.aci = ACIParams() if aci is True else aci
         self.qc = CausalQC(elev=self.elev)
+        self.runtime_cfg = load_runtime_config() if runtime_cfg is None else runtime_cfg
         self.loaded_site = None
+        self.site_change = None
         self.idle_hours = 0
         self.fallbacks = 0
         self.reset_calibration()
@@ -355,6 +370,11 @@ class StreamingMayak:
         if last_hour is not None:
             self.last_hour = int(last_hour)
             self._rebuild(seed_qc=False)
+
+    @property
+    def site(self):
+        """Текущие широта, долгота и высота так, как они пишутся в состояние."""
+        return as_site((self.lat, self.lon, self.elev))
 
     @property
     def memory_nbytes(self):
@@ -682,14 +702,33 @@ class StreamingMayak:
         Args:
             raw: байты состояния.
 
+        Если состояние записано для другой точки, сдвиг в пределах порогов рантайма -
+        уточнение: окно сохраняется и пересчитывается для новой точки. Больше порога -
+        перенос: окно пустое, множитель калибровки нулевой, момент последнего шага
+        сохраняется.
+
         Raises:
             ValueError: байты не состояние этого формата, не подходят конфигу модели или
                 повреждены. Рантайм тогда остаётся в холодном старте.
         """
         snap = parse_state(raw, self.window)
+        kind, gap = site_change(snap.site, self.site, self.runtime_cfg)
         self.reset()
+        self.loaded_site, self.site_change = snap.site, kind
+        if kind == SITE_MOVED:
+            log.warning("прибор перенесён: %s; холодный старт, множитель калибровки сброшен",
+                        describe_gap(gap, self.runtime_cfg))
+            self.reset_calibration(0.0)
+            try:
+                self.reset(snap.last_hour)
+            except Exception:
+                self.reset()
+                raise
+            return
+        if kind == SITE_REFINED:
+            log.warning("координаты уточнены: %s; окно пересчитано для новой точки, множитель "
+                        "калибровки сохранён", describe_gap(gap, self.runtime_cfg))
         self.reset_calibration(snap.theta)
-        self.loaded_site = snap.site
         if snap.last_hour is None:
             return
         W = self.window

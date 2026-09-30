@@ -13,7 +13,8 @@
   выпуска - текущий час по часам устройства; секунды в команде заменяют часы
   устройства. Ответ: момент выпуска, признак отката, множитель калибровки, медиана и
   квантили.
-* ``status`` - сводка рантайма.
+* ``status`` - сводка рантайма, в том числе текущая точка, точка загруженного состояния
+  и исход их сравнения: та же точка, уточнение или перенос прибора.
 
 Любая ошибка команды - ответ ``{"error": "..."}``, хост продолжает работу.
 
@@ -269,7 +270,9 @@ class Host:
                 "aci_updates": int(rt.aci_updates), "aci_misses": int(rt.aci_misses),
                 "idle_hours": int(rt.idle_hours), "fallbacks": int(rt.fallbacks),
                 "state_bytes": int(rt.state_nbytes), "last_unix_hour": rt.last_hour,
-                "memory_bytes": int(rt.memory_nbytes),
+                "memory_bytes": int(rt.memory_nbytes), "site": list(rt.site),
+                "loaded_site": None if rt.loaded_site is None else list(rt.loaded_site),
+                "site_change": rt.site_change,
                 "rss_bytes": rss_bytes(), "peak_rss_bytes": peak_rss_bytes()}
 
     def handle(self, line):

@@ -16,6 +16,12 @@
 //! устройства, и прогноз строится по пустому окну, которое этим часом кончается; окно
 //! и счётчики при этом не меняются.
 //!
+//! Смена точки. Состояние помнит координаты и высоту, для которых оно записано. Сдвиг
+//! в пределах порогов манифеста - уточнение метаданных: окно сохраняется и
+//! пересчитывается для новой точки, множитель калибровки сохраняется. Больше порога -
+//! прибор перенесён: окно пустое, множитель нулевой, момент последнего шага сохранён.
+//! Контроль качества новых часов берёт текущую высоту.
+//!
 //! Откат. Граф старта возвращает таблицу климатологии точки: среднее и масштаб
 //! климат-поля с паспортом холодного старта на каждый час года. Если выпуск не удался
 //! или дал нечисловые квантили, прогноз - квантили нормального распределения с этими
@@ -27,6 +33,7 @@ use crate::calib::{aci_score, apply_adaptive, apply_conformal, AciParams};
 use crate::graphs::{Graphs, Precision};
 use crate::manifest::{Dims, Manifest};
 use crate::qc::CausalQc;
+use crate::site::{describe_gap, site_change, SiteChange};
 use crate::state::{to_store, Snapshot};
 use crate::{Error, Result};
 
@@ -128,6 +135,7 @@ pub struct Runtime {
     // учёт
     idle_hours: u64,
     loaded_site: Option<[f32; 3]>,
+    site_change: Option<SiteChange>,
     pub fallbacks: u64,
 }
 
@@ -242,6 +250,7 @@ impl Runtime {
             pending: false,
             idle_hours: 0,
             loaded_site: None,
+            site_change: None,
             fallbacks: 0,
             d,
         };
@@ -311,6 +320,15 @@ impl Runtime {
     /// Координаты и высота из загруженного состояния.
     pub fn loaded_site(&self) -> Option<[f32; 3]> {
         self.loaded_site
+    }
+    /// Текущие координаты и высота так, как они пишутся в состояние.
+    pub fn site(&self) -> [f32; 3] {
+        self.site
+    }
+    /// Исход сравнения точки загруженного состояния с текущей; None - состояние не
+    /// загружалось.
+    pub fn site_change(&self) -> Option<SiteChange> {
+        self.site_change
     }
     pub fn stream_window(&self) -> usize {
         self.d.stream_window
@@ -715,12 +733,36 @@ impl Runtime {
     }
 
     /// Загрузка состояния и восстановление всего остального одним проходом по окну.
-    /// При ошибке рантайм остаётся в холодном старте.
+    /// Состояние другой точки: сдвиг в пределах порогов - окно пересчитывается для новой
+    /// точки, больше порога - окно пустое, множитель калибровки нулевой, момент
+    /// последнего шага сохраняется. При ошибке рантайм остаётся в холодном старте.
     pub fn load_state(&mut self, raw: &[u8]) -> Result<()> {
         let s = Snapshot::parse(raw, &self.d, &self.bounds)?;
+        let lim = self.manifest.runtime;
+        let (change, gap) = site_change(s.site, self.site, &lim);
         self.reset(None)?;
-        self.reset_calibration(s.theta);
         self.loaded_site = Some(s.site);
+        self.site_change = Some(change);
+        if change == SiteChange::Moved {
+            eprintln!(
+                "mayak-rt: прибор перенесён: {}; холодный старт, множитель калибровки сброшен",
+                describe_gap(gap, &lim)
+            );
+            self.reset_calibration(0.0);
+            if let Err(e) = self.reset(s.last_hour) {
+                self.reset(None)?;
+                return Err(e);
+            }
+            return Ok(());
+        }
+        if change == SiteChange::Refined {
+            eprintln!(
+                "mayak-rt: координаты уточнены: {}; окно пересчитано для новой точки, множитель \
+                 калибровки сохранён",
+                describe_gap(gap, &lim)
+            );
+        }
+        self.reset_calibration(s.theta);
         let Some(last) = s.last_hour else { return Ok(()) };
         let w = self.d.stream_window;
         self.last_hour = Some(last);

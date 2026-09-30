@@ -11,6 +11,8 @@
         --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2 --aci
 
 Команды: ``obs <секунды UTC> <T> <P> <RH>``, ``forecast [<секунды UTC>]``, ``status``.
+Пороги смены координат при перезапуске берутся из манифеста экспорта, а для чекпойнта -
+из конфига рантайма.
 Значение наблюдения - число, ``-`` (нет данных) или ``nan``. Если модель не удалось
 поднять, в том числе не удался расчёт климатологии точки при старте, процесс
 завершается с кодом 1.
@@ -41,6 +43,9 @@ def build_parser():
     ap.add_argument("--calibration-config", default=None,
                     help="YAML с параметрами ACI для --ckpt (по умолчанию "
                          "conf/calibration/default.yaml)")
+    ap.add_argument("--runtime-config", default=None,
+                    help="YAML с порогами смены координат для --ckpt (по умолчанию "
+                         "conf/runtime/default.yaml); у экспорта пороги лежат в манифесте")
     return ap
 
 
@@ -65,9 +70,11 @@ def open_runtime(args):
     if args.aci:
         from mayak.calibration import load_config
         aci = load_config(args.calibration_config).aci()
+    from mayak.runtime.site import load_runtime_config
     conformal = None if args.no_conformal else args.conformal
     return StreamingMayak(load_model(args.ckpt).eval(), args.lat, args.lon, args.elev,
-                          conformal=conformal, aci=aci)
+                          conformal=conformal, aci=aci,
+                          runtime_cfg=load_runtime_config(args.runtime_config))
 
 
 def main(argv=None):
@@ -77,6 +84,8 @@ def main(argv=None):
         ap.error("--int8 и --threads относятся к графам экспорта: нужен --model")
     if args.model and args.conformal:
         ap.error("--conformal относится к чекпойнту: у экспорта таблица лежит в манифесте")
+    if args.model and args.runtime_config:
+        ap.error("--runtime-config относится к чекпойнту: у экспорта пороги лежат в манифесте")
     # Ответы и сообщения идут в UTF-8 на любой системе, как у рантайма на Rust: иначе на
     # Windows с однобайтовой кодовой страницей вывода сообщение по-русски роняет хост.
     for stream in (sys.stdout, sys.stderr):

@@ -13,13 +13,15 @@
 * model/      - графы ONNX fp32 и int8, манифест, конформная таблица;
 * model_nan/  - та же модель, но граф выпуска возвращает нечисловые квантили; остальные
                 файлы берутся из соседнего каталога;
-* golden.json - сценарии, календарь, калибровка;
+* golden.json - сценарии, календарь, калибровка, сравнения точек при смене координат;
 * golden.f32  - ожидаемые квантили и входы калибровки, float32 little-endian;
 * state_*.bin - состояния: начальные файлы сценариев и ожидаемые состояния.
 
 События сценария:
 * ``restart`` - новый процесс хоста с тем же каталогом состояния, при желании с новыми
-  координатами; ожидается имя восстановленного файла или его отсутствие;
+  координатами; ожидается имя восстановленного файла или его отсутствие. Файл
+  состояния другой точки тоже восстановлен: при переносе прибора из него берётся
+  момент последнего шага;
 * ``cmd``     - строка протокола и ожидаемый ответ;
 * ``state``   - сверка состояния рантайма с файлом эталона до байта, кроме множителя
   калибровки, который сверяется с допуском.
@@ -36,11 +38,13 @@ from mayak.data.qc import station_pressure_expected
 from mayak.data.recording import record_channel
 from mayak.metrics import ACIParams, aci_run, aci_score, calibrate_forecast
 from mayak.runtime.equivalence import synthetic_series
+from mayak.config import RuntimeConfig
 from mayak.runtime.host import Host, StateStore
+from mayak.runtime.site import SITE_MOVED, SITE_REFINED, SITE_SAME, site_change, site_gap
 from mayak.runtime.streaming import STATE_HEADER, StreamingMayak
 from mayak.timeaxis import hour_of_year, to_utc_hour, window_calendar
 
-GOLDEN_FORMAT = 3
+GOLDEN_FORMAT = 4
 GOLDEN_SEED = 1414
 GOLDEN_PERTURB = 0.05
 GOLDEN_ACI = ACIParams(target=0.10, gamma=0.05, max_factor=4.0)
@@ -56,9 +60,10 @@ THETA_ATOL = 1e-6
 MTIME_BASE = 1_700_000_000
 DEFAULT_DIR = os.path.join("tests", "data", "runtime_golden")
 STATUS_KEYS = ("filled", "theta", "conformal", "aci_updates", "aci_misses", "idle_hours",
-               "fallbacks", "state_bytes", "last_unix_hour", "memory_bytes")
+               "fallbacks", "state_bytes", "last_unix_hour", "memory_bytes", "site",
+               "loaded_site", "site_change")
 SCENARIOS = ("cold_aci", "restart", "extremes", "long", "qc", "rounding", "sparse", "int8",
-             "fallback", "no_obs", "site_shift", "store_order")
+             "fallback", "no_obs", "site_shift", "relocation", "store_order")
 
 
 def golden_model(cfg=None):
@@ -531,6 +536,62 @@ def scenario_site_shift(make, out, blob, variant=0):
     return _run(sc, make, out, blob, body)
 
 
+def scenario_relocation(make, out, blob, variant=0):
+    """Уточнение высоты, перенос прибора и перезапуск на той же точке.
+
+    Точка в горах на 700 м, станционное давление около 970 гПа. Затем высота уточняется
+    до 790 м: окно и множитель калибровки сохраняются, а новые часы того же давления
+    проверка давления на уровне моря уже отбраковывает по новой высоте. Затем прибор
+    перенесён в Осло: окно пустое, множитель нулевой, момент последнего шага сохранён,
+    выпуск сразу после перезапуска строится по пустому окну. Последний перезапуск - на
+    той же точке.
+    """
+    alps, alps_fixed, oslo = (46.95, 7.45, 700.0), (46.95, 7.45, 790.0), (59.91, 10.75, 20.0)
+    sc = _scenario("relocation", *alps, conformal=True, aci=True)
+    n1, n2, n3 = 300, 30, 60
+
+    def body(ses):
+        s = synthetic_series(n1 + n2 + n3, seed=71 + 100 * variant, t0=_hour("2023-11-20T00"))
+        k = np.arange(n1 + n2 + n3)
+        s["x"][:, 1] = np.where(k < n1 + n2, 970.0 + 1.2 * np.sin(k / 30.0), s["x"][:, 1])
+        s["m"][:, 1] = np.where(k < n1 + n2, 1.0, s["m"][:, 1])
+        ses.restart()
+        for i in range(n1):
+            ses.obs(_obs(s, i), s["t0"] + i)
+            if i % 24 == 23:
+                ses.forecast(record=i % 96 == 95)
+        ses.restart(site=alps_fixed)
+        ses.status()
+        ses.forecast()
+        slp = 0
+        for i in range(n1, n1 + n2):
+            slp |= ses.obs(_obs(s, i), s["t0"] + i)["codes"][1]
+        ses.forecast()
+        ses.status()
+        ses.restart(site=oslo)
+        rt = ses.host.rt
+        moved = (rt.site_change, rt.filled, rt.theta, rt.last_hour)
+        ses.status()
+        ses.forecast()
+        for i in range(n1 + n2, n1 + n2 + n3):
+            ses.obs(_obs(s, i), s["t0"] + i)
+            if i % 12 == 11:
+                ses.forecast()
+        ses.state("state_relocation_end.bin")
+        ses.status()
+        ses.restart(site=oslo)
+        same = ses.host.rt.site_change
+        ses.status()
+        ses.forecast()
+        if not slp & 64:
+            raise RuntimeError("сценарий смены точки: после уточнения высоты давление на "
+                               "уровне моря не отбраковано")
+        if moved != (SITE_MOVED, 0, 0.0, s["t0"] + n1 + n2 - 1) or same != SITE_SAME:
+            raise RuntimeError(f"сценарий смены точки: перенос дал {moved}, повторный "
+                               f"перезапуск {same}")
+    return _run(sc, make, out, blob, body)
+
+
 def scenario_store_order(make, out, blob, variant=0):
     """Выбор свежего состояния по содержимому. Старое состояние с полным окном изменено
     позже, новое состояние после холодного старта изменено раньше; выбирается новое."""
@@ -609,6 +670,43 @@ def write_nan_model(out_dir):
         json.dump(man, fh, ensure_ascii=False, indent=1)
 
 
+SITE_CASES = (
+    ((52.37, 4.9, -2.0), (52.37, 4.9, -2.0)),
+    ((52.37, 4.9, -2.0), (52.67, 5.2, 40.0)),
+    ((52.0, 4.9, 10.0), (52.5, 4.9, 10.0)),
+    ((52.0, 4.9, 10.0), (52.500004, 4.9, 10.0)),
+    ((52.0, 4.9, 10.0), (51.4, 4.9, 10.0)),
+    ((10.0, 179.9, 0.0), (10.0, -179.9, 0.0)),
+    ((10.0, 179.8, 0.0), (10.0, -179.5, 0.0)),
+    ((10.0, 180.0, 0.0), (10.0, -180.0, 0.0)),
+    ((10.0, 0.25, 0.0), (10.0, -0.25, 0.0)),
+    ((10.0, 20.0, 500.0), (10.0, 20.0, 600.0)),
+    ((10.0, 20.0, 500.0), (10.0, 20.0, 600.5)),
+    ((-33.87, 151.21, 58.0), (59.91, 10.75, 20.0)),
+)
+
+
+def site_cases(cfg=None):
+    """Сравнения точки состояния с текущей: границы порогов, долгота через 180 градусов.
+
+    Args:
+        cfg: параметры хоста с порогами или None - значения датакласса.
+
+    Returns:
+        Словарь: пороги и список случаев с разницами и ожидаемым исходом.
+    """
+    cfg = RuntimeConfig() if cfg is None else cfg
+    cases = []
+    for old, new in SITE_CASES:
+        kind, _ = site_change(old, new, cfg)
+        cases.append(dict(old=[_f(v) for v in old], new=[_f(v) for v in new],
+                          gap=[float(g) for g in site_gap(old, new)], expect=kind))
+    kinds = {c["expect"] for c in cases}
+    if kinds != {SITE_SAME, SITE_REFINED, SITE_MOVED}:
+        raise RuntimeError(f"сравнения точек покрывают не все исходы: {sorted(kinds)}")
+    return dict(runtime=cfg.to_dict(), cases=cases)
+
+
 def calendar_cases():
     """Часы от эпохи вокруг границ годов, включая 2000 (високосный) и 2100 (нет)."""
     pts = ["1970-01-01T00", "1999-12-31T23", "2000-02-28T12", "2000-12-31T23",
@@ -654,7 +752,7 @@ def calibration_cases(model, blob):
 
 BUILDERS = (scenario_cold_aci, scenario_restart, scenario_extremes, scenario_long,
             scenario_qc, scenario_rounding, scenario_sparse, scenario_int8, scenario_fallback,
-            scenario_no_obs, scenario_site_shift, scenario_store_order)
+            scenario_no_obs, scenario_site_shift, scenario_relocation, scenario_store_order)
 
 
 def generate(out_dir=DEFAULT_DIR):
@@ -704,7 +802,7 @@ def generate(out_dir=DEFAULT_DIR):
                tolerance=dict(q_abs=Q_ATOL, q_abs_int8=Q_ATOL_INT8, fresh_abs=FRESH_ATOL,
                               theta_abs=THETA_ATOL),
                aci_margin_min=float(min(margins)) if margins else None,
-               scenarios=scenarios, calendar=calendar_cases(),
+               scenarios=scenarios, calendar=calendar_cases(), site=site_cases(),
                calibration=calibration_cases(model, blob))
     blob.array().astype("<f4").tofile(os.path.join(out_dir, "golden.f32"))
     with open(os.path.join(out_dir, "golden.json"), "w", encoding="utf-8") as fh:
@@ -827,4 +925,4 @@ __all__ = ["DEFAULT_DIR", "FRESH_ATOL", "GOLDEN_ACI", "GOLDEN_FORMAT", "GOLDEN_S
            "GoldenMismatch", "MIN_ACI_MARGIN", "Q_ATOL", "Q_ATOL_INT8", "SCENARIOS",
            "STATUS_KEYS", "THETA_ATOL", "calendar_cases", "calibration_cases",
            "compare_state", "generate", "golden_model", "load", "place_init_files",
-           "replay_scenario", "scenario_runtime", "take"]
+           "replay_scenario", "scenario_runtime", "site_cases", "take"]

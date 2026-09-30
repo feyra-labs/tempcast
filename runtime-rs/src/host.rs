@@ -3,7 +3,8 @@
 //! Команды, по одной на строку:
 //!   obs <секунды UTC> <T> <P> <RH>   значение: число, "-" (нет данных) или "nan";
 //!   forecast [<секунды UTC>]         выпуск после последнего шага;
-//!   status                           сводка рантайма.
+//!   status                           сводка рантайма, в том числе текущая точка, точка
+//!                                    загруженного состояния и исход их сравнения.
 //! Ответ на каждую команду - одна строка JSON. Момент наблюдения лежит на целом часе и
 //! позже последнего шага; пропущенные часы заполняются пустыми шагами, в том числе
 //! простой между перезапусками. После каждого наблюдения состояние пишется на диск.
@@ -141,7 +142,8 @@ impl Host {
                "aci_updates": rt.aci_updates(), "aci_misses": rt.aci_misses(),
                "idle_hours": rt.idle_hours(), "fallbacks": rt.fallbacks,
                "state_bytes": rt.state_nbytes(), "last_unix_hour": rt.last_hour(),
-               "memory_bytes": rt.memory_bytes(),
+               "memory_bytes": rt.memory_bytes(), "site": rt.site(),
+               "loaded_site": rt.loaded_site(), "site_change": rt.site_change().map(|c| c.as_str()),
                "rss_bytes": rss_bytes(), "peak_rss_bytes": peak_rss_bytes()})
     }
 }

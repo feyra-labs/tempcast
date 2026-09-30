@@ -33,7 +33,7 @@ from mayak.astro import astro_features
 from mayak.runtime.streaming import (CTX, RAW_CHANNELS, RESYNC_HOURS, STATE_HEADER,
                                      STATE_VERSION, StreamingMayak, state_nbytes)
 
-GRAPH_FORMAT = 3
+GRAPH_FORMAT = 4
 GRAPH_NAMES = ("init", "step", "window", "resync", "issue")
 COEFS = ("c_mu", "c_sig", "c_def")
 HOURS_OF_YEAR = 366 * 24
@@ -284,7 +284,7 @@ def conformal_for_export(conformal, precision, checkpoint=None):
 
 
 def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset=17,
-                  check_atol=1e-4, seed=0, checkpoint=None):
+                  check_atol=1e-4, seed=0, checkpoint=None, runtime=None):
     """Экспорт графов, манифеста и развёрнутой по лидам конформной таблицы.
 
     Каждый граф при экспорте сверяется с PyTorch на правдоподобных входах. Входы, от
@@ -306,9 +306,12 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
         seed: сид правдоподобных входов для сверки.
         checkpoint: путь к экспортируемому чекпойнту для сверки с записью о подгонке
             таблицы.
+        runtime: параметры хоста устройства с порогами смены точки или None - конфиг
+            рантайма по умолчанию.
 
     Returns:
-        Манифест экспорта. В разделе калибровки записана точность таблицы.
+        Манифест экспорта. В разделе калибровки записана точность таблицы, в разделе
+        рантайма - пороги смены точки.
 
     Raises:
         ValueError: таблица другой точности, подогнана по другому чекпойнту или на
@@ -320,7 +323,9 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
     from mayak.data.qc import DEFAULT_QC, PHYS
     from mayak.metrics import I_MED, conformal_table
     from mayak.provenance import provenance
+    from mayak.runtime.site import load_runtime_config
 
+    runtime = load_runtime_config() if runtime is None else runtime
     model = model.eval()
     cfg = model.cfg
     if cfg.stream_tail < 1 or cfg.stream_edge < 1:
@@ -395,7 +400,8 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
         qc=dict(DEFAULT_QC.to_dict(), lookback_hours=DEFAULT_QC.lookback_hours),
         state=dict(version=STATE_VERSION, header_bytes=STATE_HEADER.itemsize,
                    nbytes=state_nbytes(cfg), resync_hours=RESYNC_HOURS),
-        graphs=graphs, calibration=cal, export_check_max_rel=checks, opset=opset,
+        graphs=graphs, calibration=cal, runtime=runtime.to_dict(),
+        export_check_max_rel=checks, opset=opset,
         provenance=provenance())
     with open(os.path.join(out_dir, "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, ensure_ascii=False, indent=1)
@@ -471,11 +477,14 @@ class GraphRuntime(StreamingMayak):
         elev: высота точки, м.
         conformal: таблица поправок или None.
         aci: параметры адаптивной калибровки или None.
+        runtime_cfg: параметры хоста с порогами смены точки или None - конфиг рантайма
+            по умолчанию.
     """
 
-    def __init__(self, backend, cfg, lat, lon, elev, conformal=None, aci=None):
+    def __init__(self, backend, cfg, lat, lon, elev, conformal=None, aci=None,
+                 runtime_cfg=None):
         self.m = None
-        self._setup(backend, cfg, lat, lon, elev, conformal, aci)
+        self._setup(backend, cfg, lat, lon, elev, conformal, aci, runtime_cfg)
 
 
 def manifest_conformal(manifest, model_dir, precision):
@@ -541,18 +550,24 @@ def runtime_from_export(model_dir, lat, lon, elev, precision="fp32", threads=1, 
         conformal: применять конформную таблицу экспорта, если она подходит графам.
         aci: подстраивать множитель калибровки с параметрами из манифеста.
 
+    Пороги смены точки берутся из манифеста, как у рантайма устройства.
+
     Returns:
         Хост потока на графах.
 
     Raises:
-        ValueError: калибровка включена, а её параметров в манифесте нет.
+        ValueError: манифест другого формата или калибровка включена, а её параметров в
+            манифесте нет.
         RuntimeError: граф старта не дал годной таблицы климатологии.
     """
     import logging
-    from mayak.config import ModelConfig
+    from mayak.config import ModelConfig, RuntimeConfig
     from mayak.metrics import ACIParams
     backend = OnnxBackend(model_dir, precision, threads)
     man = backend.manifest
+    if man.get("format") != GRAPH_FORMAT:
+        raise ValueError(f"формат манифеста {man.get('format')}, рантайм читает {GRAPH_FORMAT}; "
+                         f"экспортируйте графы заново: python scripts/export_runtime.py")
     table = None
     if conformal:
         table, why = manifest_conformal(man, model_dir, precision)
@@ -568,7 +583,8 @@ def runtime_from_export(model_dir, lat, lon, elev, precision="fp32", threads=1, 
             raise ValueError(f"манифест: интервал ACI {a['interval']} не соответствует цели "
                              f"{a['target']}")
     return GraphRuntime(backend, ModelConfig.from_dict(man["model_config"]), lat, lon, elev,
-                        conformal=table, aci=params)
+                        conformal=table, aci=params,
+                        runtime_cfg=RuntimeConfig.from_dict(man["runtime"]))
 
 
 class GraphModel:

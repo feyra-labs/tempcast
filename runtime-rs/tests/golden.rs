@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use mayak_rt::calendar::{doy_hour, hour_of_year};
 use mayak_rt::calib::{aci_score, apply_adaptive, apply_conformal, AciParams};
+use mayak_rt::site::{site_change, site_gap};
 use mayak_rt::state::HEADER;
 use mayak_rt::store::StateStore;
 use mayak_rt::{Host, Manifest, Precision, Runtime, RuntimeOptions};
@@ -65,6 +66,11 @@ impl Golden {
 
 fn f(v: &Value) -> f32 {
     v.as_f64().unwrap() as f32
+}
+
+/// Широта, долгота и высота точки из эталона.
+fn point(v: &Value) -> [f32; 3] {
+    std::array::from_fn(|k| f(&v[k]))
 }
 
 fn score(v: &Value) -> f64 {
@@ -255,6 +261,7 @@ fn every_scenario_has_a_test() {
             "fallback",
             "no_obs",
             "site_shift",
+            "relocation",
             "store_order"
         ]
     );
@@ -313,6 +320,32 @@ fn forecast_before_first_obs_uses_device_clock() {
 #[test]
 fn restart_with_refined_site() {
     replay(&load(), "site_shift");
+}
+
+#[test]
+fn refined_elevation_and_relocation() {
+    replay(&load(), "relocation");
+}
+
+#[test]
+fn site_comparison_matches_python() {
+    let g = load();
+    let m = Manifest::load(golden_dir().join("model")).unwrap();
+    let site = &g.doc["site"];
+    let lim = &m.runtime;
+    let names = ["site_max_dlat_deg", "site_max_dlon_deg", "site_max_delev_m"];
+    let want = [lim.site_max_dlat_deg, lim.site_max_dlon_deg, lim.site_max_delev_m];
+    for (name, v) in names.iter().zip(want) {
+        assert_eq!(site["runtime"][*name].as_f64(), Some(v), "порог {name}");
+    }
+    for (i, case) in site["cases"].as_array().unwrap().iter().enumerate() {
+        let (old, new) = (point(&case["old"]), point(&case["new"]));
+        let (kind, _) = site_change(old, new, lim);
+        assert_eq!(kind.as_str(), case["expect"].as_str().unwrap(), "случай {i}: исход");
+        for (k, gap) in site_gap(old, new).iter().enumerate() {
+            assert_eq!(Some(*gap), case["gap"][k].as_f64(), "случай {i}: разница {k}");
+        }
+    }
 }
 
 #[test]

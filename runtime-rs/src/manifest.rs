@@ -9,7 +9,7 @@ use crate::graphs::Precision;
 use crate::qc::QcConfig;
 use crate::{Error, Result};
 
-pub const FORMAT: u32 = 3;
+pub const FORMAT: u32 = 4;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Dims {
@@ -57,6 +57,15 @@ pub struct Calibration {
     pub aci: Option<AciJson>,
 }
 
+/// Пороги, в пределах которых смена координат и высоты при перезапуске считается
+/// уточнением метаданных, а не переносом прибора.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct RuntimeJson {
+    pub site_max_dlat_deg: f64,
+    pub site_max_dlon_deg: f64,
+    pub site_max_delev_m: f64,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct StateInfo {
     pub version: u8,
@@ -78,6 +87,7 @@ pub struct Manifest {
     pub state: StateInfo,
     pub graphs: HashMap<String, GraphEntry>,
     pub calibration: Calibration,
+    pub runtime: RuntimeJson,
     #[serde(skip)]
     pub dir: PathBuf,
 }
@@ -133,6 +143,11 @@ impl Manifest {
                 self.state.resync_hours,
                 crate::runtime::RESYNC_HOURS
             )));
+        }
+        let r = &self.runtime;
+        let limits = [r.site_max_dlat_deg, r.site_max_dlon_deg, r.site_max_delev_m];
+        if limits.iter().any(|v| !v.is_finite() || *v < 0.0) {
+            return Err(Error::new("манифест: порог смены координат не число или меньше нуля"));
         }
         for g in ["init", "step", "window", "resync", "issue"] {
             if !self.graphs.contains_key(g) {
