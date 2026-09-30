@@ -28,7 +28,6 @@ import json
 import logging
 import math
 import os
-import resource
 import sys
 import time
 
@@ -152,18 +151,28 @@ def parse_obs(text):
         raise ValueError(f"значение наблюдения не число: {text}") from None
 
 
-def rss_bytes():
-    """Текущая резидентная память процесса, байт, или None."""
+def _status_kib(key):
+    """Поле сводки процесса Linux в КиБ или None, если сводки нет."""
     try:
-        with open("/proc/self/statm", encoding="ascii") as fh:
-            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+        with open("/proc/self/status", encoding="ascii") as fh:
+            for line in fh:
+                if line.startswith(key):
+                    return int(line.split()[1])
     except (OSError, ValueError, IndexError):
-        return None
+        pass
+    return None
+
+
+def rss_bytes():
+    """Текущая резидентная память процесса, байт; вне Linux None."""
+    kib = _status_kib("VmRSS:")
+    return None if kib is None else kib * 1024
 
 
 def peak_rss_bytes():
-    """Пиковая резидентная память процесса, байт."""
-    return int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * 1024
+    """Пиковая резидентная память процесса, байт; вне Linux None."""
+    kib = _status_kib("VmHWM:")
+    return None if kib is None else kib * 1024
 
 
 def _f32(v):

@@ -55,8 +55,8 @@ from mayak.config import CHANNEL_MAX_LAG
 from mayak.data.qc import PHYS, CausalQC, qc_window
 from mayak.data.recording import RECORD_SCALE, record_values
 from mayak.leakage import load_conformal, precision_mismatch
-from mayak.metrics import (ACIParams, aci_score, apply_adaptive, check_median_free,
-                           conformal_table, order_around_median)
+from mayak.metrics import (ACIParams, aci_score, apply_adaptive, apply_conformal,
+                           check_median_free)
 from mayak.timeaxis import hour_of_year, window_calendar
 
 log = logging.getLogger(__name__)
@@ -561,7 +561,7 @@ class StreamingMayak:
         """
         q = self.raw_forecast(now_hour)
         if self.conformal is not None:
-            q = order_around_median(q + self.conformal)
+            q = apply_conformal(q, self.conformal)
         if self.aci is not None:
             self._pending = dict(first=self.issue_hour(now_hour) + 1,
                                  q=np.array(q, np.float32), last=-1)
@@ -633,31 +633,31 @@ class StreamingMayak:
         self.filled = take
         self._rebuild(seed_qc=True)
 
-    def _conformal(self, conformal):
+    @staticmethod
+    def _conformal(conformal):
         """Таблица поправок, которую можно применять к выходам этой модели.
 
         Модель здесь считает во fp32. Таблица, подогнанная на другой точности, не
         применяется, причина пишется в лог.
 
         Args:
-            conformal: None, путь к таблице с записью о подгонке рядом или сама таблица по
-                бинам лидов.
+            conformal: None, путь к таблице с записью о подгонке рядом или сама таблица.
 
         Returns:
-            Таблица float32, развёрнутая по лидам, формы (H, число квантилей), или None.
+            Таблица float32 по бинам лидов или None.
         """
         if conformal is None:
             return None
         if not isinstance(conformal, str):
             shift = np.asarray(conformal, np.float32)
             check_median_free(shift)
-            return conformal_table(shift, self.horizon)
+            return shift
         shift, rec = load_conformal(conformal)
         why = precision_mismatch(rec, "fp32")
         if why:
             log.warning("конформная таблица %s не применяется: %s", conformal, why)
             return None
-        return conformal_table(shift, self.horizon)
+        return shift
 
     @property
     def state_nbytes(self):

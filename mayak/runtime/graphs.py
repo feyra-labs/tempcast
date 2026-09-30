@@ -403,11 +403,24 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
 
 
 def quantize_graph(path):
-    """Динамическая int8-квантизация весов графа → имя файла рядом с исходным."""
+    """Динамическая int8-квантизация весов графа.
+
+    Веса и активации беззнаковые. Со знаковыми весами процессоры x86 без инструкций
+    VNNI складывают пары произведений в 16-битный регистр с насыщением, и выход
+    int8-графа зависит от процессора на десятые доли градуса. Беззнаковые веса считаются
+    точной целочисленной арифметикой на любом процессоре, поэтому int8-граф даёт один и
+    тот же результат на устройстве, в CI и у разработчика.
+
+    Args:
+        path: путь к графу fp32.
+
+    Returns:
+        Имя квантованного графа рядом с исходным.
+    """
     import onnx
     from onnxruntime.quantization import QuantType, quantize_dynamic
     out = path.replace(".onnx", "_int8.onnx")
-    quantize_dynamic(path, out, weight_type=QuantType.QInt8,
+    quantize_dynamic(path, out, weight_type=QuantType.QUInt8,
                      extra_options={"DefaultTensorType": onnx.TensorProto.FLOAT})
     return os.path.basename(out)
 
@@ -466,7 +479,10 @@ class GraphRuntime(StreamingMayak):
 
 
 def manifest_conformal(manifest, model_dir, precision):
-    """Развёрнутая по лидам конформная таблица экспорта для графов заданной точности.
+    """Конформная таблица экспорта по бинам лидов для графов заданной точности.
+
+    В экспорте таблица лежит развёрнутой по лидам; здесь она сворачивается обратно в
+    бины, чтобы поправку применяла та же функция, что и везде в проекте.
 
     Таблица, подогнанная на другой точности или без записанной точности, не
     применяется: вместо неё возвращается причина для лога.
@@ -477,12 +493,14 @@ def manifest_conformal(manifest, model_dir, precision):
         precision: точность графов, fp32 или int8.
 
     Returns:
-        Пара: таблица float32 формы (H, число квантилей) или None и причина или None.
+        Пара: таблица float32 формы (число бинов лидов, число квантилей) или None и
+        причина или None.
 
     Raises:
-        ValueError: таблица не того размера или сдвигает медиану.
+        ValueError: таблица не того размера, сдвигает медиану или меняется внутри бина
+            лидов.
     """
-    from mayak.metrics import I_MED
+    from mayak.metrics import I_MED, LEAD_BINS, conformal_table
     cal = manifest["calibration"]
     if not cal.get("conformal"):
         return None, None
@@ -495,9 +513,13 @@ def manifest_conformal(manifest, model_dir, precision):
     if np.any(table[:, I_MED] != 0.0):
         raise ValueError(f"{cal['conformal']}: поправка медианы не нулевая - таблица сдвигает "
                          f"точечный прогноз; подгоните таблицу заново")
+    shift = table[[lo - 1 for lo, _ in LEAD_BINS]]
+    if not np.array_equal(conformal_table(shift, d["horizon"]), table):
+        raise ValueError(f"{cal['conformal']}: поправка меняется внутри бина лидов - таблица "
+                         f"записана не этим экспортом")
     have = cal.get("precision")
     if have == precision:
-        return table, None
+        return shift, None
     if have is None:
         return None, (f"точность конформной таблицы не записана в манифесте, графы считают в "
                       f"{precision}: таблица не применяется")
@@ -545,10 +567,8 @@ def runtime_from_export(model_dir, lat, lon, elev, precision="fp32", threads=1, 
         if list(params.interval) != list(a["interval"]):
             raise ValueError(f"манифест: интервал ACI {a['interval']} не соответствует цели "
                              f"{a['target']}")
-    rt = GraphRuntime(backend, ModelConfig.from_dict(man["model_config"]), lat, lon, elev,
-                      aci=params)
-    rt.conformal = table
-    return rt
+    return GraphRuntime(backend, ModelConfig.from_dict(man["model_config"]), lat, lon, elev,
+                        conformal=table, aci=params)
 
 
 class GraphModel:

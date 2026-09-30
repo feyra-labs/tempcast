@@ -77,6 +77,13 @@ def main(argv=None):
         ap.error("--int8 и --threads относятся к графам экспорта: нужен --model")
     if args.model and args.conformal:
         ap.error("--conformal относится к чекпойнту: у экспорта таблица лежит в манифесте")
+    # Ответы и сообщения идут в UTF-8 на любой системе, как у рантайма на Rust: иначе на
+    # Windows с однобайтовой кодовой страницей вывода сообщение по-русски роняет хост.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
     import logging
     logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="mayak-rt: %(message)s")
     from mayak.runtime.host import Host, StateStore
