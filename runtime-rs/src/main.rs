@@ -1,17 +1,8 @@
 //! mayak-rt - потоковый рантайм МАЯК для устройства.
 //!
-//!   mayak-rt run   --model DIR --lat 52.37 --lon 4.9 [--elev -2] [--state-dir runtime]
-//!                  [--aci] [--no-conformal] [--int8] [--threads 1]
-//!   mayak-rt bench --model DIR --lat .. --lon .. --series FILE --start-unix-hour H
-//!                  [--forecast-every 24] [--warmup 48] [--int8] [--out bench.json]
-//!                  [--dump-q q.f32]
-//!   mayak-rt info  --model DIR
-//!
-//! `run` читает stdin построчно:
-//!   obs <unix_seconds> <T> <P> <RH>   значения: число, "-" (нет данных) или "nan";
-//!   forecast [<unix_seconds>]         прогноз после последнего часа, строка JSON;
-//!   status                            состояние рантайма, строка JSON.
-//! Час наблюдения должен лежать на целом часе UTC и быть позже последнего шага.
+//! Подкоманды run, bench и info; справка по каждой - `mayak-rt <команда> --help`.
+//! `run` читает stdin построчно и отвечает одной строкой JSON на команду. Час
+//! наблюдения должен лежать на целом часе UTC и быть позже последнего шага.
 //! Пропущенные часы заполняются пустыми шагами, в том числе простой между перезапусками:
 //! абсолютный час последнего шага хранится в заголовке состояния. Простой не короче окна
 //! означает холодный старт. После каждого obs состояние атомарно пишется в --state-dir,
@@ -19,9 +10,9 @@
 //! До первого наблюдения прогноз выпускается после текущего часа по часам устройства;
 //! секунды в команде forecast заменяют часы устройства. Если состояние записано для
 //! другой точки, сдвиг в пределах порогов манифеста считается уточнением координат, а
-//! больше порога - переносом прибора с холодным стартом; это видно в логе и в status. Любой сбой выпуска заменяется
-//! климатологией точки. Если модель не поднялась, в том числе не удался расчёт
-//! климатологии точки при старте, процесс завершается с кодом 1.
+//! больше порога - переносом прибора с холодным стартом; это видно в логе и в status.
+//! Любой сбой выпуска заменяется климатологией точки. Если модель не поднялась, в том
+//! числе не удался расчёт климатологии точки при старте, процесс завершается с кодом 1.
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
@@ -31,6 +22,73 @@ use mayak_rt::memory::{peak_rss_bytes, rss_bytes};
 use mayak_rt::store::StateStore;
 use mayak_rt::{Error, Host, Precision, Result, Runtime, RuntimeOptions};
 use serde_json::json;
+
+const USAGE: &str = "\
+mayak-rt - потоковый рантайм МАЯК
+
+Использование:
+  mayak-rt run   --model DIR --lat ГРАД --lon ГРАД [ключи]   поток наблюдений со stdin
+  mayak-rt bench --model DIR --lat ГРАД --lon ГРАД --series ФАЙЛ --start-unix-hour Ч
+  mayak-rt info  --model DIR                                 размеры модели и состояния
+
+Справка по команде: mayak-rt <команда> --help
+";
+
+const USAGE_RUN: &str = "\
+mayak-rt run --model DIR --lat ГРАД --lon ГРАД [--elev М] [--state-dir DIR]
+             [--aci] [--no-conformal] [--int8] [--threads N]
+
+Ключи:
+  --model DIR       каталог экспорта: графы ONNX и манифест
+  --lat, --lon      координаты прибора, градусы
+  --elev М          высота прибора, м (по умолчанию 0)
+  --state-dir DIR   каталог состояния (по умолчанию runtime)
+  --aci             адаптивная калибровка ширины интервалов
+  --no-conformal    не применять конформную таблицу из манифеста
+  --int8            int8-графы экспорта
+  --threads N       потоков ONNX Runtime (по умолчанию 1)
+
+Команды на stdin, по одной на строку, ответ - одна строка JSON:
+  obs <секунды UTC> <T> <P> <RH>   T °C, P гПа, RH %; \"-\" - нет данных
+  forecast [<секунды UTC>]         прогноз после последнего часа
+  status                           состояние рантайма
+";
+
+const USAGE_BENCH: &str = "\
+mayak-rt bench --model DIR --lat ГРАД --lon ГРАД --series ФАЙЛ --start-unix-hour Ч
+               [--elev М] [--forecast-every 24] [--warmup 48] [--int8] [--threads N]
+               [--out ФАЙЛ] [--dump-q ФАЙЛ]
+
+Прогоняет ряд наблюдений (float32 little-endian, три значения на час: T, P, RH;
+NaN - нет данных) и печатает задержки шага и выпуска, память, размеры модели,
+бинарника и состояния одной строкой JSON или пишет их в --out.
+";
+
+const USAGE_INFO: &str = "\
+mayak-rt info --model DIR
+
+Печатает размеры модели, размер состояния, наличие калибровки и пороги смены точки.
+";
+
+/// Текст справки для команды; неизвестная команда получает общую справку.
+fn usage(cmd: &str) -> &'static str {
+    match cmd {
+        "run" => USAGE_RUN,
+        "bench" => USAGE_BENCH,
+        "info" => USAGE_INFO,
+        _ => USAGE,
+    }
+}
+
+/// Просит ли командная строка справку: словом help, ключом -h или --help.
+fn wants_help(args: &[String]) -> Option<&str> {
+    let is_flag = |a: &str| matches!(a, "-h" | "--help");
+    let first = args.first().map(|s| s.as_str()).unwrap_or("");
+    if first.is_empty() || first == "help" || is_flag(first) {
+        return Some("");
+    }
+    args.iter().skip(1).any(|a| is_flag(a)).then_some(first)
+}
 
 struct Args {
     cmd: String,
@@ -235,11 +293,19 @@ fn cmd_info(a: &Args) -> Result<()> {
 }
 
 fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(cmd) = wants_help(&argv) {
+        print!("{}", usage(cmd));
+        return;
+    }
     let res = Args::parse().and_then(|a| match a.cmd.as_str() {
         "run" => cmd_run(&a),
         "bench" => cmd_bench(&a),
         "info" => cmd_info(&a),
-        _ => Err(Error::new("команда: run | bench | info (см. заголовок src/main.rs)")),
+        _ => Err(Error::new(format!(
+            "неизвестная команда {:?}; справка: mayak-rt --help",
+            a.cmd
+        ))),
     });
     if let Err(e) = res {
         eprintln!("mayak-rt: {e}");

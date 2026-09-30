@@ -5,9 +5,14 @@ __pycache__/
 .venv/
 
 # Experiment outputs
-runs/*
+runs/
 lightning_logs/
-!runs/plots/
+
+# Results: only JSON tables and the description are tracked
+results/**
+!results/**/
+!results/**/*.json
+!results/README.md
 
 # Rust
 runtime-rs/target/

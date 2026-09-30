@@ -323,3 +323,29 @@ def test_grid_parsing():
     from mayak.evaluate import parse_grid
     assert parse_grid("672, 0,24,24") == (0, 24, L_MAX)
     assert check_history_grid(HISTORY_GRID) == HISTORY_GRID
+
+
+def test_result_tables_are_strict_json_with_run_record(results, tmp_path):
+    import json
+
+    from mayak.results import evaluation_tables, run_record, write_tables
+    raw, cal = results
+    record = run_record(ckpt=["x.ckpt"], eval_seed=3)
+    names = {}
+    for tag, res in (("raw", raw), ("cal", cal)):
+        paths = write_tables(evaluation_tables(res), str(tmp_path / tag), record)
+        names[tag] = sorted(p.rsplit("/", 1)[-1] for p in paths)
+        for p in paths:
+            with open(p, encoding="utf-8") as f:
+                blob = json.loads(f.read(), parse_constant=lambda c: pytest.fail(c))
+            assert blob["run"]["schema"] == 1 and blob["run"]["ckpt"] == ["x.ckpt"]
+            assert "git" in blob["run"] and "created_utc" in blob["run"]
+    assert names["raw"] == ["breakdowns.json", "history.json", "metrics.json",
+                            "reliability.json"]
+    assert names["cal"] == sorted(names["raw"] + ["calibrated.json"])
+    with open(tmp_path / "raw" / "metrics.json", encoding="utf-8") as f:
+        table = json.load(f)["table"]
+    got = table["leads"]["МАЯК"]["24"]["pooled"]["Skill"]
+    assert got == pytest.approx(raw["leads"]["МАЯК"][24]["pooled"]["Skill"])
+    with open(tmp_path / "raw" / "history.json", encoding="utf-8") as f:
+        assert json.load(f)["table"]["grid"] == list(HISTORY_GRID)

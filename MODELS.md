@@ -74,8 +74,56 @@
 
 ### МАЯК (`mayak`)
 
-Основная модель проекта: климат-поле плюс аномалия из затухающих мод. Описание — в
-README и спецификации. Параметров по умолчанию: 109 379.
+Основная модель проекта. Прогноз медианы раскладывается на климатический якорь и аномалию:
+
+```
+T(t+h) = C(h) + σ(h) · (o(h) + r(h))
+```
+
+`C` и `σ` — климатическое среднее и масштаб разброса точки на часе горизонта, `o` —
+аномалия из затухающих мод памяти, `r` — ограниченная нелинейная поправка, умноженная на
+вес доверия к истории `ē / (ē + κ_r)`, где `ē` — средняя масса свидетельств мод. Без
+истории `ē = 0`, поэтому медиана точно равна климат-полю при любых весах голов.
+Параметров по умолчанию: 109 379.
+
+| Компонент | Что делает | Источник идеи |
+|---|---|---|
+| Координатный вход | Случайные Фурье-признаки точки на сфере с ограниченной частотой, широта и высота | Rahimi, Recht 2007; Tancik et al. 2020 |
+| Климат-поле | Координаты в коэффициенты годового и суточного гармонического базиса среднего, масштаба и дефицита точки росы; паспорт модулирует скрытый слой, модуляция ограничена ±30 % | гармонический анализ — Wilks 2019, гл. 10; FiLM — Perez et al. 2018 |
+| Паспорт станции | Латент `z ~ N(m, v)`: глобальный приор, обновление по суточным сводкам истории рекуррентной сетью, KL к приору | Neural Processes — Garnelo et al. 2018; вариационный вывод — Kingma, Welling 2014; GRU — Cho et al. 2014 |
+| Энкодер | Строго причинный TCN: 12 depthwise-separable блоков с растущей дилатацией, нормализация каналов в пределах одного часа, потактовый шаг через кольцевые буферы | Bai et al. 2018; van den Oord et al. 2016; Chollet 2017; Wu, He 2018 |
+| Считывание мод | 24 затухающие комплексные моды `λ = −1/τ + iω` (релаксационные, суточные, полусуточные, синоптические); состояние делится на `e + κ` — доказательное сжатие к нулю при короткой истории | диагональные линейные рекуррентности — Gu et al. 2020, 2022; Orvieto et al. 2023; сжатие — собственная конструкция |
+| Пропагатор мод | Затухание и поворот фазы мод на 168 ч; паспорт подстраивает `τ` и `ω`, подстроенная `τ` обрезается в `[3, 240]` ч | собственная конструкция |
+| Головы | Поправка `r = 0.6·tanh(…)·ē/(ē + κ_r)`, масштаб интервала, монотонные смещения квантилей от медианы | собственная конструкция; квантильная регрессия — Koenker, Bassett 1978 |
+| Солнечные признаки | Уравнение времени, склонение, косинус зенитного угла, фазы суток и года | Masters 2004, гл. 7; Cooper 1969 |
+
+- **Отличия от спецификации** — в разделе «Отклонения от спецификации» README.
+- **Ссылки.**
+  - A. Rahimi, B. Recht. *Random Features for Large-Scale Kernel Machines*. NeurIPS 2007.
+  - M. Tancik, P. P. Srinivasan, B. Mildenhall et al. *Fourier Features Let Networks Learn
+    High Frequency Functions in Low Dimensional Domains*. NeurIPS 2020. arXiv:2006.10739.
+  - E. Perez, F. Strub, H. de Vries, V. Dumoulin, A. Courville. *FiLM: Visual Reasoning with
+    a General Conditioning Layer*. AAAI 2018. arXiv:1709.07871.
+  - M. Garnelo, J. Schwarz, D. Rosenbaum et al. *Neural Processes*. ICML 2018 Workshop on
+    Theoretical Foundations and Applications of Deep Generative Models. arXiv:1807.01622.
+  - D. P. Kingma, M. Welling. *Auto-Encoding Variational Bayes*. ICLR 2014. arXiv:1312.6114.
+  - S. Bai, J. Z. Kolter, V. Koltun. *An Empirical Evaluation of Generic Convolutional and
+    Recurrent Networks for Sequence Modeling*. arXiv:1803.01271, 2018.
+  - A. van den Oord, S. Dieleman, H. Zen et al. *WaveNet: A Generative Model for Raw Audio*.
+    arXiv:1609.03499, 2016.
+  - F. Chollet. *Xception: Deep Learning with Depthwise Separable Convolutions*. CVPR 2017.
+    arXiv:1610.02357.
+  - Y. Wu, K. He. *Group Normalization*. ECCV 2018. arXiv:1803.08494.
+  - A. Gu, T. Dao, S. Ermon, A. Rudra, C. Ré. *HiPPO: Recurrent Memory with Optimal
+    Polynomial Projections*. NeurIPS 2020. arXiv:2008.07669.
+  - A. Gu, K. Goel, C. Ré. *Efficiently Modeling Long Sequences with Structured State
+    Spaces*. ICLR 2022. arXiv:2111.00396.
+  - G. M. Masters. *Renewable and Efficient Electric Power Systems*, гл. 7 (положение Солнца,
+    солнечное и гражданское время). Wiley, 2004.
+  - P. I. Cooper. *The absorption of radiation in solar stills*. Solar Energy, 12(3), 1969,
+    333–346 (гармоническая аппроксимация склонения).
+  - Остальные — Wilks, Cho et al., Orvieto et al., Koenker, Bassett — полностью в разделах
+    климатологии, GRU, LRU и функции потерь.
 
 ### GRU (`gru`)
 
@@ -277,3 +325,106 @@ README и спецификации. Параметров по умолчанию
 - **Источник.** O. A. Alduchov, R. E. Eskridge. *Improved Magnus Form Approximation of
   Saturation Vapor Pressure*. Journal of Applied Meteorology, 35(4), 1996, 601–609.
 - **Что взято.** Коэффициенты 17.625 и 243.04 °C.
+
+## Данные
+
+- **ERA5.** H. Hersbach, B. Bell, P. Berrisford et al. *The ERA5 global reanalysis*.
+  Quarterly Journal of the Royal Meteorological Society, 146(730), 2020, 1999–2049.
+  doi:10.1002/qj.3803. Набор: Hersbach et al. (2023), *ERA5 hourly data on single levels
+  from 1940 to present*, C3S Climate Data Store, doi:10.24381/cds.adbb2d47. Generated using
+  Copernicus Climate Change Service information.
+- **Open-Meteo.** P. Zippenfenig. *Open-Meteo.com Weather API*. Zenodo, 2023.
+  doi:10.5281/zenodo.7970649. Данные — CC BY 4.0; бесплатный API — только для
+  некоммерческого использования (https://open-meteo.com/en/terms). Запрашивается только
+  модель `era5`: смесь моделей по умолчанию меняет модель внутри многолетнего ряда.
+- **GHCNh.** M. J. Menne, S. Noone, N. W. Casey et al. *Global Historical Climatology
+  Network-Hourly (GHCNh), Version 1*. NOAA NCEI, 2023. doi:10.25921/jp3d-3v19. Используются
+  штатные коды качества источника; только внешний тест.
+- **Зоны Кёппена — Гейгера.** H. E. Beck, N. E. Zimmermann, T. R. McVicar et al. *Present
+  and future Köppen-Geiger climate classification maps at 1-km resolution*. Scientific Data
+  5, 180214, 2018. doi:10.1038/sdata.2018.214.
+- **Высота внешних станций.** Copernicus DEM GLO-90 через Elevation API Open-Meteo.
+  doi:10.5270/ESA-c5d3d65.
+- **Выбор точек.** Решётка Фибоначчи на сфере: Á. González. *Measurement of Areas on a
+  Sphere Using Fibonacci and Latitude–Longitude Lattices*. Mathematical Geosciences 42,
+  2010, 49–64. doi:10.1007/s11004-009-9257-x. Отличие: точки только на суше, с гарантией
+  минимума точек в каждой зоне и минимального расстояния между точками.
+- **Роли станций и временные блоки.** Разбиение с зазорами между обучением, валидацией и
+  тестом длиннее самой длинной истории: D. R. Roberts, V. Bahn, S. Ciuti et al.
+  *Cross-validation strategies for data with temporal, spatial, hierarchical, or
+  phylogenetic structure*. Ecography 40(8), 2017, 913–929. doi:10.1111/ecog.02881.
+- **Чек-лист утечек.** S. Kapoor, A. Narayanan. *Leakage and the reproducibility crisis in
+  machine-learning-based science*. Patterns 4(9), 2023, 100804.
+  doi:10.1016/j.patter.2023.100804.
+- **Контроль качества.** Проверки диапазона, скачков, залипания и согласованности каналов:
+  I. Zahumenský. *Guidelines on Quality Control Procedures for Data from Automatic Weather
+  Stations*. WMO, 2004; I. Durre, M. J. Menne, B. E. Gleason, T. G. Houston, R. S. Vose.
+  *Comprehensive Automated Quality Assurance of Daily Surface Observations*. Journal of
+  Applied Meteorology and Climatology 49(8), 2010, 1615–1633. doi:10.1175/2010JAMC2375.1.
+  Отличие: проверки причинные — решение о часе только по нему и прошлым часам, пороги
+  рассчитаны на целые градусы и проценты.
+
+## Обучение
+
+- **Функция потерь.** Pinball по семи квантилям: R. Koenker, G. Bassett. *Regression
+  Quantiles*. Econometrica 46(1), 1978, 33–50. Отличие: ошибка делится на климатологический
+  масштаб остатка станции, общий для всех моделей.
+- **Оптимизатор и расписание.** AdamW: I. Loshchilov, F. Hutter. *Decoupled Weight Decay
+  Regularization*. ICLR 2019. arXiv:1711.05101. Косинусное расписание: I. Loshchilov,
+  F. Hutter. *SGDR: Stochastic Gradient Descent with Warm Restarts*. ICLR 2017.
+  arXiv:1608.03983 (без перезапусков).
+- **Обрезка градиента.** R. Pascanu, T. Mikolov, Y. Bengio. *On the difficulty of training
+  recurrent neural networks*. ICML 2013. arXiv:1211.5063.
+- **Усреднение весов (EMA).** B. T. Polyak, A. B. Juditsky. *Acceleration of Stochastic
+  Approximation by Averaging*. SIAM Journal on Control and Optimization 30(4), 1992,
+  838–855. Отличие: экспоненциальное, а не равномерное среднее.
+- **Этапы и распределение длин истории.** Y. Bengio, J. Louradour, R. Collobert, J. Weston.
+  *Curriculum Learning*. ICML 2009.
+- **Квантизация int8.** B. Jacob, S. Kligys, B. Chen et al. *Quantization and Training of
+  Neural Networks for Efficient Integer-Arithmetic-Only Inference*. CVPR 2018.
+  arXiv:1712.05877. Отличие: динамическая квантизация весов после обучения средствами ONNX
+  Runtime, без обучения с квантизацией.
+
+## Оценка
+
+- **CRPS.** J. E. Matheson, R. L. Winkler. *Scoring Rules for Continuous Probability
+  Distributions*. Management Science 22(10), 1976, 1087–1096; T. Gneiting, A. E. Raftery.
+  *Strictly Proper Scoring Rules, Prediction, and Estimation*. JASA 102(477), 2007, 359–378.
+  По семи квантилям CRPS приближается удвоенным средним pinball: F. Laio, S. Tamea.
+  *Verification tools for probabilistic forecasts of continuous hydrological variables*.
+  Hydrology and Earth System Sciences 11, 2007, 1267–1277; J. Bracher, E. L. Ray,
+  T. Gneiting, N. G. Reich. *Evaluating epidemic forecasts in an interval format*. PLoS
+  Computational Biology 17(2), 2021, e1008618.
+- **Интервальная оценка Винклера.** R. L. Winkler. *A Decision-Theoretic Approach to Interval
+  Estimation*. JASA 67(337), 1972, 187–191.
+- **PIT, надёжность, острота против покрытия.** A. P. Dawid. *Statistical Theory: The
+  Prequential Approach*. JRSS A 147(2), 1984, 278–292; T. Gneiting, F. Balabdaoui,
+  A. E. Raftery. *Probabilistic forecasts, calibration and sharpness*. JRSS B 69(2), 2007,
+  243–268; J. Bröcker, L. A. Smith. *Increasing the Reliability of Reliability Diagrams*.
+  Weather and Forecasting 22(3), 2007, 651–661. Отличие: PIT по бинам между семью
+  квантилями, а не по непрерывной функции распределения.
+- **Интервалы бутстрапа по станциям.** B. Efron. *Bootstrap Methods: Another Look at the
+  Jackknife*. Annals of Statistics 7(1), 1979, 1–26; A. C. Davison, D. V. Hinkley.
+  *Bootstrap Methods and Their Application*, разд. 3.8 (данные с группами). Cambridge
+  University Press, 1997. Станция переизвлекается целиком, окна одной станции не
+  разделяются.
+- **Сплит-конформная поправка.** V. Vovk, A. Gammerman, G. Shafer. *Algorithmic Learning in a
+  Random World*. Springer, 2005; J. Lei, M. G'Sell, A. Rinaldo, R. J. Tibshirani,
+  L. Wasserman. *Distribution-Free Predictive Inference for Regression*. JASA 113(523),
+  2018, 1094–1111. arXiv:1604.04173; Y. Romano, E. Patterson, E. Candès. *Conformalized
+  Quantile Regression*. NeurIPS 2019. arXiv:1905.03222. Отличие: поправка каждого квантиля
+  отдельно по бинам лидов, поправка медианы равна нулю.
+
+## Прочие компоненты бейзлайнов
+
+- Трансформер: A. Vaswani, N. Shazeer, N. Parmar et al. *Attention Is All You Need*.
+  NeurIPS 2017. arXiv:1706.03762.
+- Residual attention в PatchTST: R. He, A. Ravula, B. Kanagal, J. Ainslie. *RealFormer:
+  Transformer Likes Residual Attention*. Findings of ACL 2021. arXiv:2012.11747.
+- GLU в блоке LRU: Y. N. Dauphin, A. Fan, M. Auli, D. Grangier. *Language Modeling with
+  Gated Convolutional Networks*. ICML 2017. arXiv:1612.08083.
+- GELU: D. Hendrycks, K. Gimpel. *Gaussian Error Linear Units (GELUs)*. arXiv:1606.08415,
+  2016.
+- LayerNorm: J. L. Ba, J. R. Kiros, G. E. Hinton. *Layer Normalization*. arXiv:1607.06450,
+  2016.
+- BatchNorm: S. Ioffe, C. Szegedy. *Batch Normalization*. ICML 2015. arXiv:1502.03167.

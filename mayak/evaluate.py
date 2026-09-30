@@ -33,6 +33,7 @@ from mayak.data.holdout import (HISTORY_GRID, NOMINAL_HISTORY, EvalSet, check_hi
                                 history_label, history_strata)
 from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, breakdown, by_lead, coverage,
                            metric_table, seed_spread, skill, wmean)
+from mayak.results import evaluation_tables, run_record, transfer_tables, write_tables
 from mayak.zones import normalize_zone
 
 Q = np.array(QUANTILES, np.float32)
@@ -408,13 +409,24 @@ def print_reliability(ev, lead_bins=LEAD_BINS):
 
 
 def print_seed_spread(evs_by_seed, lead=24):
+    """Печатает разброс метрик основной модели по сидам на одном лиде.
+
+    Args:
+        evs_by_seed: оценки одной и той же модели, обученной с разными сидами.
+        lead: лид, ч.
+
+    Returns:
+        Словарь из имени метрики в среднее, минимум, максимум и стандартное отклонение.
+    """
     summaries = [ev.restrict(leads=[lead]).summary() for ev in evs_by_seed]
+    spread = seed_spread(summaries)
     print(f"\n--- разброс по {len(evs_by_seed)} сидам, лид {lead} ч ---")
     print(f"{'метрика':>10} {'среднее':>10} {'мин':>10} {'макс':>10} {'ст.откл.':>10}")
-    for m, s in seed_spread(summaries).items():
+    for m, s in spread.items():
         if not np.isfinite(s["mean"]):
             continue
         print(f"{m:>10} {s['mean']:>10.3f} {s['min']:>10.3f} {s['max']:>10.3f} {s['std']:>10.3f}")
+    return dict(lead=int(lead), n_seeds=len(evs_by_seed), metrics=spread)
 
 
 def koppen_per_window(ds):
@@ -1288,6 +1300,9 @@ def main():
                          "полной истории) и DIR/internal_history.npz (МАЯК на всей сетке "
                          "длин истории), для внешнего теста - DIR/external*.npz; их читает "
                          "python -m mayak.calibration")
+    ap.add_argument("--results-dir", default=None, metavar="DIR",
+                    help="записать каждую таблицу в свой JSON с записью о прогоне: "
+                         "DIR/internal/*.json, DIR/external/*.json, DIR/params.json")
     args = ap.parse_args()
     grid = parse_grid(args.history_grid)
 
@@ -1339,6 +1354,11 @@ def main():
                      f"fp32, нужна таблица, подогнанная без --precision int8")
     boot = dict(n_boot=args.bootstrap, seed=eval_seed, level=args.ci_level)
     ci = args.bootstrap > 0
+    record = run_record(ckpt=args.ckpt, baselines=baseline_ckpts, ablations=args.ablation_ckpt,
+                        conformal=args.conformal, manifest=args.manifest,
+                        external_manifest=args.external_manifest, eval_seed=eval_seed,
+                        bootstrap=boot, history_grid=list(grid))
+    written = []
 
     print(f"\n=== Таблицы метрик: окон {len(base)}, сетка длин истории {list(grid)} ===")
     res = evaluate_set(named_all, base, grid=grid, r_damped=r, shift=shift, ci=ci,
@@ -1351,11 +1371,12 @@ def main():
         for p in save_bench(res, args.save_preds, "internal", shift=shift, info=info):
             print("Предсказания:", p)
 
+    tables = evaluation_tables(res)
     nominal_ds = base.with_history(NOMINAL_HISTORY)
     if len(seeds) > 1:
         evs = [evaluation_for(dict(zip(("mu", "q"), _mu_q(m, nominal_ds))), aux)
                for m in seeds[1:]]
-        print_seed_spread([evaluation_for(preds[MAIN_MODEL], aux)] + evs)
+        tables["seeds"] = print_seed_spread([evaluation_for(preds[MAIN_MODEL], aux)] + evs)
 
     print("\n=== Графики (сырые выходы) ===")
     for p in plot_metric_curves(build_tables(preds, aux), args.out_dir):
@@ -1367,10 +1388,14 @@ def main():
     print("  ", save_history_table(res, args.out_dir, "internal"))
 
     print("\n=== Разрез по зонам Кёппена (МАЯК) ===")
-    print_zone_breakdown(zone_breakdown(preds, aux))
+    tables["zones"] = zone_breakdown(preds, aux)
+    print_zone_breakdown(tables["zones"])
 
     print("\n=== Холодный старт L=0 ===")
-    coldstart_L0_check(mayak, base.with_history(0))
+    tables["coldstart"] = coldstart_L0_check(mayak, base.with_history(0))
+    if args.results_dir:
+        written += write_tables(tables, os.path.join(args.results_dir, "internal"), record)
+        written += write_tables(dict(params=n_params), args.results_dir, record)
 
     print("\n=== Графики прогноз vs факт (примеры МАЯК, сырые выходы) ===")
     plot_forecast_examples(mayak, clims, manifest=args.manifest,
@@ -1397,6 +1422,14 @@ def main():
             for p in save_bench(res_e, args.save_preds, "external", shift=shift,
                                 info=dict(info, manifest=args.external_manifest)):
                 print("Предсказания:", p)
+        if args.results_dir:
+            ext = dict(evaluation_tables(res_e), transfer=transfer_tables(_tr))
+            written += write_tables(ext, os.path.join(args.results_dir, "external"), record)
+
+    if written:
+        print("\n=== Таблицы результатов (JSON) ===")
+        for p in written:
+            print("  ", p)
 
 
 def _mu_q(model, ds):
