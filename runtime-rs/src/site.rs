@@ -64,12 +64,7 @@ pub fn site_change(old: [f32; 3], new: [f32; 3], lim: &RuntimeJson) -> (SiteChan
 pub fn describe_gap(gap: [f64; 3], lim: &RuntimeJson) -> String {
     format!(
         "широта на {:.4}° (порог {}°), долгота на {:.4}° (порог {}°), высота на {:.1} м (порог {} м)",
-        gap[0],
-        lim.site_max_dlat_deg,
-        gap[1],
-        lim.site_max_dlon_deg,
-        gap[2],
-        lim.site_max_delev_m
+        gap[0], lim.site_max_dlat_deg, gap[1], lim.site_max_dlon_deg, gap[2], lim.site_max_delev_m
     )
 }
 
