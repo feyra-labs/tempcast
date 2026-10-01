@@ -12,8 +12,10 @@ DEFAULT_START = "2021-12-27T00"
 
 
 def default_start():
-    """Абсолютный час начала синтетических рядов: конец декабря, чтобы ряды переходили
-    через Новый год."""
+    """Абсолютный час начала синтетических рядов.
+
+    Конец декабря, чтобы ряды переходили через Новый год.
+    """
     return int(to_utc_hour(np.datetime64(DEFAULT_START, "s")))
 
 
@@ -116,7 +118,17 @@ def batch_forecast(model, series, end, lat, lon, elev):
 
 
 def feed(stream, series, k0, k1):
-    """Часы ряда с k0 до k1 в поток через публичный шаг, с контролем качества прибора."""
+    """Подать часы ряда в поток через публичный шаг, с контролем качества прибора.
+
+    Args:
+        stream: потоковый рантайм.
+        series: синтетический ряд со значениями, масками и первым часом.
+        k0: первая строка.
+        k1: строка после последней.
+
+    Returns:
+        Тот же поток.
+    """
     x, m = series["x"], series["m"]
     for k in range(k0, k1):
         v = [float(x[k, j]) if m[k, j] > 0 else None for j in range(3)]
@@ -125,7 +137,19 @@ def feed(stream, series, k0, k1):
 
 
 def stream_forecast(model, series, end, lat, lon, elev):
-    """Потоковый выпуск: поток с начала ряда, выпуск после часа end - 1."""
+    """Потоковый выпуск: поток с начала ряда, выпуск после строки перед ``end``.
+
+    Args:
+        model: модель МАЯК.
+        series: синтетический ряд.
+        end: число поданных строк.
+        lat: широта, градусы.
+        lon: долгота, градусы.
+        elev: высота, м.
+
+    Returns:
+        Пара: квантили и поток.
+    """
     from mayak.runtime.streaming import StreamingMayak
     s = feed(StreamingMayak(model, lat, lon, elev), series, 0, end)
     q, _ = s.forecast()
@@ -268,7 +292,19 @@ def runtime_cost(model, reps=100, seed=0):
 
 
 def stream_hour_ms(model, hours=200, seed=0, lat=52.37, lon=4.9, elev=0.0):
-    """Полная стоимость шага потока: контроль качества, каналы, энкодер, моды, кольца, мс."""
+    """Полная стоимость шага потока: контроль качества, каналы, энкодер, моды, кольца.
+
+    Args:
+        model: модель МАЯК.
+        hours: число шагов замера.
+        seed: сид синтетического ряда.
+        lat: широта, градусы.
+        lon: долгота, градусы.
+        elev: высота, м.
+
+    Returns:
+        Пара: среднее время шага, мс, и поток.
+    """
     from mayak.runtime.streaming import StreamingMayak
     series = synthetic_series(hours + 50, seed=seed)
     s = feed(StreamingMayak(model, lat, lon, elev), series, 0, 50)

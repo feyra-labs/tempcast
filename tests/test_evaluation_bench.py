@@ -170,9 +170,11 @@ def _perturbed(clims, items, cut_of):
 
 @pytest.mark.parametrize("L", [24, 168, L_MAX])
 def test_baselines_see_only_the_window_history(store, manifest, L):
-    """Эталоны видят ту же историю, что модели: часы до начала истории окна (и до
-    начала контекста QC при полной истории) на них не влияют, а часы внутри истории
-    влияют."""
+    """Эталоны видят ту же историю, что модели.
+
+    Часы до начала истории окна (и до начала контекста QC при полной истории) на них не влияют, а
+    часы внутри истории влияют.
+    """
     from mayak.evaluate import (EvalSet, add_statistical_baselines, collect_predictions)
     clims = store.clims()
     ds = EvalSet(clims, station_splits=(ROLE_TEST,), manifest=manifest, time_key="test",

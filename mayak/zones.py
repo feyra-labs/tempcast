@@ -25,27 +25,60 @@ N_SEASONS = len(SEASONS)
 
 
 def normalize_zone(zone) -> str:
-    """Строка из манифеста → зона из таблицы либо ``UNK``."""
+    """Зона из манифеста, приведённая к таблице зон.
+
+    Args:
+        zone: зона Кёппена как в манифесте, любого типа.
+
+    Returns:
+        Зона из таблицы или ``UNK``, если такой зоны в таблице нет.
+    """
     z = str(zone).strip()
     return z if z in KOPPEN_ID else UNKNOWN_ZONE
 
 
 def koppen_id(zone) -> int:
-    """Полная зона Кёппена → стабильный идентификатор [0, N_KOPPEN)."""
+    """Стабильный номер полной зоны Кёппена.
+
+    Args:
+        zone: зона Кёппена как в манифесте.
+
+    Returns:
+        Номер от нуля до числа зон в таблице, у неизвестной зоны - последний.
+    """
     return KOPPEN_ID[normalize_zone(zone)]
 
 
 def koppen_group(zone) -> str:
-    """Крупный разрез: A/B/C/D/E либо UNK. Для мелких зон с малым числом станций."""
+    """Крупная группа зоны: первая буква кода или ``UNK``.
+
+    Нужна для разрезов, где в мелких зонах слишком мало станций.
+
+    Args:
+        zone: зона Кёппена как в манифесте.
+
+    Returns:
+        Одна из букв A, B, C, D, E либо ``UNK``.
+    """
     z = normalize_zone(zone)
     return UNKNOWN_ZONE if z == UNKNOWN_ZONE else z[0]
 
 
 def season_of(month, lat) -> str:
-    """(месяц UTC 1..12, широта) → местный сезон.
+    """Местный сезон по месяцу и широте.
 
-    Северное полушарие: DJF → winter, MAM → spring, JJA → summer, SON → autumn.
-    Южное — сдвиг на два бина (полгода).
+    В северном полушарии зима - декабрь, январь и февраль, дальше по три месяца на
+    сезон. В южном полушарии сезоны сдвинуты на полгода.
+
+    Args:
+        month: месяц UTC от 1 до 12.
+        lat: широта, градусы.
+
+    Returns:
+        Имя сезона: ``winter``, ``spring``, ``summer`` или ``autumn``.
+
+    Raises:
+        ValueError: месяц вне диапазона от 1 до 12.
     """
     m = int(month)
     if not 1 <= m <= 12:
@@ -61,7 +94,18 @@ def season_id(month, lat) -> int:
 
 
 def seasons_of(months, lat) -> np.ndarray:
-    """Векторная версия ``season_of`` для массива месяцев одной станции."""
+    """Местные сезоны для массива месяцев одной станции.
+
+    Args:
+        months: месяцы UTC от 1 до 12, массив.
+        lat: широта станции, градусы.
+
+    Returns:
+        Массив имён сезонов той же формы.
+
+    Raises:
+        ValueError: хотя бы один месяц вне диапазона от 1 до 12.
+    """
     m = np.asarray(months, dtype=np.int64)
     if m.size and (m.min() < 1 or m.max() > 12):
         raise ValueError("месяц вне [1, 12]")

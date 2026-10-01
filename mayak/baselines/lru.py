@@ -72,7 +72,6 @@ def lru_scan_associative(a_re, a_im, u_re, u_im):
     Returns:
         Пара тензоров формы (B, L, N): вещественная и мнимая части состояний.
     """
-
     h_re, h_im = u_re, u_im
     L = h_re.shape[1]
     k = 1
@@ -102,7 +101,6 @@ def lru_scan_chunked(nu, theta, u_re, u_im, chunk=32):
     Returns:
         Пара тензоров формы (B, L, N): вещественная и мнимая части состояний.
     """
-
     B, L, N = u_re.shape
     C = min(int(chunk), L)
     pad = (-L) % C
@@ -131,7 +129,17 @@ def lru_scan_chunked(nu, theta, u_re, u_im, chunk=32):
 
 
 def lru_recurrent(a_re, a_im, u_re, u_im):
-    """Та же рекуррентность простым циклом по часам, эталон для проверки сканов."""
+    """Рекуррентность простым циклом по часам - эталон для проверки параллельных развёрток.
+
+    Args:
+        a_re: действительные части собственных чисел, форма (N,).
+        a_im: мнимые части, форма (N,).
+        u_re: действительная часть входа, форма (B, L, N).
+        u_im: мнимая часть входа, форма (B, L, N).
+
+    Returns:
+        Пара: действительная и мнимая части состояния на каждом часе, форма (B, L, N).
+    """
     B, L, N = u_re.shape
     h_re = u_re.new_zeros(B, N)
     h_im = u_re.new_zeros(B, N)
@@ -265,11 +273,26 @@ class LRUForecaster(nn.Module):
         self.head = LeadHead(cfg.d_model, cfg.head_hidden, cfg.horizon, self.nq)
 
     def inputs(self, batch):
-        """Вход стека, форма (B, L, N_RECURRENT_INPUT)."""
+        """Вход стека.
+
+        Args:
+            batch: батч.
+
+        Returns:
+            Тензор формы (B, L, число входных признаков).
+        """
         return recurrent_inputs(batch)
 
     def encode(self, batch, scan=None):
-        """Выход стека на каждом часе истории, форма (B, L, d_model)."""
+        """Выход стека на каждом часе истории.
+
+        Args:
+            batch: батч.
+            scan: развёртка рекуррентности; None - из конфига.
+
+        Returns:
+            Тензор формы (B, L, d_model).
+        """
         z = self.embed(self.inputs(batch))
         for blk in self.blocks:
             z = blk(z, scan)
@@ -279,7 +302,14 @@ class LRUForecaster(nn.Module):
         return self.head(self.encode(batch, scan)[:, -1], batch)
 
     def optim_groups(self, weight_decay):
-        """Группы весового затухания: рекуррентные параметры без затухания, остальные с ним."""
+        """Группы весового затухания: рекуррентные параметры без затухания, остальные с ним.
+
+        Args:
+            weight_decay: базовое весовое затухание протокола.
+
+        Returns:
+            Список групп.
+        """
         rec, other = [], []
         for name, p in self.named_parameters():
             if not p.requires_grad:

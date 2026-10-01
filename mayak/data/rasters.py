@@ -38,7 +38,15 @@ class RasterSampler:
 
 
 def koppen_reader(path):
-    """Карта Бека и соавт. (коды 1..30) → функция (lat, lon) → полная зона Кёппена."""
+    """Чтение карты зон Кёппена Бека и соавторов.
+
+    Args:
+        path: путь к растру с кодами зон от 1 до 30.
+
+    Returns:
+        Функция от широты и долготы, которая возвращает полную зону Кёппена или
+        ``UNK``.
+    """
     sampler = RasterSampler(path)
 
     def get(lat, lon):
@@ -51,7 +59,14 @@ def koppen_reader(path):
 
 
 def dem_reader(path):
-    """Растр ЦМР → функция (lat, lon) → высота, м, или None."""
+    """Чтение цифровой модели рельефа.
+
+    Args:
+        path: путь к растру высот.
+
+    Returns:
+        Функция от широты и долготы, которая возвращает высоту, м, или None.
+    """
     return RasterSampler(path)
 
 

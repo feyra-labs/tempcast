@@ -117,7 +117,14 @@ class GRUSeq2Seq(nn.Module):
         self.head = LeadHead(cfg.hidden, cfg.head_hidden, cfg.horizon, self.nq)
 
     def inputs(self, batch):
-        """Вход кодировщика, форма (B, L, N_RECURRENT_INPUT)."""
+        """Вход кодировщика.
+
+        Args:
+            batch: батч.
+
+        Returns:
+            Тензор формы (B, L, число входных признаков).
+        """
         return recurrent_inputs(batch)
 
     def forward(self, batch):
@@ -167,7 +174,14 @@ class DLinear(nn.Module):
         return trend, T - trend
 
     def point(self, T):
-        """Точечный прогноз по ряду длины входа модели, форма (B, H)."""
+        """Точечный прогноз по ряду длины входа модели.
+
+        Args:
+            T: ряд, форма (B, длина входа).
+
+        Returns:
+            Прогноз формы (B, H).
+        """
         trend, resid = self.decompose(T)
         return self.lin_trend(trend) + self.lin_resid(resid)
 

@@ -1,11 +1,11 @@
 """Обучение через Hydra: композиция конфигов, переопределения, групповые запуски.
 
-Примеры:
+Example:
     python scripts/run.py                                   # МАЯК, протокол по умолчанию
     python scripts/run.py model=gru                         # бейзлайн - другая группа model
     python scripts/run.py -m model=gru,dlinear,lru,patchtst # все нейробейзлайны
     python scripts/run.py train=debug run.accelerator=cpu   # отладка на CPU
-    python scripts/run.py -m ablation=none,no_anchor,no_compression   # абляции (блок 6.7)
+    python scripts/run.py -m ablation=none,no_anchor,no_compression   # абляции МАЯК
     python scripts/run.py -m train.seed=0,1,2               # три сида основной модели
 """
 import os
@@ -17,7 +17,16 @@ RUN_SECTIONS = ("model", "data", "train")
 
 
 def to_run_config(cfg):
-    """DictConfig Hydra → RunConfig (только секции model/data/train, всё разрешено)."""
+    """Полная конфигурация прогона из конфига Hydra.
+
+    Берутся только секции модели, данных и обучения, все подстановки разрешены.
+
+    Args:
+        cfg: конфиг Hydra.
+
+    Returns:
+        Полная конфигурация прогона.
+    """
     from mayak.config import RunConfig
     d = {k: OmegaConf.to_container(cfg[k], resolve=True) for k in RUN_SECTIONS}
     if d["model"].get("arch") != "mayak" and not d["model"].get("ablations", True):

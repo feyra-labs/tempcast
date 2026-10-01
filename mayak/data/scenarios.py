@@ -1,9 +1,8 @@
 """Сценарии робастности: преобразования окна для обученной модели.
 
-Сценарий - это преобразование одного окна (``AugWindow`` из ``mayak.data.augment``),
-а не отдельная копия датасета. Контракт каждого сценария - ``SCENARIO_RULES`` в
-``mayak/config.py`` (класс, искажается ли цель, границы уровня, параметры), здесь -
-только реализация.
+Сценарий - это преобразование одного окна аугментаций, а не отдельная копия
+датасета. Контракт каждого сценария - класс, искажается ли цель, границы уровня,
+параметры - задан в конфиге робастности; здесь только реализация.
 """
 from __future__ import annotations
 
@@ -63,8 +62,10 @@ def _drift_params(w, level, target):
 
 
 def _drift(w, level, rng, p):
-    """Дрейф температуры той же функцией, что в обучении: история нарастает до текущего
-    смещения, цель получает это смещение постоянным."""
+    """Дрейф температуры той же функцией, что в обучении.
+
+    История нарастает до текущего смещения, цель получает это смещение постоянным.
+    """
     apply_one(w, "drift", _drift_params(w, level, True))
 
 
@@ -79,7 +80,11 @@ def _scale(w, level, rng, p):
 
 
 def _noise(w, level, rng, p):
-    """Гауссов шум: σ_T = level, σ_P и σ_RH - в отношении ``sd_ratio``; RH насыщается."""
+    """Гауссов шум; его разброс у температуры равен уровню.
+
+    У давления и влажности разброс задан в отношении ``sd_ratio``. Влажность после
+    шума обрезается в допустимый диапазон.
+    """
     z = rng.standard_normal((L_MAX, 3)).astype(np.float32)
     sd = np.float32(level) * np.asarray(p["sd_ratio"], np.float32)
     w.x[:] = w.x + z * sd * (w.m > 0)
@@ -88,7 +93,10 @@ def _noise(w, level, rng, p):
 
 
 def _spikes(w, level, rng, p):
-    """Одиночные выбросы: на доле ``level`` валидных точек значение сдвинуто на ±magnitude."""
+    """Одиночные выбросы: на доле валидных точек, равной уровню, значение сдвинуто на ``magnitude``.
+
+    Направление сдвига каждой точки случайное.
+    """
     u = rng.random((L_MAX, 3))
     sign = np.where(rng.random((L_MAX, 3)) < 0.5, -1.0, 1.0).astype(np.float32)
     hit = (u < level) & (w.m > 0)
@@ -189,33 +197,70 @@ SCENARIOS = {n: ScenarioDef(n, SCENARIO_RULES[n], _FN[n], _STREAM[n]) for n in S
 
 
 def variants_of(name):
-    """Варианты «искажён только вход» основного сценария name."""
+    """Варианты «искажён только вход» основного сценария.
+
+    Args:
+        name: имя основного сценария.
+
+    Returns:
+        Кортеж имён вариантов.
+    """
     return tuple(n for n, d in SCENARIOS.items() if d.rule.variant_of == name)
 
 
 def scenario_rng(seed, name, index):
-    """Генератор сценария name на окне index - одинаковый на всех уровнях."""
+    """Генератор сценария на окне; одинаковый на всех уровнях.
+
+    Args:
+        seed: сид прогона робастности.
+        name: имя сценария.
+        index: номер окна.
+
+    Returns:
+        Генератор случайных чисел.
+    """
     return np.random.default_rng([int(seed), SCENARIOS[name].stream, int(index)])
 
 
 def dither_rng(seed, index):
-    """Генератор шума непрерывности окна index - общий для всех сценариев и уровней."""
+    """Генератор шума непрерывности окна; общий для всех сценариев и уровней.
+
+    Args:
+        seed: сид прогона робастности.
+        index: номер окна.
+
+    Returns:
+        Генератор случайных чисел.
+    """
     return np.random.default_rng([int(seed), _DITHER_STREAM, int(index)])
 
 
 def apply_scenario(w: AugWindow, name, level, rng, params=None):
-    """Применить сценарий name уровня level к окну w (на месте) и проверить контракт.
+    """Применить сценарий к окну на месте и проверить контракт сценария.
 
-    params - параметры сценария (по умолчанию - из ``SCENARIO_RULES``).
+    Args:
+        w: окно.
+        name: имя сценария.
+        level: уровень деградации.
+        rng: генератор сценария.
+        params: параметры сценария; по умолчанию - из правила сценария.
+
+    Returns:
+        То же окно.
+
+    Raises:
+        RuntimeError: сценарий изменил маску цели или, будучи отказом входа, саму цель.
     """
     d = SCENARIOS[name]
     p = {**d.rule.params, **(params or {})}
     y0, ym0 = w.y.copy(), w.y_mask.copy()
     d.fn(w, float(level), rng, p)
     if not np.array_equal(w.y_mask, ym0):
-        raise RuntimeError(f"сценарий {name} изменил маску цели (блок 1.6)")
+        raise RuntimeError(f"сценарий {name} изменил маску цели: сценарии не решают, "
+                           f"какие часы цели оцениваются")
     if not d.target and not np.array_equal(w.y, y0):
-        raise RuntimeError(f"сценарий {name} класса «отказ входа» изменил цель (блок 12.2)")
+        raise RuntimeError(f"сценарий {name} класса «отказ входа» изменил цель: такой "
+                           f"сценарий портит только вход модели")
     w.applied[f"scenario:{name}"] = float(level)
     return w
 
@@ -253,7 +298,15 @@ def instrument_reference(name, level, w: AugWindow, mu_clim, rng, params=None):
 
 
 def level_label(name, level):
-    """Подпись уровня для таблиц и осей."""
+    """Подпись уровня для таблиц и осей.
+
+    Args:
+        name: имя сценария.
+        level: уровень деградации.
+
+    Returns:
+        Строка подписи.
+    """
     if name == "drop_channel":
         return DROP_CHANNEL_LABELS[int(level)]
     if SCENARIOS[name].rule.integer:

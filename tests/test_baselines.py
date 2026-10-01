@@ -73,7 +73,7 @@ def _rand_lambda(N, seed=0, r=(0.3, 0.999), phase=3.0):
 @pytest.mark.parametrize("L", [1, 7, 32, 33, 100, 672])
 @pytest.mark.parametrize("chunk", [1, 8, 32])
 def test_lru_scans_match_naive_recurrence(L, chunk):
-    """Блочный и полный ассоциативные сканы = наивный цикл h_t = λ h_{t−1} + u_t."""
+    """Блочный и полный ассоциативные сканы совпадают с простым циклом рекуррентности по часам."""
     nu, theta = _rand_lambda(16)
     g = torch.Generator().manual_seed(L)
     u_re = torch.randn(2, L, 16, generator=g, dtype=torch.float64)
@@ -127,8 +127,12 @@ def test_lru_scan_does_not_run_python_loop_over_hours(monkeypatch):
 
 
 def test_lru_eigenvalues_inside_unit_disk_for_any_parameters():
-    """Экспоненциальная параметризация: |λ| = exp(−exp(ν_log)) < 1 при любых ν_log, θ_log
-    (в float64 различимо до ν_log ≈ −36; в float32 |λ| округляется к 1 при ν_log < −17)."""
+    """Экспоненциальная параметризация держит модуль собственного числа строго меньше единицы.
+
+    Это верно при любых сырых параметрах, пока модуль различим в float64. В float32 он
+    округляется к единице уже при сырых параметрах около минус семнадцати, поэтому
+    проверка идёт в float64.
+    """
     lay = LRULayer(4, 64, 0.5, 0.99, 1.0).double()
     with torch.no_grad():
         lay.nu_log.copy_(torch.linspace(-30, 5, 64, dtype=torch.float64))
@@ -147,7 +151,7 @@ def test_lru_init_follows_config_ranges():
     mod, phase = lay.eigenvalues()
     assert mod.min() >= cfg.r_min - 1e-6 and mod.max() <= cfg.r_max + 1e-6
     assert phase.min() >= 0 and phase.max() <= cfg.max_phase + 1e-6
-    # |λ|² ~ U[r_min², r_max²]
+    # квадрат модуля собственного числа равномерен между квадратами границ
     m2 = (mod.detach() ** 2).numpy()
     assert abs(m2.mean() - (cfg.r_min ** 2 + cfg.r_max ** 2) / 2) < 0.01
     assert torch.allclose(torch.exp(lay.gamma_log), torch.sqrt(1 - mod ** 2), atol=1e-6)
@@ -155,7 +159,11 @@ def test_lru_init_follows_config_ranges():
 
 @pytest.mark.parametrize("modulus", [0.5, 0.9, 0.995])
 def test_lru_input_normalization_keeps_state_variance(modulus):
-    """γ = √(1 − |λ|²): при белом шуме на входе E|h|² ≈ E|Bu|² вне зависимости от |λ|."""
+    """Нормировка входа сохраняет энергию состояния.
+
+    При белом шуме на входе средняя энергия состояния примерно равна энергии входа
+    независимо от модуля собственного числа.
+    """
     torch.manual_seed(0)
     lay = LRULayer(1, 1, 0.5, 0.6, 1.0).double()
     with torch.no_grad():
@@ -237,7 +245,11 @@ def test_masked_revin_statistics():
 
 
 def test_patchtst_is_shift_and_scale_equivariant():
-    """RevIN: q(a·T + b) = a·q(T) + b при a > 0 (с точностью до eps в σ)."""
+    """Нормировка окна делает прогноз согласованным со сдвигом и положительным растяжением ряда.
+
+    Растяжение и сдвиг входа растягивают и сдвигают квантили так же, с точностью до
+    добавки к разбросу окна.
+    """
     m = _trained_like(_model("patchtst"))
     b = _batch(B=2, p_valid=1.0)
     a, s = 2.5, -7.0
@@ -260,7 +272,7 @@ def test_patchtst_channel_independence():
 
 
 def test_patchtst_matches_revin_denormalization():
-    """mu, sigma и квантили связаны обратной RevIN: q = q̂·σ + μ, монотонно."""
+    """Квантили получаются из нормированных обратной нормировкой окна и остаются монотонными."""
     m = _trained_like(_model("patchtst"))
     b = _batch(B=3)
     with torch.no_grad():
@@ -449,7 +461,11 @@ def test_damped_persistence_formula():
 
 
 def test_damped_coefficients_recover_known_decay():
-    """МНК через ноль восстанавливает r_h, если a(t+h) = r_h·ā точно; обрезка в [0, 1]."""
+    """Метод наименьших квадратов без свободного члена восстанавливает коэффициент затухания лида.
+
+    Коэффициент восстанавливается точно, если будущая аномалия ровно пропорциональна
+    средней; результат обрезается в отрезок от нуля до единицы.
+    """
     rng = np.random.default_rng(0)
     r_true = np.exp(-np.arange(1, H + 1) / 30.0)
     Sxx, Sxy = np.zeros(H), np.zeros(H)
@@ -537,7 +553,7 @@ def test_check_comparable_rejects_mismatch_and_pre_protocol_checkpoints(tmp_path
     with pytest.raises(ProtocolError, match="batch_size"):
         check_comparable(ref, [other])
     old = _fake_ckpt(tmp_path / "old.ckpt", "dlinear", None)
-    with pytest.raises(ProtocolError, match="блок 4"):
+    with pytest.raises(ProtocolError, match="нет протокола обучения"):
         check_comparable(ref, [old])
     seed1 = _fake_ckpt(tmp_path / "s1.ckpt", "mayak", Protocol(seed=1))
     with pytest.raises(ProtocolError, match="seed"):

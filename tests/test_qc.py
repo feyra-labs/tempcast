@@ -32,8 +32,11 @@ YEAR = 8766
 
 
 def physical_series(n, lat=45.0, lon=30.0, elev=200.0, seed=0, t0=T0, lag_h=2.5):
-    """Правдоподобный почасовой ряд: годовой ход, суточный ход по местному солнечному
-    времени с тепловым запаздыванием, синоптический AR(1)-шум, давление по высоте."""
+    """Правдоподобный почасовой ряд.
+
+    Годовой ход, суточный ход по местному солнечному времени с тепловым запаздыванием, синоптический
+    AR(1)-шум, давление по высоте.
+    """
     rng = np.random.default_rng(seed)
     k = np.arange(n)
     abs_h = t0 + k
@@ -194,8 +197,10 @@ def test_spike_return_is_not_a_jump(clean):
 
 
 def test_short_excursion_is_a_spike_and_return_hour_stays_valid(clean):
-    """Выброс на 2 ч, не пойманный порогом SPIKE: бракуются оба часа выброса,
-    а час возврата к норме остаётся валидным."""
+    """Выброс на 2 ч, не пойманный порогом SPIKE.
+
+    Бракуются оба часа выброса, а час возврата к норме остаётся валидным.
+    """
     T, P, RH = (a.copy() for a in clean)
     T[400:402] += 22.0
     _, mask, codes = run(T, P, RH, elev=200.0)
@@ -317,9 +322,11 @@ CAUSAL_DELAY = {"range_T": 0, "spike": 0, "stuck_T": DEFAULT_QC.stuck_T_alone_ho
 
 @pytest.mark.parametrize("kind", list(CAUSAL_DELAY))
 def test_window_path_catches_artifact_after_causal_delay(clean, kind):
-    """Окно проходит причинный QC: артефакт получает свой код на своём канале, начиная с
-    часа, когда его можно распознать по прошлому. Центрированный QC кэша помечает его
-    целиком."""
+    """Окно проходит причинный QC.
+
+    Артефакт получает свой код на своём канале, начиная с часа, когда его можно распознать по
+    прошлому. Центрированный QC кэша помечает его целиком.
+    """
     series, extra, ch, sl = _inject(kind, *clean)
     elev = extra.get("elev", 200.0)
     _, _, c_station = run(*series, elev=elev)
@@ -640,8 +647,10 @@ def _items(manifest, n=24, **kw):
 
 
 def test_window_qc_sees_augmented_artifacts(train_manifest):
-    """Грубый шум аугментации выводит T за физический диапазон: QC окна обязан это
-    увидеть. Без QC окна те же значения проходят в модель как валидные."""
+    """Грубый шум аугментации выводит T за физический диапазон: QC окна обязан это увидеть.
+
+    Без QC окна те же значения проходят в модель как валидные.
+    """
     aug = dict(noise_sd=(40.0, 0.5, 2.0), gap_prob=0.0, offset_max=0.0)
     on = _items(train_manifest, augment=aug, window_qc=True)
     off = _items(train_manifest, augment=aug, window_qc=False)

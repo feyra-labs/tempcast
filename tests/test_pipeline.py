@@ -251,7 +251,7 @@ def test_calendar_fixed_points(ts, doy, hour):
 
 
 def test_all_calendar_paths_agree(manifest):
-    """Сборщик (сетка) → кэш → датасет → рантайм дают один и тот же календарь."""
+    """Сетка сборщика, кэш, датасет и рантайм дают один и тот же календарь."""
     from mayak.data.dataset import WindowDataset
     times = pd.date_range("2020-02-27 22:00", periods=100, freq="h", tz="UTC")
     t0, _ = to_hourly_grid(times, {"T": np.zeros(100)})

@@ -1,10 +1,10 @@
-"""Экспорт модели для компилируемого рантайма: графы ONNX и манифест.
+r"""Экспорт модели для компилируемого рантайма: графы ONNX и манифест.
 
-    python scripts/export_runtime.py --ckpt runs/mayak/stageB/best.ckpt \\
+    python scripts/export_runtime.py --ckpt runs/mayak/stageB/best.ckpt \
         --conformal runs/conformal_int8.npy --aci --int8 --out runtime/model
 
 Каталог --out целиком - то, что копируется на устройство вместе с бинарником
-runtime-rs (mayak-rt run --model runtime/model ...). Архитектура берётся из
+рантайма: ``mayak-rt run --model runtime/model ...``. Архитектура берётся из
 конфига в чекпойнте; манифест хранит конфиг, размеры, пределы QC, формат состояния,
 параметры калибровки и пороги смены координат прибора. Конформная таблица должна быть
 подогнана на той точности, которую объявляет экспорт: с --int8 - на int8-графах этого же

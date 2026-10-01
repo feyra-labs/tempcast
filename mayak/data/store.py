@@ -62,7 +62,7 @@ SOURCE_BUILD_NAME = "source_build.json"
 
 
 def new_climatology():
-    """Пустая климатология с базисом из CLIM_PARAMS"""
+    """Пустая климатология с базисом из параметров климатологии кэша."""
     return Climatology(**{k: CLIM_PARAMS[k] for k in CLIM_BASIS})
 
 
@@ -80,7 +80,15 @@ def source_path(manifest, sid):
 
 
 def read_source(path):
-    """Исходный файл станции → dict(T, P, RH, valid, t0[, flag][, Td])."""
+    """Содержимое исходного файла станции.
+
+    Args:
+        path: путь к файлу npz.
+
+    Returns:
+        Словарь: ``T``, ``P``, ``RH``, маски ``valid``, абсолютный час первой строки
+        ``t0``; если есть в файле - флаги источника ``flag`` и точка росы ``Td``.
+    """
     with np.load(path) as d:
         out = dict(T=d["T"], P=d["P"], RH=d["RH"], valid=d["valid"])
         for opt in ("flag", "Td"):
@@ -110,7 +118,15 @@ def _opt_float(v):
 
 
 def qc_meta(row):
-    """Метаданные станции, которые читает QC: долгота, заявленная высота, высота из ЦМР."""
+    """Метаданные станции, которые читает QC.
+
+    Args:
+        row: строка манифеста.
+
+    Returns:
+        Словарь: долгота, заявленная высота и высота из цифровой модели рельефа, если
+        они есть.
+    """
     declared = _opt_float(row.get("station_elev"))
     meta = dict(lon=_opt_float(row.get("lon")),
                 elev=declared if declared is not None else _opt_float(row.get("elev")),
@@ -121,7 +137,14 @@ def qc_meta(row):
 
 
 def qc_elev(meta):
-    """Высота для проверки давления: из ЦМР, если есть, иначе заявленная."""
+    """Высота для проверки давления: из цифровой модели рельефа, если есть, иначе заявленная.
+
+    Args:
+        meta: метаданные станции для QC.
+
+    Returns:
+        Высота, м, или None.
+    """
     return meta["dem_elev"] if meta.get("dem_elev") is not None else meta.get("elev")
 
 
@@ -315,10 +338,18 @@ def check_sources(manifest):
 
 
 def process_station(path, meta=None, qc_cfg=DEFAULT_QC):
-    """QC + станционные проверки + отбор + климатология одной станции (в пуле процессов).
+    """Обработка одной станции в пуле процессов.
 
-    Возвращает dict с данными станции либо с ``error``; в обоих случаях - ``report``
-    (строка отчёта QC) и ``reasons`` [(правило, текст)].
+    QC, станционные проверки, отбор и подгонка климатологии.
+
+    Args:
+        path: путь к исходному файлу станции.
+        meta: метаданные станции для QC.
+        qc_cfg: пороги контроля качества.
+
+    Returns:
+        Словарь с данными станции либо с ``error``. В обоих случаях в нём есть
+        ``report`` - строка отчёта QC - и ``reasons`` - список пар правило и пояснение.
     """
     meta = meta or {}
     src = read_source(path)

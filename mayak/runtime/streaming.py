@@ -340,7 +340,11 @@ class StreamingMayak:
         self.reset()
 
     def reset_calibration(self, theta=0.0):
-        """Сброс адаптивной калибровки прибора: множитель и счётчики обратной связи."""
+        """Сброс адаптивной калибровки прибора: множитель и счётчики обратной связи.
+
+        Args:
+            theta: новый логарифм множителя.
+        """
         self.theta = float(np.float32(theta)) if self.aci is None else self.aci.clip(theta)
         self.aci_updates = 0
         self.aci_misses = 0
@@ -531,8 +535,10 @@ class StreamingMayak:
         return int(now_hour)
 
     def _empty_history(self, last):
-        """Строки накопителя, сумма мод и край истории пустого окна, которое кончается
-        часом last. Состояние рантайма не меняется."""
+        """Строки накопителя, сумма мод и край истории пустого окна, которое кончается часом last.
+
+        Состояние рантайма не меняется.
+        """
         W, L, E = self.window, self.history, self.edge
         hours = last - W + 1 + np.arange(W, dtype=np.int64)
         zeros = np.zeros((W, 3), np.float32)

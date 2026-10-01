@@ -118,7 +118,7 @@ def test_quality_policy_is_source_dependent(code, source, flagged):
 
 
 def _obs(rows):
-    """[(минуты от 00:00 1.1.2020, T, Td, P, флаг T)] → таблица наблюдений."""
+    """Таблица наблюдений из строк: минуты от начала 2020 года, T, Td, P и флаг T."""
     base = int(to_utc_hour(datetime(2020, 1, 1))) * 60
     df = pd.DataFrame(rows, columns=["m", "T", "Td", "P", "fT"])
     return pd.DataFrame(dict(minute=base + df["m"], T=df["T"], Td=df["Td"], P=df["P"],

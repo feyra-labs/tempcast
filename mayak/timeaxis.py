@@ -10,7 +10,10 @@ _EPOCH_H = np.datetime64("1970-01-01T00", "h")
 
 
 def _as_datetime64_s(ts) -> np.ndarray:
-    """datetime / pd.Timestamp / np.datetime64 / строка / массив → datetime64[s] (UTC)."""
+    """Момент или массив моментов в любом привычном виде как datetime64[s] в UTC.
+
+    Понимает datetime, метки pandas, datetime64, строки и массивы из них.
+    """
     if isinstance(ts, datetime):
         if ts.tzinfo is not None:
             ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
@@ -26,7 +29,14 @@ def _as_datetime64_s(ts) -> np.ndarray:
 
 
 def doy_hour(ts):
-    """Момент(ы) UTC → (doy, hour) по конвенции модуля, float64. Векторизовано."""
+    """День года и час UTC по календарной конвенции проекта.
+
+    Args:
+        ts: момент UTC или массив моментов.
+
+    Returns:
+        Пара float64: день года с нуля с дробной частью, равной доле суток, и час UTC.
+    """
     t = _as_datetime64_s(ts)
     year_start = t.astype("datetime64[Y]").astype("datetime64[s]")
     sec = (t - year_start).astype(np.int64)
@@ -34,18 +44,43 @@ def doy_hour(ts):
 
 
 def month_of(ts):
-    """Момент(ы) UTC → календарный месяц 1..12 (int64). Векторизовано."""
+    """Календарный месяц UTC.
+
+    Args:
+        ts: момент UTC или массив моментов.
+
+    Returns:
+        Месяц от 1 до 12, int64.
+    """
     t = _as_datetime64_s(ts)
     return t.astype("datetime64[M]").astype(np.int64) % 12 + 1
 
 
 def window_month(t0_utc_h: int, idx):
-    """Часы ряда станции (индексы от ``t0_utc_h``) → календарные месяцы UTC."""
+    """Календарные месяцы UTC для часов ряда станции.
+
+    Args:
+        t0_utc_h: абсолютный час первой строки ряда, часы от эпохи.
+        idx: номера строк ряда.
+
+    Returns:
+        Месяцы от 1 до 12, int64, форма ``idx``.
+    """
     return month_of(from_utc_hour(int(t0_utc_h) + np.asarray(idx, dtype=np.int64)))
 
 
 def to_utc_hour(ts) -> int:
-    """Момент UTC → целое число часов от эпохи. Падает, если момент не на целом часе."""
+    """Целое число часов от эпохи для момента UTC.
+
+    Args:
+        ts: момент UTC или массив моментов.
+
+    Returns:
+        Часы от эпохи, int64.
+
+    Raises:
+        ValueError: момент не лежит на целом часе.
+    """
     t = _as_datetime64_s(ts)
     h = t.astype("datetime64[h]")
     if np.any(h.astype("datetime64[s]") != t):
@@ -54,7 +89,14 @@ def to_utc_hour(ts) -> int:
 
 
 def from_utc_hour(t_h) -> np.ndarray:
-    """Часы от эпохи → datetime64[h]."""
+    """Моменты для часов от эпохи.
+
+    Args:
+        t_h: часы от эпохи, число или массив.
+
+    Returns:
+        Массив datetime64[h].
+    """
     return _EPOCH_H + np.asarray(t_h, dtype=np.int64).astype("timedelta64[h]")
 
 
@@ -82,7 +124,14 @@ def window_calendar(t0_utc_h: int, idx):
 
 
 def utc_to_doy_hour(dt: datetime):
-    """Скалярная обёртка для рантайма: datetime (UTC) → (doy, hour)."""
+    """День года и час UTC одного момента как обычные числа.
+
+    Args:
+        dt: момент UTC.
+
+    Returns:
+        Пара float: день года с дробной частью и час UTC.
+    """
     d, h = doy_hour(dt)
     return float(d), float(h)
 
@@ -103,9 +152,16 @@ def legacy_t0(t0_doy: float, t0_hour: float) -> int:
 def to_hourly_grid(times, columns: dict):
     """Переиндексация ряда на полную почасовую сетку UTC.
 
-    times   — метки времени наблюдений;
-    columns — {имя: массив той же длины}.
-    Возвращает (t0_utc_h, {имя: float32 (N,) с NaN в отсутствующих часах}).
+    Args:
+        times: метки времени наблюдений, каждая на целом часе.
+        columns: словарь имя колонки - массив той же длины, что ``times``.
+
+    Returns:
+        Пара: абсолютный час первой строки сетки и словарь колонок float32 длины
+        сетки, где отсутствующие часы заполнены NaN.
+
+    Raises:
+        ValueError: ряд пуст или метки времени повторяются.
     """
     t_h = np.asarray(to_utc_hour(times), dtype=np.int64).ravel()
     if t_h.size == 0:

@@ -1,4 +1,5 @@
 """Генератор синтетического метео-датасета.
+
 Запуск:
     python scripts/make_synth.py --out data --n-stations 40 --years 6 --seed 1
 """

@@ -29,12 +29,23 @@ target-version = "py310"
 extend-exclude = ["runs"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "UP", "B"]
+select = ["E", "F", "W", "UP", "B", "D"]
 ignore = [
     "B905",
     "E731",
     "UP045",
+    "D100",
+    "D101",
+    "D102",
+    "D103",
+    "D104",
+    "D105",
+    "D106",
+    "D107",
 ]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["E402"]

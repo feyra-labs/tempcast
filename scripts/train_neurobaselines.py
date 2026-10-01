@@ -1,13 +1,13 @@
-"""Обучение нейробейзлайнов по тому же протоколу, что и МАЯК.
+r"""Обучение нейробейзлайнов по тому же протоколу, что и МАЯК.
 
 Эквивалентно `python scripts/train.py --arch <имя>` для каждого имени из --models:
-та же функция запуска (mayak.protocol.run_protocol), те же флаги протокола.
+та же функция запуска и те же флаги протокола.
 
 Запуск полный:
     python scripts/train_neurobaselines.py --accelerator gpu      # все: gru dlinear lru patchtst
     python scripts/train_neurobaselines.py --models lru patchtst --accelerator gpu
 Отладка:
-    python scripts/train_neurobaselines.py --models lru --steps-a 200 --steps-b 1000 \\
+    python scripts/train_neurobaselines.py --models lru --steps-a 200 --steps-b 1000 \
         --batch 32 --windows 2000 --workers 0 --accelerator cpu --precision 32 --val-every 200
 """
 import argparse

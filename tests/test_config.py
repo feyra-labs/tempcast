@@ -261,8 +261,11 @@ def test_hydra_run_tag_distinguishes_sweep_jobs():
 
 
 def _trained_like(m, seed=1):
-    """Сбить инициализацию: у свежей модели веса выхода голов нулевые, и часть входов
-    (паспорт, энергии групп) на выход ещё не влияет."""
+    """Сбить инициализацию.
+
+    У свежей модели веса выхода голов нулевые, и часть входов (паспорт, энергии групп) на выход ещё
+    не влияет.
+    """
     g = torch.Generator().manual_seed(seed)
     with torch.no_grad():
         for p in m.parameters():
@@ -397,8 +400,10 @@ def test_runtime_follows_model_config(flag):
 
 
 def test_runtime_state_size_follows_config_and_mismatch_fails():
-    """Состояние - только сырое окно: размер зависит от длины окна, а не от размеров
-    модели."""
+    """Состояние - только сырое окно.
+
+    Размер зависит от длины окна, а не от размеров модели.
+    """
     from mayak.runtime.streaming import StreamingMayak
     other = _model(ModelConfig(mode_groups=(ModeGroup("R", (3, 24)),), passport_dim=4))
     big = _model()

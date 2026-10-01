@@ -1,4 +1,4 @@
-# Протокол обучения: значения по умолчанию = mayak.protocol.DEFAULT_PROTOCOL.
+# Протокол обучения: значения совпадают с протоколом по умолчанию в коде.
 stages:
   - {name: A, curriculum: L0, steps: 10000}
   - {name: B, curriculum: full, steps: 200000}

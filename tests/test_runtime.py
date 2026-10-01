@@ -1,6 +1,6 @@
 """Тесты: рантайм на компилируемом языке.
 
-Что проверяется на стороне Python (сторона Rust - runtime-rs/tests/golden.rs):
+Что проверяется на стороне Python; сторону Rust проверяют тесты крейта рантайма:
 * шаг энкодера без состояния (step_shift) совпадает с кольцевым шагом и пакетным проходом;
 * графы (PyTorch и ONNX) в хосте на графах совпадают с потоковым рантаймом на
   PyTorch - на модели по умолчанию и на каждой абляции, дольше полного окна;
@@ -157,8 +157,10 @@ def _replay(model, golden, name, state_dir, onnx):
 
 @pytest.mark.parametrize("name", G.SCENARIOS)
 def test_golden_is_fresh(model, golden, name, tmp_path):
-    """Эталон воспроизводится текущим кодом хоста. Упало - поведение эталона изменилось:
-    пересоздать эталон скриптом и прогнать cargo test."""
+    """Эталон воспроизводится текущим кодом хоста.
+
+    Упало - поведение эталона изменилось: пересоздать эталон скриптом и прогнать cargo test.
+    """
     sc, err = _replay(model, golden, name, tmp_path, onnx=False)
     tol = G.Q_ATOL_INT8 if sc["precision"] == "int8" else G.FRESH_ATOL
     assert err <= tol, f"{name}: эталон устарел, max|Δq| = {err:.2e}"
@@ -166,8 +168,10 @@ def test_golden_is_fresh(model, golden, name, tmp_path):
 
 @pytest.mark.parametrize("name", G.SCENARIOS)
 def test_python_host_on_exported_graphs(model, golden, name, tmp_path):
-    """Хост на Python поверх закоммиченных графов проходит те же сценарии, что хост на
-    Rust, с теми же допусками."""
+    """Хост на Python поверх закоммиченных графов проходит эталонные сценарии.
+
+    Допуски те же, что у хоста на Rust.
+    """
     sc, err = _replay(model, golden, name, tmp_path, onnx=True)
     tol = G.Q_ATOL_INT8 if sc["precision"] == "int8" else G.Q_ATOL
     assert err <= tol, f"{name}: графы эталона расходятся с эталоном: {err:.2e}"

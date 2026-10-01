@@ -12,5 +12,12 @@ MAGNUS_B = 243.04
 
 
 def inv_softplus(y: torch.Tensor) -> torch.Tensor:
-    """x такой, что softplus(x) = y"""
+    """Обратная функция к softplus: сырой параметр, который даёт заданное значение.
+
+    Args:
+        y: положительные значения после softplus.
+
+    Returns:
+        Тензор той же формы.
+    """
     return torch.log(torch.expm1(y))

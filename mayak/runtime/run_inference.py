@@ -1,13 +1,13 @@
-"""Хост устройства на Python: построчный протокол на stdin, ответы JSON на stdout.
+r"""Хост устройства на Python: построчный протокол на stdin, ответы JSON на stdout.
 
 Протокол, формат и выбор файлов состояния, откат к климатологии точки - те же, что у
 компилируемого рантайма, и проверяются одними эталонными сценариями. Модель берётся
 либо из каталога экспорта графов ONNX, либо из чекпойнта PyTorch.
 
 Запуск:
-    python -m mayak.runtime.run_inference --model runtime/model \\
+    python -m mayak.runtime.run_inference --model runtime/model \
         --lat 52.37 --lon 4.90 --elev -2 --state-dir runtime --aci
-    python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt \\
+    python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt \
         --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2 --aci
 
 Команды: ``obs <секунды UTC> <T> <P> <RH>``, ``forecast [<секунды UTC>]``, ``status``.

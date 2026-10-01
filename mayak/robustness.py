@@ -1,4 +1,4 @@
-"""Робастность обученной модели без переобучения.
+r"""Робастность обученной модели без переобучения.
 
 Проверяется главное заявление проекта: при отказе входа прогноз деградирует плавно и не
 проваливается ниже того, что модель умеет без истории. Сценарий применяется на лету к
@@ -24,7 +24,7 @@
 
 Запуск::
 
-    python -m mayak.robustness --ckpt runs/mayak/stageB/best.ckpt \\
+    python -m mayak.robustness --ckpt runs/mayak/stageB/best.ckpt \
         --external-manifest data/ghcnh/manifest.csv
 """
 from __future__ import annotations
@@ -71,7 +71,15 @@ def _np(v):
 
 
 def load_config(path=None):
-    """YAML → ``RobustnessConfig``; None - ``conf/robustness/default.yaml``, если он есть."""
+    """Конфиг робастности из YAML.
+
+    Args:
+        path: путь к YAML; None - файл робастности по умолчанию из каталога конфигов,
+            если он есть, иначе значения по умолчанию.
+
+    Returns:
+        Конфиг робастности.
+    """
     path = path or (DEFAULT_CONFIG if os.path.exists(DEFAULT_CONFIG) else None)
     if path is None:
         return RobustnessConfig()
@@ -183,7 +191,18 @@ class RobustnessSet(Dataset):
 
 
 def base_eval_set(clims, manifest, cfg: RobustnessConfig, roles=None, time_key=None):
-    """Окна, на которых оцениваются все сценарии, уровни и модели."""
+    """Окна, на которых оцениваются все сценарии, уровни и модели.
+
+    Args:
+        clims: климатологии станций.
+        manifest: путь к манифесту.
+        cfg: конфиг робастности.
+        roles: роли станций; None - из конфига.
+        time_key: временное окно; None - из конфига.
+
+    Returns:
+        Набор окон оценки.
+    """
     return EvalSet(clims, station_splits=tuple(roles or cfg.roles), manifest=manifest,
                    time_key=time_key or cfg.time_key, every_hours=cfg.every_hours,
                    max_windows=None, windows_per_station=cfg.windows_per_station)
@@ -257,7 +276,14 @@ def skill_floor(row, tolerance):
 
 
 def add_excess(rows):
-    """ΔMAE относительно нулевого уровня и превышение ΔMAE над искажением цели."""
+    """Добавить рост MAE относительно нулевого уровня и превышение этого роста над искажением цели.
+
+    Args:
+        rows: строки сценария по уровням.
+
+    Returns:
+        Те же строки с новыми полями.
+    """
     ref = {(r["set"], r["scenario"], r["model"], r["lead"]): r["MAE"]
            for r in rows if r["level"] == 0.0}
     for r in rows:
@@ -545,6 +571,17 @@ def plot_scenario(rows, cfg, spec, out_dir, set_name="internal", model=MAIN_MODE
     Каждый лид - своя кривая. На панели скилла пунктиром того же цвета - порог проверки
     на этом лиде. Для смещения и дрейфа поверх штрихами - вариант, где искажён только
     вход.
+
+    Args:
+        rows: строки робастности.
+        cfg: конфиг робастности.
+        spec: сценарий.
+        out_dir: каталог картинок.
+        set_name: имя набора в имени файла.
+        model: модель на графике.
+
+    Returns:
+        Путь к картинке.
     """
     import matplotlib
     matplotlib.use("Agg")
@@ -600,6 +637,17 @@ def plot_summary(rows, cfg, out_dir, set_name="internal", model=MAIN_MODEL, lead
     Горизонтальные линии: скилл холодного старта модели на этом лиде и два порога -
     для отказа входа и для свойства прибора. Если холодный старт не хуже климатологии,
     пороги совпадают.
+
+    Args:
+        rows: строки робастности.
+        cfg: конфиг робастности.
+        out_dir: каталог картинок.
+        set_name: имя набора в имени файла.
+        model: модель на графике.
+        lead: лид, ч.
+
+    Returns:
+        Путь к картинке.
     """
     import matplotlib
     matplotlib.use("Agg")

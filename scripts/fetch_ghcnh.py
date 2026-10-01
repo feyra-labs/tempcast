@@ -1,4 +1,4 @@
-"""Скачивание наблюдений GHCNh (NOAA/NCEI) для внешнего теста.
+r"""Скачивание наблюдений GHCNh (NOAA/NCEI) для внешнего теста.
 
 Отбор станций по списку станций (координаты, страна, тип сети, явный список id),
 затем скачивание файлов по станциям. Скачанное кэшируется: готовый файл повторно
@@ -6,8 +6,8 @@
 докачивается с места обрыва (заголовок Range) из ``<файл>.part``; сетевые ошибки
 повторяются с экспоненциальной паузой. Журнал - ``<out>/download_log.csv``.
 
-Фильтр по длине ряда и наличию переменных применяется к скачанным данным в
-``scripts/make_ghcnh.py``: в списке станций периода наблюдений нет.
+Фильтр по длине ряда и наличию переменных применяется к скачанным данным командой
+``python scripts/make_ghcnh.py``: в списке станций периода наблюдений нет.
 
 Раскладка файлов (документация GHCNh 1.1.0):
   by-year: <base>/by-year/<ГОД>/<psv|parquet>/GHCNh_<ID>_<ГОД>.<psv|parquet>
@@ -15,7 +15,7 @@
 Зеркало в открытом реестре AWS (registry.opendata.aws/noaa-ghcnh) - через --base-url.
 
 Запуск:
-    python scripts/fetch_ghcnh.py --out data/ghcnh/raw --years 2015-2024 \\
+    python scripts/fetch_ghcnh.py --out data/ghcnh/raw --years 2015-2024 \
         --bbox 35 60 -10 40 --max-stations 300 --jobs 8
 """
 import argparse
@@ -44,7 +44,18 @@ class Absent(Exception):
 
 
 def file_urls(base, sid, layout, years=(), fmt="psv"):
-    """[(url, имя файла)] для станции."""
+    """Адреса и имена файлов станции.
+
+    Args:
+        base: базовый адрес архива.
+        sid: идентификатор станции.
+        layout: ``by-year`` - файлы по годам, ``por`` - один файл за весь период.
+        years: годы для раскладки по годам.
+        fmt: формат файлов: ``psv`` или ``parquet``.
+
+    Returns:
+        Список пар: адрес и имя файла.
+    """
     base = base.rstrip("/")
     if layout == "por":
         name = f"GHCNh_{sid}_por.psv"
@@ -62,7 +73,23 @@ def _open(url, start, timeout, open_url):
 
 def download(url, dest, retries=5, timeout=60, backoff=2.0, open_url=urllib.request.urlopen,
              sleep=time.sleep):
-    """Скачать url в dest с докачкой и повторами. Возвращает 'cached'|'absent'|'done'."""
+    """Скачать файл с докачкой и повторами.
+
+    Args:
+        url: адрес.
+        dest: путь к файлу назначения.
+        retries: число повторов после первой попытки.
+        timeout: таймаут запроса, с.
+        backoff: основание экспоненциальной паузы между повторами, с.
+        open_url: функция открытия адреса; подменяется в тестах.
+        sleep: функция паузы; подменяется в тестах.
+
+    Returns:
+        ``cached`` - файл уже был, ``absent`` - на сервере его нет, ``done`` - скачан.
+
+    Raises:
+        ConnectionError: файл не удалось скачать за все попытки.
+    """
     if os.path.exists(dest):
         return "cached"
     if os.path.exists(dest + ".absent"):
@@ -121,7 +148,21 @@ def parse_years(spec):
 
 def select_stations(df, bbox=None, countries=None, networks=None, ids=None, max_stations=None,
                     seed=0):
-    """Фильтр списка станций. bbox = (lat_min, lat_max, lon_min, lon_max)."""
+    """Отбор станций из списка.
+
+    Args:
+        df: список станций.
+        bbox: границы области: наименьшая и наибольшая широта, наименьшая и наибольшая
+            долгота.
+        countries: коды стран, первые два знака идентификатора.
+        networks: коды сетей, третий знак идентификатора.
+        ids: явный список идентификаторов.
+        max_stations: наибольшее число станций; лишние отбрасываются случайно.
+        seed: сид случайного отбора.
+
+    Returns:
+        Отобранные строки списка.
+    """
     sel = df
     if ids:
         sel = sel[sel["id"].isin(set(ids))]

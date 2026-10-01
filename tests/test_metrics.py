@@ -146,7 +146,7 @@ def test_summary_carries_window_and_station_counts():
 
 
 def test_bootstrap_zero_interval_on_degenerate_data():
-    """Все станции одинаковы → любой ресэмпл даёт то же число → интервал точка."""
+    """Все станции одинаковы, поэтому любой ресэмпл даёт то же число и интервал сжат в точку."""
     h = 4
     one = np.arange(h, dtype=np.float64)
     y = np.tile(one, (12, 1))
@@ -257,7 +257,7 @@ def test_pit_histogram_matches_expectation_on_calibrated_forecast():
 
 
 def test_pit_histogram_detects_overconfidence():
-    """Слишком узкие интервалы → хвостовые бины тяжелее ожидаемого."""
+    """Слишком узкие интервалы делают хвостовые бины тяжелее ожидаемого."""
     ev = _calibrated(seed=12)
     narrow = Evaluation(y=ev.y, mu=ev.mu, q=ev.mu[..., None] + 0.3 * (ev.q - ev.mu[..., None]),
                         mu_clim=ev.mu_clim, w=ev.w, station=ev.station)
@@ -553,7 +553,7 @@ def test_eval_set_subsample_is_stratified(store, manifest):
 
 
 def test_evaluation_from_eval_set_breakdowns_run(store, manifest):
-    """Сквозная проверка: окна → метаданные → разрезы, без модели."""
+    """Сквозная проверка без модели: от окон к метаданным и разрезам."""
     from mayak.evaluate import EvalSet, all_breakdowns
     from mayak.metrics import Evaluation as Ev
     ds = EvalSet(store.clims(), station_splits=(ROLE_TRAIN, ROLE_TEST), manifest=manifest,

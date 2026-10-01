@@ -1,4 +1,4 @@
-//! manifest.json, который пишет `mayak.runtime.graphs.export_graphs`. Все размеры
+//! manifest.json, который пишет экспорт графов модели. Все размеры
 //! хоста берутся отсюда, а не из констант: крейт работает с любой конфигурацией модели.
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -174,7 +174,8 @@ impl Manifest {
         ["T", "P", "RH"].map(|c| self.phys[c])
     }
 
-    /// Развёрнутая конформная таблица (horizon × NQ), если она экспортирована.
+    /// Развёрнутая по лидам конформная таблица, если она экспортирована.
+    /// Строка на каждый час горизонта, в строке по значению на квантиль.
     pub fn conformal_table(&self) -> Result<Option<Vec<f32>>> {
         let Some(name) = &self.calibration.conformal else {
             return Ok(None);

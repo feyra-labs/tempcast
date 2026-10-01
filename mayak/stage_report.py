@@ -197,7 +197,15 @@ def field_metrics(pred, aux, seed=0, n_boot=N_BOOT, leads=REPORT_LEADS, n_worst=
 
 
 def skill_at(entry, lead):
-    """Скилл записи отчёта на лиде или None, если лида нет в таблице."""
+    """Скилл записи отчёта на лиде.
+
+    Args:
+        entry: запись отчёта о чекпойнте.
+        lead: лид, ч.
+
+    Returns:
+        Скилл или None, если лида нет в таблице.
+    """
     for row in (entry or {}).get("by_lead", []):
         if row.get("lead") == lead:
             return row.get("Skill")
@@ -272,7 +280,12 @@ def build_field_report(items, dataset, arch, stage, device="cpu", seed=0, thresh
 
 
 def write_report(path, report):
-    """Записывает отчёт в JSON атомарно."""
+    """Записать отчёт в JSON атомарно.
+
+    Args:
+        path: путь к файлу.
+        report: отчёт.
+    """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
@@ -281,7 +294,14 @@ def write_report(path, report):
 
 
 def read_report(path):
-    """Отчёт из JSON."""
+    """Отчёт из JSON.
+
+    Args:
+        path: путь к файлу.
+
+    Returns:
+        Отчёт.
+    """
     with open(path) as f:
         return json.load(f)
 

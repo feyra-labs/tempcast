@@ -1,12 +1,12 @@
-"""Замеры рантайма на устройстве - один воспроизводимый прогон.
+r"""Замеры рантайма на устройстве - один воспроизводимый прогон.
 
     cargo build --release --manifest-path runtime-rs/Cargo.toml
-    python scripts/bench_device.py --ckpt runs/mayak/stageB/best.ckpt \\
+    python scripts/bench_device.py --ckpt runs/mayak/stageB/best.ckpt \
         --manifest data/manifest.csv --out-dir runs/bench_device
 
 Что меряется (всё на одном устройстве, на одних и тех же входах, 1 поток):
 * задержка потактового шага и выпуска прогноза: медиана, p95, p99 на длинном прогоне -
-  для Rust fp32, Rust int8, эталонного Python (PyTorch, StreamingMayak) и Python +
+  для Rust fp32, Rust int8, эталонного потокового рантайма на PyTorch и Python с
   ONNX Runtime (те же графы, что у Rust; отделяет выигрыш от языка хоста и от движка);
 * пиковая резидентная память процесса (каждая реализация - в отдельном процессе);
 * размер бинарника, размер модели fp32 и int8, размер состояния - точным числом байт;
@@ -35,8 +35,11 @@ PCTL = (0.50, 0.95, 0.99)
 
 
 def peak_rss_bytes():
-    """Пиковый RSS процесса. None там, где нет resource (Windows): замер идёт на
-    устройстве, а Windows не целевая платформа, но --help должен работать везде."""
+    """Пиковый RSS процесса.
+
+    None там, где нет resource (Windows): замер идёт на устройстве, а Windows не целевая платформа,
+    но --help должен работать везде.
+    """
     try:
         import resource
     except ImportError:
@@ -45,7 +48,15 @@ def peak_rss_bytes():
 
 
 def percentile(v, p):
-    """Ближайший ранг - та же формула, что в mayak-rt bench."""
+    """Процентиль методом ближайшего ранга.
+
+    Args:
+        v: значения.
+        p: процентиль от 0 до 100.
+
+    Returns:
+        Значение процентиля; NaN для пустого набора.
+    """
     s = np.sort(np.asarray(v, np.float64))
     if s.size == 0:
         return float("nan")
@@ -76,7 +87,11 @@ def start_hour():
 # --------------------------------------------------------------------------- Python-воркер
 
 def worker(args):
-    """Отдельный процесс: одна реализация на Python, замер задержек и пиковой памяти."""
+    """Отдельный процесс: одна реализация на Python, замер задержек и пиковой памяти.
+
+    Args:
+        args: аргументы командной строки замера.
+    """
     import torch
     torch.set_num_threads(1)
     model = load_model(args.ckpt)
@@ -146,7 +161,15 @@ def run_rust(args, precision, dump):
 # --------------------------------------------------------------------------- метрики int8
 
 def int8_metrics(args, model):
-    """Метрики fp32 и int8 на тестовой выборке через графы ONNX (путь устройства)."""
+    """Метрики fp32 и int8 на тестовой выборке через графы ONNX, как на устройстве.
+
+    Args:
+        args: аргументы командной строки замера.
+        model: модель МАЯК.
+
+    Returns:
+        Словарь метрик по точностям.
+    """
     import torch
     from mayak.data.store import get_store
     from mayak.evaluate import EvalSet

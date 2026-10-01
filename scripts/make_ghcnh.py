@@ -1,10 +1,10 @@
-"""Сборка набора внешнего теста из скачанных наблюдений GHCNh.
+r"""Сборка набора внешнего теста из скачанных наблюдений GHCNh.
 
-Скачанные файлы (scripts/fetch_ghcnh.py) → разбор T, Td, станционного давления и
-их штатных кодов качества → почасовая сетка без интерполяции (ближайший к целому
-часу отчёт в пределах допуска) → влажность из T и Td формулой модели →
-<out>/stations/<id>.npz + <out>/manifest.csv (роль external_test) +
-<out>/selection_report.csv.
+Файлы скачивает ``python scripts/fetch_ghcnh.py``. Сборка разбирает T, Td,
+станционное давление и их штатные коды качества, кладёт их на почасовую сетку без
+интерполяции - берётся ближайший к целому часу отчёт в пределах допуска - и считает
+влажность из T и Td по формуле Магнуса. Результат: <out>/stations/<id>.npz,
+<out>/manifest.csv с ролью external_test и <out>/selection_report.csv.
 
 Метаданные станции:
   * координаты - из списка станций;
@@ -24,11 +24,11 @@
 сборка кэша откажется работать, если этот код потом изменится, а набор не
 пересоберут.
 
-Затем - кэш и QC тем же модулем, что для обучения:
+Затем - кэш и QC той же командой, что для обучения:
     python scripts/build_cache.py --manifest data/ghcnh/manifest.csv
 
 Запуск:
-    python scripts/make_ghcnh.py --raw data/ghcnh/raw --out data/ghcnh \\
+    python scripts/make_ghcnh.py --raw data/ghcnh/raw --out data/ghcnh \
         --koppen Beck_KG_V1_present_0p0083.tif --dem open-meteo
 """
 import argparse

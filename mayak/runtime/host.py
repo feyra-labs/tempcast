@@ -96,7 +96,13 @@ class StateStore:
         return [(f, raw) for _, f, raw in out]
 
     def mark_restored(self, path):
-        """Следующая запись идёт в другой файл, чтобы восстановленный остался целым."""
+        """Отметить восстановленный файл: следующая запись идёт в другой.
+
+        Так восстановленное состояние остаётся целым до конца следующей записи.
+
+        Args:
+            path: путь к восстановленному файлу.
+        """
         self.toggle = 1 if os.path.abspath(path) == os.path.abspath(self.files[0]) else 0
 
     def save(self, data):

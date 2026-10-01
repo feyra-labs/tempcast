@@ -254,7 +254,16 @@ def evaluations(preds, aux):
 
 
 def build_tables(preds, aux, leads=FINE_LEADS):
-    """Пуловые таблицы по лидам - вход для графиков ``plot_metric_curves``."""
+    """Пуловые таблицы метрик по лидам - вход для графиков кривых метрик.
+
+    Args:
+        preds: словарь: имя модели и её медиана и квантили.
+        aux: факт, маска факта и прогноз климатологии.
+        leads: лиды таблиц.
+
+    Returns:
+        Словарь: имя модели и таблица по лидам.
+    """
     y, w, muc = aux["y"], aux["y_mask"], aux["mu_clim"]
     return {name: metric_table(y, p["mu"], p["q"], muc, w, leads=leads)
             for name, p in preds.items()}
@@ -386,7 +395,12 @@ def print_breakdowns(rows_by_dim):
 
 
 def print_reliability(ev, lead_bins=LEAD_BINS):
-    """Гистограмма PIT (по всему горизонту и по бинам лидов), надёжность, острота."""
+    """Печать гистограммы PIT по всему горизонту и по бинам лидов, надёжности и остроты.
+
+    Args:
+        ev: оценка одной модели.
+        lead_bins: бины лидов.
+    """
     pit = ev.pit_histogram()
     edges = ["<q05"] + [f"q{int(100 * Q[i]):02d}-q{int(100 * Q[i + 1]):02d}"
                         for i in range(NQ - 1)] + [">q95"]
@@ -435,7 +449,20 @@ def koppen_per_window(ds):
 
 def zone_breakdown(preds, aux, koppen=None, leads=(24, 72), model="МАЯК",
                    min_windows=MIN_WINDOWS, min_stations=MIN_STATIONS):
-    """Разрез по полным зонам Кёппена для одной модели: {зона: {лид: сводка}}."""
+    """Разрез одной модели по полным зонам Кёппена.
+
+    Args:
+        preds: словарь: имя модели и её медиана и квантили.
+        aux: факт, маска факта, прогноз климатологии и метаданные окон.
+        koppen: зона каждого окна; None - из метаданных.
+        leads: лиды разреза.
+        model: имя модели.
+        min_windows: страта с меньшим числом окон не показывается.
+        min_stations: страта с меньшим числом станций не показывается.
+
+    Returns:
+        Словарь: зона, затем лид - сводка.
+    """
     ev = evaluation_for(preds[model], aux)
     keys = aux["meta"]["zone"] if koppen is None else np.asarray(koppen)
     out = {}
@@ -495,7 +522,16 @@ def plot_metric_curves(tables, out_dir="runs/plots"):
 
 
 def plot_reliability(ev, out_dir="runs/plots", name="МАЯК"):
-    """Диаграмма надёжности и кривая «острота против покрытия» одной картинкой."""
+    """Диаграмма надёжности и кривая «острота против покрытия» одной картинкой.
+
+    Args:
+        ev: оценка одной модели.
+        out_dir: каталог картинок.
+        name: имя модели в заголовке и имени файла.
+
+    Returns:
+        Путь к картинке.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -795,7 +831,15 @@ def history_predictions(bench):
 
 
 def calibration_config(ci, bootstrap):
-    """Настройки анализа калибровки с параметрами бутстрапа стенда оценки."""
+    """Настройки анализа калибровки с параметрами бутстрапа стенда оценки.
+
+    Args:
+        ci: считать ли интервалы бутстрапа.
+        bootstrap: число повторов и сид бутстрапа.
+
+    Returns:
+        Конфиг калибровки; без интервалов - с нулевым числом повторов.
+    """
     from dataclasses import replace
 
     from mayak.calibration import load_config
@@ -1003,7 +1047,18 @@ def coldstart_L0_check(model, ds):
 
 def stage_a_field_check(model, clims, manifest="data/manifest.csv",
                         station_split="unseen_val", time_key="val"):
-    """Критерий этапа A"""
+    """Критерий этапа A: поле без истории против климатологии станций.
+
+    Args:
+        model: модель МАЯК.
+        clims: климатологии станций.
+        manifest: путь к манифесту.
+        station_split: роль станций проверки.
+        time_key: временное окно проверки.
+
+    Returns:
+        Словарь: ошибка поля, ошибка климатологии, их отношение и средний сдвиг.
+    """
     ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest,
                  time_key=time_key, L=0)
     D = gather(model, ds)
@@ -1029,7 +1084,18 @@ def stage_a_field_check(model, clims, manifest="data/manifest.csv",
 @torch.no_grad()
 def pure_field_check(model, clims, manifest="data/manifest.csv",
                      station_split="unseen_val", time_key="val"):
-    """Чистое поле: field.coefficients(loc) БЕЗ паспорта (z=None) и БЕЗ r-головы."""
+    """Критерий этапа A для чистого поля: без паспорта и без поправки голов.
+
+    Args:
+        model: модель МАЯК.
+        clims: климатологии станций.
+        manifest: путь к манифесту.
+        station_split: роль станций проверки.
+        time_key: временное окно проверки.
+
+    Returns:
+        Словарь того же вида, что у критерия этапа A.
+    """
     from mayak.astro import astro_features
     ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest,
                  time_key=time_key, L=0)

@@ -1,3 +1,4 @@
 # @package model.ablations
-# Абляция «no_anchor» (mayak.config.Ablations). Только для model=mayak*.
+# Абляция «no_anchor»: прогноз без климат-поля, климатический уровень и разброс - общие обучаемые константы.
+# Только для model=mayak*.
 no_anchor: true

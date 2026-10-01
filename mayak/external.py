@@ -104,7 +104,18 @@ def station_attributes(stations, train_km=None):
 
 
 def zone_keys(zones, level="group"):
-    """Метки зон окон для сопоставления: крупная группа A-E либо полная зона."""
+    """Метки зон окон для сопоставления наборов.
+
+    Args:
+        zones: зона каждого окна.
+        level: ``group`` - крупная группа зон, ``full`` - полная зона.
+
+    Returns:
+        Массив меток.
+
+    Raises:
+        ValueError: неизвестный уровень.
+    """
     if level == "group":
         return np.array([koppen_group(z) for z in zones], object)
     if level == "full":
@@ -117,7 +128,18 @@ def _n_stations(ev, sel):
 
 
 def common_zones(ev_int, z_int, ev_ext, z_ext, min_stations=2):
-    """Зоны, в которых не меньше min_stations станций и во внутреннем, и во внешнем наборе."""
+    """Зоны, где достаточно станций и во внутреннем, и во внешнем наборе.
+
+    Args:
+        ev_int: оценка на внутреннем наборе.
+        z_int: зона каждого окна внутреннего набора.
+        ev_ext: оценка на внешнем наборе.
+        z_ext: зона каждого окна внешнего набора.
+        min_stations: наименьшее число станций зоны в каждом наборе.
+
+    Returns:
+        Список зон по алфавиту.
+    """
     out = []
     for z in sorted(set(z_int.tolist()) & set(z_ext.tolist())):
         if (_n_stations(ev_int, z_int == z) >= min_stations
@@ -128,7 +150,23 @@ def common_zones(ev_int, z_int, ev_ext, z_ext, min_stations=2):
 
 def transfer_table(ev_int, zones_int, ev_ext, zones_ext, leads=TRANSFER_LEADS, level="group",
                    min_stations=2, n_boot=1000, seed=0, ci_level=0.90):
-    """Внутренний тест против внешнего на одинаковых лидах и общих зонах."""
+    """Внутренний тест против внешнего на одинаковых лидах и общих зонах.
+
+    Args:
+        ev_int: оценка на внутреннем наборе.
+        zones_int: зона каждого окна внутреннего набора.
+        ev_ext: оценка на внешнем наборе.
+        zones_ext: зона каждого окна внешнего набора.
+        leads: лиды сравнения.
+        level: уровень зон: ``group`` или ``full``.
+        min_stations: наименьшее число станций зоны в каждом наборе.
+        n_boot: число повторов бутстрапа.
+        seed: сид бутстрапа.
+        ci_level: уровень интервалов.
+
+    Returns:
+        Словарь: общие зоны, уровень зон и строки сравнения.
+    """
     zi, ze = zone_keys(zones_int, level), zone_keys(zones_ext, level)
     zones = common_zones(ev_int, zi, ev_ext, ze, min_stations)
     rows = {}

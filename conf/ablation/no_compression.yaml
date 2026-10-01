@@ -1,3 +1,4 @@
 # @package model.ablations
-# Абляция «no_compression» (mayak.config.Ablations). Только для model=mayak*.
+# Абляция «no_compression»: без доказательного сжатия: считывание мод нормируется только массой свидетельств.
+# Только для model=mayak*.
 no_compression: true

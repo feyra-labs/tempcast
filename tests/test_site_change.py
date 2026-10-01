@@ -76,8 +76,11 @@ def test_longitude_gap_is_the_short_arc():
 
 
 def test_refined_site_equals_runtime_started_at_new_site(model, caplog):
-    """Уточнение на 0.3 градуса: всё модельное состояние пересчитывается для новой точки,
-    выпуск совпадает с рантаймом, который с начала работал с новыми координатами."""
+    """Уточнение на 0.3 градуса.
+
+    Всё модельное состояние пересчитывается для новой точки, выпуск совпадает с рантаймом, который с
+    начала работал с новыми координатами.
+    """
     s = synthetic_series(900, seed=81)
     cut = 760
     old = _feed(StreamingMayak(model, *AMS), s, 0, cut)
@@ -152,8 +155,10 @@ def test_state_without_steps_on_moved_site(model):
 
 
 def test_first_obs_after_move_outranks_old_site_file(model, tmp_path):
-    """После переноса первое же наблюдение даёт состояние свежее файла старой точки,
-    поэтому следующий перезапуск не вернётся к чужой истории."""
+    """После переноса первое же наблюдение даёт состояние свежее файла старой точки.
+
+    Поэтому следующий перезапуск не вернётся к чужой истории.
+    """
     s = synthetic_series(60, seed=87)
     host = Host(StreamingMayak(model, *AMS), StateStore(tmp_path))
     for k in range(40):
@@ -168,8 +173,10 @@ def test_first_obs_after_move_outranks_old_site_file(model, tmp_path):
 
 
 def test_new_hours_use_current_elevation(model):
-    """После уточнения высоты проверка давления на уровне моря решает о новых часах по
-    новой высоте. На 700 м давление 970 гПа станционное, на 790 м - уже нет."""
+    """После уточнения высоты проверка давления на уровне моря решает о новых часах по новой высоте.
+
+    На 700 м давление 970 гПа станционное, на 790 м - уже нет.
+    """
     s = synthetic_series(120, seed=89, p_valid=1.0)
     s["x"][:, 1] = 970.0 + 1.2 * np.sin(np.arange(120) / 30.0)
     low = _feed(StreamingMayak(model, 46.95, 7.45, 700.0), s, 0, 100)
@@ -196,8 +203,10 @@ def test_runtime_yaml_matches_dataclass():
 
 
 def test_thresholds_travel_in_manifest(model, tmp_path):
-    """Экспорт пишет пороги в манифест, рантайм на графах берёт их оттуда: с порогом
-    широты 0.1 градуса сдвиг на 0.3 - уже перенос."""
+    """Экспорт пишет пороги в манифест, рантайм на графах берёт их оттуда.
+
+    С порогом широты 0.1 градуса сдвиг на 0.3 - уже перенос.
+    """
     tight = RuntimeConfig(site_max_dlat_deg=0.1)
     out = str(tmp_path / "m")
     man = export_graphs(model, out, runtime=tight)

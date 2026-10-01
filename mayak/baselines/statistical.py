@@ -172,7 +172,6 @@ def damped_persistence_forecast(a_recent, mu_clim_fut, sigma_clim, r, valid=None
     Returns:
         Пара: медиана формы (B, H) и квантили формы (B, H, nq).
     """
-
     a = np.asarray(a_recent, np.float32)[:, None]
     r = np.broadcast_to(np.asarray(r, np.float32)[None, :], (a.shape[0], len(r)))
     if valid is not None:
@@ -199,7 +198,6 @@ def seasonal_naive_forecast(x_hist, mask_hist, mu_clim_fut, sigma_clim, period=2
     Returns:
         Пара: медиана формы (B, H) и квантили формы (B, H, nq).
     """
-
     B, Lh = x_hist.shape[:2]
     D = Lh // period
     T = x_hist[:, Lh - D * period:, 0].reshape(B, D, period)[:, ::-1]

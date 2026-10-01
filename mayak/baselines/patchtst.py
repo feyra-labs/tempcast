@@ -184,7 +184,15 @@ class PatchTST(nn.Module):
         return (x - mean) / std * m, m, mean, std
 
     def encode(self, batch):
-        """Представления патчей формы (B, n_patches, d_model), среднее и разброс окна."""
+        """Представления патчей, среднее и разброс окна.
+
+        Args:
+            batch: батч.
+
+        Returns:
+            Тройка: представления формы (B, число патчей, d_model), среднее и разброс
+            окна.
+        """
         z, m, mean, std = self.normalize(batch)
         c = self.cfg
         p = make_patches(torch.stack([z, m], -1), c.patch_len, c.stride, c.padding_patch)

@@ -1,4 +1,4 @@
-# Данные: значения по умолчанию = mayak.config.DataConfig().
+# Данные: значения совпадают с конфигом данных в коде по умолчанию.
 manifest: data/manifest.csv
 cache_root: null
 time_layout:

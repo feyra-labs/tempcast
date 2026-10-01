@@ -272,8 +272,10 @@ def _history(model, x, m, t0):
 
 
 def test_edge_features_depend_on_window_start_tail_features_do_not(model):
-    """Почему край пересчитывается при выпуске: у пакета признаки ранних часов окна
-    зависят от того, что было до окна, у поздних - нет."""
+    """Почему край пересчитывается при выпуске.
+
+    У пакета признаки ранних часов окна зависят от того, что было до окна, у поздних - нет.
+    """
     cfg = model.cfg
     s = synthetic_series(L_MAX + 200, seed=21, p_valid=1.0)
     x, m = s["x"], s["m"]
@@ -335,8 +337,10 @@ def test_full_forecast_short_history(model, end):
 
 
 def test_long_run_random_hours_error_does_not_grow(record_property):
-    """Выпуски в случайные часы ряда длиной десять тысяч часов: расхождение с пакетом
-    в допуске и не растёт со временем."""
+    """Выпуски в случайные часы ряда длиной десять тысяч часов.
+
+    Расхождение с пакетом в допуске и не растёт со временем.
+    """
     m = _model(ModelConfig(**TINY))
     rep = divergence(m, n_issues=12, hours=10_000, seed=3)
     errs = np.array([e for _, e in rep["batch_stream_by_issue"]])
@@ -354,8 +358,10 @@ def _mode_error(st):
 
 
 def test_resync_bounds_rounding_error(monkeypatch):
-    """Без пересинхронизации ошибка скользящей суммы остаётся малой и не растёт;
-    пересинхронизация обнуляет её раз в сутки."""
+    """Без пересинхронизации ошибка скользящей суммы остаётся малой и не растёт.
+
+    Пересинхронизация обнуляет её раз в сутки.
+    """
     m = _model(ModelConfig(**TINY))
     s = synthetic_series(4000, seed=12)
     monkeypatch.setattr(S, "RESYNC_HOURS", 10 ** 9)
@@ -399,8 +405,10 @@ def test_restart_at_any_hour_equals_continuous_run(model, cut):
 
 
 def test_restart_keeps_quality_control_decisions(model):
-    """Кольцо контроля качества после перезапуска видит отбракованные значения так же,
-    как непрерывный прогон: решения о следующих часах не меняются."""
+    """Кольцо контроля качества после перезапуска видит отбракованные значения так же.
+
+    Как непрерывный прогон: решения о следующих часах не меняются.
+    """
     s = synthetic_series(400, seed=14, p_valid=1.0)
     s["x"][250:330, 0] = 7.0
     s["x"][250:330, 2] = 64.0

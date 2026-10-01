@@ -1,4 +1,4 @@
-"""Калибровка интервалов обученной модели.
+r"""Калибровка интервалов обученной модели.
 
 Всё считается по уже собранным предсказаниям, модель здесь не запускается.
 
@@ -22,8 +22,8 @@
 
 Запуск::
 
-    python -m mayak.calibration --preds runs/preds/internal.npz \\
-        --history-preds runs/preds/internal_history.npz \\
+    python -m mayak.calibration --preds runs/preds/internal.npz \
+        --history-preds runs/preds/internal_history.npz \
         --external-preds runs/preds/external.npz --out-dir runs/calibration
 """
 from __future__ import annotations
@@ -57,7 +57,15 @@ FORMAT_VERSION = 1
 
 
 def load_config(path=None):
-    """YAML → ``CalibrationConfig``; None - ``conf/calibration/default.yaml``, если есть."""
+    """Конфиг калибровки из YAML.
+
+    Args:
+        path: путь к YAML; None - файл калибровки по умолчанию из каталога конфигов,
+            если он есть, иначе значения по умолчанию.
+
+    Returns:
+        Конфиг калибровки.
+    """
     path = path or (DEFAULT_CONFIG if os.path.exists(DEFAULT_CONFIG) else None)
     if path is None:
         return CalibrationConfig()
@@ -67,11 +75,18 @@ def load_config(path=None):
 
 
 def save_predictions(path, preds, aux, shift=None, info=None):
-    """Предсказания всех моделей и всё, что нужно для оценки без модели, → .npz.
+    """Сохранить предсказания всех моделей и всё, что нужно для оценки без модели.
 
-    preds - {имя: dict(mu, q)} до калибровки; aux - y, y_mask, mu_clim, meta (выход
-    ``mayak.evaluate.collect_predictions``); shift - конформная таблица, с которой
-    велась оценка (сохраняется, чтобы анализ применил ту же самую).
+    Args:
+        path: путь к файлу npz.
+        preds: словарь: имя модели и её медиана и квантили до калибровки.
+        aux: факт, маска факта, прогноз климатологии и метаданные окон.
+        shift: конформная таблица, с которой велась оценка; сохраняется, чтобы анализ
+            применил ту же самую.
+        info: дополнительные сведения о прогоне.
+
+    Returns:
+        Путь к записанному файлу.
     """
     names = list(preds)
     arrays = dict(y=np.asarray(aux["y"], np.float32), y_mask=np.asarray(aux["y_mask"], np.float32),
@@ -94,7 +109,18 @@ def save_predictions(path, preds, aux, shift=None, info=None):
 
 
 def load_predictions(path):
-    """.npz ``save_predictions`` → (preds, aux, shift, info)."""
+    """Прочитать сохранённые предсказания.
+
+    Args:
+        path: путь к файлу npz.
+
+    Returns:
+        Четвёрка: предсказания моделей, вспомогательные массивы, конформная таблица или
+        None и сведения о прогоне.
+
+    Raises:
+        ValueError: файл другой версии формата.
+    """
     with np.load(path, allow_pickle=False) as z:
         header = json.loads(str(z["header"]))
         if header.get("format") != FORMAT_VERSION:
@@ -148,7 +174,19 @@ def _coverage(ev, nominal):
 
 
 def coverage_row(ev, nominal=0.9, n_boot=0, seed=0, level=0.90):
-    """Покрытие одной страты: все центральные интервалы, хвосты, ширина, интервал."""
+    """Покрытие одной страты.
+
+    Args:
+        ev: оценка страты.
+        nominal: номинал разбираемого интервала.
+        n_boot: число повторов бутстрапа; 0 - без интервалов.
+        seed: сид бутстрапа.
+        level: уровень интервалов бутстрапа.
+
+    Returns:
+        Словарь: число окон, станций и пар, покрытие, доли промахов ниже и выше, ширина,
+        макро-покрытие, покрытие всех центральных интервалов и интервалы бутстрапа.
+    """
     prof = {r["nominal"]: r for r in ev.sharpness_coverage()}
     main = prof[round(nominal, 6)]
     metric = f"PICP{int(round(100 * nominal))}"
@@ -164,7 +202,10 @@ def coverage_row(ev, nominal=0.9, n_boot=0, seed=0, level=0.90):
 
 
 def _outside(value, ref, ci, tol):
-    """Существенно (дальше допуска) и значимо (интервал не содержит ref) отличается."""
+    """Отличается ли значение от отсчёта и существенно, и значимо.
+
+    Существенно - дальше допуска, значимо - интервал бутстрапа отсчёт не содержит.
+    """
     if not abs(value - ref) > tol:
         return False
     lo, hi = ci
@@ -174,7 +215,18 @@ def _outside(value, ref, ci, tol):
 
 
 def verdict(row, nominal, overall, tol):
-    """Вердикты страты: мимо номинала / отличается от набора / характер промаха."""
+    """Вердикты страты.
+
+    Args:
+        row: строка покрытия страты.
+        nominal: номинал интервала.
+        overall: покрытие всего набора.
+        tol: допуск отклонения покрытия.
+
+    Returns:
+        Словарь: мимо номинала и в какую сторону или None; отличается ли от набора;
+        характер промаха - широкий, узкий или сдвиг вниз либо вверх.
+    """
     cov = row["coverage"]
     off = _outside(cov, nominal, row["ci"], tol)
     het = _outside(cov, overall, row["ci"], tol)
@@ -386,7 +438,17 @@ def print_gate(gate):
 
 
 def sharpness_curves(evs, cfg=None, lead_bins=LEAD_BINS):
-    """{модель: {панель: кривая + ширина при фактическом покрытии номинала}}."""
+    """Кривые «острота против покрытия» всех моделей.
+
+    Args:
+        evs: словарь: имя модели и её оценка.
+        cfg: конфиг калибровки; None - по умолчанию.
+        lead_bins: бины лидов для отдельных панелей.
+
+    Returns:
+        Словарь: модель, затем панель - кривая, покрытие и ширина выхода модели как
+        есть и ширина при фактическом покрытии, равном номиналу.
+    """
     cfg = cfg or CalibrationConfig()
     scales = sharpness_scales(*cfg.sharpness_range, cfg.sharpness_points)
     out = {}
@@ -440,7 +502,17 @@ def plot_sharpness(curves, out_dir, set_name="internal", nominal=0.9):
 
 
 def plot_coverage_strata(report, out_dir, set_name="internal", model=MAIN_MODEL):
-    """Точечный график PICP страт с интервалами бутстрапа по всем разрезам."""
+    """Точечный график покрытия страт с интервалами бутстрапа по всем разрезам.
+
+    Args:
+        report: отчёт о покрытии.
+        out_dir: каталог картинок.
+        set_name: имя набора в имени файла.
+        model: модель, покрытие которой показывается.
+
+    Returns:
+        Путь к картинке.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -480,11 +552,19 @@ def plot_coverage_strata(report, out_dir, set_name="internal", model=MAIN_MODEL)
 
 
 def served_pairs(station, t, horizon):
-    """Пары (окно, индекс лида), которые прибор проверил бы по своим прогнозам.
+    """Пары окна и лида, которые прибор проверил бы по своим прогнозам.
 
-    Окна одной станции упорядочиваются по времени; прогноз окна i действует до выпуска
-    следующего: лиды 1 … min(H, t_{i+1} − t_i); у последнего окна - весь горизонт.
-    Возвращает индексы окон и лидов, упорядоченные по (станция, время).
+    Окна одной станции упорядочиваются по времени. Прогноз окна действует до выпуска
+    следующего: берутся лиды с первого до промежутка между выпусками, но не дальше
+    горизонта. У последнего окна станции - весь горизонт.
+
+    Args:
+        station: станция каждого окна.
+        t: момент выпуска каждого окна, часы.
+        horizon: длина горизонта, ч.
+
+    Returns:
+        Пара массивов: номера окон и номера лидов, упорядоченные по станции и времени.
     """
     station = np.asarray(station).astype(str)
     t = np.asarray(t, np.int64)
@@ -503,11 +583,25 @@ def served_pairs(station, t, horizon):
 
 
 def aci_replay(ev, meta, params, lead_bins=LEAD_BINS):
-    """Офлайн-прогон ACI по окнам оценки (оценка уже со сплит-конформной поправкой).
+    """Офлайн-прогон адаптивной калибровки по окнам оценки.
 
-    На каждой станции θ стартует с нуля. Возвращает сводки «без ACI» (θ = 0 - то, что
-    прибор выдал бы без подстройки) и «с ACI» по всему потоку, бинам лидов и ролям,
-    распределение покрытия по станциям и траекторию θ.
+    Оценка приходит уже со сплит-конформной поправкой. На каждой станции параметр
+    стартует с нуля.
+
+    Args:
+        ev: оценка модели после конформной поправки.
+        meta: метаданные окон; нужны станция, роль и момент выпуска.
+        params: параметры адаптивной калибровки.
+        lead_bins: бины лидов для сводок.
+
+    Returns:
+        Словарь: сводки без подстройки - то, что прибор выдал бы с нулевым параметром, -
+        и с подстройкой по всему потоку, бинам лидов и ролям, распределение покрытия по
+        станциям и траектория параметра.
+
+    Raises:
+        KeyError: в метаданных нет момента выпуска.
+        ValueError: нет ни одной валидной пары окна и лида.
     """
     if "t" not in meta:
         raise KeyError("в метаданных окон нет времени начала 't' - пересохраните "
@@ -516,7 +610,7 @@ def aci_replay(ev, meta, params, lead_bins=LEAD_BINS):
     ok = ev.w[win, lead] > 0
     win, lead = win[ok], lead[ok]
     if not len(win):
-        raise ValueError("ACI: нет ни одной валидной пары «окно × лид» для прогона")
+        raise ValueError("ACI: нет ни одной валидной пары окна и лида для прогона")
     i, j = params.interval
     q = np.asarray(ev.q, np.float64)[win, lead]
     score = aci_score(np.asarray(ev.y, np.float64)[win, lead], q, (i, j))
@@ -808,7 +902,14 @@ def analyze(preds, aux, shift=None, cfg=None, external=False, model=MAIN_MODEL,
 
 
 def jsonable(o):
-    """Результаты анализа → строгий JSON: массивы - списки, NaN/inf - null."""
+    """Результаты анализа в виде строгого JSON.
+
+    Args:
+        o: любое значение из словарей, списков, массивов и чисел.
+
+    Returns:
+        То же значение, где массивы стали списками, а не конечные числа - None.
+    """
     if isinstance(o, dict):
         return {str(k): jsonable(v) for k, v in o.items()}
     if isinstance(o, (list, tuple)):

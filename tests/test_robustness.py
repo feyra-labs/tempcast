@@ -147,8 +147,10 @@ def test_scenario_and_augmentation_with_same_parameters_give_same_window(L):
 
 
 def test_small_input_offset_shifts_recorded_history_like_a_real_sensor(base):
-    """Перед сценарием, искажающим значения, записи возвращается непрерывность: смещение
-    на 0.3 градуса сдвигает среднюю запись истории на 0.3, цель не трогает."""
+    """Перед сценарием, искажающим значения, записи возвращается непрерывность.
+
+    Смещение на 0.3 градуса сдвигает среднюю запись истории на 0.3, цель не трогает.
+    """
     ds = _rset(base, "offset_input", 0.3)
     d = []
     for i in range(len(base)):
@@ -312,8 +314,10 @@ STATIONS = [("t0", ROLE_TRAIN, 52.0, "Cfb"), ("t1", ROLE_TRAIN, 48.0, "Dfb"),
 
 
 def _write_station(root, sid, seed, n=N_HOURS):
-    """Суточный ход + синоптическая AR(1)-аномалия (память есть - персистентность полезна)
-    + редкие пропуски по каналам."""
+    """Суточный ход, синоптическая аномалия с памятью и редкие пропуски по каналам.
+
+    Память в аномалии есть, поэтому персистентность полезна.
+    """
     rng = np.random.default_rng(seed)
     h = np.arange(n)
     rho = np.exp(-1 / 48)
@@ -369,9 +373,12 @@ def _rset(base, name, level, qc="device", params=None):
 @pytest.mark.parametrize("qc", ["device"])
 @pytest.mark.parametrize("name", ALL)
 def test_zero_level_dataset_equals_eval_set(base, name, qc):
-    """Нулевой параметр на полном пути (сценарий → инвариант → QC → батч): тот же батч,
-    что у EvalSet, до бита - включая пересчитанную по истории недавнюю аномалию.
-    Добавляется только эталон скилла, и на нулевом уровне он равен климатологии."""
+    """Нулевой параметр на полном пути даёт тот же батч, что у набора оценки, до бита.
+
+    Путь: сценарий, восстановление инварианта, QC, сборка батча. Совпадает и
+    пересчитанная по истории недавняя аномалия. Добавляется только эталон скилла, и на
+    нулевом уровне он равен климатологии.
+    """
     ds = _rset(base, name, 0.0, qc=qc)
     for i in range(len(base)):
         a, b = base[i], ds[i]
@@ -428,8 +435,10 @@ def test_full_loss_of_history_is_cold_start(base, store, manifest):
 
 
 def test_device_qc_catches_frozen_sensor(base):
-    """Залипание всех каналов на 72 ч: QC прибора бракует часы после срока залипания,
-    без QC они проходят как данные."""
+    """Залипание всех каналов на 72 ч.
+
+    QC прибора бракует часы после срока залипания, без QC они проходят как данные.
+    """
     n = 72
     none, dev = _rset(base, "freeze", n, qc="none"), _rset(base, "freeze", n, qc="device")
     frac_none, frac_dev = [], []
@@ -511,9 +520,11 @@ def ref_rows(base):
 
 
 def test_reference_model_scores_zero_in_every_scenario(ref_rows):
-    """Модель, выдающая сам эталон скилла, - нижняя граница архитектуры: её скилл ровно
-    0 во всех сценариях, в том числе там, где искажена цель. Иначе знаменатель скилла
-    посчитан не на тех же парах, что числитель."""
+    """Модель, выдающая сам эталон скилла, - нижняя граница архитектуры.
+
+    Её скилл ровно 0 во всех сценариях, в том числе там, где искажена цель. Иначе знаменатель скилла
+    посчитан не на тех же парах, что числитель.
+    """
     from mayak.robustness import check_skill_guard
     cfg, rows = ref_rows
     mine = [r for r in rows if r["model"] == "МАЯК"]
@@ -526,9 +537,12 @@ def test_reference_model_scores_zero_in_every_scenario(ref_rows):
 
 
 def test_instrument_fault_no_longer_improves_skill_of_climatology(ref_rows):
-    """Климатология станции ничего не знает о приборе. Против эталона того же прибора
-    её скилл в сценариях, искажающих цель, падает ниже нуля; при эталоне без искажения
-    он был бы ровно 0 и рос бы вместе с поломкой. В отказе входа он по-прежнему 0."""
+    """Климатология станции ничего не знает о приборе.
+
+    Против эталона того же прибора её скилл в сценариях, искажающих цель, падает ниже нуля; при
+    эталоне без искажения он был бы ровно 0 и рос бы вместе с поломкой. В отказе входа он
+    по-прежнему 0.
+    """
     _cfg_, rows = ref_rows
     clim = [r for r in rows if r["model"] == "клим"]
     top = {sc.name: max(sc.levels) for sc in _short(ALL)}
@@ -540,9 +554,11 @@ def test_instrument_fault_no_longer_improves_skill_of_climatology(ref_rows):
 
 
 def test_guard_catches_mask_blind_model_and_passes_mask_aware(base):
-    """Слепая к маске модель при полной потере истории выдаёт климатологию, поэтому её
-    холодный старт не хуже климатологии и пол проверки не опускается. Ловится она на
-    частичной потере данных, где читает пропуски как 0 °C."""
+    """Слепая к маске модель при полной потере истории выдаёт климатологию.
+
+    Поэтому её холодный старт не хуже климатологии и пол проверки не опускается. Ловится она на
+    частичной потере данных, где читает пропуски как 0 °C.
+    """
     from mayak.robustness import RobustnessError, check_skill_guard, skill_violations
     cfg, rows = _sweep(base, {"МАЯК": _Anchored("mask"), "слепая": _Anchored("blind")},
                        AVAILABILITY)
@@ -561,8 +577,10 @@ def test_guard_catches_mask_blind_model_and_passes_mask_aware(base):
 
 def test_model_that_always_gives_its_cold_start_passes_every_level(base):
     """Модель со сдвинутым полем при любом отказе входа выдаёт свой прогноз без истории.
-    Её скилл везде ниже климатологии больше чем на допуск: прежнее правило отбраковало
-    бы её на каждом уровне. Пол холодного старта пропускает её: деградации нет."""
+
+    Её скилл везде ниже климатологии больше чем на допуск: прежнее правило отбраковало бы её на
+    каждом уровне. Пол холодного старта пропускает её: деградации нет.
+    """
     from mayak.robustness import check_skill_guard, skill_violations
     cfg, rows = _sweep(base, {"МАЯК": _Anchored("biased", bias=2.0)}, GUARDED_INPUT)
     assert {r["scenario"] for r in rows} == set(GUARDED_INPUT)
@@ -575,8 +593,10 @@ def test_model_that_always_gives_its_cold_start_passes_every_level(base):
 
 
 def test_floor_follows_cold_start_only_when_it_is_worse_than_climatology():
-    """Хороший холодный старт не ужесточает проверку, плохой - ослабляет её ровно до
-    себя; свойство прибора пола холодного старта не получает."""
+    """Хороший холодный старт не ужесточает проверку, плохой - ослабляет её ровно до себя.
+
+    Свойство прибора пола холодного старта не получает.
+    """
     from mayak.robustness import skill_floor
     tol = 0.05
     assert skill_floor(dict(kind=SCENARIO_INPUT, Skill_L0=0.3), tol) == pytest.approx(-0.05)
@@ -615,9 +635,11 @@ def test_guard_is_never_vacuous(ref_rows):
                                          ("drift", 0.2), ("offset_input", 2.0),
                                          ("drift_input", 0.2), ("noise", 2.0)])
 def test_same_instrument_reference_follows_the_target_transform(base, name, level):
-    """Эталон скилла искажается тем же преобразованием, что цель: плюс смещение, умножение
-    на масштаб, плюс текущее смещение дрейфа. Если цель не искажена, эталон равен
-    климатологии станции."""
+    """Эталон скилла искажается тем же преобразованием, что цель.
+
+    Плюс смещение, умножение на масштаб, плюс текущее смещение дрейфа. Если цель не искажена, эталон
+    равен климатологии станции.
+    """
     ds = _rset(base, name, level)
     for i in range(len(base)):
         a, b = base[i], ds[i]
@@ -631,9 +653,11 @@ def test_same_instrument_reference_follows_the_target_transform(base, name, leve
 
 
 def test_perfect_forecast_of_distorted_target_has_skill_one(base):
-    """Смещение на целое число градусов b и прогноз «исходная цель плюс b»: запись
-    прибора совпадает с ним точно, и скилл относительно эталона того же прибора равен 1.
-    Сам эталон как прогноз даёт скилл 0."""
+    """Смещение на целое число градусов b и прогноз «исходная цель плюс b».
+
+    Запись прибора совпадает с ним точно, и скилл относительно эталона того же прибора равен 1. Сам
+    эталон как прогноз даёт скилл 0.
+    """
     from mayak.evaluate import collect_predictions, evaluation_for
     from mayak.robustness import reference_aux
     b = 2.0
@@ -662,9 +686,12 @@ def test_reference_aux_leaves_sets_without_reference_alone(base):
 
 
 def test_unnoticed_offset_is_reported_but_not_asserted(base):
-    """Незамеченное смещение прибора: даже модель, знающая свойства своего прибора,
-    теряет скилл - цель не искажена, а история сдвинута. Проверка этот вариант не
-    смотрит. То же смещение как свойство прибора - смотрит, и модель его проходит."""
+    """Незамеченное смещение прибора.
+
+    Даже модель, знающая свойства своего прибора, теряет скилл - цель не искажена, а история
+    сдвинута. Проверка этот вариант не смотрит. То же смещение как свойство прибора - смотрит, и
+    модель его проходит.
+    """
     from mayak.robustness import (RobustnessError, check_skill_guard, robustness_sweep,
                                   skill_violations)
     specs = (ScenarioSpec("offset", (0.0, 5.0)), ScenarioSpec("offset_input", (0.0, 5.0)))
@@ -682,10 +709,13 @@ def test_unnoticed_offset_is_reported_but_not_asserted(base):
 
 
 def test_model_that_forgets_instrument_offset_fails_the_guard(base):
-    """Модель, которая принимает смещение прибора за погодную аномалию и забывает его
-    за сутки, против эталона того же прибора проверку не проходит на длинных лидах.
-    При эталоне без искажения её скилл там был бы около нуля, и проверка бы молчала.
-    Модель, которая держит смещение на всём горизонте, проходит на тех же окнах."""
+    """Модель, которая забывает смещение прибора за сутки, не проходит проверку на длинных лидах.
+
+    Такая модель принимает смещение за погодную аномалию. Против эталона того же прибора
+    она проверку на длинных лидах не проходит. При эталоне без искажения её скилл там
+    был бы около нуля, и проверка бы молчала. Модель, которая держит смещение на всём горизонте,
+    проходит на тех же окнах.
+    """
     from mayak.robustness import RobustnessError, check_skill_guard, robustness_sweep
     cfg = _cfg(scenarios=(ScenarioSpec("offset", (0.0, 5.0)),))
     rows = robustness_sweep({"МАЯК": _Anchored("mask"), "знающая": _Anchored("aware")}, base,
@@ -732,8 +762,10 @@ def test_rows_carry_ci_distortion_and_excess(base):
 
 
 def test_cold_start_rows_measure_the_same_windows_without_history(base):
-    """Холодный старт - те же окна и та же цель без истории; эталон скилла - климатология
-    станции. Сценарий полной потери истории даёт ровно тот же скилл."""
+    """Холодный старт - те же окна и та же цель без истории; эталон скилла - климатология станции.
+
+    Сценарий полной потери истории даёт ровно тот же скилл.
+    """
     from mayak.robustness import cold_start_sweep, robustness_sweep
     cfg = _cfg(scenarios=(ScenarioSpec("history", (0.0, float(L_MAX))),), bootstrap=20)
     models = {"МАЯК": _Anchored("mask"), "сдвиг": _Anchored("biased", bias=1.0)}
@@ -777,8 +809,11 @@ def test_results_and_plots_are_written(ref_rows, tmp_path):
 
 
 def test_mayak_survives_every_scenario_at_max_level(base):
-    """Настоящая архитектура на худшем уровне каждого сценария: формы, конечность,
-    монотонность квантилей. Обученность здесь не нужна - это проверка пути данных."""
+    """Настоящая архитектура на худшем уровне каждого сценария.
+
+    Формы, конечность, монотонность квантилей. Обученность здесь не нужна - это проверка пути
+    данных.
+    """
     from mayak.evaluate import gather
     from mayak.model import MAYAK
     torch.manual_seed(0)
@@ -804,8 +839,10 @@ TINY_STEPS = (20, 30)
 
 @pytest.fixture(scope="module")
 def tiny_ckpt(manifest, store, tmp_path_factory):
-    """Уменьшенный МАЯК, обученный здесь же обычным протоколом за несколько десятков
-    шагов: этап без истории, затем полный куррикулум."""
+    """Уменьшенный МАЯК, обученный здесь же обычным протоколом за несколько десятков шагов.
+
+    Этап без истории, затем полный куррикулум.
+    """
     from mayak.config import ModelConfig
     from mayak.protocol import Protocol, Stage, run_protocol
     proto = Protocol(stages=(Stage("A", "L0", TINY_STEPS[0]), Stage("B", "full", TINY_STEPS[1])),
@@ -820,8 +857,11 @@ def tiny_ckpt(manifest, store, tmp_path_factory):
 
 
 def _tiny_config(path):
-    """Короткий конфиг сценариев: по одному сценарию полной потери истории каждого вида,
-    частичная потеря, шум и смещение прибора; два лида, без бутстрапа."""
+    """Короткий конфиг сценариев.
+
+    По одному сценарию полной потери истории каждого вида, частичная потеря, шум и смещение прибора;
+    два лида, без бутстрапа.
+    """
     cfg = RobustnessConfig(windows_per_station=3, leads=(1, 24), bootstrap=0, scenarios=(
         dict(name="dropout", levels=(0.0, 0.5, 1.0)),
         dict(name="gap", levels=(0, 24, L_MAX)),
@@ -835,11 +875,12 @@ def _tiny_config(path):
 
 
 def test_trained_tiny_model_through_the_command_line(tiny_ckpt, manifest, tmp_path, capsys):
-    """Полный путь на обученной модели без внешних артефактов: командная строка, отчёт,
-    JSON. Холодный старт посчитан по каждому лиду; каждая строка отказа входа несёт его
-    скилл и свой порог; три пути к полной потере истории дают ровно скилл холодного
-    старта и потому никогда не нарушают проверку; нарушения в JSON - ровно те, что
-    находит проверка по строкам."""
+    """Полный путь на обученной модели без внешних артефактов: командная строка, отчёт, JSON.
+
+    Холодный старт посчитан по каждому лиду; каждая строка отказа входа несёт его скилл и свой
+    порог; три пути к полной потере истории дают ровно скилл холодного старта и потому никогда не
+    нарушают проверку; нарушения в JSON - ровно те, что находит проверка по строкам.
+    """
     from mayak.robustness import main, skill_floor, skill_violations
     cfg = _tiny_config(tmp_path / "tiny.yaml")
     out = tmp_path / "out"
@@ -871,9 +912,11 @@ def test_trained_tiny_model_through_the_command_line(tiny_ckpt, manifest, tmp_pa
 
 
 def test_trained_tiny_model_giving_its_cold_start_passes_the_guard(tiny_ckpt, base):
-    """Обученная модель, которой всегда подают вход без истории, при любом отказе входа
-    выдаёт свой прогноз холодного старта и проходит проверку на всех уровнях, какой бы
-    ни был этот холодный старт."""
+    """Модель, которой всегда подают вход без истории, проходит проверку на всех уровнях.
+
+    При любом отказе входа она выдаёт свой прогноз холодного старта, каким бы ни был этот
+    холодный старт.
+    """
     from mayak.lit import load_model
     from mayak.robustness import check_skill_guard, skill_violations
 
