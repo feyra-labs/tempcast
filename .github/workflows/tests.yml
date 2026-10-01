@@ -14,8 +14,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --group dev
-      - run: uv run ruff check --output-format=github .
+      - run: uv sync --only-group dev
+      - run: uv run --no-sync ruff check --output-format=github .
 
   rust-runtime:
     runs-on: ubuntu-latest
