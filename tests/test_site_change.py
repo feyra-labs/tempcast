@@ -92,7 +92,7 @@ def test_refined_site_equals_runtime_started_at_new_site(model, caplog):
     assert back.site_change == SITE_REFINED and back.loaded_site == old.site
     assert "координаты уточнены" in caplog.text
     assert back.filled == fresh.filled and back.last_hour == fresh.last_hour
-    assert back.theta == pytest.approx(0.37), "множитель калибровки прибора сохраняется"
+    assert back.theta == pytest.approx((0.37,) * 4), "множитель калибровки прибора сохраняется"
     before = np.abs(old.raw_forecast() - fresh.raw_forecast()).max()
     assert before > 20 * ATOL_FORECAST, "сдвиг точки должен быть заметен в выпуске"
     done = cut
@@ -117,7 +117,7 @@ def test_move_beyond_threshold_is_cold_start(model, caplog):
         back.load_state(old.serialize())
     assert "прибор перенесён" in caplog.text
     assert back.site_change == SITE_MOVED
-    assert back.filled == 0 and back.theta == 0.0
+    assert back.filled == 0 and back.theta == (0.0,) * 4
     assert not back.present.any() and not back.valid.any() and not back.raw.any()
     assert back.last_hour == old.last_hour, "время прибора от места не зависит"
     new = StreamingMayak(model, *OSLO, aci=G.GOLDEN_ACI)
@@ -143,7 +143,7 @@ def test_each_axis_over_threshold_resets_window_and_theta(model, axis, delta):
     back = StreamingMayak(model, *site)
     back.load_state(old.serialize())
     assert back.site_change == SITE_MOVED
-    assert back.filled == 0 and back.theta == 0.0 and not back.valid.any()
+    assert back.filled == 0 and back.theta == (0.0,) * 4 and not back.valid.any()
 
 
 def test_state_without_steps_on_moved_site(model):
@@ -151,7 +151,7 @@ def test_state_without_steps_on_moved_site(model):
     old.reset_calibration(0.3)
     back = StreamingMayak(model, *OSLO)
     back.load_state(old.serialize())
-    assert back.site_change == SITE_MOVED and back.last_hour is None and back.theta == 0.0
+    assert back.site_change == SITE_MOVED and back.last_hour is None and back.theta == (0.0,) * 4
 
 
 def test_first_obs_after_move_outranks_old_site_file(model, tmp_path):

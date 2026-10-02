@@ -2,8 +2,13 @@
 
 Таблица подгоняется на валидационных станциях в блоках калибровки, разнесённых по всему
 году. Длина истории каждого окна берётся из того распределения, на котором обучен
-чекпойнт, генератором с фиксированным сидом, тем же, что у набора валидации. Так таблица
-видит холодный старт, короткую и полную историю в той же пропорции, что и модель.
+чекпойнт, генератором с фиксированным сидом, тем же, что у набора валидации.
+
+Таблица разбита по бинам лидов и бинам длины истории: у каждого бина длины истории свои
+поправки, подогнанные по окнам с такой фактической длиной истории. Так номинальное
+покрытие держится в каждом режиме прибора, в том числе при полной истории, в которой
+устройство проводит почти всё время. Бин, в котором окон меньше порога из конфига
+калибровки, получает маргинальную строку по всем окнам; это пишется в запись о подгонке.
 
 Поправка медианы равна нулю: таблица меняет только ширину интервалов, точечный прогноз
 остаётся прогнозом модели.
@@ -113,7 +118,7 @@ def predictor(model, precision, model_dir=None):
     return GraphModel(OnnxBackend(model_dir, precision), model.cfg), digest
 
 
-def fit(model, ds, precision="fp32", model_dir=None, checkpoint=None):
+def fit(model, ds, precision="fp32", model_dir=None, checkpoint=None, min_windows=None):
     """Подгонка таблицы на калибровочном наборе.
 
     Args:
@@ -122,15 +127,24 @@ def fit(model, ds, precision="fp32", model_dir=None, checkpoint=None):
         precision: точность, на которой таблицу будут применять.
         model_dir: каталог экспорта с int8-графами для точности int8.
         checkpoint: путь к чекпойнту для записи о подгонке.
+        min_windows: наименьшее число окон бина длины истории для своей строки
+            таблицы; None - из конфига калибровки по умолчанию.
 
     Returns:
         Тройка: таблица поправок, запись о подгонке и прогон набора (факт, квантили,
-        веса и остальное про окна).
+        веса, фактическая длина истории окон и остальное про окна).
     """
+    from mayak.config import CalibrationConfig
+    if min_windows is None:
+        min_windows = CalibrationConfig().fit_min_windows
     net, graphs = predictor(model, precision, model_dir)
     D = gather(net, ds)
-    shift = fit_conformal_shift(D["y"], D["q"], D["y_mask"], LEAD_BINS)
-    rec = conformal_record(ds, checkpoint=checkpoint, precision=precision, graphs=graphs)
+    D["history"] = np.asarray(ds.window_meta()["history"], np.int64)
+    shift, history_fit = fit_conformal_shift(D["y"], D["q"], D["y_mask"], D["history"],
+                                             LEAD_BINS, min_windows=min_windows)
+    rec = conformal_record(ds, checkpoint=checkpoint, precision=precision, graphs=graphs,
+                           history_fit=history_fit)
+    rec["min_windows"] = int(min_windows)
     return shift, rec, D
 
 
@@ -152,6 +166,14 @@ def report(D, meta, shift, cfg=None):
     return fit_report(evaluation_of(pred, aux), evaluation_of(pred, aux, shift), meta, cfg)
 
 
+def print_table(shift, rec):
+    """Печатает таблицу по бинам длины истории и отметку о маргинальных строках."""
+    for k, row in enumerate(rec["history_fit"]):
+        tag = "маргинальная строка" if row["marginal"] else "своя строка"
+        print(f"\n{row['bin']}: окон {row['windows']}, {tag} (порог {rec['min_windows']})")
+        print(np.round(shift[:, k], 3))
+
+
 def main(argv=None):
     import logging
 
@@ -160,8 +182,8 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     ap = argparse.ArgumentParser(
         description="сплит-конформная таблица МАЯК: валидационные станции, блоки калибровки "
-                    "по всему году, длины истории по куррикулуму чекпойнта, медиана без "
-                    "поправки",
+                    "по всему году, длины истории по куррикулуму чекпойнта, поправки по "
+                    "бинам лидов и бинам длины истории, медиана без поправки",
         epilog=USAGE, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--manifest", default="data/manifest.csv")
@@ -190,12 +212,14 @@ def main(argv=None):
           f"куррикулум {curriculum!r}, сид {cfg.fit_seed}, точность {args.precision}")
 
     model = load_model(args.ckpt)
-    shift, rec, D = fit(model, ds, args.precision, args.model_dir, checkpoint=args.ckpt)
+    shift, rec, D = fit(model, ds, args.precision, args.model_dir, checkpoint=args.ckpt,
+                        min_windows=cfg.fit_min_windows)
     save_conformal(args.out, shift, rec)
-    print("Таблица поправок (бины лидов × квантили), °C; столбец медианы - нули:")
-    print(np.round(shift, 3))
+    print("Таблица поправок по бинам длины истории (бины лидов × квантили), °C; столбец "
+          "медианы - нули:")
+    print_table(shift, rec)
     before = coverage(D["y"], D["q"], D["y_mask"])
-    after = coverage(D["y"], apply_conformal(D["q"], shift), D["y_mask"])
+    after = coverage(D["y"], apply_conformal(D["q"], shift, D["history"]), D["y_mask"])
     print(f"PICP-90 на калибровочном наборе (в выборке): до {before:.1%}, после {after:.1%}")
 
     rep = report(D, ds.window_meta(), shift, cfg)

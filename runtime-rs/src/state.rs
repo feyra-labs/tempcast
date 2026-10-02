@@ -6,11 +6,11 @@
 //! | поле               | тип   | число                               |
 //! |--------------------|-------|-------------------------------------|
 //! | magic              | "MYK" | 3 Б                                 |
-//! | version            | u8    | 4                                   |
+//! | version            | u8    | 5                                   |
 //! | filled             | u16   | часов окна после холодного старта   |
 //! | reserved           | u16   |                                     |
 //! | last_hour          | i64   | абсолютный час последнего шага      |
-//! | aci_theta          | f32   | множитель калибровки в логарифме    |
+//! | aci_theta          | 4×f32 | множители калибровки по бинам лидов |
 //! | lat, lon, elev     | f32   | точка, для которой записано окно    |
 //! | температура        | i8    | W, целые градусы                    |
 //! | давление           | u16   | W, десятые гектопаскаля             |
@@ -19,13 +19,21 @@
 //! | маска годности     | биты  | три бита на час, младший первым     |
 //!
 //! Всё little-endian, окно от старых часов к новым. Если шагов не было, в last_hour
-//! записано наименьшее i64. Всё остальное состояние рантайма восстанавливается из окна.
+//! записано наименьшее i64. Всё остальное состояние рантайма восстанавливается из окна;
+//! кольцо адаптивной калибровки после перезапуска пусто.
+//!
+//! Состояние версии 4 читается: в нём один множитель калибровки (заголовок 32 Б), он
+//! переносится во все бины лидов. Пишется всегда текущая версия.
+use crate::calib::N_LEAD_BINS;
 use crate::manifest::Dims;
 use crate::{Error, Result};
 
 pub const MAGIC: &[u8; 3] = b"MYK";
-pub const VERSION: u8 = 4;
-pub const HEADER: usize = 32;
+pub const VERSION: u8 = 5;
+pub const HEADER: usize = 28 + 4 * N_LEAD_BINS;
+/// Прежняя версия с одним множителем калибровки, которая ещё читается.
+pub const VERSION_V4: u8 = 4;
+pub const HEADER_V4: usize = 32;
 pub const NO_HOUR: i64 = i64::MIN;
 /// Шаг сетки хранения по каналам: доли единицы, в которых записан канал.
 pub const STORE_SCALE: [f64; 3] = [1.0, 10.0, 1.0];
@@ -37,10 +45,14 @@ pub fn mask_bytes(w: usize) -> usize {
     (3 * w).div_ceil(8)
 }
 
-/// Размер состояния для размеров модели, байт.
+/// Размер состояния текущей версии для размеров модели, байт.
 pub fn nbytes(d: &Dims) -> usize {
+    nbytes_with_header(d, HEADER)
+}
+
+fn nbytes_with_header(d: &Dims, header: usize) -> usize {
     let w = d.stream_window;
-    HEADER + 4 * w + 2 * mask_bytes(w)
+    header + 4 * w + 2 * mask_bytes(w)
 }
 
 /// Значение канала на сетке хранения: сетка записи прибора, обрезанная до диапазона
@@ -57,7 +69,7 @@ pub fn to_store(v: f32, c: usize) -> f32 {
 pub struct Snapshot {
     pub filled: usize,
     pub last_hour: Option<i64>,
-    pub theta: f32,
+    pub theta: [f32; N_LEAD_BINS],
     pub site: [f32; 3],
     /// Окно от старых часов к новым: значения на сетке хранения, наличие и годность.
     pub raw: Vec<[f32; 3]>,
@@ -96,28 +108,36 @@ impl Snapshot {
         if raw.len() < 4 || &raw[..3] != MAGIC {
             return Err(Error::new("не состояние МАЯК: нет заголовка"));
         }
-        if raw[3] != VERSION {
-            return Err(Error::new(format!(
-                "версия состояния {}, рантайм читает {VERSION}; прежние версии не хранят сырое \
-                 окно целиком, нужен холодный старт",
-                raw[3]
-            )));
-        }
-        if raw.len() != nbytes(d) {
+        let header = match raw[3] {
+            VERSION => HEADER,
+            VERSION_V4 => HEADER_V4,
+            v => {
+                return Err(Error::new(format!(
+                    "версия состояния {v}, рантайм читает [{VERSION_V4}, {VERSION}]; прежние версии \
+                     не хранят сырое окно целиком, нужен холодный старт"
+                )));
+            }
+        };
+        if raw.len() != nbytes_with_header(d, header) {
             return Err(Error::new(format!(
                 "состояние {} Б не соответствует конфигу модели (ожидалось {} Б)",
                 raw.len(),
-                nbytes(d)
+                nbytes_with_header(d, header)
             )));
         }
         let w = d.stream_window;
         let filled = u16::from_le_bytes([raw[4], raw[5]]) as usize;
         let last = i64::from_le_bytes(raw[8..16].try_into().expect("8 байт"));
-        let theta = f32_at(raw, 16);
-        let site = [f32_at(raw, 20), f32_at(raw, 24), f32_at(raw, 28)];
-        if !theta.is_finite() {
+        let theta: [f32; N_LEAD_BINS] = if header == HEADER_V4 {
+            [f32_at(raw, 16); N_LEAD_BINS]
+        } else {
+            std::array::from_fn(|b| f32_at(raw, 16 + 4 * b))
+        };
+        let o = header - 12;
+        let site = [f32_at(raw, o), f32_at(raw, o + 4), f32_at(raw, o + 8)];
+        if theta.iter().any(|t| !t.is_finite()) {
             return Err(Error::new(format!(
-                "повреждённый множитель калибровки в состоянии: {theta}"
+                "повреждённый множитель калибровки в состоянии: {theta:?}"
             )));
         }
         if filled > w || (last == NO_HOUR && filled > 0) {
@@ -125,7 +145,7 @@ impl Snapshot {
                 "повреждённый заголовок состояния: filled={filled}, окно {w}, последний час {last}"
             )));
         }
-        let mut off = HEADER;
+        let mut off = header;
         let t: Vec<f32> = raw[off..off + w].iter().map(|b| *b as i8 as f32).collect();
         off += w;
         let p: Vec<f32> = raw[off..off + 2 * w]
@@ -173,7 +193,9 @@ impl Snapshot {
         out.extend_from_slice(&(self.filled as u16).to_le_bytes());
         out.extend_from_slice(&[0, 0]);
         out.extend_from_slice(&self.last_hour.unwrap_or(NO_HOUR).to_le_bytes());
-        out.extend_from_slice(&self.theta.to_le_bytes());
+        for t in self.theta {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
         for v in self.site {
             out.extend_from_slice(&v.to_le_bytes());
         }

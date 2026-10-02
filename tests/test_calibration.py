@@ -6,8 +6,12 @@
 * адаптивная калибровка (ACI): сходится к заданному покрытию на синтетическом потоке, в
   том числе после сдвига распределения; не нарушает монотонность квантилей; не
   меняется и не расходится при длинной серии пропусков; ограничена при сплошных
-  промахах; рантайм даёт ту же траекторию параметра, что офлайн-прогон;
-* параметр адаптивной калибровки - часть персистентного состояния;
+  промахах; рантайм обновляет множители бинов лидов через кольцо по часам-мишеням так
+  же, как независимый перебор выпусков; при ежечасном выпуске обновляются все бины;
+* офлайн-прогон с ежечасным выпуском совпадает с потоковым рантаймом на одной станции и
+  приводит покрытие каждого бина лидов к номиналу;
+* множители адаптивной калибровки по бинам лидов - часть персистентного состояния;
+  состояние версии 4 с одним множителем читается;
 * кривая «острота против покрытия» по уже собранным предсказаниям;
 * разрезы покрытия с вердиктами и критерий условной поправки на
   сконструированных примерах;
@@ -31,18 +35,20 @@ from mayak.config import (COVERAGE_DIMS_EXTERNAL, COVERAGE_DIMS_INTERNAL, Calibr
                           ConfigError)
 from mayak.constants import H, QUANTILES
 from mayak.data import store as S
-from mayak.data.recording import record_values
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN
-from mayak.metrics import (I_HI90, I_LO90, I_MED, LEAD_BINS, NQ, ACIParams, Evaluation,
-                           aci_effective_level, aci_run, aci_score, apply_adaptive,
-                           apply_conformal, calibrate_forecast, inside, width_at_coverage)
+from mayak.metrics import (HISTORY_BINS, I_HI90, I_LO90, I_MED, LEAD_BINS, NO_HOUR, NQ,
+                           ACIParams, Evaluation, aci_effective_level, aci_run, aci_score,
+                           apply_adaptive, apply_conformal, calibrate_forecast, inside,
+                           lead_bin_index, width_at_coverage)
 from mayak.runtime.equivalence import feed, synthetic_series
-from mayak.runtime.streaming import STATE_HEADER, STATE_VERSION, StreamingMayak
+from mayak.runtime.streaming import (STATE_HEADER, STATE_HEADER_V4, STATE_VERSION,
+                                     StreamingMayak)
 
 REPO = Path(__file__).resolve().parents[1]
 Z = norm.ppf(np.asarray(QUANTILES, np.float64))
 LAT, LON, ELEV = 52.37, 4.9, 0.0
-DEFAULT_STATE_BYTES = 3224
+DEFAULT_STATE_BYTES = 3236
+NB = len(LEAD_BINS)
 N_HOURS = 12_000
 
 
@@ -110,8 +116,9 @@ def model():
 
 def _shift(seed=0):
     """Случайная таблица поправок с нулевой поправкой медианы, как у подгонки."""
-    shift = np.random.default_rng(seed).normal(0, 0.4, (len(LEAD_BINS), NQ)).astype(np.float32)
-    shift[:, I_MED] = 0.0
+    shift = np.random.default_rng(seed).normal(
+        0, 0.4, (len(LEAD_BINS), len(HISTORY_BINS), NQ)).astype(np.float32)
+    shift[..., I_MED] = 0.0
     return shift
 
 
@@ -138,7 +145,9 @@ def test_adaptive_never_breaks_quantile_order(theta):
     out, _ = apply_adaptive(q, theta)
     assert np.isfinite(out).all() and (np.diff(out, axis=-1) >= 0).all()
     messy = rng.normal(0, 3, (30, H, NQ)).astype(np.float32)
-    out, _ = calibrate_forecast(messy, _shift(1), theta)
+    out, _ = calibrate_forecast(messy, _shift(1), theta, 100)
+    assert (np.diff(out, axis=-1) >= 0).all()
+    out, _ = calibrate_forecast(messy, _shift(1), (theta, 0.0, -0.3, 0.2), 100)
     assert (np.diff(out, axis=-1) >= 0).all()
 
 
@@ -146,20 +155,41 @@ def test_calibrate_forecast_is_conformal_then_adaptive():
     rng = np.random.default_rng(2)
     q = np.sort(rng.normal(0, 3, (7, H, NQ)), axis=-1).astype(np.float32)
     shift = _shift(2)
-    got_q, got_mu = calibrate_forecast(q, shift, 0.4)
-    ref_q, ref_mu = apply_adaptive(apply_conformal(q, shift), 0.4)
+    hist = np.array([0, 3, 30, 200, 672, 24, 25])
+    got_q, got_mu = calibrate_forecast(q, shift, 0.4, hist)
+    ref_q, ref_mu = apply_adaptive(apply_conformal(q, shift, hist), 0.4)
     assert np.array_equal(got_q, ref_q) and np.array_equal(got_mu, ref_mu)
     same_q, _ = calibrate_forecast(q)
     assert np.array_equal(same_q, q)
+    with pytest.raises(ValueError, match="не задана"):
+        calibrate_forecast(q, shift, 0.4)
+
+
+def test_adaptive_by_lead_bin_touches_only_its_leads():
+    """Множитель бина растягивает только его лиды; лиды с нулевым множителем - до бита."""
+    rng = np.random.default_rng(12)
+    messy = rng.normal(0, 3, (4, H, NQ)).astype(np.float32)
+    theta = (0.0, 0.5, 0.0, -0.4)
+    out, mu = apply_adaptive(messy, theta)
+    assert np.array_equal(mu, messy[..., I_MED])
+    for h in range(H):
+        b = lead_bin_index(h + 1)
+        ref, _ = apply_adaptive(messy[:, h], theta[b])
+        assert np.array_equal(out[:, h], ref), h
+    one, _ = apply_adaptive(messy, (0.3,) * NB)
+    assert np.array_equal(one, apply_adaptive(messy, 0.3)[0])
+    with pytest.raises(ValueError, match="бинов"):
+        apply_adaptive(messy, (0.1, 0.2))
 
 
 def test_evaluation_with_calibration_uses_the_same_function():
     preds, aux = _dataset(n_st=6, per=4)
     ev = _ev(preds["МАЯК"], aux)
-    assert ev.with_calibration() is ev and ev.with_conformal(None) is ev
+    assert ev.with_calibration() is ev and ev.with_conformal(None, None) is ev
     shift = _shift(3)
-    cal = ev.with_calibration(shift, 0.3)
-    q, mu = calibrate_forecast(ev.q, shift, 0.3)
+    hist = aux["meta"]["history"]
+    cal = ev.with_calibration(shift, 0.3, hist)
+    q, mu = calibrate_forecast(ev.q, shift, 0.3, hist)
     assert np.array_equal(cal.q, q) and np.array_equal(cal.mu, mu)
     wider = ev.with_calibration(None, 0.5).pooled()["PICP90"]
     assert wider > ev.pooled()["PICP90"] > ev.with_calibration(None, -0.5).pooled()["PICP90"]
@@ -168,7 +198,7 @@ def test_evaluation_with_calibration_uses_the_same_function():
 def test_all_modules_share_one_calibration_implementation():
     import mayak.runtime.streaming as R
     from mayak import metrics as M
-    for name in ("apply_conformal", "apply_adaptive", "aci_score", "ACIParams"):
+    for name in ("apply_conformal", "apply_adaptive", "AdaptiveCalibration", "ACIParams"):
         assert getattr(R, name) is getattr(M, name), name
     offenders = []
     for p in (REPO / "mayak").rglob("*.py"):
@@ -264,24 +294,78 @@ def test_aci_frozen_without_feedback_and_bounded_under_constant_misses():
     assert abs(back["theta_end"]) < 0.2, "после восстановления прибора θ возвращается"
 
 
-def test_runtime_theta_matches_offline_run(model):
-    p = ACIParams(gamma=0.05)
-    n = 150
-    s = synthetic_series(n + 1, seed=3)
-    st = StreamingMayak(model, LAT, LON, ELEV, conformal=_shift(4), aci=p)
-    scores = []
+def _reference_aci(issued, obs, p, theta0=0.0):
+    """Независимый перебор выпусков для обратной связи адаптивной калибровки.
+
+    Для каждого валидного часа и бина лидов берётся последний выпуск, чей лид до этого
+    часа попадает в бин.
+
+    Args:
+        issued: выпуски по порядку: час, после которого начинается горизонт, и квантили
+            после конформной таблицы.
+        obs: пары из часа и факта валидных часов по порядку.
+        p: параметры адаптивной калибровки.
+        theta0: начальный множитель.
+
+    Returns:
+        Тройка: множители, число обратных связей и промахов по бинам.
+    """
+    theta = [p.clip(theta0)] * NB
+    upd, mis = [0] * NB, [0] * NB
+    for hour, y in obs:
+        for b in range(NB):
+            best = None
+            for after, q in issued:
+                k = hour - after
+                if after < hour and 1 <= k <= H and lead_bin_index(k) == b:
+                    best = q[k - 1]
+            if best is None:
+                continue
+            theta[b], miss = p.step(theta[b], float(aci_score(y, best, p.interval)))
+            upd[b] += 1
+            mis[b] += int(miss)
+    return theta, upd, mis
+
+
+def _run_hourly(model, p, n, seed, shift=None, every=1):
+    """Поток с выпуском каждые every часов; выпуски после таблицы и факты для перебора."""
+    s = synthetic_series(n, seed=seed, p_valid=1.0)
+    st = StreamingMayak(model, LAT, LON, ELEV, conformal=shift, aci=p)
+    issued, obs, raw = [], [], []
     for k in range(n):
-        if k and st._pending is not None:
-            y = float(record_values(s["x"][k])[0]) if s["m"][k, 0] > 0 else float("nan")
-            scores.append(float(aci_score(y, st._pending["q"][0], p.interval)))
+        hour = s["t0"] + k
         feed(st, s, k, k + 1)
-        q, _ = st.forecast()
-        assert np.isfinite(q).all() and (np.diff(q, axis=-1) >= 0).all()
-    r = aci_run(scores, p)
-    assert st.theta == r["theta_end"] != 0.0
-    assert st.aci_updates == int(np.isfinite(scores).sum())
-    assert st.aci_misses == int(np.nansum(r["miss"]))
-    assert 0.0 <= st.aci_coverage <= 1.0
+        j = hour % st.window
+        if st.valid[j, 0]:
+            obs.append((hour, float(st.raw[j, 0])))
+        if k % every == every - 1:
+            q = st.raw_forecast()
+            raw.append((hour, q, st.history_length))
+            cq = q if shift is None else apply_conformal(q, shift, st.history_length)
+            issued.append((hour, cq))
+            st.forecast()
+    return st, issued, obs, raw
+
+
+def test_runtime_theta_matches_brute_force_by_lead_bin(model):
+    p = ACIParams(gamma=0.05)
+    st, issued, obs, _raw = _run_hourly(model, p, 120, seed=3, shift=_shift(4), every=5)
+    theta, upd, mis = _reference_aci(issued, obs, p)
+    assert st.theta == tuple(theta) and any(t != 0.0 for t in theta)
+    assert st.aci_updates == tuple(upd) and st.aci_misses == tuple(mis)
+    cov = st.aci_coverage
+    assert all(0.0 <= c <= 1.0 for c in cov)
+
+
+def test_hourly_issue_updates_every_lead_bin(model):
+    """Ежечасный выпуск: обратную связь получает каждый бин лидов, а не только первый лид."""
+    p = ACIParams(gamma=0.05)
+    st, _issued, obs, _raw = _run_hourly(model, p, 120, seed=13)
+    assert min(st.aci_updates) > 0
+    k = np.array([h for h, _y in obs]) - (st.last_hour - 119)
+    assert st.aci_updates[0] == int((k >= 1).sum()), "первый бин - каждый час после выпуска"
+    assert st.aci_updates[3] == int((k >= 73).sum()), "дальний бин - с 73-го часа"
+    assert st.memory_nbytes - StreamingMayak(model, LAT, LON, ELEV).memory_nbytes == H * NB * 20
 
 
 def test_runtime_forecast_equals_single_implementation(model):
@@ -289,11 +373,21 @@ def test_runtime_forecast_equals_single_implementation(model):
     shift = _shift(5)
     raw = feed(StreamingMayak(model, LAT, LON, ELEV), s, 0, 80)
     cal = feed(StreamingMayak(model, LAT, LON, ELEV, conformal=shift), s, 0, 80)
-    cal.reset_calibration(0.25)
+    cal.reset_calibration((0.25, -0.1, 0.0, 0.4))
     q_raw, _ = raw.forecast()
     q, mu = cal.forecast()
-    ref_q, ref_mu = calibrate_forecast(q_raw, shift, cal.theta)
+    assert cal.history_length == 80
+    ref_q, ref_mu = calibrate_forecast(q_raw, shift, cal.theta, 80)
     assert np.array_equal(q, ref_q) and np.array_equal(mu, ref_mu)
+
+
+def test_runtime_conformal_row_follows_hours_since_cold_start(model):
+    s = synthetic_series(model.cfg.max_history + 30, seed=6)
+    st = StreamingMayak(model, LAT, LON, ELEV, conformal=_shift(6))
+    assert st.history_length == 0
+    for k, want in ((0, 1), (23, 24), (24, 25), (len(s["x"]) - 1, model.cfg.max_history)):
+        feed(st, s, st.filled, k + 1)
+        assert st.history_length == want
 
 
 def test_runtime_without_aci_never_moves_theta(model):
@@ -302,7 +396,7 @@ def test_runtime_without_aci_never_moves_theta(model):
     for k in range(60):
         feed(st, s, k, k + 1)
         st.forecast()
-    assert st.theta == 0.0 and st.aci_updates == 0 and st._pending is None
+    assert st.theta == (0.0,) * NB and st.aci_updates == (0,) * NB and st.cal.ring is None
 
 
 def test_runtime_long_gap_freezes_theta(model):
@@ -314,13 +408,16 @@ def test_runtime_long_gap_freezes_theta(model):
     st.forecast()
     for k in range(48, 600):
         st.step(None, float(s["x"][k, 1]), float(s["x"][k, 2]), s["t0"] + k)
-    assert st.theta == pytest.approx(0.3, abs=1e-7) and st.aci_updates == 0
+    assert st.theta == pytest.approx((0.3,) * NB, abs=1e-7) and sum(st.aci_updates) == 0
     feed(st, s, 600, 650)
-    assert st.aci_updates == 0, "лиды старого прогноза давно прошли"
+    assert sum(st.aci_updates) == 0, "лиды старого прогноза давно прошли"
     q, _ = st.forecast()
     assert np.isfinite(q).all() and (np.diff(q, axis=-1) >= 0).all()
     feed(st, s, 650, 670)
-    assert st.aci_updates == int((s["m"][650:670, 0] > 0).sum()) > 0
+    valid = s["m"][:, 0] > 0
+    assert st.aci_updates[0] == int(valid[650:656].sum()) > 0
+    assert st.aci_updates[1] == int(valid[656:670].sum()) > 0
+    assert st.aci_updates[2:] == (0, 0)
 
 
 def test_runtime_each_lead_is_checked_once_and_in_order(model):
@@ -331,12 +428,15 @@ def test_runtime_each_lead_is_checked_once_and_in_order(model):
     valid = s["m"][:, 0] > 0
     feed(st, s, 24, 24 + 30)
     n30 = int(valid[24:54].sum())
-    assert st.aci_updates == n30
+    assert sum(st.aci_updates) == n30
     with pytest.raises(ValueError, match="не позже"):
         st.step(float(s["x"][30, 0]), None, None, s["t0"] + 30)
-    assert st.aci_updates == n30
+    assert sum(st.aci_updates) == n30
     feed(st, s, 54, 300)
-    assert st.aci_updates == int(valid[24:24 + H].sum()), "каждый лид - не больше одного раза"
+    assert sum(st.aci_updates) == int(valid[24:24 + H].sum()), "каждый лид - не больше одного раза"
+    left = st.cal.ring_hour[st.cal.ring_hour != NO_HOUR]
+    assert (left <= st.last_hour).all() and not st.valid[left % st.window, 0].any(), \
+        "записи кольца на валидные часы погашены"
 
 
 def test_runtime_constant_misses_hit_the_bound(model):
@@ -346,28 +446,42 @@ def test_runtime_constant_misses_hit_the_bound(model):
     st = feed(StreamingMayak(model, LAT, LON, ELEV, aci=p), s, 0, 48)
     for k in range(48, 100):
         st.forecast()
-        q0 = st._pending["q"][0]
-        med, d = float(q0[I_MED]), float(q0[I_HI90] - q0[I_MED])
-        T = min(med + 6.0 * d + 0.5, 59.0)
+        lo, med, hi = (float(v) for v in st.cal.ring[(s["t0"] + k) % H, 0])
+        T = min(med + 6.0 * (hi - med) + 0.5, 59.0)
         st.step(T, float(s["x"][k, 1]), float(s["x"][k, 2]), s["t0"] + k)
-    assert st.theta == p.theta_max
+    assert st.theta[0] == p.theta_max
     q, _ = st.forecast()
     assert np.isfinite(q).all() and (np.diff(q, axis=-1) >= 0).all()
 
 
 def test_state_is_pinned_and_carries_theta(model):
-    assert STATE_VERSION == 4 and STATE_HEADER.itemsize == 32
+    assert STATE_VERSION == 5 and STATE_HEADER.itemsize == 44 and STATE_HEADER_V4.itemsize == 32
     s = synthetic_series(100, seed=10)
     st = feed(StreamingMayak(model, LAT, LON, ELEV, aci=True), s, 0, 100)
-    st.reset_calibration(0.3141)
+    st.reset_calibration((0.3141, -0.2, 0.1, 0.0))
     raw = st.serialize()
     assert len(raw) == st.state_nbytes == DEFAULT_STATE_BYTES < 4096
     hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0]
-    assert int(hdr["version"]) == 4 and float(hdr["aci_theta"]) == st.theta
+    assert int(hdr["version"]) == 5 and tuple(float(v) for v in hdr["aci_theta"]) == st.theta
     back = StreamingMayak(model, LAT, LON, ELEV)
     back.load_state(raw)
     assert back.theta == st.theta and back.serialize() == raw
     np.testing.assert_allclose(back.forecast()[0], st.forecast()[0], atol=1e-4)
+
+
+def test_version_4_state_is_read_into_every_bin(model):
+    from mayak.runtime.golden import state_v4
+    s = synthetic_series(100, seed=10)
+    st = feed(StreamingMayak(model, LAT, LON, ELEV, aci=True), s, 0, 100)
+    raw = st.serialize()
+    old = state_v4(raw, 0.25)
+    assert len(old) == DEFAULT_STATE_BYTES - 12 and old[3] == 4
+    back = StreamingMayak(model, LAT, LON, ELEV, aci=True)
+    back.load_state(old)
+    assert back.theta == (float(np.float32(0.25)),) * NB
+    assert back.filled == st.filled and back.last_hour == st.last_hour
+    assert back.serialize()[STATE_HEADER.itemsize:] == raw[STATE_HEADER.itemsize:]
+    np.testing.assert_allclose(back.raw_forecast(), st.raw_forecast(), atol=1e-5)
 
 
 def test_theta_survives_restart_and_reset_keeps_it(model):
@@ -379,40 +493,37 @@ def test_theta_survives_restart_and_reset_keeps_it(model):
         live.forecast()
     back = StreamingMayak(model, LAT, LON, ELEV, aci=p)
     back.load_state(live.serialize())
-    assert back.theta == live.theta != 0.0
-    for st in (live, back):
-        for k in range(120, 220):
-            feed(st, s, k, k + 1)
-            st.forecast()
-    assert back.theta == pytest.approx(live.theta, abs=1e-6)
+    assert back.theta == live.theta and any(t != 0.0 for t in live.theta)
+    assert (back.cal.ring_hour == NO_HOUR).all(), "кольцо на диск не пишется"
     theta = live.theta
     live.reset()
-    assert live.theta == theta and live._pending is None
+    assert live.theta == theta and (live.cal.ring_hour == NO_HOUR).all()
     live.reset_calibration()
-    assert live.theta == 0.0 and live.aci_updates == 0
+    assert live.theta == (0.0,) * NB and live.aci_updates == (0,) * NB
 
 
 def test_older_state_versions_need_cold_start(model):
-    """Прежние версии состояния не хранят сырое окно целиком.
+    """Версии раньше 4 не хранят сырое окно целиком.
 
-    Они не читаются, рантайм остаётся в холодном старте с тем множителем калибровки, что был.
+    Они не читаются, рантайм остаётся в холодном старте с теми множителями калибровки,
+    что были.
     """
     s = synthetic_series(90, seed=12)
     raw = bytearray(feed(StreamingMayak(model, LAT, LON, ELEV), s, 0, 90).serialize())
     back = StreamingMayak(model, LAT, LON, ELEV)
     back.reset_calibration(0.7)
-    for version in (2, 3):
+    for version in (2, 3, 6):
         raw[3] = version
         with pytest.raises(ValueError, match="версия"):
             back.load_state(bytes(raw))
-    assert back.theta == pytest.approx(0.7) and back.last_hour is None
+    assert back.theta == pytest.approx((0.7,) * NB) and back.last_hour is None
 
 
 def test_corrupted_theta_is_rejected(model):
     st = StreamingMayak(model, LAT, LON, ELEV)
     raw = st.serialize()
     hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0].copy()
-    hdr["aci_theta"] = np.nan
+    hdr["aci_theta"][2] = np.nan
     with pytest.raises(ValueError, match="калибровки"):
         st.load_state(hdr.tobytes() + raw[STATE_HEADER.itemsize:])
 
@@ -524,35 +635,62 @@ def test_small_strata_are_dropped_and_external_dims_used():
     assert "частота отчётности" not in ext["dims"], "во внешнем тесте только почасовые станции"
 
 
-def test_served_pairs_follow_time_and_next_issue():
-    from mayak.calibration import served_pairs
-    station = np.array(["a", "b", "a", "a", "a"], object)
-    t = np.array([144, 0, 0, 72, 72])
-    win, lead = served_pairs(station, t, H)
-    assert len(win) == 72 + 72 + H + H
-    a_first = win[:72]
-    assert set(a_first.tolist()) == {2} and list(lead[:72]) == list(range(72))
-    assert set(win[72:144].tolist()) <= {3, 4} and len(set(win[72:144].tolist())) == 1
-    assert list(win[144:144 + H]) == [0] * H and list(lead[144:144 + H]) == list(range(H))
-    assert list(win[-H:]) == [1] * H
+def test_hourly_replay_matches_streaming_runtime(model):
+    """Офлайн-прогон с ритмом устройства на одной станции совпадает с потоковым рантаймом."""
+    from mayak.calibration import aci_hourly_replay
+    p = ACIParams(gamma=0.05)
+    shift = _shift(14)
+    n = 200
+    st, _issued, _obs, raw = _run_hourly(model, p, n, seed=14, shift=shift)
+    W = st.window
+    hours = np.array([h for h, _q, _L in raw], np.int64)
+    future = hours[:, None] + 1 + np.arange(H)[None, :]
+    seen = future <= st.last_hour
+    pos = future % W
+    y = np.where(seen & (st.valid[pos, 0] > 0), st.raw[pos, 0], np.nan)
+    q = np.stack([qq for _h, qq, _L in raw])
+    meta = dict(station=np.full(len(raw), "s0", object), role=np.full(len(raw), "train", object),
+                t=hours + 1, history=np.array([L for _h, _q, L in raw], np.int64))
+    aux = dict(y=np.nan_to_num(y), y_mask=np.isfinite(y).astype(np.float32),
+               mu_clim=np.zeros_like(y), meta=meta)
+    r = aci_hourly_replay(dict(mu=q[..., I_MED], q=q), aux, p, shift)
+    keys = [f"{a}-{b}" for a, b in LEAD_BINS]
+    assert tuple(r["theta_end"][k]["median"] for k in keys) == st.theta
+    assert tuple(r["updates"][k] for k in keys) == st.aci_updates
+    assert min(st.aci_updates) > 0 and r["stations_n"] == 1 and r["issues"] == n
 
 
-def test_aci_replay_brings_each_station_to_nominal():
-    from mayak.calibration import aci_replay
-    rng = np.random.default_rng(7)
-    n_st, per = 12, 60
-    preds, aux = _dataset(n_st=n_st, per=per, seed=7)
-    sig = np.repeat(rng.choice([0.6, 1.0, 1.6], n_st), per)[:, None]
-    aux["y"] = preds["МАЯК"]["mu"] + sig * rng.standard_normal(aux["y"].shape)
-    ev = _ev(preds["МАЯК"], aux)
-    r = aci_replay(ev, aux["meta"], ACIParams(gamma=0.02))
-    assert r["overall"]["n"] == n_st * ((per - 1) * 72 + H)
-    assert abs(r["overall"]["aci"] - 0.9) < 0.02
+def _hourly_dataset(n_st=6, per=600, seed=7):
+    """Ежечасные выпуски: прогноз N(0, 1) каждый час, факт - непрерывный ряд станции."""
+    rng = np.random.default_rng(seed)
+    sig = rng.choice([0.6, 1.0, 1.6], n_st)
+    st, t, ys = [], [], []
+    for i in range(n_st):
+        z = sig[i] * rng.standard_normal(per + H)
+        st += [f"s{i}"] * per
+        t += list(range(1000, 1000 + per))
+        ys += [z[k:k + H] for k in range(per)]
+    y = np.stack(ys)
+    n = len(y)
+    meta = dict(station=np.array(st, object), role=np.full(n, ROLE_TEST, object),
+                t=np.array(t, np.int64), history=np.full(n, 672, np.int64))
+    aux = dict(y=y, y_mask=np.ones_like(y), mu_clim=np.zeros_like(y), meta=meta)
+    return dict(mu=np.zeros_like(y), q=_gauss_q(np.zeros_like(y))), aux
+
+
+def test_hourly_replay_brings_each_lead_bin_to_nominal():
+    from mayak.calibration import aci_hourly_replay
+    pred, aux = _hourly_dataset(per=1000)
+    r = aci_hourly_replay(pred, aux, ACIParams(gamma=0.05))
+    assert r["rhythm"] == "ежечасный выпуск" and r["issues"] == 6 * 1000
+    assert set(r["by_lead_bin"]) == {f"{a}-{b}" for a, b in LEAD_BINS}
+    for k, row in r["by_lead_bin"].items():
+        assert abs(row["aci"] - 0.9) < 0.04, k
+        assert r["updates"][k] > 0
     assert r["stations"]["mad_aci"] < 0.5 * r["stations"]["mad_base"]
-    assert r["clipped"] == 0 and set(r["by_lead_bin"]) == {f"{a}-{b}" for a, b in LEAD_BINS}
     meta = {k: v for k, v in aux["meta"].items() if k != "t"}
     with pytest.raises(KeyError, match="t"):
-        aci_replay(ev, meta, ACIParams())
+        aci_hourly_replay(pred, dict(aux, meta=meta), ACIParams())
 
 
 def test_predictions_roundtrip_and_analysis_on_saved_file(tmp_path):
@@ -579,7 +717,10 @@ def test_predictions_roundtrip_and_analysis_on_saved_file(tmp_path):
                      "coverage_strata_internal_calibrated.png", "calibration_internal.json"}
     data = json.loads((tmp_path / "out" / "calibration_internal.json").read_text("utf-8"))
     assert set(data) >= {"raw", "calibrated", "sharpness", "aci", "config"}
-    assert data["conformal"] is True
+    assert data["conformal"] is True and data["aci"] is None
+    h_pred, h_aux = _hourly_dataset(n_st=2, per=200)
+    hourly = analyze(preds, aux, shift, cfg, hourly=({"МАЯК": h_pred}, h_aux))
+    assert hourly["aci"]["issues"] == 400
     with pytest.raises(KeyError):
         analyze(preds, aux, None, cfg, model="нет такой")
 
@@ -613,13 +754,29 @@ def test_eval_set_meta_carries_window_time_and_feeds_analysis(tmp_path):
                  time_key="test", every_hours=24, windows_per_station=10)
     meta = ds.window_meta()
     assert list(meta["t"]) == [t for _sid, t in ds.items]
+    hourly = ds.hourly(2, 50)
+    assert len(hourly) == 100 and hourly.history_spec()["L"] is None
+    for sid in {s_ for s_, _t in hourly.items}:
+        ts = [t for s_, t in hourly.items if s_ == sid]
+        assert np.array_equal(np.diff(ts), np.ones(len(ts) - 1)), "выпуск каждый час подряд"
+    from mayak.leakage import check_windows
+    assert check_windows([hourly], store) == 100
     n = len(ds)
     rng = np.random.default_rng(0)
     mu = rng.normal(10, 3, (n, H))
     aux = dict(y=mu + rng.standard_normal((n, H)), y_mask=np.ones((n, H)), mu_clim=mu, meta=meta)
     path = save_predictions(tmp_path / "internal.npz", {"МАЯК": dict(mu=mu, q=_gauss_q(mu))}, aux)
     p2, a2, _s, _i = load_predictions(path)
-    res = analyze(p2, a2, None, _cfg(bootstrap=0, min_windows=1, min_stations=1))
+    h_meta = hourly.window_meta()
+    hn = len(hourly)
+    h_mu = rng.normal(10, 3, (hn, H))
+    h_aux = dict(y=h_mu + rng.standard_normal((hn, H)), y_mask=np.ones((hn, H)), mu_clim=h_mu,
+                 meta=h_meta)
+    h_path = save_predictions(tmp_path / "internal_hourly.npz",
+                              {"МАЯК": dict(mu=h_mu, q=_gauss_q(h_mu))}, h_aux)
+    h2, ha2, _s, _i = load_predictions(h_path)
+    res = analyze(p2, a2, None, _cfg(bootstrap=0, min_windows=1, min_stations=1),
+                  hourly=(h2, ha2))
     assert res["aci"]["overall"]["n"] > 0 and res["calibrated"] is None
     assert res["raw"]["report"]["dims"]["роль станции"]
 
@@ -661,6 +818,8 @@ def test_yaml_matches_dataclass_defaults():
     (dict(conditional_dims=("сезон",)), "conditional_dims"),
     (dict(sharpness_range=(2.0, 4.0)), "sharpness_range"), (dict(aci_gamma=0.0), "aci"),
     (dict(aci_max_factor=1.0), "aci"), (dict(bootstrap=-1), "bootstrap"),
+    (dict(aci_stations=0), "aci_stations"), (dict(aci_hours=0), "aci_hours"),
+    (dict(fit_min_windows=0), "fit_min_windows"),
     (dict(ci_level=1.0), "ci_level")])
 def test_bad_calibration_config_is_rejected(kw, match):
     with pytest.raises(ConfigError, match=match):

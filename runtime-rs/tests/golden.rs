@@ -2,8 +2,8 @@
 //!
 //! Каждый сценарий - строки протокола с ожидаемыми ответами, перезапуски хоста с тем же
 //! каталогом состояния и сверки состояния на диске. Сверяются коды контроля качества,
-//! моменты выпуска, признаки отката, множитель калибровки, сводка, выбранный при
-//! перезапуске файл и квантили в пределах допуска своей точности.
+//! моменты выпуска, признаки отката, множители калибровки по бинам лидов, сводка,
+//! выбранный при перезапуске файл и квантили в пределах допуска своей точности.
 //!
 //! Эталон лежит среди данных тестов репозитория и пересоздаётся генератором эталона
 //! хоста только при изменении поведения.
@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use mayak_rt::calendar::{doy_hour, hour_of_year};
-use mayak_rt::calib::{aci_score, apply_adaptive, apply_conformal, AciParams};
+use mayak_rt::calib::{aci_score, apply_adaptive_bins, apply_conformal, lead_bin_of, AciParams, N_LEAD_BINS};
 use mayak_rt::site::{site_change, site_gap};
-use mayak_rt::state::HEADER;
+use mayak_rt::state::{HEADER, HEADER_V4};
 use mayak_rt::store::StateStore;
 use mayak_rt::{Host, Manifest, Precision, Runtime, RuntimeOptions};
 use serde_json::Value;
@@ -81,6 +81,12 @@ fn score(v: &Value) -> f64 {
     }
 }
 
+/// Множители по бинам совпадают с эталоном в пределах допуска.
+fn close(got: &Value, want: &Value, tol: f32) -> bool {
+    let (a, b) = (got.as_array().unwrap(), want.as_array().unwrap());
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (f(x) - f(y)).abs() <= tol)
+}
+
 fn max_abs(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
@@ -130,20 +136,23 @@ fn host(sc: &Value, site: [f64; 3], dir: &Path) -> Host {
         .with_clock(|| panic!("в эталоне часы устройства не используются"))
 }
 
-/// Состояние хоста против файла эталона: заголовок до множителя калибровки, координаты
-/// и окно до байта, множитель с допуском.
+/// Состояние хоста против файла эталона: заголовок до множителей калибровки, координаты
+/// и окно до байта, множители с допуском.
 fn assert_state(rt: &Runtime, file: &Path, theta_tol: f32, what: &str) {
     let mut got = Vec::new();
     rt.serialize(&mut got);
     let want = fs::read(file).unwrap();
     assert_eq!(got.len(), want.len(), "{what}: размер состояния");
     assert_eq!(got[..16], want[..16], "{what}: заголовок состояния");
-    let th = |b: &[u8]| f32::from_le_bytes([b[16], b[17], b[18], b[19]]);
-    assert!(
-        (th(&got) - th(&want)).abs() <= theta_tol,
-        "{what}: множитель калибровки"
-    );
-    assert_eq!(got[20..HEADER], want[20..HEADER], "{what}: координаты");
+    let th = |b: &[u8], k: usize| f32::from_le_bytes(b[16 + 4 * k..20 + 4 * k].try_into().unwrap());
+    for k in 0..N_LEAD_BINS {
+        assert!(
+            (th(&got, k) - th(&want, k)).abs() <= theta_tol,
+            "{what}: множитель калибровки бина {k}"
+        );
+    }
+    let o = 16 + 4 * N_LEAD_BINS;
+    assert_eq!(got[o..HEADER], want[o..HEADER], "{what}: координаты");
     assert_eq!(got[HEADER..], want[HEADER..], "{what}: сырое окно и маски");
 }
 
@@ -202,10 +211,7 @@ fn replay(g: &Golden, name: &str) -> f32 {
                     "forecast" => {
                         assert_eq!(reply["after_unix_hour"], exp["after_unix_hour"], "{at}: момент выпуска");
                         assert_eq!(reply["fallback"], exp["fallback"], "{at}: признак отката");
-                        assert!(
-                            (f(&reply["theta"]) - f(&exp["theta"])).abs() <= theta_tol,
-                            "{at}: множитель"
-                        );
+                        assert!(close(&reply["theta"], &exp["theta"], theta_tol), "{at}: множители");
                         let rows = reply["q"].as_array().unwrap();
                         let nq = rows[0].as_array().unwrap().len();
                         let q: Vec<f32> = rows.iter().flat_map(|r| r.as_array().unwrap().iter().map(f)).collect();
@@ -224,7 +230,7 @@ fn replay(g: &Golden, name: &str) -> f32 {
                     _ => {
                         for (k, v) in exp.as_object().unwrap() {
                             if k == "theta" {
-                                assert!((f(&reply[k]) - f(v)).abs() <= theta_tol, "{at}: сводка {k}");
+                                assert!(close(&reply[k], v, theta_tol), "{at}: сводка {k}");
                             } else {
                                 assert_eq!(&reply[k], v, "{at}: сводка {k}");
                             }
@@ -252,6 +258,7 @@ fn every_scenario_has_a_test() {
         [
             "cold_aci",
             "restart",
+            "restart_v4",
             "extremes",
             "long",
             "qc",
@@ -262,7 +269,8 @@ fn every_scenario_has_a_test() {
             "no_obs",
             "site_shift",
             "relocation",
-            "store_order"
+            "store_order",
+            "hourly_aci"
         ]
     );
 }
@@ -275,6 +283,52 @@ fn cold_start_with_conformal_aci_and_bad_commands() {
 #[test]
 fn restart_from_python_state_forecasts_before_obs() {
     replay(&load(), "restart");
+}
+
+#[test]
+fn restart_from_version_4_state() {
+    replay(&load(), "restart_v4");
+}
+
+#[test]
+fn hourly_issue_updates_every_lead_bin() {
+    let g = load();
+    replay(&g, "hourly_aci");
+    let sc = g.scenario("hourly_aci");
+    let last = sc["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e["op"] == "cmd")
+        .unwrap();
+    let updates = last["expect"]["aci_updates"].as_array().unwrap();
+    assert_eq!(updates.len(), N_LEAD_BINS);
+    assert!(
+        updates.iter().all(|u| u.as_u64().unwrap() > 0),
+        "все бины лидов получили обратную связь"
+    );
+}
+
+#[test]
+fn version_4_state_is_read_into_every_bin() {
+    let g = load();
+    let sc = g.scenario("restart_v4");
+    let raw = fs::read(golden_dir().join(sc["init_files"][0]["file"].as_str().unwrap())).unwrap();
+    assert_eq!(raw[3], 4);
+    let site = [
+        sc["lat"].as_f64().unwrap(),
+        sc["lon"].as_f64().unwrap(),
+        sc["elev"].as_f64().unwrap(),
+    ];
+    let mut rt = runtime(sc, site);
+    rt.load_state(&raw).unwrap();
+    let theta = f32::from_le_bytes(raw[16..20].try_into().unwrap());
+    assert_eq!(rt.theta(), [theta; N_LEAD_BINS]);
+    let mut back = Vec::new();
+    rt.serialize(&mut back);
+    assert_eq!(back[3], mayak_rt::state::VERSION);
+    assert_eq!(back[HEADER..], raw[HEADER_V4..], "окно версии 4 читается без изменений");
 }
 
 #[test]
@@ -378,8 +432,9 @@ fn python_state_roundtrips_byte_exact() {
 #[test]
 fn state_size_is_pinned() {
     let m = Manifest::load(golden_dir().join("model")).unwrap();
-    assert_eq!(mayak_rt::state::nbytes(&m.dims), 3224);
-    assert_eq!(m.state.nbytes, 3224);
+    assert_eq!(mayak_rt::state::nbytes(&m.dims), 3236);
+    assert_eq!(m.state.nbytes, 3236);
+    assert_eq!(HEADER, 44);
 }
 
 #[test]
@@ -393,7 +448,7 @@ fn corrupted_state_is_rejected_and_leaves_cold_start() {
         sc["elev"].as_f64().unwrap(),
     ];
     let mut rt = runtime(sc, site);
-    for bad in [&raw[..raw.len() - 1], &[b'X'; 3224][..]] {
+    for bad in [&raw[..raw.len() - 1], &[b'X'; 3236][..]] {
         assert!(rt.load_state(bad).is_err());
     }
     let mut v = raw.clone();
@@ -425,14 +480,17 @@ fn calibration_matches_metrics() {
     let g = load();
     let m = Manifest::load(golden_dir().join("model")).unwrap();
     let table = m.conformal_table().unwrap().unwrap();
-    let (nq, im) = (m.dims.n_quantiles, m.i_med);
+    let (nq, im, h) = (m.dims.n_quantiles, m.i_med, m.dims.horizon);
+    let lead_bin = lead_bin_of(&m.calibration.lead_bins, h);
     let cal = &g.doc["calibration"];
     for case in cal["cases"].as_array().unwrap() {
         let mut q = g.take(&case["q"]).to_vec();
         if case["conformal"].as_bool().unwrap() {
-            apply_conformal(&mut q, &table, nq, im);
+            let hb = m.history_bin(case["history"].as_u64().unwrap() as usize);
+            apply_conformal(&mut q, &table[hb * h * nq..(hb + 1) * h * nq], nq, im);
         }
-        apply_adaptive(&mut q, f(&case["theta"]), nq, im);
+        let theta: Vec<f32> = case["theta"].as_array().unwrap().iter().map(f).collect();
+        apply_adaptive_bins(&mut q, &theta, &lead_bin, nq, im);
         let want = g.take(&case["expect"]);
         for (x, y) in q.iter().zip(want) {
             assert_eq!(x.to_bits(), y.to_bits(), "калибровка расходится до бита");

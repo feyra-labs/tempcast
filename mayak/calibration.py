@@ -16,7 +16,12 @@ r"""Калибровка интервалов обученной модели.
 всех страт отклонение исправляет маргинальная поправка, отличие страты от набора нет.
 
 Разрез по длине истории строится по сетке длин, если предсказания сохранены для всей
-сетки. Тогда каждая длина из сетки становится своей стратой.
+сетки. Тогда каждая длина из сетки становится своей стратой. Конформная таблица
+применяется к каждому окну по его фактической длине истории.
+
+Офлайн-прогон адаптивной калибровки идёт с ритмом устройства: непрерывный период с
+выпуском каждый час на части станций набора. Для него стенд оценки сохраняет отдельные
+предсказания основной модели; без них раздел адаптивной калибровки пропускается.
 
 Предсказания сохраняет стенд оценки с флагом --save-preds.
 
@@ -24,6 +29,7 @@ r"""Калибровка интервалов обученной модели.
 
     python -m mayak.calibration --preds runs/preds/internal.npz \
         --history-preds runs/preds/internal_history.npz \
+        --hourly-preds runs/preds/internal_hourly.npz \
         --external-preds runs/preds/external.npz --out-dir runs/calibration
 """
 from __future__ import annotations
@@ -37,9 +43,9 @@ import numpy as np
 
 from mayak.config import COVERAGE_DIMS_EXTERNAL, COVERAGE_DIMS_INTERNAL, CalibrationConfig
 from mayak.data.holdout import history_label, history_strata
-from mayak.metrics import (FINE_LEADS, LEAD_BINS, Evaluation, aci_effective_level, aci_run,
-                           aci_score, lead_bin_of, ordered_labels, sharpness_scales,
-                           width_at_coverage)
+from mayak.metrics import (FINE_LEADS, LEAD_BINS, AdaptiveCalibration, Evaluation,
+                           aci_effective_level, aci_score, apply_conformal, lead_bin_of,
+                           ordered_labels, sharpness_scales, width_at_coverage)
 
 log = logging.getLogger(__name__)
 
@@ -137,9 +143,21 @@ def load_predictions(path):
 
 
 def evaluation_of(pred, aux, shift=None, theta=0.0):
+    """Оценка модели по сохранённым предсказаниям, при желании после калибровки.
+
+    Args:
+        pred: медиана и квантили модели.
+        aux: факт, веса, эталон и метаданные окон; длина истории окон - в метаданных.
+        shift: конформная таблица; применяется по фактической длине истории окна.
+        theta: логарифм адаптивного множителя: число или по бинам лидов.
+
+    Returns:
+        Оценка.
+    """
+    hist = aux["meta"].get("history") if shift is not None else None
     return Evaluation(y=aux["y"], mu=pred["mu"], q=pred["q"], mu_clim=aux["mu_clim"],
                       w=aux["y_mask"],
-                      station=aux["meta"]["station"]).with_calibration(shift, theta)
+                      station=aux["meta"]["station"]).with_calibration(shift, theta, hist)
 
 
 def coverage_strata(meta, external=False):
@@ -551,117 +569,124 @@ def plot_coverage_strata(report, out_dir, set_name="internal", model=MAIN_MODEL)
     return p
 
 
-def served_pairs(station, t, horizon):
-    """Пары окна и лида, которые прибор проверил бы по своим прогнозам.
+def aci_hourly_replay(pred, aux, params, shift=None, lead_bins=LEAD_BINS):
+    """Офлайн-прогон адаптивной калибровки с ритмом устройства.
 
-    Окна одной станции упорядочиваются по времени. Прогноз окна действует до выпуска
-    следующего: берутся лиды с первого до промежутка между выпусками, но не дальше
-    горизонта. У последнего окна станции - весь горизонт.
+    Окна станции - выпуски каждый час подряд. Прогон повторяет прибор: на каждом часе
+    сначала валидный факт часа сверяется с кольцом калибровки, затем выпуск, который
+    начинается со следующего часа, записывается в кольцо. Кольцо и подстройка - тот же
+    объект, что в потоковом рантайме. На каждой станции множители стартуют с нуля.
 
-    Args:
-        station: станция каждого окна.
-        t: момент выпуска каждого окна, часы.
-        horizon: длина горизонта, ч.
-
-    Returns:
-        Пара массивов: номера окон и номера лидов, упорядоченные по станции и времени.
-    """
-    station = np.asarray(station).astype(str)
-    t = np.asarray(t, np.int64)
-    order = np.lexsort((t, station))
-    st, ts = station[order], t[order]
-    nxt = np.empty(len(order), np.int64)
-    nxt[:-1] = ts[1:] - ts[:-1]
-    nxt[-1:] = horizon
-    last = np.ones(len(order), bool)
-    last[:-1] = st[1:] != st[:-1]
-    k = np.where(last, horizon, np.clip(nxt, 0, horizon))
-    win = np.repeat(order, k)
-    starts = np.repeat(np.cumsum(k) - k, k)
-    lead = np.arange(int(k.sum())) - starts
-    return win, lead
-
-
-def aci_replay(ev, meta, params, lead_bins=LEAD_BINS):
-    """Офлайн-прогон адаптивной калибровки по окнам оценки.
-
-    Оценка приходит уже со сплит-конформной поправкой. На каждой станции параметр
-    стартует с нуля.
+    Покрытие считается по всем валидным парам выпуска и лида: так пользователь видит
+    прогноз прибора на любом лиде. Интервал пары растянут множителем бина её лида,
+    действовавшим в момент выпуска.
 
     Args:
-        ev: оценка модели после конформной поправки.
-        meta: метаданные окон; нужны станция, роль и момент выпуска.
+        pred: медиана и квантили модели до калибровки на ежечасных окнах.
+        aux: факт, веса и метаданные тех же окон; нужны станция, момент начала горизонта
+            и, с таблицей, длина истории.
         params: параметры адаптивной калибровки.
-        lead_bins: бины лидов для сводок.
+        shift: конформная таблица; None - прибор без таблицы.
+        lead_bins: бины лидов.
 
     Returns:
-        Словарь: сводки без подстройки - то, что прибор выдал бы с нулевым параметром, -
-        и с подстройкой по всему потоку, бинам лидов и ролям, распределение покрытия по
-        станциям и траектория параметра.
+        Словарь: ритм прогона, сводки без подстройки и с подстройкой по всему потоку,
+        бинам лидов и ролям, покрытие по станциям, число обратных связей и итоговые
+        множители по бинам лидов, число упоров в границы.
 
     Raises:
-        KeyError: в метаданных нет момента выпуска.
-        ValueError: нет ни одной валидной пары окна и лида.
+        KeyError: в метаданных нет момента начала горизонта.
+        ValueError: нет ни одной валидной пары выпуска и лида.
     """
+    meta = aux["meta"]
     if "t" not in meta:
         raise KeyError("в метаданных окон нет времени начала 't' - пересохраните "
                        "предсказания текущей версией mayak.evaluate --save-preds")
-    win, lead = served_pairs(meta["station"], meta["t"], ev.horizon)
-    ok = ev.w[win, lead] > 0
-    win, lead = win[ok], lead[ok]
-    if not len(win):
-        raise ValueError("ACI: нет ни одной валидной пары окна и лида для прогона")
-    i, j = params.interval
-    q = np.asarray(ev.q, np.float64)[win, lead]
-    score = aci_score(np.asarray(ev.y, np.float64)[win, lead], q, (i, j))
-    width0 = q[:, j] - q[:, i]
-    st = np.asarray(meta["station"]).astype(str)[win]
-    theta = np.zeros(len(win))
-    miss_aci = np.zeros(len(win))
-    theta_end, clipped = {}, 0
-    bounds = np.flatnonzero(np.r_[True, st[1:] != st[:-1], True])
+    q = np.asarray(pred["q"], np.float32)
+    if shift is not None:
+        q = apply_conformal(q, shift, meta["history"], lead_bins)
+    y = np.asarray(aux["y"], np.float64)
+    w = np.asarray(aux["y_mask"]) > 0
+    n, horizon = y.shape
+    nb = len(lead_bins)
+    st = np.asarray(meta["station"]).astype(str)
+    t = np.asarray(meta["t"], np.int64)
+    theta_at = np.zeros((n, nb), np.float64)
+    updates, clipped, theta_end, hours = np.zeros(nb, np.int64), 0, [], 0
+    order = np.lexsort((t, st))
+    bounds = np.flatnonzero(np.r_[True, st[order][1:] != st[order][:-1], True])
     for a, b in zip(bounds[:-1], bounds[1:]):
-        r = aci_run(score[a:b], params)
-        theta[a:b], miss_aci[a:b] = r["theta"], r["miss"]
-        theta_end[st[a]] = r["theta_end"]
-        clipped += r["clipped"]
+        idx = order[a:b]
+        ts = t[idx]
+        h0, span = int(ts[0]), int(ts[-1] - ts[0]) + horizon
+        yl = np.full(span, np.nan)
+        for k in idx:
+            off = int(t[k]) - h0
+            yl[off:off + horizon] = np.where(w[k], y[k], yl[off:off + horizon])
+        start = {int(ts[j]): int(idx[j]) for j in range(len(idx))}
+        cal = AdaptiveCalibration(params, horizon, lead_bins)
+        for h in range(h0 - 1, h0 + span):
+            if h >= h0 and np.isfinite(yl[h - h0]):
+                cal.feedback(float(yl[h - h0]), h)
+            k = start.get(h + 1)
+            if k is not None:
+                theta_at[k] = cal.theta
+                cal.record(h, q[k])
+        updates += np.asarray(cal.updates, np.int64)
+        clipped += cal.clipped
+        theta_end.append(list(cal.theta))
+        hours += len(idx)
+    win, lead = np.nonzero(w)
+    if not len(win):
+        raise ValueError("ACI: нет ни одной валидной пары выпуска и лида для прогона")
+    i, j = params.interval
+    qp = q[win, lead]
+    score = aci_score(y[win, lead], qp, (i, j))
+    lb = lead_bin_of(horizon, lead_bins)[lead]
+    factor = np.exp(theta_at[win, lb])
     miss0 = (score > 1.0).astype(np.float64)
-    width1 = np.exp(theta) * width0
+    miss1 = (score > factor).astype(np.float64)
+    width0 = (qp[:, j] - qp[:, i]).astype(np.float64)
+    width1 = factor * width0
     nominal = 1.0 - params.target
 
     def summ(sel):
-        n = int(sel.sum())
-        if not n:
+        k = int(sel.sum())
+        if not k:
             return None
-        return dict(n=n, base=float(1 - miss0[sel].mean()), aci=float(1 - miss_aci[sel].mean()),
+        return dict(n=k, base=float(1 - miss0[sel].mean()), aci=float(1 - miss1[sel].mean()),
                     width_base=float(width0[sel].mean()), width_aci=float(width1[sel].mean()))
 
-    lb = lead_bin_of(ev.horizon, lead_bins)[lead]
     by_bin = {f"{a}-{b}": summ(lb == k) for k, (a, b) in enumerate(lead_bins)}
-    role = np.asarray(meta.get("role", np.full(len(ev.y), "—"))).astype(str)[win]
+    role = np.asarray(meta.get("role", np.full(n, "—"))).astype(str)[win]
     by_role = {r: summ(role == r) for r in sorted(set(role.tolist()))}
-    per_st = {}
-    for s in sorted(set(st.tolist())):
-        sel = st == s
-        per_st[s] = (1 - miss0[sel].mean(), 1 - miss_aci[sel].mean())
+    sw = st[win]
+    per_st = {s_: (1 - miss0[sw == s_].mean(), 1 - miss1[sw == s_].mean())
+              for s_ in sorted(set(sw.tolist()))}
     dev0 = np.array([abs(v[0] - nominal) for v in per_st.values()])
     dev1 = np.array([abs(v[1] - nominal) for v in per_st.values()])
-    te = np.array(list(theta_end.values()))
+    te = np.asarray(theta_end, np.float64).reshape(-1, nb)
     return dict(
-        nominal=nominal, gamma=params.gamma, max_factor=params.max_factor,
+        rhythm="ежечасный выпуск", nominal=nominal, gamma=params.gamma,
+        max_factor=params.max_factor, stations_n=int(len(theta_end)), issues=int(hours),
         overall=summ(np.ones(len(win), bool)), by_lead_bin=by_bin, by_role=by_role,
         stations=dict(n=len(per_st), mad_base=float(dev0.mean()) if len(dev0) else float("nan"),
                       mad_aci=float(dev1.mean()) if len(dev1) else float("nan"),
                       per_station={k: dict(base=float(a), aci=float(b))
                                    for k, (a, b) in per_st.items()}),
-        theta_end=dict(median=float(np.median(te)) if te.size else float("nan"),
-                       min=float(te.min()) if te.size else float("nan"),
-                       max=float(te.max()) if te.size else float("nan")),
+        updates={f"{a}-{b}": int(updates[k]) for k, (a, b) in enumerate(lead_bins)},
+        theta_end={f"{a}-{b}": dict(median=float(np.median(te[:, k])), min=float(te[:, k].min()),
+                                    max=float(te[:, k].max()))
+                   for k, (a, b) in enumerate(lead_bins)},
         clipped=int(clipped))
 
 
 def print_aci_replay(r, tol=0.04):
-    print(f"\n--- адаптивная калибровка на устройстве (офлайн-прогон), γ = {r['gamma']}, "
+    if r is None:
+        print("\n--- адаптивная калибровка на устройстве: ежечасного прогона нет ---")
+        return
+    print(f"\n--- адаптивная калибровка на устройстве (офлайн-прогон, {r['rhythm']}): "
+          f"станций {r['stations_n']}, выпусков {r['issues']}, γ = {r['gamma']}, "
           f"множитель ≤ {r['max_factor']:g} ---")
     print(f"{'':>18} {'пар':>8} {'PICP без ACI':>13} {'PICP с ACI':>11} "
           f"{'ширина без':>11} {'ширина с':>9}")
@@ -683,10 +708,12 @@ def print_aci_replay(r, tol=0.04):
     print(f"  станций {s['n']}: среднее |PICP − {r['nominal']:.0%}| без ACI {_pct(s['mad_base'])}, "
           f"с ACI {_pct(s['mad_aci'])}; в допуске ±{tol:.0%}: без {_pct(within('base'))}, "
           f"с {_pct(within('aci'))}")
-    te = r["theta_end"]
-    print(f"  θ в конце: медиана {te['median']:+.3f} (эквивалент номинала "
-          f"{aci_effective_level(te['median'], 1 - r['nominal']):.1%}), "
-          f"диапазон [{te['min']:+.3f}; {te['max']:+.3f}]; обновлений на границе: {r['clipped']}")
+    for k, te in r["theta_end"].items():
+        print(f"  лиды {k}: обратных связей {r['updates'][k]}, θ в конце: медиана "
+              f"{te['median']:+.3f} (эквивалент номинала "
+              f"{aci_effective_level(te['median'], 1 - r['nominal']):.1%}), "
+              f"диапазон [{te['min']:+.3f}; {te['max']:+.3f}]")
+    print(f"  обновлений на границе: {r['clipped']}")
 
 
 def calibration_effect(ev_raw, ev_cal, lead_bins=LEAD_BINS):
@@ -731,9 +758,10 @@ def fit_report(ev_raw, ev_cal, meta, cfg=None):
     """Покрытие на калибровочном наборе до и после таблицы по сезонам и длине истории.
 
     Числа считаются на тех же окнах, по которым подогнана таблица, поэтому покрытие после
-    таблицы в целом близко к номиналу по построению. Смысл отчёта - в стратах: таблица
-    одна на все сезоны и длины истории, и отчёт показывает, держит ли она номинал в
-    каждой из них.
+    таблицы в целом и в бинах длины истории со своей строкой близко к номиналу по
+    построению. Смысл отчёта - в стратах: таблица одна на все сезоны, а бины длины
+    истории с маргинальной строкой держат номинал не по построению, и отчёт показывает,
+    держит ли таблица номинал в каждой из них.
 
     Args:
         ev_raw: оценка модели по сырым выходам.
@@ -820,14 +848,14 @@ def history_evaluations(history, model, shift=None):
 
 
 def analyze(preds, aux, shift=None, cfg=None, external=False, model=MAIN_MODEL,
-            out_dir=None, set_name="internal", history=None):
+            out_dir=None, set_name="internal", history=None, hourly=None):
     """Анализ калибровки по сохранённым предсказаниям.
 
     Кривые «острота против покрытия» всех моделей и покрытие основной модели по разрезам
     считаются по сырым выходам. Если задана конформная таблица, та же модель после
     калибровки разбирается отдельным разделом. Офлайн-прогон адаптивной калибровки идёт
-    по тем интервалам, которые выпустил бы прибор: после конформной таблицы, если она
-    есть, иначе по сырым.
+    по ежечасным выпускам и по тем интервалам, которые выпустил бы прибор: после
+    конформной таблицы, если она есть, иначе по сырым.
 
     Args:
         preds: словарь из имени модели в её медиану и квантили на окнах при полной
@@ -842,11 +870,13 @@ def analyze(preds, aux, shift=None, cfg=None, external=False, model=MAIN_MODEL,
         history: пара из предсказаний и вспомогательных данных тех же окон по всей
             сетке длин истории; нужна основная модель. None значит разрез по длине
             истории строится по метаданным набора.
+        hourly: пара из предсказаний и вспомогательных данных ежечасных выпусков; нужна
+            основная модель. None значит без офлайн-прогона адаптивной калибровки.
 
     Returns:
         Словарь: модель, набор, настройки, признак калибровки, кривые остроты, покрытие
         сырых выходов, раздел после калибровки или None, офлайн-прогон адаптивной
-        калибровки и, если что-то записано, пути к файлам.
+        калибровки или None и, если что-то записано, пути к файлам.
 
     Raises:
         KeyError: основной модели нет в предсказаниях.
@@ -868,12 +898,13 @@ def analyze(preds, aux, shift=None, cfg=None, external=False, model=MAIN_MODEL,
 
     raw = section(evs[model], None)
     calibrated = None
-    device_ev = evs[model]
     if shift is not None:
         device_ev = evaluation_of(preds[model], aux, shift)
         calibrated = section(device_ev, shift)
         calibrated["effect"] = calibration_effect(evs[model], device_ev)
-    replay = aci_replay(device_ev, aux["meta"], cfg.aci())
+    replay = None
+    if hourly is not None and model in hourly[0]:
+        replay = aci_hourly_replay(hourly[0][model], hourly[1], cfg.aci(), shift)
 
     tag = "ВНЕШНИЙ ТЕСТ" if external else "внутренний тест"
     print_coverage_report(raw["report"], raw["gate"],
@@ -948,6 +979,11 @@ def main(argv=None):
     ap.add_argument("--external-preds", default=None, help="предсказания внешнего теста")
     ap.add_argument("--external-history-preds", default=None,
                     help="предсказания внешнего теста по сетке длин истории")
+    ap.add_argument("--hourly-preds", default=None,
+                    help="ежечасные выпуски основной модели внутреннего теста "
+                         "(DIR/internal_hourly.npz) для офлайн-прогона адаптивной калибровки")
+    ap.add_argument("--external-hourly-preds", default=None,
+                    help="ежечасные выпуски основной модели внешнего теста")
     ap.add_argument("--config", default=None,
                     help="YAML (по умолчанию conf/calibration/default.yaml)")
     ap.add_argument("--model", default=MAIN_MODEL, help="модель для разрезов и ACI")
@@ -962,23 +998,28 @@ def main(argv=None):
     cfg = load_config(args.config)
     if args.bootstrap is not None:
         cfg = replace(cfg, bootstrap=args.bootstrap)
-    for path, hist_path, external, name in (
-            (args.preds, args.history_preds, False, "internal"),
-            (args.external_preds, args.external_history_preds, True, "external")):
+    for path, hist_path, hourly_path, external, name in (
+            (args.preds, args.history_preds, args.hourly_preds, False, "internal"),
+            (args.external_preds, args.external_history_preds, args.external_hourly_preds,
+             True, "external")):
         if not path:
             continue
         preds, aux, shift, info = load_predictions(path)
-        history = None
+        history = hourly = None
         if hist_path:
             h_preds, h_aux, _shift, _info = load_predictions(hist_path)
             history = (h_preds, h_aux)
+        if hourly_path:
+            r_preds, r_aux, _shift, _info = load_predictions(hourly_path)
+            hourly = (r_preds, r_aux)
         if args.no_conformal:
             shift = None
         print(f"\n{path}: моделей {len(preds)}, окон {len(aux['y'])}, конформная таблица "
               f"{'есть' if shift is not None else 'нет'}; сетка длин истории "
-              f"{'есть' if history is not None else 'нет'}; {info}")
+              f"{'есть' if history is not None else 'нет'}; ежечасные выпуски "
+              f"{'есть' if hourly is not None else 'нет'}; {info}")
         res = analyze(preds, aux, shift, cfg, external=external, model=args.model,
-                      out_dir=args.out_dir, set_name=name, history=history)
+                      out_dir=args.out_dir, set_name=name, history=history, hourly=hourly)
         for p in res["paths"]:
             print("  ", p)
 

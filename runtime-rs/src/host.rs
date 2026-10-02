@@ -2,9 +2,12 @@
 //!
 //! Команды, по одной на строку:
 //!   obs <секунды UTC> <T> <P> <RH>   значение: число, "-" (нет данных) или "nan";
-//!   forecast [<секунды UTC>]         выпуск после последнего шага;
-//!   status                           сводка рантайма, в том числе текущая точка, точка
-//!                                    загруженного состояния и исход их сравнения.
+//!   forecast [<секунды UTC>]         выпуск после последнего шага; множители калибровки
+//!                                    в ответе - по бинам лидов;
+//!   status                           сводка рантайма: длина истории выпуска, множители,
+//!                                    обратные связи и промахи по бинам лидов, текущая
+//!                                    точка, точка загруженного состояния и исход их
+//!                                    сравнения.
 //! Ответ на каждую команду - одна строка JSON. Момент наблюдения лежит на целом часе и
 //! позже последнего шага; пропущенные часы заполняются пустыми шагами, в том числе
 //! простой между перезапусками. После каждого наблюдения состояние пишется на диск.
@@ -137,8 +140,8 @@ impl Host {
 
     fn status(&self) -> Value {
         let rt = &self.rt;
-        json!({"filled": rt.filled(), "theta": rt.theta(),
-               "conformal": rt.conformal_applied(),
+        json!({"filled": rt.filled(), "history_hours": rt.history_hours(), "theta": rt.theta(),
+               "conformal": rt.conformal_applied(), "aci_lead_bins": rt.lead_bins(),
                "aci_updates": rt.aci_updates(), "aci_misses": rt.aci_misses(),
                "idle_hours": rt.idle_hours(), "fallbacks": rt.fallbacks,
                "state_bytes": rt.state_nbytes(), "last_unix_hour": rt.last_hour(),

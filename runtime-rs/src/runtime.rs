@@ -16,10 +16,14 @@
 //! устройства, и прогноз строится по пустому окну, которое этим часом кончается; окно
 //! и счётчики при этом не меняются.
 //!
+//! Калибровка выпуска: конформная таблица, строка которой выбирается по длине истории
+//! выпуска - числу часов после холодного старта, но не больше истории модели, затем
+//! множитель своего бина лидов. Множители подстраиваются через кольцо по часам-мишеням.
+//!
 //! Смена точки. Состояние помнит координаты и высоту, для которых оно записано. Сдвиг
 //! в пределах порогов манифеста - уточнение метаданных: окно сохраняется и
-//! пересчитывается для новой точки, множитель калибровки сохраняется. Больше порога -
-//! прибор перенесён: окно пустое, множитель нулевой, момент последнего шага сохранён.
+//! пересчитывается для новой точки, множители калибровки сохраняются. Больше порога -
+//! прибор перенесён: окно пустое, множители нулевые, момент последнего шага сохранён.
 //! Контроль качества новых часов берёт текущую высоту.
 //!
 //! Откат. Граф старта возвращает таблицу климатологии точки: среднее и масштаб
@@ -29,7 +33,7 @@
 use std::path::Path;
 
 use crate::calendar::{doy_hour, hour_of_year, HOURS_OF_YEAR};
-use crate::calib::{aci_score, apply_adaptive, apply_conformal, AciParams};
+use crate::calib::{apply_adaptive_bins, apply_conformal, AciParams, Adaptive, N_LEAD_BINS};
 use crate::graphs::{Graphs, Precision};
 use crate::manifest::{Dims, Manifest};
 use crate::qc::CausalQc;
@@ -122,16 +126,10 @@ pub struct Runtime {
     doy_fut: Vec<f32>,
     hour_fut: Vec<f32>,
     out: Forecast,
-    // калибровка
+    // калибровка: таблица подряд по бинам длины истории и адаптивная калибровка по
+    // бинам лидов с кольцом по часам-мишеням
     conformal: Option<Vec<f32>>,
-    aci: Option<AciParams>,
-    theta: f32,
-    aci_updates: u64,
-    aci_misses: u64,
-    pending_first: i64,
-    pending_q: Vec<f32>,
-    pending_last: i64,
-    pending: bool,
+    cal: Adaptive,
     // учёт
     idle_hours: u64,
     loaded_site: Option<[f32; 3]>,
@@ -163,6 +161,7 @@ impl Runtime {
             (None, true) => return Err(Error::new("ACI включена, но параметров ACI в манифесте нет")),
             _ => None,
         };
+        let cal = Adaptive::new(aci, &manifest.calibration.lead_bins, d.horizon);
         let qc = CausalQc::new(manifest.qc.clone(), manifest.phys_bounds(), Some(elev));
         let site = [lat as f32, lon as f32, elev as f32];
         let (lat, lon, elev) = ([lat as f32], [lon as f32], [elev as f32]);
@@ -240,31 +239,25 @@ impl Runtime {
                 after_hour: 0,
             },
             conformal,
-            aci,
-            theta: 0.0,
-            aci_updates: 0,
-            aci_misses: 0,
-            pending_first: 0,
-            pending_q: vec![0.0; h * nq],
-            pending_last: -1,
-            pending: false,
+            cal,
             idle_hours: 0,
             loaded_site: None,
             site_change: None,
             fallbacks: 0,
             d,
         };
-        rt.reset_calibration(0.0);
+        rt.reset_calibration([0.0; N_LEAD_BINS]);
         rt.reset(None)?;
         Ok(rt)
     }
 
-    /// Холодный старт: окно состоит из пустых часов. Множитель калибровки сохраняется.
+    /// Холодный старт: окно состоит из пустых часов. Множители калибровки сохраняются,
+    /// кольцо калибровки очищается.
     ///
     /// `last_hour` - час, которым кончается пустое окно; None - момент ещё не известен,
     /// окно строится при первом шаге.
     pub fn reset(&mut self, last_hour: Option<i64>) -> Result<()> {
-        self.pending = false;
+        self.cal.clear();
         self.qc.reset();
         self.raw.fill(0.0);
         self.present.fill(false);
@@ -281,29 +274,35 @@ impl Runtime {
         Ok(())
     }
 
-    /// Сброс адаптивной калибровки: множитель и счётчики обратной связи.
-    pub fn reset_calibration(&mut self, theta: f32) {
-        self.theta = match &self.aci {
-            Some(a) => a.clip(theta as f64),
-            None => theta,
-        };
-        self.aci_updates = 0;
-        self.aci_misses = 0;
-        self.pending = false;
+    /// Сброс адаптивной калибровки: множители по бинам лидов, счётчики и кольцо.
+    pub fn reset_calibration(&mut self, theta: [f32; N_LEAD_BINS]) {
+        self.cal.reset(theta);
     }
 
     /// Применяется ли конформная таблица к выпускам.
     pub fn conformal_applied(&self) -> bool {
         self.conformal.is_some()
     }
-    pub fn theta(&self) -> f32 {
-        self.theta
+    /// Логарифмы множителей калибровки по бинам лидов.
+    pub fn theta(&self) -> [f32; N_LEAD_BINS] {
+        self.cal.theta
     }
-    pub fn aci_updates(&self) -> u64 {
-        self.aci_updates
+    /// Число обратных связей по бинам лидов с последнего сброса калибровки.
+    pub fn aci_updates(&self) -> [u64; N_LEAD_BINS] {
+        self.cal.updates
     }
-    pub fn aci_misses(&self) -> u64 {
-        self.aci_misses
+    /// Число промахов по бинам лидов с последнего сброса калибровки.
+    pub fn aci_misses(&self) -> [u64; N_LEAD_BINS] {
+        self.cal.misses
+    }
+    /// Бины лидов адаптивной калибровки из манифеста.
+    pub fn lead_bins(&self) -> &[[usize; 2]] {
+        &self.manifest.calibration.lead_bins
+    }
+    /// Длина истории выпуска: часы после холодного старта, не больше истории модели. По
+    /// ней выбирается строка конформной таблицы.
+    pub fn history_hours(&self) -> usize {
+        self.filled.min(self.d.history)
     }
     /// Сколько часов окна прошло после холодного старта, не больше длины окна.
     pub fn filled(&self) -> usize {
@@ -346,8 +345,9 @@ impl Runtime {
     pub fn encoder_buffer_bytes(&self) -> usize {
         4 * self.enc.len()
     }
-    /// Кольца, буфер энкодера и таблица климатологии в памяти, байт. На диск они не
-    /// пишутся: всё восстанавливается из окна и графа старта.
+    /// Кольца, буфер энкодера, таблица климатологии и кольцо адаптивной калибровки в
+    /// памяти, байт. На диск они не пишутся: всё восстанавливается из окна и графа
+    /// старта, кольцо калибровки после перезапуска пусто.
     pub fn memory_bytes(&self) -> usize {
         4 * (self.enc.len()
             + self.u_ring.len()
@@ -355,6 +355,7 @@ impl Runtime {
             + self.rows.len()
             + self.clim_mu.len()
             + self.clim_sig.len())
+            + self.cal.ring_bytes()
     }
 
     /// Момент выпуска: последний шаг, а до первого шага - текущий час устройства.
@@ -473,8 +474,8 @@ impl Runtime {
     fn push(&mut self, obs: [Option<f64>; 3], hour: i64) -> Result<[u8; 3]> {
         let (x, codes) = self.qc.push(obs);
         let (raw, present) = self.qc.latest();
-        if self.aci.is_some() && codes[0] == 0 {
-            self.aci_feedback(x[0] as f64, hour);
+        if codes[0] == 0 {
+            self.cal.feedback(x[0] as f64, hour);
         }
         let p = self.slot(hour);
         for c in 0..3 {
@@ -574,29 +575,6 @@ impl Runtime {
         )
     }
 
-    fn aci_feedback(&mut self, y: f64, hour: i64) {
-        let Some(aci) = self.aci else { return };
-        if !self.pending {
-            return;
-        }
-        let k = hour - self.pending_first;
-        if k < 0 || k >= self.d.horizon as i64 || k <= self.pending_last {
-            return;
-        }
-        self.pending_last = k;
-        let (nq, k) = (self.d.n_quantiles, k as usize);
-        let score = aci_score(
-            y,
-            &self.pending_q[k * nq..(k + 1) * nq],
-            aci.interval,
-            self.manifest.i_med,
-        );
-        let (theta, miss) = aci.step(self.theta, score);
-        self.theta = theta;
-        self.aci_updates += 1;
-        self.aci_misses += miss as u64;
-    }
-
     /// Выпуск на часы после момента выпуска. `now_hour` - текущий час по часам
     /// устройства, нужен только до первого шага. Ошибка графа или нечисловой выход -
     /// Err; откат к климатологии делает выпуск с откатом.
@@ -659,16 +637,13 @@ impl Runtime {
         if self.out.q.iter().any(|v| !v.is_finite()) {
             return Err(Error::new("выход графа issue не конечен"));
         }
+        let i_med = self.manifest.i_med;
         if let Some(t) = &self.conformal {
-            apply_conformal(&mut self.out.q, t, nq, self.manifest.i_med);
+            let (hb, n) = (self.manifest.history_bin(self.history_hours()), h * nq);
+            apply_conformal(&mut self.out.q, &t[hb * n..(hb + 1) * n], nq, i_med);
         }
-        if self.aci.is_some() {
-            self.pending_first = last + 1;
-            self.pending_q.copy_from_slice(&self.out.q);
-            self.pending_last = -1;
-            self.pending = true;
-        }
-        apply_adaptive(&mut self.out.q, self.theta, nq, self.manifest.i_med);
+        self.cal.record(last, &self.out.q, nq, i_med);
+        apply_adaptive_bins(&mut self.out.q, &self.cal.theta, &self.cal.lead_bin, nq, i_med);
         for k in 0..h {
             self.out.mu[k] = self.out.q[k * nq + self.manifest.i_med];
         }
@@ -717,7 +692,7 @@ impl Runtime {
         let snap = Snapshot {
             filled: self.filled,
             last_hour: self.last_hour,
-            theta: self.theta,
+            theta: self.cal.theta,
             site: self.site,
             raw: (0..w)
                 .map(|k| std::array::from_fn(|c| self.raw[pos(k) * 3 + c]))
@@ -734,8 +709,9 @@ impl Runtime {
 
     /// Загрузка состояния и восстановление всего остального одним проходом по окну.
     /// Состояние другой точки: сдвиг в пределах порогов - окно пересчитывается для новой
-    /// точки, больше порога - окно пустое, множитель калибровки нулевой, момент
-    /// последнего шага сохраняется. При ошибке рантайм остаётся в холодном старте.
+    /// точки, больше порога - окно пустое, множители калибровки нулевые, момент
+    /// последнего шага сохраняется. Состояние версии 4 читается, его множитель идёт во
+    /// все бины лидов. При ошибке рантайм остаётся в холодном старте.
     pub fn load_state(&mut self, raw: &[u8]) -> Result<()> {
         let s = Snapshot::parse(raw, &self.d, &self.bounds)?;
         let lim = self.manifest.runtime;
@@ -748,7 +724,7 @@ impl Runtime {
                 "mayak-rt: прибор перенесён: {}; холодный старт, множитель калибровки сброшен",
                 describe_gap(gap, &lim)
             );
-            self.reset_calibration(0.0);
+            self.reset_calibration([0.0; N_LEAD_BINS]);
             if let Err(e) = self.reset(s.last_hour) {
                 self.reset(None)?;
                 return Err(e);

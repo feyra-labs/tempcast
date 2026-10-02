@@ -6,12 +6,13 @@ from statistics import NormalDist
 
 import numpy as np
 
-from mayak.constants import H, QUANTILES
+from mayak.constants import H, HISTORY_BINS, QUANTILES
 
 Q = np.array(QUANTILES, np.float32)
 NQ = len(QUANTILES)
 I_LO90, I_LO80, I_MED, I_HI80, I_HI90 = 0, 1, 3, 5, 6
 EPS = 1e-9
+NO_HOUR = int(np.iinfo(np.int64).min)
 
 LEAD_BINS = ((1, 6), (7, 24), (25, 72), (73, 168))
 FINE_LEADS = (1, 2, 3, 4, 6, 8, 12, 18, 24, 36, 48, 72, 96, 120, 168)
@@ -202,6 +203,63 @@ def lead_bin_of(horizon=H, lead_bins=LEAD_BINS):
     return np.array([lead_bin_index(h + 1, lead_bins) for h in range(horizon)], np.int64)
 
 
+def check_history_bins(history_bins=HISTORY_BINS):
+    """Проверяет, что бины длины истории идут подряд с нуля без пропусков и наложений.
+
+    Args:
+        history_bins: бины длины истории: границы включительно, ч, и подпись.
+
+    Returns:
+        Верхние границы бинов, массив int64.
+
+    Raises:
+        ValueError: бинов нет, первый бин не начинается с нуля, между бинами пропуск
+            или наложение.
+    """
+    if not history_bins:
+        raise ValueError("бинов длины истории нет")
+    prev = -1
+    for lo, hi, *_name in history_bins:
+        if int(lo) != prev + 1 or int(hi) < int(lo):
+            raise ValueError(f"бины длины истории {[tuple(b[:2]) for b in history_bins]}: "
+                             f"нужны подряд с нуля, без пропусков и наложений")
+        prev = int(hi)
+    return np.array([int(b[1]) for b in history_bins], np.int64)
+
+
+def history_bin_of(history, history_bins=HISTORY_BINS):
+    """Номер бина длины истории для каждой длины.
+
+    Args:
+        history: длина истории, ч; число или массив.
+        history_bins: бины длины истории.
+
+    Returns:
+        Номера бинов int64 той же формы; длина за последним бином относится к нему.
+
+    Raises:
+        ValueError: длина истории отрицательная или бины негодны.
+    """
+    his = check_history_bins(history_bins)
+    h = np.asarray(history, np.int64)
+    if np.any(h < 0):
+        raise ValueError(f"длина истории отрицательная: {h.min()} ч")
+    return np.minimum(np.searchsorted(his, h, side="left"), len(his) - 1).astype(np.int64)
+
+
+def history_bin_index(L, history_bins=HISTORY_BINS):
+    """Номер бина длины истории для одной длины.
+
+    Args:
+        L: длина истории, ч.
+        history_bins: бины длины истории.
+
+    Returns:
+        Номер бина.
+    """
+    return int(history_bin_of(int(L), history_bins))
+
+
 def order_around_median(q):
     """Восстанавливает порядок квантилей, не трогая медиану.
 
@@ -230,99 +288,185 @@ def check_median_free(shift):
     Raises:
         ValueError: поправка медианы хотя бы в одном бине не равна нулю.
     """
-    med = np.asarray(shift, np.float32)[:, I_MED]
+    med = np.asarray(shift, np.float32)[..., I_MED]
     if np.any(med != 0.0):
         raise ValueError(f"поправка медианы в таблице не нулевая ({med.tolist()}): такая "
                          f"таблица сдвигает точечный прогноз; подгоните таблицу заново")
 
 
-def conformal_table(shift, horizon=H, lead_bins=LEAD_BINS):
-    """Поправки по бинам лидов, развёрнутые на каждый лид.
+def check_conformal_shape(shift, lead_bins=LEAD_BINS, history_bins=HISTORY_BINS):
+    """Проверяет форму конформной таблицы и нулевую поправку медианы.
 
     Args:
-        shift: таблица поправок, форма (число бинов лидов, число квантилей).
-        horizon: число лидов.
+        shift: таблица поправок.
         lead_bins: бины лидов таблицы.
+        history_bins: бины длины истории таблицы.
 
     Returns:
-        Поправки float32, форма (horizon, число квантилей).
+        Таблица float32 формы (число бинов лидов, число бинов длины истории, число
+        квантилей).
 
     Raises:
-        ValueError: неверная форма таблицы или ненулевая поправка медианы.
+        ValueError: таблица старого формата без бинов длины истории, другой формы или с
+            ненулевой поправкой медианы.
     """
     shift = np.asarray(shift, np.float32)
-    if shift.ndim != 2 or shift.shape[1] != NQ:
-        raise ValueError(f"таблица поправок формы {shift.shape}, нужно (бины, {NQ})")
-    if shift.shape[0] != len(lead_bins):
-        raise ValueError(f"таблица поправок на {shift.shape[0]} бинов, "
-                         f"а бинов лидов {len(lead_bins)}")
+    want = (len(lead_bins), len(history_bins), NQ)
+    if shift.ndim == 2:
+        raise ValueError(f"таблица поправок старого формата {shift.shape}: бины лидов × "
+                         f"квантили, без бинов длины истории. Теперь таблица - бины лидов × "
+                         f"бины длины истории × квантили {want}; подгоните таблицу заново: "
+                         f"python scripts/calibrate.py")
+    if shift.shape != want:
+        raise ValueError(f"таблица поправок формы {shift.shape}, нужно {want}: бины лидов × "
+                         f"бины длины истории × квантили")
     check_median_free(shift)
-    return shift[lead_bin_of(horizon, lead_bins)]
+    return shift
 
 
-def apply_conformal(q, shift, lead_bins=LEAD_BINS):
+def conformal_table(shift, history, horizon=H, lead_bins=LEAD_BINS, history_bins=HISTORY_BINS):
+    """Поправки таблицы, развёрнутые на каждый лид, для заданной длины истории.
+
+    Args:
+        shift: таблица поправок, форма (число бинов лидов, число бинов длины истории,
+            число квантилей).
+        history: длина истории прогноза, ч; число или массив длин по прогнозам.
+        horizon: число лидов.
+        lead_bins: бины лидов таблицы.
+        history_bins: бины длины истории таблицы.
+
+    Returns:
+        Поправки float32, форма (*форма history, horizon, число квантилей).
+
+    Raises:
+        ValueError: неверная форма таблицы, ненулевая поправка медианы или
+            отрицательная длина истории.
+    """
+    shift = check_conformal_shape(shift, lead_bins, history_bins)
+    hb = history_bin_of(history, history_bins)
+    per_lead = np.moveaxis(shift[lead_bin_of(horizon, lead_bins)], 1, 0)
+    return np.ascontiguousarray(per_lead[hb])
+
+
+def apply_conformal(q, shift, history, lead_bins=LEAD_BINS, history_bins=HISTORY_BINS):
     """Конформная поправка квантилей: меняется ширина интервалов, медиана остаётся.
+
+    Строка таблицы выбирается по фактической длине истории прогноза.
 
     Args:
         q: квантили, форма (..., лиды, число квантилей).
-        shift: таблица поправок по бинам лидов с нулевой поправкой медианы.
+        shift: таблица поправок по бинам лидов и длины истории с нулевой поправкой
+            медианы.
+        history: длина истории, ч: одно число для всех прогнозов или массив формы
+            q.shape[:-2].
         lead_bins: бины лидов таблицы.
+        history_bins: бины длины истории таблицы.
 
     Returns:
         Поправленные и упорядоченные квантили float32.
+
+    Raises:
+        ValueError: длина истории не задана или не по одной на прогноз; таблица негодна.
     """
+    if history is None:
+        raise ValueError("конформная таблица применяется по длине истории прогноза, а она "
+                         "не задана")
     q = np.asarray(q, np.float32)
-    table = conformal_table(shift, q.shape[-2], lead_bins)
+    hist = np.asarray(history)
+    if hist.ndim and hist.shape != q.shape[:-2]:
+        raise ValueError(f"длин истории {hist.shape}, а прогнозов {q.shape[:-2]}: нужна длина "
+                         f"истории каждого прогноза")
+    table = conformal_table(shift, hist, q.shape[-2], lead_bins, history_bins)
     return order_around_median(q + table)
 
 
-def apply_adaptive(q, theta=0.0):
-    """Адаптивная поправка: все квантили растягиваются вокруг медианы в одно число раз.
+def apply_adaptive(q, theta=0.0, lead_bins=LEAD_BINS):
+    """Адаптивная поправка: квантили растягиваются вокруг медианы.
 
-    Множитель растяжения - экспонента от параметра. Медиана поправкой не меняется. При
-    нулевом параметре квантили возвращаются как есть, без арифметики, чтобы пакет и
-    поток совпадали до бита. Растяжение с положительным множителем сохраняет порядок;
-    упорядочивание вокруг медианы - защита для входа, который уже был немонотонным.
+    Множитель растяжения - экспонента от параметра: один на все лиды или свой на каждый
+    бин лидов. Медиана поправкой не меняется. Лиды с нулевым параметром возвращаются как
+    есть, без арифметики, чтобы пакет и поток совпадали до бита. Растяжение с
+    положительным множителем сохраняет порядок; упорядочивание вокруг медианы - защита
+    для входа, который уже был немонотонным.
 
     Args:
-        q: квантили, последняя ось - набор квантилей.
-        theta: логарифм множителя ширины.
+        q: квантили, форма (..., лиды, число квантилей).
+        theta: логарифм множителя ширины: число или по значению на бин лидов.
+        lead_bins: бины лидов параметров.
 
     Returns:
         Пара: поправленные квантили и их медиана.
 
     Raises:
-        ValueError: параметр не конечен.
+        ValueError: параметр не конечен или число параметров не равно числу бинов.
     """
-    theta = float(theta)
-    if not math.isfinite(theta):
+    th = np.asarray(theta, np.float64)
+    if not np.all(np.isfinite(th)):
         raise ValueError(f"θ адаптивной поправки не конечно: {theta}")
     q = np.asarray(q, np.float32)
-    if theta != 0.0:
-        med = q[..., I_MED:I_MED + 1]
-        q = order_around_median(med + np.float32(math.exp(theta)) * (q - med))
+    if th.ndim == 0:
+        if float(th) != 0.0:
+            med = q[..., I_MED:I_MED + 1]
+            q = order_around_median(med + np.float32(math.exp(float(th))) * (q - med))
+        return q, q[..., I_MED].copy()
+    if th.shape != (len(lead_bins),):
+        raise ValueError(f"θ по бинам лидов формы {th.shape}, а бинов {len(lead_bins)}")
+    per_lead = th[lead_bin_of(q.shape[-2], lead_bins)]
+    nz = per_lead != 0.0
+    if nz.any():
+        k = np.array([math.exp(v) for v in per_lead[nz].tolist()], np.float32)
+        sel = q[..., nz, :]
+        med = sel[..., I_MED:I_MED + 1]
+        q = q.copy()
+        q[..., nz, :] = order_around_median(med + k[:, None] * (sel - med))
     return q, q[..., I_MED].copy()
 
 
-def calibrate_forecast(q, shift=None, theta=0.0, lead_bins=LEAD_BINS):
+def calibrate_forecast(q, shift=None, theta=0.0, history=None, lead_bins=LEAD_BINS,
+                       history_bins=HISTORY_BINS):
     """Калибровка квантилей прогноза в фиксированном порядке.
 
-    Сначала сплит-конформная таблица по бинам лидов, подогнанная офлайн на
-    калибровочном окне, затем адаптивный множитель ширины, который подстраивается
-    онлайн на устройстве. Медиана берётся из итоговых квантилей.
+    Сначала сплит-конформная таблица по бинам лидов и длины истории, подогнанная офлайн
+    на калибровочном окне, затем адаптивный множитель ширины по бинам лидов, который
+    подстраивается онлайн на устройстве. Медиана берётся из итоговых квантилей.
 
     Args:
         q: квантили модели, форма (..., лиды, число квантилей).
-        shift: конформная таблица по бинам лидов; None - без неё.
-        theta: логарифм адаптивного множителя ширины.
-        lead_bins: бины лидов таблицы.
+        shift: конформная таблица; None - без неё.
+        theta: логарифм адаптивного множителя ширины: число или по бинам лидов.
+        history: длина истории прогноза, ч; нужна, если задана таблица.
+        lead_bins: бины лидов.
+        history_bins: бины длины истории таблицы.
 
     Returns:
         Пара: откалиброванные квантили и их медиана.
     """
     if shift is not None:
-        q = apply_conformal(q, shift, lead_bins)
-    return apply_adaptive(q, theta)
+        q = apply_conformal(q, shift, history, lead_bins, history_bins)
+    return apply_adaptive(q, theta, lead_bins)
+
+
+def aci_score_bounds(y, lo, med, hi):
+    """Нормированный выход факта за интервал по его границам и медиане.
+
+    Args:
+        y: факт.
+        lo: нижняя граница интервала.
+        med: медиана.
+        hi: верхняя граница интервала.
+
+    Returns:
+        Оценка той же формы, что факт; NaN там, где факт или медиана не конечны.
+    """
+    y = np.asarray(y, np.float64)
+    lo, med, hi = (np.asarray(v, np.float64) for v in (lo, med, hi))
+    u = y - med
+    d = np.where(u >= 0, hi - med, med - lo)
+    au = np.abs(u)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        s = np.where(d > 0, au / np.where(d > 0, d, 1.0), np.inf)
+    s = np.where(au == 0, 0.0, s)
+    return np.where(np.isfinite(y) & np.isfinite(med), s, np.nan)
 
 
 def aci_score(y, q, interval=(I_LO90, I_HI90)):
@@ -342,16 +486,8 @@ def aci_score(y, q, interval=(I_LO90, I_HI90)):
         Оценка той же формы, что факт; NaN там, где факт или медиана не конечны.
     """
     i, j = interval
-    y = np.asarray(y, np.float64)
     q = np.asarray(q, np.float64)
-    med = q[..., I_MED]
-    u = y - med
-    d = np.where(u >= 0, q[..., j] - med, med - q[..., i])
-    au = np.abs(u)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        s = np.where(d > 0, au / np.where(d > 0, d, 1.0), np.inf)
-    s = np.where(au == 0, 0.0, s)
-    return np.where(np.isfinite(y) & np.isfinite(med), s, np.nan)
+    return aci_score_bounds(y, q[..., i], q[..., I_MED], q[..., j])
 
 
 def _f32(x):
@@ -481,6 +617,142 @@ def aci_run(scores, params, theta0=0.0):
     return dict(theta=before, miss=miss, theta_end=theta, clipped=int(clipped))
 
 
+class AdaptiveCalibration:
+    """Адаптивная калибровка прибора по бинам лидов.
+
+    У каждого бина лидов свой логарифм множителя ширины. Обратная связь идёт через
+    кольцо по часам-мишеням: для каждого из следующих часов горизонта и каждого бина
+    лежат медиана и границы интервала из последнего выпуска, у которого лид до этого
+    часа попадает в бин. Валидный час сверяется со всеми записями на него, и каждый бин
+    обновляется этим часом не больше одного раза. Так при ежечасном выпуске обратную
+    связь получают все бины лидов, а не только первый лид.
+
+    Записи берутся после конформной таблицы и до множителя, как и прежде. Кольцо живёт
+    только в памяти и после перезапуска пусто.
+
+    Логика общая для потокового рантайма и офлайн-прогона калибровки; хост на Rust
+    повторяет её, совпадение закреплено эталоном.
+
+    Args:
+        params: параметры адаптивной калибровки или None: тогда множители только
+            хранятся, не подстраиваются, и кольца нет.
+        horizon: длина горизонта, ч.
+        lead_bins: бины лидов.
+
+    Attributes:
+        theta: логарифмы множителей по бинам лидов, значения float32.
+        updates: число обратных связей по бинам с последнего сброса.
+        misses: число промахов по бинам с последнего сброса.
+        clipped: число обновлений, упёршихся в границу множителя, с последнего сброса.
+    """
+
+    def __init__(self, params=None, horizon=H, lead_bins=LEAD_BINS):
+        self.params = params
+        self.horizon = int(horizon)
+        self.lead_bins = tuple(tuple(b) for b in lead_bins)
+        self.lead_bin = lead_bin_of(self.horizon, self.lead_bins)
+        nb = len(self.lead_bins)
+        self.ring_hour = None if params is None else np.full((self.horizon, nb), NO_HOUR,
+                                                             np.int64)
+        self.ring = None if params is None else np.zeros((self.horizon, nb, 3), np.float32)
+        self.reset()
+
+    @property
+    def n_bins(self):
+        return len(self.lead_bins)
+
+    @property
+    def nbytes(self):
+        """Размер кольца в памяти, байт; без параметров кольца нет."""
+        return 0 if self.ring is None else int(self.ring_hour.nbytes + self.ring.nbytes)
+
+    def reset(self, theta=0.0):
+        """Новые множители, нулевые счётчики и пустое кольцо.
+
+        Args:
+            theta: логарифм множителя: одно число на все бины или по числу на бин.
+
+        Raises:
+            ValueError: параметр не конечен или не по одному на бин.
+        """
+        th = np.asarray(theta, np.float64)
+        if th.ndim and th.shape != (self.n_bins,):
+            raise ValueError(f"θ по бинам лидов формы {th.shape}, а бинов {self.n_bins}")
+        th = np.broadcast_to(th, (self.n_bins,))
+        if not np.all(np.isfinite(th)):
+            raise ValueError(f"θ адаптивной поправки не конечно: {th.tolist()}")
+        clip = _f32 if self.params is None else self.params.clip
+        self.theta = [clip(float(v)) for v in th]
+        self.updates = [0] * self.n_bins
+        self.misses = [0] * self.n_bins
+        self.clipped = 0
+        self.clear()
+
+    def clear(self):
+        """Пустое кольцо; множители и счётчики остаются."""
+        if self.ring_hour is not None:
+            self.ring_hour.fill(NO_HOUR)
+
+    def record(self, after_hour, q):
+        """Записать выпуск в кольцо.
+
+        Args:
+            after_hour: абсолютный час, после которого начинается горизонт выпуска.
+            q: квантили выпуска после конформной таблицы и до множителя, форма
+                (горизонт, число квантилей).
+        """
+        if self.params is None:
+            return
+        q = np.asarray(q, np.float32)
+        i, j = self.params.interval
+        hours = int(after_hour) + 1 + np.arange(self.horizon, dtype=np.int64)
+        slot = hours % self.horizon
+        self.ring_hour[slot, self.lead_bin] = hours
+        self.ring[slot, self.lead_bin] = np.stack([q[:, i], q[:, I_MED], q[:, j]], -1)
+
+    def scores(self, y, hour):
+        """Нормированные выходы факта за интервал по записям кольца на этот час.
+
+        Кольцо не меняется.
+
+        Args:
+            y: факт часа.
+            hour: абсолютный час.
+
+        Returns:
+            Список пар: номер бина лидов и оценка.
+        """
+        if self.params is None:
+            return []
+        s = int(hour) % self.horizon
+        return [(b, float(aci_score_bounds(y, *self.ring[s, b].tolist())))
+                for b in range(self.n_bins) if int(self.ring_hour[s, b]) == int(hour)]
+
+    def feedback(self, y, hour):
+        """Обратная связь валидного факта часа: каждый бин с записью на этот час - один раз.
+
+        Args:
+            y: факт часа.
+            hour: абсолютный час.
+        """
+        if self.params is None:
+            return
+        s = int(hour) % self.horizon
+        for b, score in self.scores(y, hour):
+            self.ring_hour[s, b] = NO_HOUR
+            if score != score:
+                continue
+            self.theta[b], miss = self.params.step(self.theta[b], score)
+            self.updates[b] += 1
+            self.misses[b] += int(miss)
+            self.clipped += self.theta[b] in (self.params.theta_min, self.params.theta_max)
+
+    def coverage(self):
+        """Фактическое покрытие по обратной связи в каждом бине; NaN без обратной связи."""
+        return tuple(1.0 - m / u if u else float("nan")
+                     for u, m in zip(self.updates, self.misses))
+
+
 def aci_effective_level(theta, target=0.10):
     """Номинал, которому соответствует растянутый интервал при нормальной форме прогноза.
 
@@ -545,36 +817,70 @@ def width_at_coverage(coverage, width, target):
     return float(width[k - 1] + f * (width[k] - width[k - 1]))
 
 
-def fit_conformal_shift(y, q, w, lead_bins=LEAD_BINS):
-    """Сплит-конформные поправки по бинам лидов.
-
-    Поправка квантиля в бине - квантиль того же уровня от остатков факта относительно
-    этого квантиля на валидных часах. Поправка медианы равна нулю по построению: таблица
-    меняет только ширину интервалов, точечный прогноз остаётся прогнозом модели.
-
-    Args:
-        y: факт, форма (N, H).
-        q: квантили модели, форма (N, H, число квантилей).
-        w: веса часов цели, форма (N, H); учитываются только положительные.
-        lead_bins: бины лидов.
-
-    Returns:
-        Таблица float32, форма (число бинов, число квантилей), столбец медианы - нули.
-
-    Raises:
-        ValueError: в каком-то бине нет ни одного валидного часа.
-    """
+def _fit_lead_bins(y, q, w, lead_bins, what):
+    """Поправки по бинам лидов на одном наборе окон; None, если какой-то бин пуст."""
     shift = np.zeros((len(lead_bins), q.shape[-1]), np.float32)
     for bi, (a, b) in enumerate(lead_bins):
         sl = slice(a - 1, b)
         resid = (y[:, sl, None] - q[:, sl, :]).reshape(-1, q.shape[-1])
         resid = resid[np.asarray(w)[:, sl].reshape(-1) > 0]
         if len(resid) == 0:
-            raise ValueError(f"в бине лидов {a}-{b} нет ни одного валидного часа")
+            if what is None:
+                return None
+            raise ValueError(f"{what}: в бине лидов {a}-{b} нет ни одного валидного часа")
         for qi, tau in enumerate(QUANTILES):
             if qi != I_MED:
                 shift[bi, qi] = np.quantile(resid[:, qi], tau)
     return shift
+
+
+def fit_conformal_shift(y, q, w, history, lead_bins=LEAD_BINS, history_bins=HISTORY_BINS,
+                        min_windows=1):
+    """Сплит-конформные поправки по бинам лидов и бинам длины истории.
+
+    Поправка квантиля в ячейке - квантиль того же уровня от остатков факта относительно
+    этого квантиля на валидных часах окон ячейки. Строка бина длины истории подгоняется
+    по окнам этого бина. Если окон бина с валидными часами цели меньше порога или в
+    какой-то ячейке нет ни одного валидного часа, бин получает маргинальную строку -
+    поправки по всем окнам набора сразу. Поправка медианы равна нулю по построению:
+    таблица меняет только ширину интервалов, точечный прогноз остаётся прогнозом модели.
+
+    Args:
+        y: факт, форма (N, H).
+        q: квантили модели, форма (N, H, число квантилей).
+        w: веса часов цели, форма (N, H); учитываются только положительные.
+        history: фактическая длина истории каждого окна, ч, форма (N,).
+        lead_bins: бины лидов.
+        history_bins: бины длины истории.
+        min_windows: наименьшее число окон бина длины истории, при котором у бина своя
+            строка.
+
+    Returns:
+        Пара: таблица float32 формы (число бинов лидов, число бинов длины истории, число
+        квантилей) со столбцом медианы из нулей и сведения о подгонке - по словарю на бин
+        длины истории: подпись, границы, число окон и признак маргинальной строки.
+
+    Raises:
+        ValueError: длин истории не по одной на окно или в каком-то бине лидов нет ни
+            одного валидного часа во всём наборе.
+    """
+    y, q, w = np.asarray(y), np.asarray(q), np.asarray(w)
+    hist = np.asarray(history, np.int64)
+    if hist.shape != (len(y),):
+        raise ValueError(f"длин истории {hist.shape}, а окон {len(y)}")
+    marginal = _fit_lead_bins(y, q, w, lead_bins, "весь калибровочный набор")
+    hb = history_bin_of(hist, history_bins)
+    shift = np.repeat(marginal[:, None, :], len(history_bins), axis=1)
+    rows = []
+    for k, (lo, hi, name) in enumerate(history_bins):
+        sel = hb == k
+        n = int((w[sel] > 0).any(axis=1).sum()) if sel.any() else 0
+        own = _fit_lead_bins(y[sel], q[sel], w[sel], lead_bins, None) \
+            if n >= max(1, int(min_windows)) else None
+        if own is not None:
+            shift[:, k] = own
+        rows.append(dict(bin=name, lo=int(lo), hi=int(hi), windows=n, marginal=own is None))
+    return shift, rows
 
 
 def quantile_ci(samples, level=0.90):
@@ -656,34 +962,39 @@ class Evaluation:
             w = w * lm[None, :]
         return replace(self, w=w)
 
-    def with_calibration(self, shift=None, theta=0.0, lead_bins=LEAD_BINS):
+    def with_calibration(self, shift=None, theta=0.0, history=None, lead_bins=LEAD_BINS,
+                         history_bins=HISTORY_BINS):
         """Оценка после калибровки квантилей; медиана берётся из квантилей.
 
         Args:
-            shift: конформная таблица по бинам лидов; None - без неё.
-            theta: логарифм адаптивного множителя ширины.
-            lead_bins: бины лидов таблицы.
+            shift: конформная таблица; None - без неё.
+            theta: логарифм адаптивного множителя ширины: число или по бинам лидов.
+            history: фактическая длина истории каждого окна, ч; нужна с таблицей.
+            lead_bins: бины лидов.
+            history_bins: бины длины истории таблицы.
 
         Returns:
             Новая оценка; без калибровки - та же.
         """
-        if shift is None and float(theta) == 0.0:
+        if shift is None and not np.any(np.asarray(theta, np.float64)):
             return self
-        q, mu = calibrate_forecast(self.q, shift, theta, lead_bins)
+        q, mu = calibrate_forecast(self.q, shift, theta, history, lead_bins, history_bins)
         return Evaluation(y=self.y, mu=mu, q=q, mu_clim=self.mu_clim,
                           w=self.w, station=self.station)
 
-    def with_conformal(self, shift, lead_bins=LEAD_BINS):
+    def with_conformal(self, shift, history, lead_bins=LEAD_BINS, history_bins=HISTORY_BINS):
         """Оценка с конформной поправкой; медиана берётся из квантилей.
 
         Args:
-            shift: конформная таблица по бинам лидов.
+            shift: конформная таблица; None - без неё.
+            history: фактическая длина истории каждого окна, ч.
             lead_bins: бины лидов таблицы.
+            history_bins: бины длины истории таблицы.
 
         Returns:
             Новая оценка.
         """
-        return self.with_calibration(shift, 0.0, lead_bins)
+        return self.with_calibration(shift, 0.0, history, lead_bins, history_bins)
 
 
     def counts(self):
@@ -1036,11 +1347,13 @@ def metric_table(y, mu, q, mu_clim, w, leads=(1, 3, 6, 12, 24, 48, 72, 120, 168)
     return out
 
 
-__all__ = ["ACIParams", "CENTRAL_INTERVALS", "Evaluation", "FINE_LEADS", "LEAD_BINS", "METRICS",
-           "NQ", "Q", "SHARPNESS_POINTS", "SHARPNESS_RANGE", "aci_effective_level", "aci_run",
-           "aci_score", "apply_adaptive", "apply_conformal", "breakdown", "by_lead",
-           "by_lead_bin", "calibrate_forecast", "check_median_free", "conformal_table", "coverage",
-           "fit_conformal_shift", "inside", "interval_indices", "lead_bin_index", "lead_bin_of",
-           "lead_mask", "metric_table", "order_around_median", "ordered_labels", "pair_terms",
-           "pinball_crps", "seed_spread", "sharpness_scales", "skill", "skill_per_lead", "spread",
-           "width_at_coverage", "winkler", "wmean"]
+__all__ = ["ACIParams", "AdaptiveCalibration", "CENTRAL_INTERVALS", "Evaluation", "FINE_LEADS",
+           "HISTORY_BINS", "LEAD_BINS", "METRICS", "NO_HOUR", "NQ", "Q", "SHARPNESS_POINTS",
+           "SHARPNESS_RANGE", "aci_effective_level", "aci_run", "aci_score", "aci_score_bounds",
+           "apply_adaptive", "apply_conformal", "breakdown", "by_lead", "by_lead_bin",
+           "calibrate_forecast", "check_conformal_shape", "check_history_bins",
+           "check_median_free", "conformal_table", "coverage", "fit_conformal_shift",
+           "history_bin_index", "history_bin_of", "inside", "interval_indices",
+           "lead_bin_index", "lead_bin_of", "lead_mask", "metric_table", "order_around_median",
+           "ordered_labels", "pair_terms", "pinball_crps", "seed_spread", "sharpness_scales",
+           "skill", "skill_per_lead", "spread", "width_at_coverage", "winkler", "wmean"]

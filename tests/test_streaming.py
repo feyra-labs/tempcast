@@ -30,7 +30,7 @@ LAT, LON, ELEV = 52.37, 4.9, 0.0
 RTOL_STEP = 1e-5
 EXACT_F64 = 1e-10
 ATOL_FORECAST = 5e-4
-DEFAULT_STATE_BYTES = 3224
+DEFAULT_STATE_BYTES = 3236
 TINY = dict(encoder_width=16, encoder_dilations=(1, 2, 4, 8), passport_dim=8, field_hidden=24,
             heads_hidden=16, passport_hidden=16)
 
@@ -469,12 +469,12 @@ def test_idle_longer_than_window_is_cold_start(model):
     p = S.ACIParams()
     s = synthetic_series(100, seed=16)
     a = feed(StreamingMayak(model, LAT, LON, ELEV, aci=p), s, 0, 100)
-    a.theta = 0.3
+    a.reset_calibration(0.3)
     later = s["t0"] + 100 + model.cfg.stream_window + 3
     a.step(8.0, 1003.0, 71.0, later)
     fresh = StreamingMayak(model, LAT, LON, ELEV, aci=p)
     fresh.step(8.0, 1003.0, 71.0, later)
-    assert a.filled == 1 and a.theta == pytest.approx(0.3)
+    assert a.filled == 1 and a.theta == pytest.approx((0.3,) * 4)
     np.testing.assert_allclose(a.raw_forecast(), fresh.raw_forecast(), atol=1e-5)
 
 
@@ -500,7 +500,7 @@ def test_warm_start_equals_stepping(model):
 def test_state_size_is_pinned(model):
     st = StreamingMayak(model, LAT, LON, ELEV)
     assert st.state_nbytes == len(st.serialize()) == DEFAULT_STATE_BYTES < 4096
-    assert STATE_HEADER.itemsize == 32
+    assert STATE_HEADER.itemsize == 44
     feed(st, synthetic_series(100, seed=14), 0, 100)
     assert len(st.serialize()) == DEFAULT_STATE_BYTES
 

@@ -241,7 +241,7 @@ def test_protocol_errors_do_not_stop_the_host(model):
     assert host.handle("obs 7200 1 1000 50")["codes"] == [0, 0, 0]
     assert "error" in host.handle("obs 7200 1 1000 50")
     st = host.handle("status")
-    assert st["last_unix_hour"] == 2 and st["fallbacks"] == 0 and st["state_bytes"] == 3224
+    assert st["last_unix_hour"] == 2 and st["fallbacks"] == 0 and st["state_bytes"] == 3236
 
 
 def test_cli_speaks_protocol_and_restores(tmp_path, monkeypatch, capsys):

@@ -15,7 +15,7 @@ import torch
 from torch.utils.data import Dataset
 
 from mayak import baselines as BL
-from mayak.constants import H, L_MAX
+from mayak.constants import H, HISTORY_BINS, L_MAX
 from mayak.data.dataset import (HISTORY_MIX, block_starts, footprint, history_len, norm_scale,
                                 sample_history_len, slice_context, slice_history, slice_target,
                                 station_qc_elev)
@@ -26,8 +26,6 @@ from mayak.data.store import read_manifest
 from mayak.timeaxis import window_calendar, window_month
 from mayak.zones import SEASON_RU, normalize_zone, season_of
 
-HISTORY_BINS = ((0, 0, "L=0"), (1, 24, "L 1-24ч"), (25, 168, "L 25-168ч"),
-                (169, L_MAX, f"L 169-{L_MAX}ч"))
 HISTORY_GRID = (0, 6, 24, 72, 168, 336, L_MAX)
 NOMINAL_HISTORY = L_MAX
 PRESSURE_YES, PRESSURE_NO = "есть давление", "нет давления"
@@ -253,6 +251,52 @@ class EvalSet(Dataset):
         out.L, out.curriculum = int(L), None
         out.requested = [int(L)] * len(self.items)
         out.__dict__.pop("_robustness_meta", None)
+        return out
+
+    def hourly(self, n_stations, hours):
+        """Те же станции и временное окно, но непрерывный ежечасный выпуск, как у прибора.
+
+        Станции берутся равномерно из отсортированного списка станций набора. На каждой
+        станции окна начинаются каждый час подряд в самом длинном блоке временного окна
+        набора, история - полный буфер. Периоды станций разнесены по блоку, чтобы прогон
+        захватывал разные сезоны. Окна не отбираются по годности цели: прибор выпускает
+        прогноз каждый час, а невалидные часы просто не дают обратной связи.
+
+        Args:
+            n_stations: сколько станций взять.
+            hours: длина непрерывного периода на станции, ч; блок короче периода
+                укорачивает период.
+
+        Returns:
+            Новый набор окон.
+
+        Raises:
+            ValueError: в наборе нет станций или ни у одной станции блок не вмещает
+                горизонт.
+        """
+        sids = sorted(self.roles)
+        if not sids:
+            raise ValueError("ежечасный прогон: в наборе нет станций")
+        n = min(int(n_stations), len(sids))
+        pick = [sids[i] for i in np.unique(np.linspace(0, len(sids) - 1, n).round()
+                                           .astype(np.int64))]
+        items = []
+        for i, sid in enumerate(pick):
+            blocks = time_layout(self.clims[sid]["N"]).blocks[self.time_key]
+            lo, hi = max(blocks, key=lambda b: b[1] - b[0])
+            n_start = hi - lo - H + 1
+            if n_start < 1:
+                continue
+            k = min(int(hours), n_start)
+            off = lo + ((n_start - k) * i) // max(1, len(pick) - 1)
+            items += [(sid, int(t)) for t in range(off, off + k)]
+        if not items:
+            raise ValueError("ежечасный прогон: ни у одной станции блок не вмещает горизонт")
+        out = copy.copy(self)
+        out.items, out.L, out.curriculum = items, None, None
+        out.requested = [None] * len(items)
+        out.__dict__.pop("_robustness_meta", None)
+        out.__dict__.pop("_attrs", None)
         return out
 
     def history_length(self, i):

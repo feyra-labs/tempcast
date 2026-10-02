@@ -11,9 +11,9 @@ import pytest
 from mayak.constants import H, QUANTILES
 from mayak.data import store as S
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL
-from mayak.metrics import (I_MED, LEAD_BINS, METRICS, NQ, Evaluation, apply_conformal, breakdown,
-                           by_lead, conformal_table, fit_conformal_shift, lead_bin_index,
-                           seed_spread, spread)
+from mayak.metrics import (HISTORY_BINS, I_MED, LEAD_BINS, METRICS, NQ, Evaluation,
+                           apply_conformal, breakdown, by_lead, conformal_table,
+                           fit_conformal_shift, lead_bin_index, lead_bin_of, seed_spread, spread)
 from mayak.zones import (KG_TIF_CODE, KOPPEN_ZONES, SEASONS, UNKNOWN_ZONE, koppen_group,
                          koppen_id, normalize_zone, season_of, seasons_of)
 
@@ -304,11 +304,15 @@ def test_reliability_respects_target_mask():
         assert dirty.pooled()[m] == pytest.approx(clean.pooled()[m])
 
 
-def _reference_conformal(q, shift):
-    """Поправка по лидам и порядок квантилей от медианы наружу, поэлементным циклом."""
+def _reference_conformal(q, shift, history):
+    """Поправка по лидам и бину длины истории, порядок квантилей от медианы наружу, циклом."""
+    from mayak.metrics import history_bin_index
     q = np.array(q, np.float32, copy=True)
-    for h in range(q.shape[-2]):
-        q[..., h, :] += shift[lead_bin_index(h + 1)]
+    hist = np.broadcast_to(np.asarray(history), q.shape[:-2])
+    for idx in np.ndindex(*q.shape[:-2]):
+        hb = history_bin_index(int(hist[idx]))
+        for h in range(q.shape[-2]):
+            q[idx + (h,)] += shift[lead_bin_index(h + 1), hb]
     for i in range(I_MED - 1, -1, -1):
         q[..., i] = np.minimum(q[..., i], q[..., i + 1])
     for i in range(I_MED + 1, NQ):
@@ -318,8 +322,8 @@ def _reference_conformal(q, shift):
 
 def _median_free_shift(rng, scale):
     """Случайная таблица поправок с нулевой поправкой медианы, как у подгонки."""
-    shift = rng.normal(0, scale, (len(LEAD_BINS), NQ)).astype(np.float32)
-    shift[:, I_MED] = 0.0
+    shift = rng.normal(0, scale, (len(LEAD_BINS), len(HISTORY_BINS), NQ)).astype(np.float32)
+    shift[..., I_MED] = 0.0
     return shift
 
 
@@ -327,34 +331,52 @@ def test_apply_conformal_matches_reference_loop():
     rng = np.random.default_rng(0)
     q = np.sort(rng.normal(0, 3, (17, H, NQ)), axis=-1).astype(np.float32)
     shift = _median_free_shift(rng, 0.5)
-    assert np.allclose(apply_conformal(q, shift), _reference_conformal(q, shift))
+    hist = rng.choice([0, 1, 24, 25, 168, 169, 672], 17)
+    assert np.allclose(apply_conformal(q, shift, hist), _reference_conformal(q, shift, hist))
 
 
 def test_apply_conformal_works_on_single_forecast_like_runtime():
-    """Рантайм подаёт (H, NQ) — та же функция обязана его принять."""
+    """Рантайм подаёт (H, NQ) и одну длину истории — та же функция обязана его принять."""
     rng = np.random.default_rng(1)
     q = np.sort(rng.normal(0, 3, (H, NQ)), axis=-1).astype(np.float32)
     shift = _median_free_shift(rng, 0.5)
-    one = apply_conformal(q, shift)
-    batch = apply_conformal(q[None], shift)
+    one = apply_conformal(q, shift, 30)
+    batch = apply_conformal(q[None], shift, [30])
     assert np.allclose(one, batch[0])
-    assert np.allclose(one, _reference_conformal(q, shift))
+    assert np.allclose(one, _reference_conformal(q, shift, 30))
+
+
+def test_conformal_row_follows_history_bin():
+    rng = np.random.default_rng(4)
+    q = np.sort(rng.normal(0, 3, (H, NQ)), axis=-1).astype(np.float32)
+    shift = _median_free_shift(rng, 1.0)
+    for k, (lo, hi, _name) in enumerate(HISTORY_BINS):
+        for L in (lo, hi):
+            got = conformal_table(shift, L)
+            assert np.array_equal(got, shift[lead_bin_of(H), k]), (k, L)
+    assert np.array_equal(conformal_table(shift, 10_000), shift[lead_bin_of(H), -1])
+    with pytest.raises(ValueError, match="не задана"):
+        apply_conformal(q, shift, None)
+    with pytest.raises(ValueError, match="длин истории"):
+        apply_conformal(q[None].repeat(3, 0), shift, [1, 2])
 
 
 def test_conformal_keeps_quantiles_monotone():
     rng = np.random.default_rng(2)
     q = np.sort(rng.normal(0, 3, (50, H, NQ)), axis=-1).astype(np.float32)
     shift = _median_free_shift(rng, 2.0)
-    out = apply_conformal(q, shift)
+    out = apply_conformal(q, shift, np.arange(50) * 13)
     assert np.all(np.diff(out, axis=-1) >= 0)
     assert np.array_equal(out[..., I_MED], q[..., I_MED])
 
 
-def test_conformal_table_rejects_wrong_shape():
-    with pytest.raises(ValueError, match="бинов"):
-        conformal_table(np.zeros((2, NQ), np.float32))
+def test_conformal_table_rejects_wrong_shape_and_old_format():
+    with pytest.raises(ValueError, match="старого формата"):
+        conformal_table(np.zeros((len(LEAD_BINS), NQ), np.float32), 0)
     with pytest.raises(ValueError, match="поправок формы"):
-        conformal_table(np.zeros((len(LEAD_BINS), NQ + 1), np.float32))
+        conformal_table(np.zeros((len(LEAD_BINS), len(HISTORY_BINS), NQ + 1), np.float32), 0)
+    with pytest.raises(ValueError, match="поправок формы"):
+        conformal_table(np.zeros((2, len(HISTORY_BINS), NQ), np.float32), 0)
 
 
 def test_all_modules_share_one_conformal_implementation():
@@ -367,13 +389,14 @@ def test_all_modules_share_one_conformal_implementation():
 
 def test_with_conformal_sets_median_from_quantiles():
     ev = _case(n_windows=20, seed=17)
-    shift = np.full((len(LEAD_BINS), NQ), 1.5, np.float32)
-    shift[:, :I_MED] = -1.5
-    shift[:, I_MED] = 0.0
-    out = ev.with_conformal(shift)
+    shift = np.full((len(LEAD_BINS), len(HISTORY_BINS), NQ), 1.5, np.float32)
+    shift[..., :I_MED] = -1.5
+    shift[..., I_MED] = 0.0
+    hist = np.arange(20) * 30
+    out = ev.with_conformal(shift, hist)
     assert np.allclose(out.mu, out.q[..., 3])
-    assert np.allclose(out.q, apply_conformal(ev.q, shift))
-    assert ev.with_conformal(None) is ev
+    assert np.allclose(out.q, apply_conformal(ev.q, shift, hist))
+    assert ev.with_conformal(None, hist) is ev
 
 
 def test_fit_conformal_shift_uses_valid_hours_only():
@@ -382,8 +405,10 @@ def test_fit_conformal_shift_uses_valid_hours_only():
     q = np.zeros((n, H, NQ), np.float32) + np.linspace(-2, 2, NQ)
     y = rng.normal(0, 1, (n, H)).astype(np.float32)
     w = (rng.random((n, H)) < 0.6).astype(np.float32)
+    hist = rng.choice([0, 12, 100, 672], n)
     dirty = np.where(w > 0, y, 1e6).astype(np.float32)
-    assert np.allclose(fit_conformal_shift(y, q, w), fit_conformal_shift(dirty, q, w))
+    assert np.allclose(fit_conformal_shift(y, q, w, hist)[0],
+                       fit_conformal_shift(dirty, q, w, hist)[0])
 
 
 def test_breakdown_drops_small_strata_and_counts_rows():

@@ -11,10 +11,12 @@
   ``{"ok": true, "codes": [...]}`` с кодами контроля качества часа.
 * ``forecast [<секунды UTC>]`` - выпуск после последнего шага. До первого шага момент
   выпуска - текущий час по часам устройства; секунды в команде заменяют часы
-  устройства. Ответ: момент выпуска, признак отката, множитель калибровки, медиана и
-  квантили.
-* ``status`` - сводка рантайма, в том числе текущая точка, точка загруженного состояния
-  и исход их сравнения: та же точка, уточнение или перенос прибора.
+  устройства. Ответ: момент выпуска, признак отката, множители калибровки по бинам
+  лидов, медиана и квантили.
+* ``status`` - сводка рантайма: длина окна после холодного старта и длина истории, по
+  которой выбирается строка конформной таблицы; множители калибровки, число обратных
+  связей и промахов по бинам лидов и сами бины; текущая точка, точка загруженного
+  состояния и исход их сравнения: та же точка, уточнение или перенос прибора.
 
 Любая ошибка команды - ответ ``{"error": "..."}``, хост продолжает работу.
 
@@ -252,8 +254,8 @@ class Host:
             ts: секунды UTC, которые заменяют часы устройства, или None.
 
         Returns:
-            Ответ: момент выпуска, признак отката, множитель калибровки, медиана и
-            квантили по лидам.
+            Ответ: момент выпуска, признак отката, множители калибровки по бинам лидов,
+            медиана и квантили по лидам.
         """
         if ts is not None:
             try:
@@ -262,7 +264,7 @@ class Host:
                 raise ValueError(f"время не число: {ts}") from None
         # часы устройства нужны только до первого шага
         now = self._now_hour(ts) if self.rt.last_hour is None else None
-        theta = _f32(self.rt.theta)
+        theta = [_f32(v) for v in self.rt.theta]
         q, mu, fallback = self.rt.safe_forecast(now)
         return {"after_unix_hour": int(self.rt.issue_hour(now)), "fallback": bool(fallback),
                 "theta": theta, "mu": [_f32(v) for v in mu],
@@ -271,9 +273,12 @@ class Host:
     def status(self):
         """Команда сводки рантайма."""
         rt = self.rt
-        return {"filled": int(rt.filled), "theta": _f32(rt.theta),
+        return {"filled": int(rt.filled), "history_hours": int(rt.history_length),
+                "theta": [_f32(v) for v in rt.theta],
                 "conformal": rt.conformal is not None,
-                "aci_updates": int(rt.aci_updates), "aci_misses": int(rt.aci_misses),
+                "aci_lead_bins": [list(b) for b in rt.cal.lead_bins],
+                "aci_updates": [int(v) for v in rt.aci_updates],
+                "aci_misses": [int(v) for v in rt.aci_misses],
                 "idle_hours": int(rt.idle_hours), "fallbacks": int(rt.fallbacks),
                 "state_bytes": int(rt.state_nbytes), "last_unix_hour": rt.last_hour,
                 "memory_bytes": int(rt.memory_nbytes), "site": list(rt.site),

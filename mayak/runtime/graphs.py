@@ -33,7 +33,7 @@ from mayak.astro import astro_features
 from mayak.runtime.streaming import (CTX, RAW_CHANNELS, RESYNC_HOURS, STATE_HEADER,
                                      STATE_VERSION, StreamingMayak, state_nbytes)
 
-GRAPH_FORMAT = 4
+GRAPH_FORMAT = 5
 GRAPH_NAMES = ("init", "step", "window", "resync", "issue")
 COEFS = ("c_mu", "c_sig", "c_def")
 HOURS_OF_YEAR = 366 * 24
@@ -261,6 +261,18 @@ def _files_digest(model_dir, files):
     return h.hexdigest()[:16]
 
 
+def calibration_bins():
+    """Бины лидов и длины истории калибровки в том виде, в каком они пишутся в манифест.
+
+    Returns:
+        Пара списков пар границ включительно: бины лидов и бины длины истории.
+    """
+    from mayak.constants import HISTORY_BINS
+    from mayak.metrics import LEAD_BINS
+    return ([[int(a), int(b)] for a, b in LEAD_BINS],
+            [[int(b[0]), int(b[1])] for b in HISTORY_BINS])
+
+
 def conformal_for_export(conformal, precision, checkpoint=None):
     """Таблица поправок для экспорта и точность, на которой она подогнана.
 
@@ -280,11 +292,9 @@ def conformal_for_export(conformal, precision, checkpoint=None):
             по другому чекпойнту или сдвигает медиану.
     """
     from mayak.leakage import file_digest, load_conformal, precision_mismatch
-    from mayak.metrics import check_median_free
+    from mayak.metrics import check_conformal_shape
     if not isinstance(conformal, str):
-        shift = np.asarray(conformal, np.float32)
-        check_median_free(shift)
-        return shift, precision, None
+        return check_conformal_shape(conformal), precision, None
     shift, rec = load_conformal(conformal)
     why = precision_mismatch(rec, precision)
     if why:
@@ -302,6 +312,10 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
                   check_atol=1e-4, seed=0, checkpoint=None, runtime=None):
     """Экспорт графов, манифеста и развёрнутой по лидам конформной таблицы.
 
+    Таблица в экспорте - подряд по бинам длины истории, в каждом бине строка на каждый
+    лид горизонта, в строке по значению на квантиль. Бины лидов адаптивной калибровки и
+    бины длины истории таблицы записаны в раздел калибровки манифеста.
+
     Каждый граф при экспорте сверяется с PyTorch на правдоподобных входах. Входы, от
     которых граф не зависит, экспорт выбрасывает; манифест перечисляет фактические входы
     графа, и хост подаёт только их.
@@ -309,10 +323,10 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
     Args:
         model: модель.
         out_dir: каталог экспорта.
-        conformal: таблица поправок по бинам лидов или путь к ней с записью о подгонке
-            рядом. Точность таблицы должна совпадать с точностью экспорта: int8 при
-            экспорте int8-графов, иначе fp32. Таблица для int8 должна быть подогнана
-            именно на тех int8-графах, что получились при экспорте.
+        conformal: таблица поправок по бинам лидов и длины истории или путь к ней с
+            записью о подгонке рядом. Точность таблицы должна совпадать с точностью
+            экспорта: int8 при экспорте int8-графов, иначе fp32. Таблица для int8
+            должна быть подогнана именно на тех int8-графах, что получились при экспорте.
         aci: параметры адаптивной калибровки устройства или None.
         int8: экспортировать ещё и int8-копии графов.
         opset: версия набора операций ONNX.
@@ -390,7 +404,9 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
         graphs[name] = entry
 
     model.train(was_training)
-    cal = dict(conformal=None, precision=None, aci=None)
+    lead_bins, history_bins = calibration_bins()
+    cal = dict(conformal=None, precision=None, aci=None, lead_bins=lead_bins,
+               history_bins=history_bins)
     if table is not None:
         if fitted_on is not None:
             got = _files_digest(out_dir, [graphs[n][precision] for n in GRAPH_NAMES])
@@ -398,8 +414,8 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, int8=False, opset
                 raise ValueError(f"конформная таблица подогнана на других {precision}-графах "
                                  f"(отпечаток {fitted_on}, у экспорта {got}); подгоните "
                                  f"таблицу заново на этом экспорте")
-        conformal_table(table, cfg.horizon).astype("<f4").tofile(
-            os.path.join(out_dir, "conformal.f32"))
+        conformal_table(table, [lo for lo, _hi in history_bins], cfg.horizon).astype(
+            "<f4").tofile(os.path.join(out_dir, "conformal.f32"))
         cal["conformal"] = "conformal.f32"
         cal["precision"] = precision
     if aci is not None:
@@ -503,10 +519,11 @@ class GraphRuntime(StreamingMayak):
 
 
 def manifest_conformal(manifest, model_dir, precision):
-    """Конформная таблица экспорта по бинам лидов для графов заданной точности.
+    """Конформная таблица экспорта по бинам лидов и длины истории для графов заданной точности.
 
-    В экспорте таблица лежит развёрнутой по лидам; здесь она сворачивается обратно в
-    бины, чтобы поправку применяла та же функция, что и везде в проекте.
+    В экспорте таблица лежит развёрнутой по лидам для каждого бина длины истории; здесь
+    она сворачивается обратно в бины, чтобы поправку применяла та же функция, что и
+    везде в проекте.
 
     Таблица, подогнанная на другой точности или без записанной точности, не
     применяется: вместо неё возвращается причина для лога.
@@ -517,28 +534,31 @@ def manifest_conformal(manifest, model_dir, precision):
         precision: точность графов, fp32 или int8.
 
     Returns:
-        Пара: таблица float32 формы (число бинов лидов, число квантилей) или None и
-        причина или None.
+        Пара: таблица float32 формы (число бинов лидов, число бинов длины истории, число
+        квантилей) или None и причина или None.
 
     Raises:
-        ValueError: таблица не того размера, сдвигает медиану или меняется внутри бина
-            лидов.
+        ValueError: бины манифеста не совпадают с бинами кода; таблица не того размера,
+            сдвигает медиану или меняется внутри бина лидов.
     """
     from mayak.metrics import I_MED, LEAD_BINS, conformal_table
     cal = manifest["calibration"]
+    check_manifest_bins(manifest)
     if not cal.get("conformal"):
         return None, None
     d = manifest["dims"]
+    los = [lo for lo, _hi in cal["history_bins"]]
+    n = len(los) * d["horizon"] * d["n_quantiles"]
     table = np.fromfile(os.path.join(model_dir, cal["conformal"]), "<f4")
-    if table.size != d["horizon"] * d["n_quantiles"]:
-        raise ValueError(f"{cal['conformal']}: {4 * table.size} Б, ожидалось "
-                         f"{4 * d['horizon'] * d['n_quantiles']}")
-    table = table.reshape(d["horizon"], d["n_quantiles"])
-    if np.any(table[:, I_MED] != 0.0):
+    if table.size != n:
+        raise ValueError(f"{cal['conformal']}: {4 * table.size} Б, ожидалось {4 * n} "
+                         f"(бины длины истории × лиды × квантили)")
+    table = table.reshape(len(los), d["horizon"], d["n_quantiles"])
+    if np.any(table[..., I_MED] != 0.0):
         raise ValueError(f"{cal['conformal']}: поправка медианы не нулевая - таблица сдвигает "
                          f"точечный прогноз; подгоните таблицу заново")
-    shift = table[[lo - 1 for lo, _ in LEAD_BINS]]
-    if not np.array_equal(conformal_table(shift, d["horizon"]), table):
+    shift = np.ascontiguousarray(np.moveaxis(table[:, [lo - 1 for lo, _ in LEAD_BINS]], 0, 1))
+    if not np.array_equal(conformal_table(shift, los, d["horizon"]), table):
         raise ValueError(f"{cal['conformal']}: поправка меняется внутри бина лидов - таблица "
                          f"записана не этим экспортом")
     have = cal.get("precision")
@@ -549,6 +569,23 @@ def manifest_conformal(manifest, model_dir, precision):
                       f"{precision}: таблица не применяется")
     return None, (f"конформная таблица подогнана на {have}, графы считают в {precision}: "
                   f"таблица не применяется")
+
+
+def check_manifest_bins(manifest):
+    """Проверяет, что бины калибровки в манифесте совпадают с бинами кода.
+
+    Args:
+        manifest: манифест экспорта.
+
+    Raises:
+        ValueError: бины лидов или длины истории другие.
+    """
+    lead_bins, history_bins = calibration_bins()
+    cal = manifest["calibration"]
+    if cal.get("lead_bins") != lead_bins or cal.get("history_bins") != history_bins:
+        raise ValueError(f"манифест: бины калибровки лидов {cal.get('lead_bins')} и длины "
+                         f"истории {cal.get('history_bins')}, в коде {lead_bins} и "
+                         f"{history_bins}; экспортируйте графы заново")
 
 
 def runtime_from_export(model_dir, lat, lon, elev, precision="fp32", threads=1, conformal=True,
@@ -583,6 +620,7 @@ def runtime_from_export(model_dir, lat, lon, elev, precision="fp32", threads=1, 
     if man.get("format") != GRAPH_FORMAT:
         raise ValueError(f"формат манифеста {man.get('format')}, рантайм читает {GRAPH_FORMAT}; "
                          f"экспортируйте графы заново: python scripts/export_runtime.py")
+    check_manifest_bins(man)
     table = None
     if conformal:
         table, why = manifest_conformal(man, model_dir, precision)
@@ -666,6 +704,7 @@ class GraphModel:
 
 
 __all__ = ["DAY_ROW", "GRAPH_IO", "GRAPH_NAMES", "HOURS_OF_YEAR", "GraphModel", "GraphRuntime",
-           "OnnxBackend", "TorchBackend", "conformal_for_export", "dims", "example_inputs",
+           "OnnxBackend", "TorchBackend", "calibration_bins", "check_manifest_bins",
+           "conformal_for_export", "dims", "example_inputs",
            "export_graphs", "graphs_digest", "manifest_conformal", "quantize_graph",
            "runtime_from_export", "state_nbytes", "year_calendar"]

@@ -128,18 +128,25 @@ def test_manifest_contract(model, tmp_path):
     assert d["enc_buf_len"] == sum(model.encoder.buffer_pads)
     assert d["hours_of_year"] == 8784
     assert man["graphs"]["init"]["outputs"][-2:] == ["clim_mu", "clim_sig"]
-    assert man["state"]["nbytes"] == state_nbytes(cfg) == 3224
+    assert man["state"]["nbytes"] == state_nbytes(cfg) == 3236
     assert man["state"]["nbytes"] == StreamingMayak(model, LAT, LON, ELEV).state_nbytes
     assert {c: tuple(v) for c, v in man["phys"].items()} == {c: PHYS[c] for c in ("T", "P", "RH")}
     np.testing.assert_array_equal(np.float32(man["zq"]), ZQ)
     assert ModelConfig.from_dict(man["model_config"]) == cfg
     from mayak.config import RuntimeConfig
     from mayak.runtime.graphs import GRAPH_FORMAT
-    assert man["format"] == GRAPH_FORMAT == 4
+    assert man["format"] == GRAPH_FORMAT == 5
     assert RuntimeConfig.from_dict(man["runtime"]) == RuntimeConfig()
-    table = np.fromfile(tmp_path / "m" / "conformal.f32", "<f4").reshape(cfg.horizon, -1)
-    from mayak.metrics import conformal_table
-    np.testing.assert_array_equal(table, conformal_table(G.GOLDEN_SHIFT, cfg.horizon))
+    from mayak.constants import HISTORY_BINS
+    from mayak.metrics import LEAD_BINS, conformal_table
+    assert man["calibration"]["lead_bins"] == [list(b) for b in LEAD_BINS]
+    assert man["calibration"]["history_bins"] == [[b[0], b[1]] for b in HISTORY_BINS]
+    table = np.fromfile(tmp_path / "m" / "conformal.f32", "<f4").reshape(
+        len(HISTORY_BINS), cfg.horizon, -1)
+    for k, (lo, hi, _name) in enumerate(HISTORY_BINS):
+        for L in (lo, hi):
+            np.testing.assert_array_equal(table[k], conformal_table(G.GOLDEN_SHIFT, L,
+                                                                    cfg.horizon))
 
 
 def _scenario(doc, name):
@@ -220,7 +227,7 @@ def test_golden_covers_device_cases(golden):
     changes = [e["expect"]["site_change"] for e in reloc]
     assert {"refined", "moved", "same"} <= set(changes), "уточнение, перенос и та же точка"
     first_moved = reloc[changes.index("moved")]["expect"]
-    assert first_moved["filled"] == 0 and first_moved["theta"] == 0.0
+    assert first_moved["filled"] == 0 and first_moved["theta"] == [0.0] * 4
     assert any(e["expect"]["codes"][1] & 64 for e in _lines(_scenario(doc, "relocation"), "obs")), \
         "после уточнения высоты давление на уровне моря решается по новой высоте"
     order = _scenario(doc, "store_order")
@@ -237,9 +244,9 @@ def test_golden_state_is_raw_window(model, golden):
     s = StreamingMayak(model, sc["lat"], sc["lon"], sc["elev"], aci=G.GOLDEN_ACI)
     s.load_state(raw)
     assert s.filled == model.cfg.stream_window, "эталон рестарта начинается с полного окна"
-    assert s.theta != 0.0
+    assert any(t != 0.0 for t in s.theta)
     assert s.serialize() == raw
-    assert len(raw) == 3224
+    assert len(raw) == 3236
 
 
 def test_nan_model_reuses_golden_graphs():

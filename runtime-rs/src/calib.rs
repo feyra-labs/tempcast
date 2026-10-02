@@ -1,9 +1,21 @@
-//! Калибровка интервалов на устройстве: сплит-конформная таблица, адаптивный множитель
-//! ширины интервала и его онлайн-подстройка по промахам.
+//! Калибровка интервалов на устройстве: сплит-конформная таблица, адаптивные множители
+//! ширины интервала по бинам лидов и их онлайн-подстройка по промахам.
 //!
 //! Эталонная реализация калибровки написана на Python; здесь её перенос. Совпадение
 //! двух реализаций проверяют эталонные векторы, а не ревью. Таблица приходит уже
-//! развёрнутой по лидам, поэтому бинов лидов здесь нет.
+//! развёрнутой по лидам для каждого бина длины истории; рантайм выбирает её строку по
+//! длине истории выпуска.
+//!
+//! Адаптивная калибровка держит множитель на каждый бин лидов и кольцо по
+//! часам-мишеням: для каждого из следующих часов горизонта и каждого бина - медиана и
+//! границы интервала из последнего выпуска, чей лид до этого часа попадает в бин.
+//! Валидный час обновляет каждый бин не больше одного раза. Кольцо на диск не пишется.
+
+/// Число бинов лидов адаптивной калибровки: столько множителей хранит состояние.
+pub const N_LEAD_BINS: usize = 4;
+
+/// Час кольца калибровки без записи.
+const NO_HOUR: i64 = i64::MIN;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AciParams {
@@ -41,6 +53,19 @@ impl AciParams {
     }
 }
 
+/// Номер бина лидов для каждого лида горизонта; лиды за последним бином относятся к
+/// последнему.
+pub fn lead_bin_of(lead_bins: &[[usize; 2]], horizon: usize) -> Vec<usize> {
+    (1..=horizon)
+        .map(|h| {
+            lead_bins
+                .iter()
+                .position(|b| b[0] <= h && h <= b[1])
+                .unwrap_or(lead_bins.len() - 1)
+        })
+        .collect()
+}
+
 /// Конформная поправка квантилей таблицей, развёрнутой по лидам: меняется ширина
 /// интервалов, медиана остаётся той, что выдала модель.
 pub fn apply_conformal(q: &mut [f32], table: &[f32], nq: usize, i_med: usize) {
@@ -65,6 +90,14 @@ pub fn apply_adaptive(q: &mut [f32], theta: f32, nq: usize, i_med: usize) {
             *v = med + k * (*v - med);
         }
         order_around_median(row, i_med);
+    }
+}
+
+/// Растяжение квантилей вокруг медианы: у каждого лида множитель своего бина. Лиды с
+/// нулевым логарифмом множителя остаются нетронутыми.
+pub fn apply_adaptive_bins(q: &mut [f32], theta: &[f32], lead_bin: &[usize], nq: usize, i_med: usize) {
+    for (row, &b) in q.chunks_exact_mut(nq).zip(lead_bin) {
+        apply_adaptive(row, theta[b], nq, i_med);
     }
 }
 
@@ -94,9 +127,9 @@ pub fn order_around_median(row: &mut [f32], i_med: usize) {
     }
 }
 
-/// Нормированный выход факта за интервал для одной строки квантилей.
-pub fn aci_score(y: f64, q: &[f32], interval: [usize; 2], i_med: usize) -> f64 {
-    let med = q[i_med] as f64;
+/// Нормированный выход факта за интервал по его границам и медиане.
+pub fn aci_score_bounds(y: f64, lo: f32, med: f32, hi: f32) -> f64 {
+    let med = med as f64;
     if !y.is_finite() || !med.is_finite() {
         return f64::NAN;
     }
@@ -104,14 +137,104 @@ pub fn aci_score(y: f64, q: &[f32], interval: [usize; 2], i_med: usize) -> f64 {
     if u == 0.0 {
         return 0.0;
     }
-    let d = if u >= 0.0 {
-        q[interval[1]] as f64 - med
-    } else {
-        med - q[interval[0]] as f64
-    };
+    let d = if u >= 0.0 { hi as f64 - med } else { med - lo as f64 };
     if d > 0.0 {
         u.abs() / d
     } else {
         f64::INFINITY
+    }
+}
+
+/// Нормированный выход факта за интервал для одной строки квантилей.
+pub fn aci_score(y: f64, q: &[f32], interval: [usize; 2], i_med: usize) -> f64 {
+    aci_score_bounds(y, q[interval[0]], q[i_med], q[interval[1]])
+}
+
+/// Адаптивная калибровка прибора по бинам лидов: множители, счётчики обратной связи и
+/// кольцо по часам-мишеням. Без параметров множители только хранятся, кольца нет.
+#[derive(Debug, Clone)]
+pub struct Adaptive {
+    pub params: Option<AciParams>,
+    horizon: usize,
+    /// Номер бина для каждого лида горизонта.
+    pub lead_bin: Vec<usize>,
+    pub theta: [f32; N_LEAD_BINS],
+    pub updates: [u64; N_LEAD_BINS],
+    pub misses: [u64; N_LEAD_BINS],
+    // кольцо: место часа - абсолютный час по модулю горизонта, внутри - бин лидов
+    ring_hour: Vec<i64>,
+    ring: Vec<[f32; 3]>,
+}
+
+impl Adaptive {
+    pub fn new(params: Option<AciParams>, lead_bins: &[[usize; 2]], horizon: usize) -> Self {
+        let n = if params.is_some() { horizon * N_LEAD_BINS } else { 0 };
+        Adaptive {
+            params,
+            horizon,
+            lead_bin: lead_bin_of(lead_bins, horizon),
+            theta: [0.0; N_LEAD_BINS],
+            updates: [0; N_LEAD_BINS],
+            misses: [0; N_LEAD_BINS],
+            ring_hour: vec![NO_HOUR; n],
+            ring: vec![[0.0; 3]; n],
+        }
+    }
+
+    /// Новые множители, нулевые счётчики и пустое кольцо.
+    pub fn reset(&mut self, theta: [f32; N_LEAD_BINS]) {
+        let p = self.params;
+        self.theta = theta.map(|t| match &p {
+            Some(a) => a.clip(t as f64),
+            None => t,
+        });
+        self.updates = [0; N_LEAD_BINS];
+        self.misses = [0; N_LEAD_BINS];
+        self.clear();
+    }
+
+    /// Пустое кольцо; множители и счётчики остаются.
+    pub fn clear(&mut self) {
+        self.ring_hour.fill(NO_HOUR);
+    }
+
+    /// Размер кольца в памяти, байт.
+    pub fn ring_bytes(&self) -> usize {
+        8 * self.ring_hour.len() + 12 * self.ring.len()
+    }
+
+    /// Запись выпуска в кольцо: квантили после конформной таблицы и до множителя, лиды
+    /// подряд, горизонт начинается после часа `after`.
+    pub fn record(&mut self, after: i64, q: &[f32], nq: usize, i_med: usize) {
+        let Some(p) = self.params else { return };
+        let [i, j] = p.interval;
+        for k in 0..self.horizon {
+            let h = after + 1 + k as i64;
+            let s = h.rem_euclid(self.horizon as i64) as usize * N_LEAD_BINS + self.lead_bin[k];
+            let row = &q[k * nq..(k + 1) * nq];
+            self.ring_hour[s] = h;
+            self.ring[s] = [row[i], row[i_med], row[j]];
+        }
+    }
+
+    /// Обратная связь валидного факта часа: каждый бин с записью на этот час - один раз.
+    pub fn feedback(&mut self, y: f64, hour: i64) {
+        let Some(p) = self.params else { return };
+        let s0 = hour.rem_euclid(self.horizon as i64) as usize * N_LEAD_BINS;
+        for b in 0..N_LEAD_BINS {
+            if self.ring_hour[s0 + b] != hour {
+                continue;
+            }
+            self.ring_hour[s0 + b] = NO_HOUR;
+            let [lo, med, hi] = self.ring[s0 + b];
+            let score = aci_score_bounds(y, lo, med, hi);
+            if score.is_nan() {
+                continue;
+            }
+            let (t, miss) = p.step(self.theta[b], score);
+            self.theta[b] = t;
+            self.updates[b] += 1;
+            self.misses[b] += miss as u64;
+        }
     }
 }

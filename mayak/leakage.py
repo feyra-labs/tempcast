@@ -12,7 +12,9 @@
    и калибровку; история обучающих окон не выходит за обучение;
 4. конформная таблица построена только по калибровочным блокам и только на
    валидационных станциях, длины истории её окон взяты из распределения куррикулума,
-   поправка медианы равна нулю, а точность модели, на которой она подогнана, записана;
+   таблица разбита по бинам лидов и тем же бинам длины истории, что в коде, для каждого
+   бина длины истории записано, своя у него строка или маргинальная, поправка медианы
+   равна нулю, а точность модели, на которой она подогнана, записана;
 5. чекпойнт выбран по метрике на валидационных станциях в валидационных блоках, а
    длины истории окон валидации взяты из распределения куррикулума, а не одной длиной;
 6. окна внешних станций - только в тестовом окне; внешние станции не встречаются в
@@ -298,7 +300,20 @@ def file_digest(path):
     return h.hexdigest()[:16]
 
 
-def conformal_record(ds, checkpoint=None, precision="fp32", graphs=None):
+def history_bins_record(history_bins=None):
+    """Бины длины истории таблицы в том виде, в каком они пишутся в запись о подгонке.
+
+    Args:
+        history_bins: бины длины истории; None - бины из кода.
+
+    Returns:
+        Список пар границ, ч.
+    """
+    from mayak.constants import HISTORY_BINS
+    return [[int(b[0]), int(b[1])] for b in (history_bins or HISTORY_BINS)]
+
+
+def conformal_record(ds, checkpoint=None, precision="fp32", graphs=None, history_fit=None):
     """Запись о том, на чём подогнана конформная таблица.
 
     Args:
@@ -306,6 +321,8 @@ def conformal_record(ds, checkpoint=None, precision="fp32", graphs=None):
         checkpoint: путь к чекпойнту модели; если файл есть, пишется и его отпечаток.
         precision: точность модели, по выходам которой подогнана таблица.
         graphs: отпечаток графов, по которым считался прогноз; для int8 обязателен.
+        history_fit: сведения о подгонке по бинам длины истории: подпись и границы бина,
+            число окон и признак маргинальной строки.
 
     Returns:
         Словарь для записи рядом с таблицей.
@@ -322,6 +339,7 @@ def conformal_record(ds, checkpoint=None, precision="fp32", graphs=None):
     return dict(station_roles=sorted(ds.station_splits), time_key=ds.time_key,
                 stations=stations, checkpoint=checkpoint, checkpoint_digest=digest,
                 precision=precision, graphs=graphs, history=ds.history_spec(),
+                history_bins=history_bins_record(), history_fit=history_fit,
                 windows=len(ds), windows_digest=ds.fingerprint(), **_split_state())
 
 
@@ -330,14 +348,14 @@ def save_conformal(path, shift, record):
 
     Args:
         path: путь к таблице, файл numpy.
-        shift: таблица поправок по бинам лидов.
+        shift: таблица поправок по бинам лидов и длины истории.
         record: запись о подгонке; ложится в файл с тем же именем и суффиксом meta.json.
 
     Raises:
-        ValueError: таблица сдвигает медиану.
+        ValueError: таблица другой формы или сдвигает медиану.
     """
-    from mayak.metrics import check_median_free
-    check_median_free(shift)
+    from mayak.metrics import check_conformal_shape
+    check_conformal_shape(shift)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     np.save(path, shift)
     with open(conformal_meta_path(path), "w") as f:
@@ -355,9 +373,9 @@ def load_conformal(path):
 
     Raises:
         LeakageError: рядом с таблицей нет записи о подгонке.
-        ValueError: таблица сдвигает медиану.
+        ValueError: таблица старого формата, другой формы или сдвигает медиану.
     """
-    from mayak.metrics import check_median_free
+    from mayak.metrics import check_conformal_shape
     meta = conformal_meta_path(path)
     if not os.path.exists(meta):
         _fail(f"конформная таблица {path}: нет метаданных {meta} — неизвестно, на каких "
@@ -365,7 +383,10 @@ def load_conformal(path):
     with open(meta) as f:
         rec = json.load(f)
     shift = np.load(path).astype(np.float32)
-    check_median_free(shift)
+    try:
+        check_conformal_shape(shift)
+    except ValueError as e:
+        raise ValueError(f"конформная таблица {path}: {e}") from None
     return shift, rec
 
 
@@ -405,6 +426,13 @@ def check_conformal(path, store):
               f"должны следовать куррикулуму")
     if rec.get("precision") not in PRECISIONS:
         _fail(f"{what}: точность модели {rec.get('precision')!r} не из {PRECISIONS}")
+    if rec.get("history_bins") != history_bins_record():
+        _fail(f"{what}: подогнана по бинам длины истории {rec.get('history_bins')}, в коде "
+              f"{history_bins_record()}; подгоните таблицу заново")
+    fit = rec.get("history_fit")
+    if not isinstance(fit, list) or len(fit) != len(history_bins_record()):
+        _fail(f"{what}: в записи о подгонке нет сведений по бинам длины истории "
+              f"(history_fit); подгоните таблицу заново")
 
 
 def train_last_hour(store):

@@ -448,7 +448,7 @@ def test_runtime_state_size_follows_config_and_mismatch_fails():
     s_short = StreamingMayak(short, 50.0, 5.0, 0.0).serialize()
     assert len(s_big) == len(s_other) == StreamingMayak(big, 50.0, 5.0, 0.0).state_nbytes
     W = short.cfg.stream_window
-    assert W == 336 and len(s_short) == 32 + 4 * W + 2 * ((3 * W + 7) // 8)
+    assert W == 336 and len(s_short) == 44 + 4 * W + 2 * ((3 * W + 7) // 8)
     with pytest.raises(ValueError, match="конфигу модели"):
         StreamingMayak(big, 50.0, 5.0, 0.0).load_state(s_short)
 

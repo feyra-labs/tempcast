@@ -1,5 +1,5 @@
 {
- "format": 4,
+ "format": 5,
  "model_config": {
   "arch": "mayak",
   "horizon": 168,
@@ -267,9 +267,9 @@
   "lookback_hours": 78
  },
  "state": {
-  "version": 4,
-  "header_bytes": 32,
-  "nbytes": 3224,
+  "version": 5,
+  "header_bytes": 44,
+  "nbytes": 3236,
   "resync_hours": 24
  },
  "graphs": {
@@ -709,7 +709,43 @@
     0,
     6
    ]
-  }
+  },
+  "lead_bins": [
+   [
+    1,
+    6
+   ],
+   [
+    7,
+    24
+   ],
+   [
+    25,
+    72
+   ],
+   [
+    73,
+    168
+   ]
+  ],
+  "history_bins": [
+   [
+    0,
+    0
+   ],
+   [
+    1,
+    24
+   ],
+   [
+    25,
+    168
+   ],
+   [
+    169,
+    672
+   ]
+  ]
  },
  "runtime": {
   "site_max_dlat_deg": 0.5,
@@ -726,7 +762,7 @@
  "opset": 17,
  "provenance": {
   "git": {
-   "commit": "d994a853388387317443de232f85b5b4bdef99f6",
+   "commit": "c9d05db77abd10ad55d5aad55827724621c5b02e",
    "dirty": true
   },
   "versions": {

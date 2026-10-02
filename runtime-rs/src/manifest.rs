@@ -5,11 +5,12 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::calib::N_LEAD_BINS;
 use crate::graphs::Precision;
 use crate::qc::QcConfig;
 use crate::{Error, Result};
 
-pub const FORMAT: u32 = 4;
+pub const FORMAT: u32 = 5;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Dims {
@@ -55,6 +56,10 @@ pub struct Calibration {
     #[serde(default)]
     pub precision: Option<String>,
     pub aci: Option<AciJson>,
+    /// Бины лидов адаптивной калибровки: границы включительно, лиды с единицы.
+    pub lead_bins: Vec<[usize; 2]>,
+    /// Бины длины истории конформной таблицы: границы включительно, часы.
+    pub history_bins: Vec<[usize; 2]>,
 }
 
 /// Пороги, в пределах которых смена координат и высоты при перезапуске считается
@@ -154,6 +159,26 @@ impl Manifest {
                 return Err(Error::new(format!("манифест: нет графа {g}")));
             }
         }
+        let lb = &self.calibration.lead_bins;
+        let lead_ok = lb.len() == N_LEAD_BINS
+            && lb[0][0] == 1
+            && lb.iter().all(|b| b[0] <= b[1])
+            && lb.windows(2).all(|w| w[1][0] == w[0][1] + 1);
+        if !lead_ok {
+            return Err(Error::new(format!(
+                "манифест: бины лидов калибровки {lb:?}: нужно {N_LEAD_BINS} бина подряд с первого лида"
+            )));
+        }
+        let hb = &self.calibration.history_bins;
+        let hist_ok = !hb.is_empty()
+            && hb[0][0] == 0
+            && hb.iter().all(|b| b[0] <= b[1])
+            && hb.windows(2).all(|w| w[1][0] == w[0][1] + 1);
+        if !hist_ok {
+            return Err(Error::new(format!(
+                "манифест: бины длины истории {hb:?}: нужны подряд с нуля, без пропусков и наложений"
+            )));
+        }
         if self.state.version != crate::state::VERSION
             || self.state.nbytes != crate::state::nbytes(d)
             || self.state.header_bytes != crate::state::HEADER
@@ -174,16 +199,27 @@ impl Manifest {
         ["T", "P", "RH"].map(|c| self.phys[c])
     }
 
-    /// Развёрнутая по лидам конформная таблица, если она экспортирована.
-    /// Строка на каждый час горизонта, в строке по значению на квантиль.
+    /// Номер бина длины истории; длина за последним бином относится к последнему.
+    pub fn history_bin(&self, history: usize) -> usize {
+        let hb = &self.calibration.history_bins;
+        hb.iter().position(|b| history <= b[1]).unwrap_or(hb.len() - 1)
+    }
+
+    /// Развёрнутая по лидам конформная таблица, если она экспортирована: подряд по бинам
+    /// длины истории, в бине строка на каждый час горизонта, в строке по значению на
+    /// квантиль.
     pub fn conformal_table(&self) -> Result<Option<Vec<f32>>> {
         let Some(name) = &self.calibration.conformal else {
             return Ok(None);
         };
         let raw = std::fs::read(self.dir.join(name))?;
-        let n = self.dims.horizon * self.dims.n_quantiles;
+        let n = self.calibration.history_bins.len() * self.dims.horizon * self.dims.n_quantiles;
         if raw.len() != 4 * n {
-            return Err(Error::new(format!("{name}: {} Б, ожидалось {}", raw.len(), 4 * n)));
+            return Err(Error::new(format!(
+                "{name}: {} Б, ожидалось {} (бины длины истории × лиды × квантили)",
+                raw.len(),
+                4 * n
+            )));
         }
         let table: Vec<f32> = raw
             .as_chunks::<4>()

@@ -68,12 +68,15 @@ fn max_abs(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
 }
 
-/// Сырые квантили, к которым таблица из манифеста применена здесь же.
+/// Сырые квантили, к которым строка таблицы из манифеста для истории выпуска применена
+/// здесь же.
 fn with_table(dir: &Path, raw: &[f32]) -> Vec<f32> {
     let m = Manifest::load(dir).unwrap();
     let table = m.conformal_table().unwrap().unwrap();
+    let n = m.dims.horizon * m.dims.n_quantiles;
+    let hb = m.history_bin(HOURS);
     let mut q = raw.to_vec();
-    apply_conformal(&mut q, &table, m.dims.n_quantiles, m.i_med);
+    apply_conformal(&mut q, &table[hb * n..(hb + 1) * n], m.dims.n_quantiles, m.i_med);
     q
 }
 

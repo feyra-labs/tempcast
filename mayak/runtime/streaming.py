@@ -19,8 +19,9 @@
 по краю окна, суточные сводки и паспорт.
 
 Персистентное состояние - только сырое окно и заголовок. В заголовке абсолютный час
-последнего шага, число часов окна после холодного старта, множитель адаптивной
-калибровки и координаты точки, для которой состояние записано. В окне для каждого
+последнего шага, число часов окна после холодного старта, множители адаптивной
+калибровки по бинам лидов и координаты точки, для которой состояние записано. Состояние
+прежней версии с одним множителем читается: множитель переносится во все бины. В окне для каждого
 часа записанные прибором значения до отбраковки, маска наличия и маска годности после
 причинного контроля качества. Температура и влажность занимают по байту со знаком,
 давление - два байта в десятых гектопаскаля, маски упакованы по битам. Моды, кольца,
@@ -28,13 +29,16 @@
 проходом при загрузке.
 
 Холодный старт - это окно из пустых часов, как у пакета при короткой истории. Простой
-заполняется пустыми часами, простой не короче окна опустошает окно. Множитель
-калибровки при этом сохраняется: он относится к прибору, а не к истории.
+заполняется пустыми часами, простой не короче окна опустошает окно. Множители
+калибровки при этом сохраняются: они относятся к прибору, а не к истории.
 
 Калибровка интервалов: квантили модели, затем конформная таблица, затем адаптивный
-множитель. Множитель подстраивается онлайн, если рантайм создан с параметрами
-адаптивной калибровки: каждый валидный час температуры сверяется с последним
-выпущенным прогнозом на том лиде, который приходится на этот час.
+множитель своего бина лидов. Строка конформной таблицы выбирается по длине истории
+выпуска: числу часов после холодного старта, но не больше истории модели. Множители
+подстраиваются онлайн, если рантайм создан с параметрами адаптивной калибровки:
+каждый валидный час температуры сверяется с кольцом по часам-мишеням, где для каждого
+бина лидов лежит последний выпуск, чей лид до этого часа попадает в бин. Кольцо живёт
+только в памяти.
 
 Смена точки. Состояние помнит координаты и высоту, для которых оно записано. При загрузке
 они сравниваются с текущими. Сдвиг в пределах порогов рантайма - уточнение метаданных:
@@ -62,8 +66,8 @@ from mayak.config import CHANNEL_MAX_LAG
 from mayak.data.qc import PHYS, CausalQC, qc_window
 from mayak.data.recording import RECORD_SCALE, record_values
 from mayak.leakage import load_conformal, precision_mismatch
-from mayak.metrics import (ACIParams, aci_score, apply_adaptive, apply_conformal,
-                           check_median_free)
+from mayak.metrics import (LEAD_BINS, ACIParams, AdaptiveCalibration, apply_adaptive,
+                           apply_conformal, check_conformal_shape)
 from mayak.runtime.site import (SITE_MOVED, SITE_REFINED, as_site, describe_gap,
                                 load_runtime_config, site_change)
 from mayak.timeaxis import hour_of_year, window_calendar
@@ -71,10 +75,16 @@ from mayak.timeaxis import hour_of_year, window_calendar
 log = logging.getLogger(__name__)
 
 STATE_MAGIC = b"MYK"
-STATE_VERSION = 4
+STATE_VERSION = 5
+N_LEAD_BINS = len(LEAD_BINS)
 STATE_HEADER = np.dtype([("magic", "S3"), ("version", "u1"), ("filled", "<u2"),
-                         ("reserved", "<u2"), ("last_hour", "<i8"), ("aci_theta", "<f4"),
+                         ("reserved", "<u2"), ("last_hour", "<i8"),
+                         ("aci_theta", "<f4", (N_LEAD_BINS,)),
                          ("lat", "<f4"), ("lon", "<f4"), ("elev", "<f4")])
+STATE_HEADER_V4 = np.dtype([("magic", "S3"), ("version", "u1"), ("filled", "<u2"),
+                            ("reserved", "<u2"), ("last_hour", "<i8"), ("aci_theta", "<f4"),
+                            ("lat", "<f4"), ("lon", "<f4"), ("elev", "<f4")])
+STATE_HEADERS = {4: STATE_HEADER_V4, STATE_VERSION: STATE_HEADER}
 NO_HOUR = int(np.iinfo(np.int64).min)
 RESYNC_HOURS = 24
 CTX = CHANNEL_MAX_LAG + 1
@@ -95,7 +105,7 @@ class StateSnapshot(NamedTuple):
     Attributes:
         filled: сколько часов окна прошло после холодного старта.
         last_hour: абсолютный час последнего шага или None, если шагов не было.
-        theta: множитель адаптивной калибровки в логарифме.
+        theta: множители адаптивной калибровки в логарифме по бинам лидов.
         site: широта, долгота и высота, для которых записано окно.
         raw: значения на сетке хранения, форма (W, 3), от старых часов к новым.
         present: маска наличия, форма (W, 3).
@@ -103,7 +113,7 @@ class StateSnapshot(NamedTuple):
     """
     filled: int
     last_hour: int | None
-    theta: float
+    theta: tuple
     site: tuple
     raw: np.ndarray
     present: np.ndarray
@@ -120,6 +130,9 @@ def parse_state(raw, window):
     Returns:
         Разобранное состояние.
 
+    Состояние версии 4 хранит один множитель калибровки: он переносится во все бины
+    лидов.
+
     Raises:
         ValueError: байты не состояние этого формата, не подходят длине окна или
             повреждены.
@@ -128,22 +141,24 @@ def parse_state(raw, window):
     if len(raw) < len(STATE_MAGIC) + 1 or raw[:len(STATE_MAGIC)] != STATE_MAGIC:
         raise ValueError("не состояние МАЯК: нет заголовка")
     version = raw[len(STATE_MAGIC)]
-    if version != STATE_VERSION:
-        raise ValueError(f"версия состояния {version}, рантайм читает {STATE_VERSION}; "
-                         f"прежние версии не хранят сырое окно целиком, нужен холодный "
-                         f"старт")
-    want = window_nbytes(window)
+    if version not in STATE_HEADERS:
+        raise ValueError(f"версия состояния {version}, рантайм читает "
+                         f"{sorted(STATE_HEADERS)}; прежние версии не хранят сырое окно "
+                         f"целиком, нужен холодный старт")
+    header = STATE_HEADERS[version]
+    want = window_nbytes(window, version)
     if len(raw) != want:
         raise ValueError(f"состояние {len(raw)} Б не соответствует конфигу модели "
                          f"(ожидалось {want} Б)")
-    hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0]
-    theta, filled, last = float(hdr["aci_theta"]), int(hdr["filled"]), int(hdr["last_hour"])
-    if not np.isfinite(theta):
-        raise ValueError(f"повреждённый множитель калибровки в состоянии: {theta}")
+    hdr = np.frombuffer(raw, header, count=1)[0]
+    theta = tuple(float(v) for v in np.broadcast_to(hdr["aci_theta"], (N_LEAD_BINS,)))
+    filled, last = int(hdr["filled"]), int(hdr["last_hour"])
+    if not np.all(np.isfinite(theta)):
+        raise ValueError(f"повреждённый множитель калибровки в состоянии: {list(theta)}")
     if filled > window or (last == NO_HOUR and filled):
         raise ValueError(f"повреждённый заголовок состояния: filled={filled}, окно {window}, "
                          f"последний час {last}")
-    x, present, valid = decode_window(raw[STATE_HEADER.itemsize:], window)
+    x, present, valid = decode_window(raw[header.itemsize:], window)
     if np.any(valid > present):
         raise ValueError("повреждённое окно: годный час без значения")
     ok = valid > 0
@@ -212,17 +227,19 @@ def mask_bytes(n_hours):
     return (3 * n_hours + 7) // 8
 
 
-def window_nbytes(window):
+def window_nbytes(window, version=STATE_VERSION):
     """Размер сериализованного состояния для длины окна.
 
     Args:
         window: длина окна, часы.
+        version: версия формата состояния.
 
     Returns:
         Число байт.
     """
     W = int(window)
-    return STATE_HEADER.itemsize + W * sum(d.itemsize for d in STORE_DTYPES) + 2 * mask_bytes(W)
+    return (STATE_HEADERS[version].itemsize + W * sum(d.itemsize for d in STORE_DTYPES)
+            + 2 * mask_bytes(W))
 
 
 def state_nbytes(cfg):
@@ -290,16 +307,17 @@ class StreamingMayak:
         lat: широта точки.
         lon: долгота точки.
         elev: высота точки, м.
-        conformal: таблица поправок, путь к ней с записью о подгонке рядом или None.
+        conformal: таблица поправок по бинам лидов и длины истории, путь к ней с записью
+            о подгонке рядом или None.
         aci: параметры адаптивной калибровки, True для параметров по умолчанию или None,
-            если множитель калибровки не подстраивается.
+            если множители калибровки не подстраиваются.
         runtime_cfg: параметры хоста с порогами смены точки или None - конфиг рантайма
             по умолчанию.
 
     Attributes:
         last_hour: абсолютный час UTC последнего шага или None до первого шага.
         filled: сколько часов окна прошло после холодного старта, не больше длины окна.
-        theta: множитель адаптивной калибровки в логарифме.
+        cal: адаптивная калибровка по бинам лидов: множители, счётчики и кольцо.
         idle_hours: сколько пустых часов подставлено за простой в этом процессе.
         loaded_site: координаты и высота из загруженного состояния или None.
         site_change: исход сравнения точки загруженного состояния с текущей: та же
@@ -330,6 +348,7 @@ class StreamingMayak:
         self.zq = np.asarray(ZQ, np.float32)
         self.conformal = self._conformal(conformal)
         self.aci = ACIParams() if aci is True else aci
+        self.cal = AdaptiveCalibration(self.aci, self.horizon, LEAD_BINS)
         self.qc = CausalQC(elev=self.elev)
         self.runtime_cfg = load_runtime_config() if runtime_cfg is None else runtime_cfg
         self.loaded_site = None
@@ -340,25 +359,43 @@ class StreamingMayak:
         self.reset()
 
     def reset_calibration(self, theta=0.0):
-        """Сброс адаптивной калибровки прибора: множитель и счётчики обратной связи.
+        """Сброс адаптивной калибровки прибора: множители, счётчики и кольцо.
 
         Args:
-            theta: новый логарифм множителя.
+            theta: новый логарифм множителя: одно число на все бины лидов или по числу
+                на бин.
         """
-        self.theta = float(np.float32(theta)) if self.aci is None else self.aci.clip(theta)
-        self.aci_updates = 0
-        self.aci_misses = 0
-        self._pending = None
+        self.cal.reset(theta)
+
+    @property
+    def theta(self):
+        """Логарифмы множителей адаптивной калибровки по бинам лидов."""
+        return tuple(self.cal.theta)
+
+    @property
+    def aci_updates(self):
+        """Число обратных связей по бинам лидов с последнего сброса калибровки."""
+        return tuple(self.cal.updates)
+
+    @property
+    def aci_misses(self):
+        """Число промахов по бинам лидов с последнего сброса калибровки."""
+        return tuple(self.cal.misses)
+
+    @property
+    def history_length(self):
+        """Длина истории выпуска: часы после холодного старта, не больше истории модели."""
+        return min(int(self.filled), int(self.history))
 
     def reset(self, last_hour=None):
-        """Холодный старт: окно состоит из пустых часов. Множитель калибровки сохраняется.
+        """Холодный старт: окно состоит из пустых часов. Множители калибровки сохраняются.
 
         Args:
             last_hour: час, которым заканчивается пустое окно. None - момент ещё не
                 известен, окно строится при первом шаге.
         """
         W, M = self.window, self.n_modes
-        self._pending = None
+        self.cal.clear()
         self.qc.reset()
         self.raw = np.zeros((W, 3), np.float32)
         self.present = np.zeros((W, 3), np.uint8)
@@ -384,10 +421,13 @@ class StreamingMayak:
     def memory_nbytes(self):
         """Размер колец, буфера энкодера и таблицы климатологии в памяти, байт.
 
-        На диск ничего из этого не пишется: всё восстанавливается из окна и графа старта.
+        Кольцо адаптивной калибровки считается, если она включена. На диск ничего из
+        этого не пишется: всё восстанавливается из окна и графа старта, кольцо
+        калибровки после перезапуска пусто.
         """
         return int(self.u_ring.nbytes + self.v_ring.nbytes + self.rows.nbytes
-                   + self.enc_buf.nbytes + self.clim_mu.nbytes + self.clim_sig.nbytes)
+                   + self.enc_buf.nbytes + self.clim_mu.nbytes + self.clim_sig.nbytes
+                   + self.cal.nbytes)
 
     def _hours(self, n):
         """Абсолютные часы последних n часов окна, от старых к новым."""
@@ -459,8 +499,8 @@ class StreamingMayak:
         xj, codes = self.qc.push(values)
         raw, present = self.qc.latest()
         valid = (codes == 0).astype(np.uint8)
-        if self.aci is not None and valid[0]:
-            self._aci_feedback(float(xj[0]), hour)
+        if valid[0]:
+            self.cal.feedback(float(xj[0]), hour)
         j = hour % self.window
         self.raw[j] = np.where(present > 0, to_store(raw), 0.0)
         self.present[j], self.valid[j] = present, valid
@@ -494,26 +534,10 @@ class StreamingMayak:
         slot = self._hours(self.tail) % self.tail
         self.modes = list(self.b.run("resync", self.u_ring[slot][None], self.v_ring[slot][None]))
 
-    def _aci_feedback(self, y, hour):
-        """Сверка валидной температуры часа с последним выпущенным прогнозом."""
-        p = self._pending
-        if p is None:
-            return
-        k = hour - p["first"]
-        if k < 0 or k >= len(p["q"]) or k <= p["last"]:
-            return
-        p["last"] = k
-        score = float(aci_score(y, p["q"][k], self.aci.interval))
-        self.theta, miss = self.aci.step(self.theta, score)
-        self.aci_updates += 1
-        self.aci_misses += int(miss)
-
     @property
     def aci_coverage(self):
-        """Фактическое покрытие по обратной связи с момента последнего сброса калибровки."""
-        if not self.aci_updates:
-            return float("nan")
-        return 1.0 - self.aci_misses / self.aci_updates
+        """Фактическое покрытие по обратной связи в каждом бине лидов с последнего сброса."""
+        return self.cal.coverage()
 
     def issue_hour(self, now_hour=None):
         """Момент выпуска: последний шаг, а до первого шага - текущий час устройства.
@@ -587,10 +611,8 @@ class StreamingMayak:
         """
         q = self.raw_forecast(now_hour)
         if self.conformal is not None:
-            q = apply_conformal(q, self.conformal)
-        if self.aci is not None:
-            self._pending = dict(first=self.issue_hour(now_hour) + 1,
-                                 q=np.array(q, np.float32), last=-1)
+            q = apply_conformal(q, self.conformal, self.history_length)
+        self.cal.record(self.issue_hour(now_hour), q)
         return apply_adaptive(q, self.theta)
 
     def climatology_forecast(self, last):
@@ -670,14 +692,15 @@ class StreamingMayak:
             conformal: None, путь к таблице с записью о подгонке рядом или сама таблица.
 
         Returns:
-            Таблица float32 по бинам лидов или None.
+            Таблица float32 по бинам лидов и длины истории или None.
+
+        Raises:
+            ValueError: таблица старого формата, другой формы или сдвигает медиану.
         """
         if conformal is None:
             return None
         if not isinstance(conformal, str):
-            shift = np.asarray(conformal, np.float32)
-            check_median_free(shift)
-            return shift
+            return check_conformal_shape(conformal)
         shift, rec = load_conformal(conformal)
         why = precision_mismatch(rec, "fp32")
         if why:
@@ -697,7 +720,7 @@ class StreamingMayak:
         hdr["magic"], hdr["version"] = STATE_MAGIC, STATE_VERSION
         hdr["filled"] = self.filled
         hdr["last_hour"] = NO_HOUR if self.last_hour is None else self.last_hour
-        hdr["aci_theta"] = self.theta
+        hdr["aci_theta"] = np.asarray(self.theta, np.float32)
         hdr["lat"], hdr["lon"], hdr["elev"] = self.lat, self.lon, self.elev
         pos = np.arange(W) if self.last_hour is None else self._hours(W) % W
         return hdr.tobytes() + encode_window(self.raw[pos], self.present[pos], self.valid[pos])
@@ -710,8 +733,8 @@ class StreamingMayak:
 
         Если состояние записано для другой точки, сдвиг в пределах порогов рантайма -
         уточнение: окно сохраняется и пересчитывается для новой точки. Больше порога -
-        перенос: окно пустое, множитель калибровки нулевой, момент последнего шага
-        сохраняется.
+        перенос: окно пустое, множители калибровки нулевые, момент последнего шага
+        сохраняется. Состояние версии 4 читается, его множитель идёт во все бины лидов.
 
         Raises:
             ValueError: байты не состояние этого формата, не подходят конфигу модели или
@@ -749,7 +772,7 @@ class StreamingMayak:
             raise
 
 
-__all__ = ["CTX", "HOURS_OF_YEAR", "NO_HOUR", "RAW_CHANNELS", "RESYNC_HOURS", "STATE_HEADER",
-           "STATE_VERSION", "StateSnapshot", "StreamingMayak", "check_climatology",
-           "decode_window", "encode_window", "mask_bytes", "parse_state", "state_nbytes",
-           "to_store", "window_nbytes"]
+__all__ = ["CTX", "HOURS_OF_YEAR", "NO_HOUR", "N_LEAD_BINS", "RAW_CHANNELS", "RESYNC_HOURS",
+           "STATE_HEADER", "STATE_HEADERS", "STATE_HEADER_V4", "STATE_VERSION", "StateSnapshot",
+           "StreamingMayak", "check_climatology", "decode_window", "encode_window", "mask_bytes",
+           "parse_state", "state_nbytes", "to_store", "window_nbytes"]

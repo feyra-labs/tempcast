@@ -493,6 +493,7 @@ def test_climatology_and_damped_persistence_ignore_masked_values():
 
 def test_conformal_shift_ignores_masked_pairs():
     y, mu, q, mu_clim, w = _np_case(seed=2)
-    ref = fit_conformal_shift(np.where(w > 0, y, 0.0), q, w)
-    got = fit_conformal_shift(np.where(w > 0, y, 1e6), q, w)
+    hist = np.arange(len(y)) % 700
+    ref, _ = fit_conformal_shift(np.where(w > 0, y, 0.0), q, w, hist)
+    got, _ = fit_conformal_shift(np.where(w > 0, y, 1e6), q, w, hist)
     assert np.array_equal(ref, got)

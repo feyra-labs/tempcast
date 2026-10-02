@@ -335,10 +335,12 @@ def test_calibration_set_is_val_stations_in_calib_window(store, manifest):
 
 
 def test_conformal_check(store, manifest, tmp_path):
-    shift = np.zeros((4, 7), np.float32)
+    from mayak.constants import HISTORY_BINS
+    shift = np.zeros((4, len(HISTORY_BINS), 7), np.float32)
+    fit = [dict(bin=b[2], lo=b[0], hi=b[1], windows=0, marginal=True) for b in HISTORY_BINS]
     good = _load_calibrate().calibration_set(store.clims(), manifest)
     p = str(tmp_path / "ok.npy")
-    save_conformal(p, shift, conformal_record(good))
+    save_conformal(p, shift, conformal_record(good, history_fit=fit))
     check_conformal(p, store)
 
     cases = {
@@ -348,7 +350,7 @@ def test_conformal_check(store, manifest, tmp_path):
     }
     for name, ds in cases.items():
         p = str(tmp_path / f"{name}.npy")
-        save_conformal(p, shift, conformal_record(ds))
+        save_conformal(p, shift, conformal_record(ds, history_fit=fit))
         with pytest.raises(LeakageError):
             check_conformal(p, store)
 

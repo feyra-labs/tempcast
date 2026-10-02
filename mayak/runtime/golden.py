@@ -23,8 +23,13 @@
   состояния другой точки тоже восстановлен: при переносе прибора из него берётся
   момент последнего шага;
 * ``cmd``     - строка протокола и ожидаемый ответ;
-* ``state``   - сверка состояния рантайма с файлом эталона до байта, кроме множителя
-  калибровки, который сверяется с допуском.
+* ``state``   - сверка состояния рантайма с файлом эталона до байта, кроме множителей
+  калибровки, которые сверяются с допуском.
+
+Конформная таблица эталона разбита по бинам лидов и длины истории, адаптивная
+калибровка - по бинам лидов. Отдельные сценарии проверяют ежечасный выпуск, при котором
+обратную связь получают все бины лидов, и старт из состояния прежней версии с одним
+множителем калибровки.
 """
 import json
 import os
@@ -41,16 +46,18 @@ from mayak.runtime.equivalence import synthetic_series
 from mayak.config import RuntimeConfig
 from mayak.runtime.host import Host, StateStore
 from mayak.runtime.site import SITE_MOVED, SITE_REFINED, SITE_SAME, site_change, site_gap
-from mayak.runtime.streaming import STATE_HEADER, StreamingMayak
+from mayak.runtime.streaming import STATE_HEADER, STATE_HEADER_V4, StreamingMayak
 from mayak.timeaxis import hour_of_year, to_utc_hour, window_calendar
 
-GOLDEN_FORMAT = 4
+GOLDEN_FORMAT = 5
 GOLDEN_SEED = 1414
 GOLDEN_PERTURB = 0.05
 GOLDEN_ACI = ACIParams(target=0.10, gamma=0.05, max_factor=4.0)
-GOLDEN_SHIFT = (np.array([-0.3, -0.2, -0.08, 0.0, 0.08, 0.2, 0.3], np.float32)[None, :]
-                * np.array([1.0, 1.5, 2.0, 2.5], np.float32)[:, None]
-                + np.array([0.0, 0.0, 0.0, 0.0, 0.05, 0.05, 0.1], np.float32))
+GOLDEN_SHIFT = ((np.array([-0.3, -0.2, -0.08, 0.0, 0.08, 0.2, 0.3], np.float32)[None, :]
+                 * np.array([1.0, 1.5, 2.0, 2.5], np.float32)[:, None]
+                 + np.array([0.0, 0.0, 0.0, 0.0, 0.05, 0.05, 0.1], np.float32))[:, None, :]
+                * np.array([1.6, 1.3, 1.1, 1.0], np.float32)[None, :, None])
+V4_THETA = float(np.float32(0.123))
 MIN_ACI_MARGIN = 1e-3
 MAX_VARIANTS = 20
 Q_ATOL = 5e-4
@@ -59,11 +66,12 @@ FRESH_ATOL = 2e-4
 THETA_ATOL = 1e-6
 MTIME_BASE = 1_700_000_000
 DEFAULT_DIR = os.path.join("tests", "data", "runtime_golden")
-STATUS_KEYS = ("filled", "theta", "conformal", "aci_updates", "aci_misses", "idle_hours",
-               "fallbacks", "state_bytes", "last_unix_hour", "memory_bytes", "site",
-               "loaded_site", "site_change")
-SCENARIOS = ("cold_aci", "restart", "extremes", "long", "qc", "rounding", "sparse", "int8",
-             "fallback", "no_obs", "site_shift", "relocation", "store_order")
+STATUS_KEYS = ("filled", "history_hours", "theta", "conformal", "aci_lead_bins", "aci_updates",
+               "aci_misses", "idle_hours", "fallbacks", "state_bytes", "last_unix_hour",
+               "memory_bytes", "site", "loaded_site", "site_change")
+SCENARIOS = ("cold_aci", "restart", "restart_v4", "extremes", "long", "qc", "rounding", "sparse",
+             "int8", "fallback", "no_obs", "site_shift", "relocation", "store_order",
+             "hourly_aci")
 
 
 def golden_model(cfg=None):
@@ -200,15 +208,12 @@ class _Session:
 
     def _margin(self, value, hour):
         rt = self.host.rt
-        p = rt._pending
-        if rt.aci is None or p is None or value is None or value != value:
+        if rt.aci is None or value is None or value != value:
             return
-        k = hour - p["first"]
-        if 0 <= k < len(p["q"]) and k > p["last"]:
-            y = float(record_channel(value, 0))
-            sc = float(aci_score(y, p["q"][k], rt.aci.interval))
+        y = float(record_channel(value, 0))
+        for b, sc in rt.cal.scores(y, hour):
             if np.isfinite(sc):
-                self.margins.append(abs(sc - np.exp(rt.theta)))
+                self.margins.append(abs(sc - np.exp(rt.theta[b])))
 
     def cmd(self, line, record=True):
         parts = line.split()
@@ -223,7 +228,8 @@ class _Session:
         elif parts[0] == "forecast":
             q = np.asarray(reply["q"], np.float32)
             exp = dict(after_unix_hour=reply["after_unix_hour"], fallback=reply["fallback"],
-                       theta=_f(reply["theta"]), q=self.blob.put(q) if record else None)
+                       theta=[_f(v) for v in reply["theta"]],
+                       q=self.blob.put(q) if record else None)
         else:
             exp = {k: reply[k] for k in STATUS_KEYS}
         self.sc["events"].append(dict(op="cmd", line=line, expect=exp))
@@ -413,7 +419,7 @@ def scenario_long(make, out, blob, variant=0):
         Пара: описание сценария с командами и ожидаемыми ответами и наибольшие
         отклонения, которые нужны для допусков.
     """
-    sc = _scenario("long", 55.75, 37.62, 150.0, conformal=True, aci=True)
+    sc = _scenario("long", 55.75, 37.62, 150.0, conformal=True, aci=False)
     rng = np.random.default_rng(GOLDEN_SEED + 1 + variant)
 
     def body(ses):
@@ -728,7 +734,7 @@ def scenario_relocation(make, out, blob, variant=0):
         ses.status()
         ses.restart(site=oslo)
         rt = ses.host.rt
-        moved = (rt.site_change, rt.filled, rt.theta, rt.last_hour)
+        moved = (rt.site_change, rt.filled, max(abs(t) for t in rt.theta), rt.last_hour)
         ses.status()
         ses.forecast()
         for i in range(n1 + n2, n1 + n2 + n3):
@@ -801,6 +807,95 @@ def scenario_store_order(make, out, blob, variant=0):
         ses.restart()
         ses.forecast()
         ses.status()
+    return _run(sc, make, out, blob, body)
+
+
+def state_v4(raw, theta):
+    """Состояние версии 4 из состояния текущей версии: то же окно, один множитель калибровки.
+
+    Args:
+        raw: байты состояния текущей версии.
+        theta: логарифм множителя для заголовка версии 4.
+
+    Returns:
+        Байты состояния версии 4.
+    """
+    hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0]
+    old = np.zeros((), STATE_HEADER_V4)
+    for k in ("magic", "filled", "reserved", "last_hour", "lat", "lon", "elev"):
+        old[k] = hdr[k]
+    old["version"], old["aci_theta"] = 4, theta
+    return old.tobytes() + raw[STATE_HEADER.itemsize:]
+
+
+def scenario_restart_v4(make, out, blob, variant=0):
+    """Старт из состояния версии 4: один множитель калибровки переходит во все бины лидов.
+
+    Окно - то же, что у эталона рестарта. После старта прибор выпускает и подстраивает
+    множители бинов по отдельности; состояние на диске - уже текущей версии.
+
+    Args:
+        make: фабрика рантайма по описанию сценария и точке.
+        out: каталог эталонов.
+        blob: накопитель эталонных векторов прогнозов.
+        variant: номер варианта; меняет сид синтетического ряда.
+
+    Returns:
+        Пара: описание сценария с командами и ожидаемыми ответами и наибольшие
+        отклонения, которые нужны для допусков.
+    """
+    with open(os.path.join(out, "state_restart.bin"), "rb") as fh:
+        raw = fh.read()
+    last = int(np.frombuffer(raw, STATE_HEADER, count=1)[0]["last_hour"])
+    with open(os.path.join(out, "state_v4.bin"), "wb") as fh:
+        fh.write(state_v4(raw, V4_THETA))
+    sc = _scenario("restart_v4", -33.87, 151.21, 58.0, conformal=True, aci=True,
+                   init_files=[dict(file="state_v4.bin", **{"as": "state_a.bin"}, mtime=0)])
+
+    def body(ses):
+        if ses.restart() != "state_a.bin":
+            raise RuntimeError("эталон состояния версии 4 не восстановил начальное состояние")
+        st = ses.status()
+        if st["theta"] != [V4_THETA] * len(st["theta"]):
+            raise RuntimeError(f"множитель состояния версии 4 не перенесён во все бины: "
+                               f"{st['theta']}")
+        ses.forecast()
+        s = synthetic_series(72, seed=91 + 100 * variant, t0=last + 1)
+        for k in range(72):
+            ses.obs(_obs(s, k), s["t0"] + k)
+            if k % 6 == 5:
+                ses.forecast(record=k % 24 == 23)
+        ses.state("state_v4_end.bin")
+        ses.status()
+    return _run(sc, make, out, blob, body)
+
+
+def scenario_hourly_aci(make, out, blob, variant=0):
+    """Ежечасный выпуск с калибровкой: обратную связь получают все бины лидов.
+
+    Args:
+        make: фабрика рантайма по описанию сценария и точке.
+        out: каталог эталонов.
+        blob: накопитель эталонных векторов прогнозов.
+        variant: номер варианта; меняет сид синтетического ряда.
+
+    Returns:
+        Пара: описание сценария с командами и ожидаемыми ответами и наибольшие
+        отклонения, которые нужны для допусков.
+    """
+    sc = _scenario("hourly_aci", 48.85, 2.35, 35.0, conformal=True, aci=True)
+
+    def body(ses):
+        ses.restart()
+        n = 240
+        s = synthetic_series(n, seed=81 + 100 * variant, t0=_hour("2024-05-10T00"))
+        for k in range(n):
+            ses.obs(_obs(s, k), s["t0"] + k)
+            ses.forecast(record=k % 24 == 23)
+        st = ses.status()
+        if min(st["aci_updates"]) == 0:
+            raise RuntimeError(f"ежечасный выпуск: не все бины лидов получили обратную связь: "
+                               f"{st['aci_updates']}")
     return _run(sc, make, out, blob, body)
 
 
@@ -907,12 +1002,18 @@ def calibration_cases(model, blob):
     rng = np.random.default_rng(GOLDEN_SEED)
     H = model.cfg.horizon
     cases = []
-    for theta, conf in ((0.0, True), (0.37, True), (-0.52, True), (0.37, False)):
+    for theta, conf, hist in (((0.0, 0.0, 0.0, 0.0), True, 0),
+                              ((0.37, 0.37, 0.37, 0.37), True, 5),
+                              ((-0.52, 0.0, 0.21, -0.1), True, 100),
+                              ((0.0, 0.0, 0.0, 0.0), True, 672),
+                              ((0.37, -0.2, 0.0, 0.11), False, 30)):
         q = np.sort(rng.normal(0.0, 3.0, (H, len(model.cfg.quantiles))), axis=-1)
         q[5, 2] = q[5, 4] + 0.5
+        q[100, 1] = q[100, 5] + 0.3
         q = q.astype(np.float32)
-        out, _mu = calibrate_forecast(q, GOLDEN_SHIFT if conf else None, _f(theta))
-        cases.append(dict(q=blob.put(q), theta=_f(theta), conformal=conf,
+        th = [_f(v) for v in theta]
+        out, _mu = calibrate_forecast(q, GOLDEN_SHIFT if conf else None, th, hist)
+        cases.append(dict(q=blob.put(q), theta=th, conformal=conf, history=hist,
                           expect=blob.put(out)))
     scores = rng.exponential(0.8, 400)
     scores[::37] = np.nan
@@ -932,9 +1033,10 @@ def calibration_cases(model, blob):
     return dict(cases=cases, aci=aci, score=score)
 
 
-BUILDERS = (scenario_cold_aci, scenario_restart, scenario_extremes, scenario_long,
-            scenario_qc, scenario_rounding, scenario_sparse, scenario_int8, scenario_fallback,
-            scenario_no_obs, scenario_site_shift, scenario_relocation, scenario_store_order)
+BUILDERS = (scenario_cold_aci, scenario_restart, scenario_restart_v4, scenario_extremes,
+            scenario_long, scenario_qc, scenario_rounding, scenario_sparse, scenario_int8,
+            scenario_fallback, scenario_no_obs, scenario_site_shift, scenario_relocation,
+            scenario_store_order, scenario_hourly_aci)
 
 
 def generate(out_dir=DEFAULT_DIR):
@@ -1014,7 +1116,7 @@ def _check(ok, sc, i, what):
 
 
 def compare_state(got, ref, theta_atol=THETA_ATOL):
-    """Совпадение двух состояний: заголовок и окно до байта, множитель с допуском.
+    """Совпадение двух состояний: заголовок и окно до байта, множители с допуском.
 
     Returns:
         Пустая строка при совпадении или описание расхождения.
@@ -1022,14 +1124,20 @@ def compare_state(got, ref, theta_atol=THETA_ATOL):
     if len(got) != len(ref):
         return f"размер {len(got)} Б против {len(ref)} Б"
     if got[:16] != ref[:16]:
-        return "заголовок до множителя калибровки"
+        return "заголовок до множителей калибровки"
     ha = np.frombuffer(got, STATE_HEADER, count=1)[0]
     hb = np.frombuffer(ref, STATE_HEADER, count=1)[0]
-    if abs(float(ha["aci_theta"]) - float(hb["aci_theta"])) > theta_atol:
-        return f"множитель калибровки {ha['aci_theta']} против {hb['aci_theta']}"
-    if got[20:] != ref[20:]:
+    if np.abs(ha["aci_theta"].astype(np.float64) - hb["aci_theta"]).max() > theta_atol:
+        return f"множители калибровки {ha['aci_theta']} против {hb['aci_theta']}"
+    off = STATE_HEADER.fields["lat"][1]
+    if got[off:] != ref[off:]:
         return "координаты или сырое окно"
     return ""
+
+
+def _close(a, b, atol):
+    """Множители по бинам совпадают с допуском."""
+    return len(a) == len(b) and all(abs(x - y) <= atol for x, y in zip(a, b))
 
 
 def replay_scenario(sc, blob, make, state_dir, golden_dir, n_quantiles, i_med,
@@ -1085,8 +1193,8 @@ def replay_scenario(sc, blob, make, state_dir, golden_dir, n_quantiles, i_med,
             _check(reply["after_unix_hour"] == exp["after_unix_hour"], sc, i,
                    f"момент выпуска {reply['after_unix_hour']} против {exp['after_unix_hour']}")
             _check(reply["fallback"] == exp["fallback"], sc, i, "признак отката")
-            _check(abs(reply["theta"] - exp["theta"]) <= theta_atol, sc, i,
-                   f"множитель {reply['theta']} против {exp['theta']}")
+            _check(_close(reply["theta"], exp["theta"], theta_atol), sc, i,
+                   f"множители {reply['theta']} против {exp['theta']}")
             q = np.asarray(reply["q"], np.float32)
             _check(np.array_equal(np.asarray(reply["mu"], np.float32), q[:, i_med]), sc, i,
                    "медиана не равна среднему квантилю")
@@ -1097,7 +1205,7 @@ def replay_scenario(sc, blob, make, state_dir, golden_dir, n_quantiles, i_med,
         else:
             for k, v in exp.items():
                 if k == "theta":
-                    _check(abs(reply[k] - v) <= theta_atol, sc, i, f"сводка {k}")
+                    _check(_close(reply[k], v, theta_atol), sc, i, f"сводка {k}")
                 else:
                     _check(reply[k] == v, sc, i, f"сводка {k}: {reply[k]} против {v}")
     return worst
@@ -1105,6 +1213,6 @@ def replay_scenario(sc, blob, make, state_dir, golden_dir, n_quantiles, i_med,
 
 __all__ = ["DEFAULT_DIR", "FRESH_ATOL", "GOLDEN_ACI", "GOLDEN_FORMAT", "GOLDEN_SHIFT",
            "GoldenMismatch", "MIN_ACI_MARGIN", "Q_ATOL", "Q_ATOL_INT8", "SCENARIOS",
-           "STATUS_KEYS", "THETA_ATOL", "calendar_cases", "calibration_cases",
+           "STATUS_KEYS", "THETA_ATOL", "V4_THETA", "calendar_cases", "calibration_cases",
            "compare_state", "generate", "golden_model", "load", "place_init_files",
-           "replay_scenario", "scenario_runtime", "site_cases", "take"]
+           "replay_scenario", "scenario_runtime", "site_cases", "state_v4", "take"]

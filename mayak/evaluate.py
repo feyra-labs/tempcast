@@ -794,7 +794,8 @@ def history_evaluations(bench, shift=None):
 
     Args:
         bench: результат прогона по сетке.
-        shift: конформная таблица; None значит сырые выходы.
+        shift: конформная таблица; None значит сырые выходы. Применяется по
+            фактической длине истории каждого окна при этой длине сетки.
 
     Yields:
         Пары из метки длины истории и оценки.
@@ -804,7 +805,7 @@ def history_evaluations(bench, shift=None):
         p = bench.main_history[L]
         ev = Evaluation(y=aux["y"], mu=p["mu"], q=p["q"], mu_clim=aux["mu_clim"],
                         w=aux["y_mask"], station=p["meta"]["station"])
-        yield history_label(L), ev.with_conformal(shift)
+        yield history_label(L), ev.with_conformal(shift, p["meta"]["history"])
 
 
 def history_predictions(bench):
@@ -855,7 +856,10 @@ def evaluate_set(named, base, grid=HISTORY_GRID, r_damped=None, shift=None, ci=T
     """Все числа стенда на одном наборе окон.
 
     Сравнительная часть считается по сырым выходам всех моделей и от конформной таблицы
-    не зависит. Таблица влияет только на раздел основной модели после калибровки.
+    не зависит. Таблица влияет только на раздел основной модели после калибровки и
+    применяется к каждому окну по его фактической длине истории. В этом разделе же
+    офлайн-прогон адаптивной калибровки: основная модель выпускает прогноз каждый час
+    на непрерывном периоде части станций набора, как прибор.
 
     Args:
         named: словарь из имени модели в модель; основная модель обязательна.
@@ -874,9 +878,10 @@ def evaluate_set(named, base, grid=HISTORY_GRID, r_damped=None, shift=None, ci=T
         Словарь. Сравнительная часть: прогон по сетке, таблицы по лидам и сводки по всему
         горизонту для всех моделей, разрезы по длине истории для всех моделей, разрезы
         основной модели, её надёжность, кривые остроты всех моделей и покрытие основной
-        модели по разрезам. Отдельно: раздел после калибровки или None.
+        модели по разрезам. Отдельно: раздел после калибровки или None и ежечасные
+        выпуски основной модели для сохранения или None.
     """
-    from mayak.calibration import (aci_replay, calibration_effect, conditional_gate,
+    from mayak.calibration import (aci_hourly_replay, calibration_effect, conditional_gate,
                                    coverage_report, sharpness_curves)
     bench = run_bench(named, base, grid=grid, r_damped=r_damped, ci=ci, bootstrap=bootstrap,
                       device=device, main=main)
@@ -900,14 +905,18 @@ def evaluate_set(named, base, grid=HISTORY_GRID, r_damped=None, shift=None, ci=T
         history=history, breakdowns=breakdowns, reliability=evs[main],
         sharpness=sharpness_curves(evs, cfg),
         coverage=dict(report=report, gate=conditional_gate(report, cfg)),
-        calibrated=None, config=cfg)
+        calibrated=None, hourly=None, config=cfg)
     if shift is not None:
-        ev_cal = evs[main].with_conformal(shift)
+        ev_cal = evs[main].with_conformal(shift, meta["history"])
         rep = coverage_report(ev_cal, meta, cfg, external=external,
                               history=history_evaluations(bench, shift))
+        hourly = collect_predictions({main: named[main]},
+                                     base.hourly(cfg.aci_stations, cfg.aci_hours), device=device)
+        res["hourly"] = hourly
         res["calibrated"] = dict(effect=calibration_effect(evs[main], ev_cal), report=rep,
                                  gate=conditional_gate(rep, cfg),
-                                 aci=aci_replay(ev_cal, meta, cfg.aci()))
+                                 aci=aci_hourly_replay(hourly[0][main], hourly[1], cfg.aci(),
+                                                       shift))
     return res
 
 
@@ -1243,7 +1252,8 @@ def save_bench(res, out_dir, set_name, shift=None, info=None):
     """Сохраняет сырые предсказания набора для анализа калибровки без повторного прогона.
 
     Пишутся два файла: предсказания всех моделей при полной истории и предсказания
-    основной модели на всей сетке длин истории.
+    основной модели на всей сетке длин истории. Если в результате есть ежечасные
+    выпуски основной модели, они ложатся третьим файлом.
 
     Args:
         res: результат оценки набора.
@@ -1253,7 +1263,7 @@ def save_bench(res, out_dir, set_name, shift=None, info=None):
         info: сведения о прогоне для заголовка файлов.
 
     Returns:
-        Пути к двум файлам.
+        Пути к записанным файлам.
     """
     from mayak.calibration import save_predictions
     bench = res["bench"]
@@ -1263,7 +1273,12 @@ def save_bench(res, out_dir, set_name, shift=None, info=None):
     h_preds, h_aux = history_predictions(bench)
     grid_path = save_predictions(os.path.join(out_dir, f"{set_name}_history.npz"), h_preds,
                                  h_aux, shift=shift, info=info)
-    return nominal, grid_path
+    if res.get("hourly") is None:
+        return nominal, grid_path
+    r_preds, r_aux = res["hourly"]
+    hourly = save_predictions(os.path.join(out_dir, f"{set_name}_hourly.npz"), r_preds, r_aux,
+                              shift=shift, info=dict(info, rhythm="hourly"))
+    return nominal, grid_path, hourly
 
 
 def save_history_table(res, out_dir, set_name):
@@ -1364,8 +1379,9 @@ def main():
     ap.add_argument("--save-preds", default=None, metavar="DIR",
                     help="сохранить сырые предсказания: DIR/internal.npz (все модели при "
                          "полной истории) и DIR/internal_history.npz (МАЯК на всей сетке "
-                         "длин истории), для внешнего теста - DIR/external*.npz; их читает "
-                         "python -m mayak.calibration")
+                         "длин истории), с --conformal ещё DIR/internal_hourly.npz (МАЯК с "
+                         "ежечасным выпуском), для внешнего теста - DIR/external*.npz; их "
+                         "читает python -m mayak.calibration")
     ap.add_argument("--results-dir", default=None, metavar="DIR",
                     help="записать каждую таблицу в свой JSON с записью о прогоне: "
                          "DIR/internal/*.json, DIR/external/*.json, DIR/params.json")

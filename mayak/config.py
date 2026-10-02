@@ -1496,10 +1496,15 @@ class CalibrationConfig:
         aci_gamma: шаг адаптивной калибровки устройства.
         aci_max_factor: граница множителя ширины адаптивной калибровки; целевая доля
             промахов равна единице минус номинал.
+        aci_stations: на скольких тестовых станциях идёт офлайн-прогон адаптивной
+            калибровки с ежечасным выпуском.
+        aci_hours: длина непрерывного периода этого прогона на каждой станции, ч.
         fit_every_hours: шаг между кандидатами в начала горизонта калибровочного набора, ч.
         fit_windows_per_station: сколько окон калибровочного набора берётся с каждой
             станции; None - все окна.
         fit_seed: сид выбора длины истории окон калибровочного набора по куррикулуму.
+        fit_min_windows: наименьшее число окон бина длины истории, при котором у бина в
+            конформной таблице своя строка; иначе строка маргинальная.
     """
     nominal: float = 0.90
     tolerance: float = 0.04
@@ -1513,16 +1518,23 @@ class CalibrationConfig:
     sharpness_points: int = 33
     aci_gamma: float = 0.005
     aci_max_factor: float = 4.0
+    aci_stations: int = 8
+    aci_hours: int = 720
     fit_every_hours: int = 24
     fit_windows_per_station: Optional[int] = None
     fit_seed: int = 0
+    fit_min_windows: int = 200
 
     def __post_init__(self):
         s = object.__setattr__
-        for name in ("fit_every_hours", "fit_seed"):
+        for name in ("fit_every_hours", "fit_seed", "fit_min_windows", "aci_stations",
+                     "aci_hours"):
             s(self, name, int(getattr(self, name)))
-        if self.fit_every_hours < 1 or self.fit_seed < 0:
-            raise ConfigError("calibration.fit_every_hours ≥ 1 и calibration.fit_seed ≥ 0")
+        if self.fit_every_hours < 1 or self.fit_seed < 0 or self.fit_min_windows < 1:
+            raise ConfigError("calibration.fit_every_hours ≥ 1, calibration.fit_seed ≥ 0 и "
+                              "calibration.fit_min_windows ≥ 1")
+        if self.aci_stations < 1 or self.aci_hours < 1:
+            raise ConfigError("calibration.aci_stations ≥ 1 и calibration.aci_hours ≥ 1")
         if self.fit_windows_per_station is not None:
             s(self, "fit_windows_per_station", int(self.fit_windows_per_station))
             if self.fit_windows_per_station < 1:

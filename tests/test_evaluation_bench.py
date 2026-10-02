@@ -95,9 +95,11 @@ def _models():
 
 def _shift():
     """Таблица поправок, как у подгонки: интервалы шире, поправка медианы нулевая."""
+    from mayak.constants import HISTORY_BINS
     rng = np.random.default_rng(11)
-    shift = np.sort(rng.normal(0.0, 0.8, (len(LEAD_BINS), NQ)), axis=-1).astype(np.float32)
-    shift -= shift[:, 3:4]
+    shift = np.sort(rng.normal(0.0, 0.8, (len(LEAD_BINS), len(HISTORY_BINS), NQ)),
+                    axis=-1).astype(np.float32)
+    shift -= shift[..., 3:4]
     return shift
 
 
@@ -283,8 +285,11 @@ def test_saved_predictions_feed_calibration_with_history_grid(results, tmp_path)
     from dataclasses import replace
     _raw, cal = results
     shift = _shift()
-    nominal, grid_path = save_bench(cal, str(tmp_path), "internal", shift=shift,
-                                    info=dict(ckpt="x"))
+    nominal, grid_path, hourly_path = save_bench(cal, str(tmp_path), "internal", shift=shift,
+                                                 info=dict(ckpt="x"))
+    r_preds, r_aux, _s, r_info = load_predictions(hourly_path)
+    assert list(r_preds) == ["МАЯК"] and r_info["rhythm"] == "hourly"
+    assert len(save_bench(_raw, str(tmp_path / "raw"), "internal")) == 2, "без таблицы - без ACI"
     preds, aux, s, info = load_predictions(nominal)
     h_preds, h_aux, _s, h_info = load_predictions(grid_path)
     assert list(h_preds) == ["МАЯК"] and set(aux["meta"]["history"].tolist()) == {L_MAX}
@@ -298,7 +303,10 @@ def test_saved_predictions_feed_calibration_with_history_grid(results, tmp_path)
     for res in (with_table, without):
         assert list(res["raw"]["report"]["dims"]["длина истории"]) == labels
     assert list(with_table["calibrated"]["report"]["dims"]["длина истории"]) == labels
-    assert without["calibrated"] is None
+    assert without["calibrated"] is None and without["aci"] is None
+    hourly = analyze(preds, aux, s, cfg, hourly=(r_preds, r_aux))
+    assert hourly["aci"]["issues"] == len(r_aux["y"])
+    assert hourly["aci"]["overall"] == cal["calibrated"]["aci"]["overall"]
     assert _same(with_table["sharpness"], without["sharpness"]), "кривые остроты - сырые"
     assert _same(with_table["raw"], without["raw"])
     ref = cal["coverage"]["report"]["dims"]["длина истории"]
