@@ -68,7 +68,7 @@ def test_soft_is_not_stronger_than_aggressive():
     soft, agg = AugmentConfig.from_profile("soft"), AugmentConfig.from_profile("aggressive")
     for f in AUGMENT_PROB_FIELDS.values():
         assert getattr(soft, f) <= getattr(agg, f), f
-    for f in ("scale_max", "drift_max", "noise_sd"):
+    for f in ("scale_max", "drift_rate_max", "noise_sd"):
         assert all(a <= b for a, b in zip(getattr(soft, f), getattr(agg, f))), f
     assert soft.offset_max <= agg.offset_max and soft.gap_max_len <= agg.gap_max_len
 
@@ -121,6 +121,12 @@ def test_config_validation_and_partial_dicts():
             AugmentConfig.from_dict({removed: 0.5})
     with pytest.raises(ConfigError, match="неизвестные ключи"):
         AugmentConfig.from_dict({"spik_prob": 0.1})
+    with pytest.raises(ConfigError, match="drift_rate_max"):
+        AugmentConfig.from_dict({"drift_max": [1.5, 1.5, 6.0]})
+    with pytest.raises(ConfigError, match="переобучите"):
+        DataConfig.from_dict({"augment": {"profile": "soft", "drift_max": [0.7, 1.0, 3.0]}})
+    with pytest.raises(ConfigError, match="drift_rate_max"):
+        AugmentConfig(drift_rate_max=(0.05, -0.01, 0.2))
     a = AugmentConfig.from_dict({"profile": "base", "gap_prob": 0.0})
     assert a.gap_prob == 0.0 and a.spike_prob == 0.0 and a.gap_max_len == 24
     assert AugmentConfig(offset_max=0.0).offset_min == 0.0
@@ -263,18 +269,71 @@ def test_scale_and_drift_change_target_by_expected_amount(L):
     w = apply_one(_copy(w0), "scale", dict(k=[1.03, 1.0, 1.1]))
     np.testing.assert_array_equal(w.y[ok], w0.y[ok] * np.float32(1.03))
     assert np.array_equal(w.y[~ok], w0.y[~ok]) and np.array_equal(w.y_mask, w0.y_mask)
+    rate = (-0.05, 0.02, 0.15)
     for walk in (False, True):
-        w = apply_one(_copy(w0), "drift", dict(b=[-1.25, 0.5, 4.0], walk=walk, seed=2))
-        np.testing.assert_array_equal(w.y[ok], w0.y[ok] + np.float32(-1.25))
+        w = apply_one(_copy(w0), "drift", dict(rate=list(rate), walk=walk, seed=2))
+        want = w0.y + A.drift_target(L, rate[0])
+        np.testing.assert_allclose(w.y[ok], want[ok], atol=1e-5)
         assert np.array_equal(w.y[~ok], w0.y[~ok]) and np.array_equal(w.y_mask, w0.y_mask)
         last = L_MAX - 1
-        for ch, b in enumerate((-1.25, 0.5, 4.0)):
+        for ch, r in enumerate(rate):
             if w0.m[last, ch] > 0:
-                assert w.x[last, ch] - w0.x[last, ch] == pytest.approx(b, abs=1e-4)
+                assert w.x[last, ch] - w0.x[last, ch] == pytest.approx(A.drift_offset(L, r),
+                                                                       abs=1e-4)
     for name, p in (("scale", dict(k=[1.03, 1.0, 1.1])), ("offset", dict(b=2.0)),
-                    ("drift", dict(b=[1.0, 0.0, 0.0], walk=False, seed=0))):
+                    ("drift", dict(rate=[0.05, 0.0, 0.0], walk=False, seed=0))):
         w = apply_one(_copy(w0), name, dict(p, target=False))
         assert np.array_equal(w.y, w0.y), f"{name}: вариант без цели трогает цель"
+
+
+def test_drift_offset_is_proportional_to_history_length():
+    """Дрейф задан скоростью: смещение в момент выпуска - скорость на длину истории.
+
+    При короткой истории смещение мало и не похоже на быстрый скачок погоды; при полной
+    истории наибольшая скорость профиля даёт смещение около прежних полутора градусов.
+    """
+    rate = 0.05
+    assert A.drift_offset(0, rate) == 0.0 and A.drift_offset(1, rate) == 0.0
+    for L in (2, 25, 169, L_MAX):
+        assert A.drift_offset(L, rate) == pytest.approx(rate * (L - 1) / 24)
+        w0 = _window(0, L=L)
+        w = apply_one(_copy(w0), "drift", dict(rate=[rate, 0.0, 0.0], walk=False, seed=0))
+        d = w.x[:, 0] - w0.x[:, 0]
+        assert d[-1] == pytest.approx(A.drift_offset(L, rate), abs=1e-4)
+        np.testing.assert_allclose(np.diff(d[w0.h0:]), rate / 24, atol=1e-4)
+        assert np.all(d[:w0.h0] == 0), "левее начала истории дрейфа нет"
+    assert A.drift_offset(L_MAX, 2 * rate) == pytest.approx(2 * A.drift_offset(L_MAX, rate))
+    agg = AugmentConfig()
+    full = A.drift_offset(L_MAX, agg.drift_rate_max[0])
+    assert 1.2 < full < 1.6, f"при полной истории наибольший дрейф T {full:.2f} °C"
+    assert A.drift_offset(24, agg.drift_rate_max[0]) < 0.1, "за сутки истории дрейф мал"
+    cfg = AugmentConfig.only("drift")
+    for seed in range(30):
+        w = augment_window(_window(seed, L=(24, 168, L_MAX)[seed % 3]), cfg,
+                           np.random.default_rng(seed))
+        r = w.applied["drift"]["rate"]
+        assert len(r) == 3 and all(abs(v) <= m for v, m in zip(r, cfg.drift_rate_max))
+
+
+@pytest.mark.parametrize("walk", [False, True])
+@pytest.mark.parametrize("L", [0, 1, 30, L_MAX])
+def test_drift_target_grows_linearly_with_lead(L, walk):
+    """На горизонте цели смещение не замораживается, а растёт с той же скоростью."""
+    rate = -0.08
+    w0 = _window(3, L=L)
+    w = apply_one(_copy(w0), "drift", dict(rate=[rate, 0.0, 0.0], walk=walk, seed=4))
+    dy = (w.y.astype(np.float64) - w0.y)
+    want = A.drift_target(L, rate)
+    np.testing.assert_allclose(dy, want, atol=1e-5)
+    if L == 0:
+        assert not np.any(dy), "без истории момент калибровки не определён - цель не трогаем"
+        return
+    np.testing.assert_allclose(np.diff(dy), rate / 24, atol=1e-5)
+    assert dy[0] == pytest.approx(A.drift_offset(L, rate) + rate / 24, abs=1e-5), \
+        "первый час горизонта - продолжение истории без скачка"
+    if w0.m[-1, 0] > 0:
+        assert dy[0] - (w.x[-1, 0] - w0.x[-1, 0]) == pytest.approx(rate / 24, abs=1e-4)
+    assert dy[-1] == pytest.approx(rate * (L - 1 + H) / 24, abs=1e-4)
 
 
 @pytest.mark.parametrize("name", INSTRUMENT_ON_TARGET)
@@ -473,7 +532,8 @@ def test_dataset_aggressive_keeps_contract(manifest):
         if "scale" in info:
             y = np.where(ym0 > 0, y * info["scale"]["k"][0], y)
         if "drift" in info:
-            y = y + info["drift"]["b"][0] * ym0
+            L = (0, 24, 200, L_MAX)[i % 4]
+            y = y + A.drift_target(L, info["drift"]["rate"][0]) * ym0
         if "offset" in info:
             y = y + info["offset"]["b"] * ym0
         got = it["y"].numpy()

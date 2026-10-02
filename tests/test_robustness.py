@@ -22,7 +22,8 @@ from mayak.data import store as S
 from mayak.data.augment import P, RH, T, clean_history, make_window
 from mayak.data.augment import apply_one
 from mayak.data.recording import is_recorded
-from mayak.data.scenarios import SCENARIOS, apply_scenario, drift_offset, scenario_rng
+from mayak.data.scenarios import (SCENARIOS, apply_scenario, drift_offset, drift_target,
+                                  scenario_rng)
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL
 
 REPO = Path(__file__).resolve().parents[1]
@@ -107,7 +108,7 @@ def test_offset_is_applied_to_history_and_target_exactly():
     assert np.array_equal(wi.y, w0.y), "... но цель не трогает"
 
 
-def test_drift_reaches_current_offset_and_holds_it_on_target():
+def test_drift_reaches_current_offset_and_keeps_growing_on_target():
     rate, L = 0.24, 300                    # 0.01 °C/ч
     w0, w = _window(L=L), _window(L=L)
     _apply(w, "drift", rate)
@@ -121,7 +122,9 @@ def test_drift_reaches_current_offset_and_holds_it_on_target():
         assert d[-1] == pytest.approx(b, abs=1e-4)
     assert np.all(np.diff(d[w0.h0:][mT[w0.h0:]]) >= 0), "линейный дрейф только нарастает"
     ok = w0.y_mask > 0
-    np.testing.assert_allclose(w.y[ok] - w0.y[ok], b, atol=1e-5)
+    lead = np.arange(1, H + 1)
+    np.testing.assert_allclose(w.y[ok] - w0.y[ok], b + rate / 24 * lead[ok], atol=1e-5)
+    np.testing.assert_allclose(drift_target(L, rate), b + rate / 24 * lead, atol=1e-5)
     assert np.array_equal(w.x[:, 1:], w0.x[:, 1:])
     wi = _window(L=L)
     _apply(wi, "drift_input", rate)
@@ -135,10 +138,9 @@ def test_scenario_and_augmentation_with_same_parameters_give_same_window(L):
     same = (("offset", 2.0, "offset", dict(b=2.0)),
             ("offset_input", 2.0, "offset", dict(b=2.0, target=False)),
             ("scale", 0.05, "scale", dict(k=[1.05, 1.0, 1.0])),
-            ("drift", 0.2, "drift", dict(b=[drift_offset(L, 0.2), 0.0, 0.0], walk=False,
-                                         seed=0)),
-            ("drift_input", 0.2, "drift", dict(b=[drift_offset(L, 0.2), 0.0, 0.0],
-                                               walk=False, seed=0, target=False)))
+            ("drift", 0.2, "drift", dict(rate=[0.2, 0.0, 0.0], walk=False, seed=0)),
+            ("drift_input", 0.2, "drift", dict(rate=[0.2, 0.0, 0.0], walk=False, seed=0,
+                                               target=False)))
     for name, level, aug, params in same:
         a, b = _window(L=L), _window(L=L)
         _apply(a, name, level)
@@ -637,8 +639,8 @@ def test_guard_is_never_vacuous(ref_rows):
 def test_same_instrument_reference_follows_the_target_transform(base, name, level):
     """Эталон скилла искажается тем же преобразованием, что цель.
 
-    Плюс смещение, умножение на масштаб, плюс текущее смещение дрейфа. Если цель не искажена, эталон
-    равен климатологии станции.
+    Плюс смещение, умножение на масштаб, плюс смещение дрейфа, растущее по лиду. Если цель не
+    искажена, эталон равен климатологии станции.
     """
     ds = _rset(base, name, level)
     for i in range(len(base)):
@@ -647,7 +649,7 @@ def test_same_instrument_reference_follows_the_target_transform(base, name, leve
         ref = b["mu_ref_fut"].numpy().astype(np.float64)
         L = int(b["hist_len"])
         want = {"offset": muc + level, "scale": muc * (1.0 + level),
-                "drift": muc + drift_offset(L, level)}.get(name, muc)
+                "drift": muc + drift_target(L, level)}.get(name, muc)
         np.testing.assert_allclose(ref, want, atol=1e-4)
         assert torch.equal(b["mu_clim_fut"], a["mu_clim_fut"]), "вход модели не искажается"
 

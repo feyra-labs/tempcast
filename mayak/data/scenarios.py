@@ -13,7 +13,7 @@ import numpy as np
 
 from mayak.config import SCENARIO_INPUT, SCENARIO_INSTRUMENT, SCENARIO_RULES, ScenarioRule
 from mayak.constants import L_MAX
-from mayak.data.augment import P, RH, AugWindow, apply_one
+from mayak.data.augment import P, RH, AugWindow, apply_one, drift_offset, drift_target
 
 DROP_CHANNEL_LABELS = ("все каналы", "без P", "без RH", "без P и RH")
 
@@ -41,37 +41,22 @@ def _offset_input(w, level, rng, p):
     apply_one(w, "offset", dict(b=float(level), target=False))
 
 
-def drift_offset(L, rate_per_day):
-    """Смещение прибора в момент выпуска при дрейфе с постоянной скоростью.
-
-    Прибор откалиброван в первом часе фактической истории и к её последнему часу
-    уходит на скорость, умноженную на прошедшее время.
-
-    Args:
-        L: длина истории, ч.
-        rate_per_day: скорость дрейфа, градусы в сутки.
-
-    Returns:
-        Смещение в последнем часе истории, градусы. Без истории - ноль.
-    """
-    return float(rate_per_day) * max(int(L) - 1, 0) / 24.0
-
-
-def _drift_params(w, level, target):
-    return dict(b=[drift_offset(w.L, level), 0.0, 0.0], walk=False, seed=0, target=target)
+def _drift_params(level, target):
+    return dict(rate=[float(level), 0.0, 0.0], walk=False, seed=0, target=target)
 
 
 def _drift(w, level, rng, p):
-    """Дрейф температуры той же функцией, что в обучении.
+    """Дрейф температуры со скоростью ``level`` в сутки той же функцией, что в обучении.
 
-    История нарастает до текущего смещения, цель получает это смещение постоянным.
+    История нарастает от нуля до текущего смещения, на горизонте цель смещается дальше с
+    той же скоростью.
     """
-    apply_one(w, "drift", _drift_params(w, level, True))
+    apply_one(w, "drift", _drift_params(level, True))
 
 
 def _drift_input(w, level, rng, p):
     """Тот же дрейф, но цель не трогается: незамеченный дрейф прибора."""
-    apply_one(w, "drift", _drift_params(w, level, False))
+    apply_one(w, "drift", _drift_params(level, False))
 
 
 def _scale(w, level, rng, p):
@@ -315,5 +300,5 @@ def level_label(name, level):
 
 
 __all__ = ["DITHER_SCENARIOS", "DROP_CHANNEL_LABELS", "SCENARIOS", "ScenarioDef",
-           "apply_scenario", "dither_rng", "drift_offset", "instrument_reference", "level_label",
-           "scenario_rng", "variants_of"]
+           "apply_scenario", "dither_rng", "drift_offset", "drift_target", "instrument_reference",
+           "level_label", "scenario_rng", "variants_of"]

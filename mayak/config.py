@@ -839,11 +839,13 @@ class AugmentConfig:
         scale_max: наибольшее отклонение множителя канала от единицы; фактическое
             отклонение случайно, от нуля до этого значения, в любую сторону.
         drift_prob: вероятность дрейфа.
-        drift_max: наибольшее смещение прибора в момент выпуска по каналам. В первом
-            часе истории смещение нулевое, к моменту выпуска нарастает до выбранного
-            значения и на горизонте цели остаётся постоянным.
-        drift_rw_frac: доля нарастания дрейфа случайным блужданием, остальное -
-            линейно.
+        drift_rate_max: наибольшая скорость дрейфа по каналам: °C, гПа и % в сутки;
+            фактическая скорость случайна, от нуля до этого значения, в любую сторону. В
+            первом часе истории смещение нулевое, к моменту выпуска оно равно скорости,
+            умноженной на прошедшее время, поэтому при короткой истории дрейф мал. На
+            горизонте цели смещение продолжает расти с той же скоростью.
+        drift_rw_frac: доля нарастания дрейфа на истории случайным блужданием,
+            остальное - линейно; на горизонте нарастание всегда линейное.
         offset_prob: вероятность постоянного смещения температуры.
         offset_min: нижняя граница величины смещения. Величина выбирается равномерно в
             логарифме между границами, а при нулевой нижней границе - равномерно.
@@ -882,7 +884,7 @@ class AugmentConfig:
     scale_prob: float = 0.3
     scale_max: tuple = (0.02, 0.001, 0.05)
     drift_prob: float = 0.3
-    drift_max: tuple = (1.5, 1.5, 6.0)
+    drift_rate_max: tuple = (0.05, 0.05, 0.2)
     drift_rw_frac: float = 0.5
     offset_prob: float = 0.8
     offset_min: float = 0.1
@@ -916,7 +918,7 @@ class AugmentConfig:
         if self.profile not in AUGMENT_PROFILES:
             raise ConfigError(f"неизвестный профиль аугментаций {self.profile!r}; "
                               f"есть {tuple(AUGMENT_PROFILES)}")
-        for name in ("scale_max", "drift_max", "noise_sd", "spike_min", "spike_max"):
+        for name in ("scale_max", "drift_rate_max", "noise_sd", "spike_min", "spike_max"):
             v = _floats(getattr(self, name))
             if len(v) != 3 or min(v) < 0:
                 raise ConfigError(f"{name} - по одному неотрицательному значению на канал "
@@ -980,7 +982,15 @@ class AugmentConfig:
 
         Returns:
             Конфиг аугментаций.
+
+        Raises:
+            ConfigError: неизвестный ключ или ключ прежнего дрейфа.
         """
+        if d is not None and "drift_max" in d:
+            raise ConfigError("data.augment.drift_max больше не поддерживается: дрейф задаётся "
+                              "скоростью в сутки (drift_rate_max), а не смещением в момент "
+                              "выпуска. Конфиг с этим ключом принадлежит прогону, обученному с "
+                              "прежним дрейфом; переобучите модель")
         d = _strict_kwargs(cls, d, "data.augment")
         return cls.from_profile(d.pop("profile", "aggressive"), **d)
 
@@ -1015,7 +1025,7 @@ AUGMENT_PROFILES = {
     "aggressive": {},
     "soft": dict(
         scale_prob=0.15, scale_max=(0.01, 0.0005, 0.03),
-        drift_prob=0.15, drift_max=(0.7, 1.0, 3.0),
+        drift_prob=0.15, drift_rate_max=(0.025, 0.035, 0.1),
         offset_max=1.5,
         noise_sd=(0.15, 0.2, 1.5),
         rh_dewpoint_prob=0.05,
