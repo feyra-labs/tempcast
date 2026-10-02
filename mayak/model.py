@@ -50,11 +50,11 @@ class MAYAK(nn.Module):
         self.encoder = SynopticEncoder(cfg.n_channels, cfg.encoder_width, cfg.encoder_dilations,
                                        cfg.encoder_kernel, cfg.encoder_norm_groups)
         self.readout = LaplaceReadout(cfg.encoder_width, cfg.effective_mode_groups,
-                                      cfg.tau_bounds, compression=not abl.no_compression)
+                                      cfg.mode_tau_bounds, compression=not abl.no_compression)
         self.propagator = ModalPropagator(cfg.n_modes, cfg.passport_dim, cfg.group_sizes,
-                                          cfg.horizon, cfg.tau_bounds)
+                                          cfg.horizon, cfg.mode_tau_bounds)
         self.heads = Heads(cfg.passport_dim, cfg.n_groups, cfg.n_solar_head, cfg.quantiles,
-                           cfg.heads_hidden, cfg.heads_z_proj)
+                           cfg.heads_hidden, cfg.heads_z_proj, cfg.evidence_modes)
         assert self.heads.in_dim == cfg.heads_in_dim
         self._ch_index = {n: i for i, n in enumerate(cfg.channel_names)}
 

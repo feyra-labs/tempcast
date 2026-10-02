@@ -138,7 +138,8 @@ class DLinear(nn.Module):
     Тренд - скользящее среднее с повтором крайних значений на краях, остаток - разность
     ряда и тренда. Каждая часть линейно отображается из истории во весь горизонт,
     результаты складываются. Модель одноканальная: давление, влажность, календарь и
-    координаты в неё не входят. Пропуски истории заполняются нулём.
+    координаты в неё не входят. Пропуски во входном окне заполняются средним валидных
+    часов этого окна, а если валидных часов нет - нулём; маска в модель не входит.
 
     Args:
         cfg: конфиг DLinear, словарь с теми же полями или None для значений по умолчанию.
@@ -157,6 +158,26 @@ class DLinear(nn.Module):
         self.lin_resid = nn.Linear(cfg.input_len, cfg.horizon)
         self.log_sig = nn.Parameter(torch.zeros(cfg.horizon))
         self.gaps = nn.Parameter(torch.zeros(cfg.horizon, self.nq - 1))
+
+    @staticmethod
+    def fill_missing(T, valid):
+        """Заполнение пропусков средним валидных часов окна.
+
+        Значение под нулевой маской не используется вовсе, поэтому мусор и нечисловые
+        значения в пропусках на результат не влияют.
+
+        Args:
+            T: ряд температуры, форма (B, L).
+            valid: маска наличия, форма (B, L).
+
+        Returns:
+            Ряд формы (B, L): валидные часы без изменений, пропуски - среднее валидных
+            часов своего окна или ноль, если валидных часов в окне нет.
+        """
+        ok = valid > 0
+        n = ok.sum(-1, keepdim=True).clamp(min=1).to(T.dtype)
+        mean = torch.where(ok, T, torch.zeros_like(T)).sum(-1, keepdim=True) / n
+        return torch.where(ok, T, mean.expand_as(T))
 
     def decompose(self, T):
         """Тренд и остаток ряда.
@@ -186,7 +207,8 @@ class DLinear(nn.Module):
         return self.lin_trend(trend) + self.lin_resid(resid)
 
     def forward(self, batch):
-        T = (batch["x_hist"][..., 0] * batch["mask_hist"][..., 0])[:, -self.input_len:]
+        n = self.input_len
+        T = self.fill_missing(batch["x_hist"][:, -n:, 0], batch["mask_hist"][:, -n:, 0])
         mu = self.point(T)
         sig = torch.exp(self.log_sig).clamp(0.3, 12)[None].expand_as(mu)
         offs = median_centered_offsets(self.gaps, self.nq, T.device)

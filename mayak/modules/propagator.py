@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 
+from mayak.modules.readout import mode_bounds
+
 TAU_SITE = 0.2
 OMEGA_SITE = 0.1
 
@@ -10,7 +12,7 @@ class ModalPropagator(nn.Module):
 
     Паспорт станции подстраивает постоянные времени примерно на двадцать процентов и
     частоты примерно на десять процентов. Подстроенная постоянная времени обрезается
-    в допустимый диапазон мод: без обрезки самая медленная мода растягивалась бы за
+    в пределы своей моды: без обрезки самая медленная мода группы растягивалась бы за
     верхнюю границу, и аномалия к концу горизонта затухала бы слабее обещанного.
 
     На выходе - аномалия на лидах и энергии групп мод на лидах; размеры групп задаёт
@@ -21,7 +23,8 @@ class ModalPropagator(nn.Module):
         dz: размер паспорта станции.
         group_sizes: размеры групп мод по порядку.
         horizon: горизонт, ч.
-        tau_bounds: пределы постоянных времени, ч.
+        tau_bounds: пределы постоянных времени, ч: одна пара на все моды или по паре на
+            каждую моду.
 
     Raises:
         ValueError: размеры групп не складываются в число мод.
@@ -34,7 +37,9 @@ class ModalPropagator(nn.Module):
         self.M = n_modes
         self.group_sizes = tuple(int(g) for g in group_sizes)
         self.horizon = int(horizon)
-        self.tau_lo, self.tau_hi = float(tau_bounds[0]), float(tau_bounds[1])
+        lo, hi = mode_bounds(tau_bounds, n_modes)
+        self.register_buffer("tau_lo", lo, persistent=False)
+        self.register_buffer("tau_hi", hi, persistent=False)
         self.site = nn.Linear(dz, 2 * n_modes)
         nn.init.zeros_(self.site.weight)
         nn.init.zeros_(self.site.bias)
@@ -50,7 +55,7 @@ class ModalPropagator(nn.Module):
             omega: общие частоты мод в радианах в час, форма (M,).
 
         Returns:
-            Пара: постоянные времени (B, M), обрезанные в допустимый диапазон, и
+            Пара: постоянные времени (B, M), обрезанные в пределы своих мод, и
             частоты (B, M).
         """
         M = self.M

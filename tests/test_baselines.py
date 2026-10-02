@@ -391,6 +391,42 @@ def test_dlinear_reads_only_last_hours_of_history():
         assert torch.equal(m(b)["q"], m(early)["q"])
 
 
+def test_dlinear_fills_gaps_with_window_mean():
+    """Пропуски входного окна DLinear - среднее валидных часов окна, а не 0 °C.
+
+    Значение под нулевой маской на прогноз не влияет, даже нечисловое; часы до окна
+    в среднее не входят; окно без валидных часов заполняется нулём.
+    """
+    m = _model("dlinear")
+    n = m.input_len
+    b = _batch(B=3, p_valid=0.7)
+    T, v = b["x_hist"][:, -n:, 0], b["mask_hist"][:, -n:, 0]
+    filled = m.fill_missing(T, v)
+    mean = (T * v).sum(-1) / v.sum(-1)
+    gaps = v == 0
+    assert gaps.any() and (v > 0).any()
+    torch.testing.assert_close(filled[gaps], mean[:, None].expand_as(T)[gaps])
+    assert torch.equal(filled[~gaps], T[~gaps])
+
+    junk = dict(b, x_hist=b["x_hist"].clone())
+    xt = junk["x_hist"][..., 0]
+    xt[b["mask_hist"][..., 0] == 0] = float("nan")
+    xt[:, :L_MAX - n] = 1e6 * (b["mask_hist"][:, :L_MAX - n, 0] + 1)
+    with torch.no_grad():
+        ref, out = m(b)["q"], m(junk)["q"]
+    assert torch.isfinite(out).all() and torch.equal(ref, out)
+    with torch.no_grad():
+        expect = m.point(filled)
+    torch.testing.assert_close(m(b)["mu"], expect)
+
+    empty = _batch(B=2, L=0)
+    assert torch.equal(m.fill_missing(empty["x_hist"][:, -n:, 0], empty["mask_hist"][:, -n:, 0]),
+                       torch.zeros(2, n))
+    with torch.no_grad():
+        q0 = m(empty)["mu"]
+    torch.testing.assert_close(q0, m.point(torch.zeros(2, n)))
+
+
 def test_pipeline_compat_allows_shorter_input_only():
     check_pipeline_compat(DLinearConfig(input_len=336))
     check_pipeline_compat(PatchTSTConfig(input_len=L_MAX, patch_len=24, stride=24))
@@ -559,3 +595,17 @@ def test_check_comparable_rejects_mismatch_and_pre_protocol_checkpoints(tmp_path
     with pytest.raises(ProtocolError, match="seed"):
         check_comparable(ref, [seed1])
     check_comparable(ref, [seed1], ignore=SEED_FIELDS)
+
+
+def test_check_comparable_rejects_mixed_precision_checkpoints(tmp_path):
+    """Чекпойнт, обученный в bf16-mixed, не сравнивается ни как эталон, ни как бейзлайн."""
+    from mayak.lit import check_comparable
+    assert DEFAULT_PROTOCOL.precision == "32"
+    ref = _fake_ckpt(tmp_path / "m.ckpt")
+    bf16 = Protocol(precision="bf16-mixed")
+    old = _fake_ckpt(tmp_path / "g.ckpt", "gru", bf16)
+    old_ref = _fake_ckpt(tmp_path / "old_m.ckpt", "mayak", bf16)
+    with pytest.raises(ProtocolError, match="bf16-mixed.*переобучите"):
+        check_comparable(ref, [old])
+    with pytest.raises(ProtocolError, match="bf16-mixed.*переобучите"):
+        check_comparable(old_ref, [old])

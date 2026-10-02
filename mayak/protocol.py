@@ -7,7 +7,8 @@ run_protocol. Для любой архитектуры одинаковы:
   куррикулум длины истории;
 * размер батча, число окон в эпохе, число воркеров и сид, то есть поток окон;
 * оптимизатор AdamW (lr, betas, базовое весовое затухание), косинусное расписание,
-  обрезка градиента, точность вычислений;
+  обрезка градиента, точность вычислений: fp32 без TF32, та же, в которой модель
+  оценивают, калибруют и экспортируют;
 * функция потерь и метрика выбора чекпойнта ``val/loss`` - общий нормированный
   pinball на всём наборе валидации: одинаковое число окон с каждой
   валидационной станции в валидационном окне, длина истории каждого окна - из того же
@@ -127,7 +128,7 @@ class Protocol:
     betas: tuple = (0.9, 0.95)
     lr_schedule: str = "cosine"
     grad_clip: float = 1.0
-    precision: str = "bf16-mixed"
+    precision: str = "32"
     ema_decay: float = 0.999
     monitor: str = "val/loss"
     val_every: int = 2000
@@ -191,6 +192,19 @@ class Protocol:
 
 
 DEFAULT_PROTOCOL = Protocol()
+
+def strict_fp32():
+    """Выключить TF32 в матричных умножениях и свёртках.
+
+    Обучение идёт в fp32, и на GPU с TF32 умножения и свёртки молча считались бы с
+    10-битной мантиссой. Свёртки cuDNN по умолчанию TF32 разрешают, поэтому запрет
+    ставится явно для обоих путей.
+    """
+    import torch
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+
 
 def protocol_for(arch, base=DEFAULT_PROTOCOL):
     """Протокол прогона архитектуры: один и тот же для всех.
@@ -328,6 +342,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
 
     launch = ST.Launch.coerce(launch)
     protocol = protocol_for(arch, protocol or DEFAULT_PROTOCOL)
+    strict_fp32()
     plan = ST.plan_stages(protocol, launch)
     first = plan[0][0]
     last_index = len(protocol.stages) - 1
@@ -528,4 +543,5 @@ def read_journal(run_dir):
 
 __all__ = ["ARCH_NAMES", "CONFIG_FILE", "DEFAULT_PROTOCOL", "Protocol", "ProtocolError",
            "SEED_NAMES", "Seeds", "Stage", "add_protocol_args", "protocol_for",
-           "protocol_from_args", "read_journal", "run_experiment", "run_protocol"]
+           "protocol_from_args", "read_journal", "run_experiment", "run_protocol",
+           "strict_fp32"]

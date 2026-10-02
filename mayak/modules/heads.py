@@ -42,6 +42,20 @@ class Heads(nn.Module):
     Масштаб интервала и зазоры между квантилями от веса не зависят: при пустой истории
     интервал по-прежнему учится быть климатологическим.
 
+    Средняя масса свидетельств - в весе поправки и во входе голов - берётся только по
+    модам погоды. Масса квазипостоянной моды на полной истории в разы больше и растёт
+    почти линейно с длиной истории, в среднем она заслонила бы остальные моды.
+
+    Args:
+        dz: размер паспорта станции.
+        n_groups: число групп мод.
+        n_sun: число солнечных ковариат на лидах.
+        quantiles: уровни квантилей по возрастанию, среди них медиана.
+        hidden: ширина скрытого слоя.
+        z_proj: размер проекции паспорта на вход голов.
+        evidence_modes: флаги мод, входящих в среднюю массу свидетельств, по одному на
+            моду; None - все моды.
+
     Attributes:
         r_kappa: сырой параметр порога веса поправки. Сам порог не меньше одного часа
             свидетельств, чтобы вес не превращался в ступеньку при исчезающе малой массе.
@@ -49,8 +63,17 @@ class Heads(nn.Module):
             силу с той же скоростью, что и аномалия.
     """
 
-    def __init__(self, dz, n_groups, n_sun, quantiles, hidden=48, z_proj=4):
+    def __init__(self, dz, n_groups, n_sun, quantiles, hidden=48, z_proj=4,
+                 evidence_modes=None):
         super().__init__()
+        if evidence_modes is None:
+            self.register_buffer("evidence_w", None)
+        else:
+            w = torch.tensor([float(bool(f)) for f in evidence_modes])
+            if not w.sum() > 0:
+                raise ValueError("ни одна мода не входит в массу свидетельств голов")
+            # Веса среднего следуют из конфига, в состояние модуля они не пишутся.
+            self.register_buffer("evidence_w", w / w.sum(), persistent=False)
         lower, upper = normal_gaps(quantiles)
         self.n_lo, self.n_hi = len(lower), len(upper)
         self.z_proj = z_proj
@@ -66,6 +89,19 @@ class Heads(nn.Module):
             self.fc2.bias[1] = 0.9
             self.fc2.bias[2:] = inv_softplus(gaps)
 
+    def evidence_mass(self, e):
+        """Средняя масса свидетельств по модам погоды.
+
+        Args:
+            e: масса свидетельств по модам, форма (B, M).
+
+        Returns:
+            Средняя масса, форма (B,).
+        """
+        if self.evidence_w is None:
+            return e.mean(-1)
+        return e @ self.evidence_w
+
     def evidence_gate(self, e):
         """Вес поправки по массе свидетельств.
 
@@ -76,7 +112,7 @@ class Heads(nn.Module):
             Вес от нуля до единицы, форма (B,). Он равен нулю ровно тогда, когда в
             истории нет ни одного валидного часа.
         """
-        e_mean = e.mean(-1)
+        e_mean = self.evidence_mass(e)
         kappa = R_KAPPA_FLOOR + F.softplus(self.r_kappa)
         return e_mean / (e_mean + kappa)
 
@@ -99,7 +135,7 @@ class Heads(nn.Module):
         zp = self.zproj(z)[:, None, :].expand(Bsz, Hn, self.z_proj)
         hn = (torch.arange(1, Hn + 1, dtype=o.dtype, device=o.device) / Hn
               )[None, :, None].expand(Bsz, Hn, 1)
-        le = torch.log1p(e.mean(-1))[:, None, None].expand(Bsz, Hn, 1)
+        le = torch.log1p(self.evidence_mass(e))[:, None, None].expand(Bsz, Hn, 1)
 
         x = torch.cat([o[..., None], Eg, Eg.sum(-1, keepdim=True), sun_fut,
                        log_sigma[..., None], zp, hn, le], dim=-1)

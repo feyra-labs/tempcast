@@ -87,10 +87,13 @@ class ModeGroup:
             группы.
         period: начальные периоды колебаний, ч; ноль - мода без колебаний, чистая
             релаксация. Один элемент распространяется на всю группу.
+        tau_bounds: собственные пределы постоянных времени группы, ч; None - общие
+            пределы модели. Их учитывают проверка конфига, считывание мод и пропагатор.
     """
     name: str
     tau0: tuple
     period: tuple = (0.0,)
+    tau_bounds: Optional[tuple] = None
 
     def __post_init__(self):
         tau0, period = _floats(self.tau0), _floats(self.period)
@@ -103,6 +106,12 @@ class ModeGroup:
                               f"но {len(period)} периодов")
         if any(p < 0 for p in period) or any(t <= 0 for t in tau0):
             raise ConfigError(f"группа мод {self.name!r}: τ₀ > 0 и период ≥ 0")
+        if self.tau_bounds is not None:
+            bounds = _floats(self.tau_bounds)
+            if len(bounds) != 2 or not 0 < bounds[0] < bounds[1]:
+                raise ConfigError(f"группа мод {self.name!r}: tau_bounds = {bounds}: нужна пара "
+                                  f"0 < τ_min < τ_max")
+            object.__setattr__(self, "tau_bounds", bounds)
         object.__setattr__(self, "name", str(self.name))
         object.__setattr__(self, "tau0", tau0)
         object.__setattr__(self, "period", period)
@@ -111,12 +120,26 @@ class ModeGroup:
     def size(self):
         return len(self.tau0)
 
+    def bounds(self, default):
+        """Пределы постоянных времени группы.
 
+        Args:
+            default: общие пределы модели, ч.
+
+        Returns:
+            Пара (τ_min, τ_max), ч: собственные пределы группы, если они заданы, иначе
+            общие.
+        """
+        return self.tau_bounds if self.tau_bounds is not None else tuple(default)
+
+
+PERSISTENT_GROUP = "P"
 DEFAULT_MODE_GROUPS = (
     ModeGroup("R", (3, 6, 12, 24, 48, 96, 168, 240), (0.0,)),
     ModeGroup("D", (12, 24, 48, 96, 168, 240), (24.0,)),
     ModeGroup("S", (12, 24, 72, 168), (12.0,)),
     ModeGroup("W", (24, 48, 72, 120, 168, 240), (60, 84, 108, 132, 156, 192)),
+    ModeGroup(PERSISTENT_GROUP, (2000.0,), (0.0,), (720.0, 8760.0)),
 )
 
 ENCODER_CHANNELS = ("aT", "adef", "dP3", "dP24", "rh", "sin_d", "cos_d", "czp",
@@ -142,9 +165,10 @@ class Ablations:
             тоже нулевой.
         no_solar: солнечные признаки убраны из входа энкодера и из входа голов.
             Гармонический базис климат-поля не трогается: это часть якоря.
-        no_mode_groups: групповой структуры нет: все моды одной группой, постоянные
-            времени и периоды при инициализации идут равномерно в логарифме, групповая
-            энергия одна.
+        no_mode_groups: групповой структуры нет: все моды, кроме квазипостоянной группы,
+            одной группой, постоянные времени и периоды при инициализации идут
+            равномерно в логарифме. Квазипостоянная группа остаётся отдельной со своими
+            пределами, поэтому групповых энергий две.
         no_offset_aug: без аугментации постоянного смещения температуры. Это свойство
             потока данных, но флаг живёт здесь, чтобы абляция задавалась в одном
             месте; полная конфигурация прогона переносит его в аугментации данных.
@@ -181,8 +205,10 @@ class ModelConfig:
         horizon: горизонт прогноза, ч.
         max_history: наибольшая длина истории, ч, кратно суткам.
         quantiles: уровни квантилей по возрастанию, среди них медиана.
-        mode_groups: группы затухающих мод.
-        tau_bounds: пределы постоянных времени мод, ч.
+        mode_groups: группы затухающих мод. Группа с именем ``P`` - квазипостоянная:
+            её мода не колеблется и затухает медленнее всех, через неё идёт устойчивое
+            смещение станции. В среднюю массу свидетельств голов она не входит.
+        tau_bounds: общие пределы постоянных времени мод, ч; группа может задать свои.
         passport_dim: размер паспорта станции.
         passport_hidden: ширина скрытого слоя кодировщика паспорта.
         encoder_width: ширина признаков энкодера истории.
@@ -255,12 +281,21 @@ class ModelConfig:
         if lo is None or not 0 < lo < hi:
             raise ConfigError(f"tau_bounds = {self.tau_bounds}: нужна пара 0 < τ_min < τ_max")
         for g in self.mode_groups:
-            bad = [t for t in g.tau0 if not lo <= t <= hi]
+            g_lo, g_hi = g.bounds(self.tau_bounds)
+            bad = [t for t in g.tau0 if not g_lo <= t <= g_hi]
             if bad:
-                raise ConfigError(f"группа мод {g.name!r}: τ₀ {bad} вне [{lo}, {hi}]")
+                raise ConfigError(f"группа мод {g.name!r}: τ₀ {bad} вне [{g_lo}, {g_hi}]")
         names = [g.name for g in self.mode_groups]
         if not names or len(set(names)) != len(names):
             raise ConfigError(f"имена групп мод пусты или повторяются: {names}")
+        for g in self.mode_groups:
+            if g.name == PERSISTENT_GROUP and any(p > 0 for p in g.period):
+                raise ConfigError(f"группа мод {g.name!r} квазипостоянная: её моды не "
+                                  f"колеблются, периоды должны быть нулевыми, получено "
+                                  f"{g.period}")
+        if names == [PERSISTENT_GROUP]:
+            raise ConfigError(f"кроме квазипостоянной группы {PERSISTENT_GROUP!r} нужна хотя "
+                              f"бы одна группа мод: по ней считается масса свидетельств голов")
         if not self.encoder_dilations or min(self.encoder_dilations) < 1:
             raise ConfigError("дилатации энкодера должны быть ≥ 1")
         if self.encoder_kernel < 2:
@@ -275,14 +310,45 @@ class ModelConfig:
 
     @property
     def effective_mode_groups(self):
-        """Группы мод с учётом абляции ``no_mode_groups``."""
+        """Группы мод с учётом абляции ``no_mode_groups``.
+
+        Абляция снимает структуру только с мод погоды: они сливаются в одну группу с
+        однородной инициализацией в общих пределах модели. Квазипостоянная группа
+        остаётся отдельной группой после неё, со своими начальными постоянными времени и
+        пределами: она описывает смещение станции, а не погоду.
+        """
         if not self.ablations.no_mode_groups:
             return self.mode_groups
-        m = self.n_modes
+        kept = tuple(g for g in self.mode_groups if g.name == PERSISTENT_GROUP)
+        m = self.n_modes - sum(g.size for g in kept)
         lo, hi = self.tau_bounds
         p_lo, p_hi = UNSTRUCTURED_PERIODS
         geom = lambda a, b: tuple(a * (b / a) ** (i / max(m - 1, 1)) for i in range(m))
-        return (ModeGroup("all", geom(lo, hi), geom(p_lo, p_hi)),)
+        return (ModeGroup("all", geom(lo, hi), geom(p_lo, p_hi)), *kept)
+
+    @property
+    def mode_tau_bounds(self):
+        """Пределы постоянной времени каждой моды, ч, в порядке мод модели.
+
+        Returns:
+            Кортеж пар (τ_min, τ_max), по паре на моду.
+        """
+        return tuple(g.bounds(self.tau_bounds) for g in self.effective_mode_groups
+                     for _ in range(g.size))
+
+    @property
+    def evidence_modes(self):
+        """Моды, по которым головы считают среднюю массу свидетельств.
+
+        Масса квазипостоянной моды за полную историю в разы больше массы остальных и
+        растёт почти линейно с длиной истории, поэтому в среднее она не входит: вес
+        поправки и вход голов описывают свидетельства о погоде.
+
+        Returns:
+            Кортеж флагов по модам в порядке мод модели.
+        """
+        return tuple(g.name != PERSISTENT_GROUP for g in self.effective_mode_groups
+                     for _ in range(g.size))
 
     @property
     def n_modes(self):
@@ -1542,7 +1608,8 @@ __all__ = ["ABLATION_NAMES", "AUGMENT_PROB_FIELDS", "AUGMENT_PROFILES", "Ablatio
            "COVERAGE_DIMS_EXTERNAL", "COVERAGE_DIMS_INTERNAL", "CalibrationConfig", "ConfigError",
            "DEFAULT_MODE_GROUPS",
            "DLinearConfig", "DataConfig", "ENCODER_CHANNELS", "GRUConfig", "LRUConfig",
-           "LRU_SCANS", "MODEL_CONFIGS", "ModeGroup", "ModelConfig", "PatchTSTConfig",
+           "LRU_SCANS", "MODEL_CONFIGS", "ModeGroup", "ModelConfig", "PERSISTENT_GROUP",
+           "PatchTSTConfig",
            "DEFAULT_SCENARIOS", "ROBUSTNESS_QC", "RobustnessConfig", "RunConfig", "RuntimeConfig",
            "SCENARIO_INPUT", "SCENARIO_INSTRUMENT", "SCENARIO_RULES", "SOLAR_CHANNELS",
            "ScenarioRule", "ScenarioSpec", "Seeds", "TrainConfig",

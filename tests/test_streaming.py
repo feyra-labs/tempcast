@@ -350,29 +350,55 @@ def test_long_run_random_hours_error_does_not_grow(record_property):
     assert errs[-4:].max() <= 3 * errs[:4].max() + 1e-5, errs
 
 
-def _mode_error(st):
+def _mode_error(st, modes=None):
+    """Наибольшая относительная ошибка скользящей суммы мод против точной суммы.
+
+    Args:
+        st: потоковый рантайм.
+        modes: маска мод, по которым считается ошибка; None - все моды.
+
+    Returns:
+        Ошибка, делённая на наибольший модуль точной суммы, но не меньше единицы.
+    """
     exact = st.b.run("resync", st.u_ring[st._hours(st.tail) % st.tail][None],
                      st.v_ring[st._hours(st.tail) % st.tail][None])
-    return max(float(np.abs(a - b).max() / max(1.0, np.abs(b).max()))
+    sel = slice(None) if modes is None else np.asarray(modes)
+    return max(float(np.abs(a - b)[..., sel].max() / max(1.0, np.abs(b).max()))
                for a, b in zip(st.modes, exact))
 
 
 def test_resync_bounds_rounding_error(monkeypatch):
-    """Без пересинхронизации ошибка скользящей суммы остаётся малой и не растёт.
+    """Ошибка скользящей суммы ограничена, пересинхронизация обнуляет её раз в сутки.
 
-    Пересинхронизация обнуляет её раз в сутки.
+    Ошибка округления моды забывается за время порядка её постоянной времени. У мод
+    погоды это не больше 240 ч: без пересинхронизации их ошибка мала и не растёт. У
+    квазипостоянной моды - тысячи часов: её ошибка без пересинхронизации растёт дольше и
+    насыщается выше, но и тогда прогноз сдвигается меньше допуска потока, а за сутки
+    между пересинхронизациями ошибка всех мод мала.
     """
     m = _model(ModelConfig(**TINY))
+    weather = np.array(m.cfg.evidence_modes)
+    assert not weather.all(), "в модели нет квазипостоянной моды"
     s = synthetic_series(4000, seed=12)
     monkeypatch.setattr(S, "RESYNC_HOURS", 10 ** 9)
     free = StreamingMayak(m, LAT, LON, ELEV)
-    errs = []
-    for k in range(0, 4000, 500):
-        feed(free, s, k, k + 500)
-        errs.append(_mode_error(free))
+    feed(free, s, 0, 24)
+    assert _mode_error(free) < 1e-5, "за сутки без пересинхронизации"
+    errs, slow = [], []
+    for k in range(24, 4000, 496):
+        feed(free, s, k, min(k + 496, 4000))
+        errs.append(_mode_error(free, weather))
+        slow.append(_mode_error(free, ~weather))
     assert max(errs) < 1e-5, errs
     assert max(errs[-3:]) <= 3 * max(errs[:3]) + 1e-7, errs
+    assert max(slow) < 2e-4, slow
+    steps = np.diff(slow)
+    assert steps[-1] < 0.5 * steps[0], f"ошибка медленной моды не насыщается: {slow}"
+    q_free = free.forecast()[0]
     monkeypatch.setattr(S, "RESYNC_HOURS", 24)
+    synced = StreamingMayak(m, LAT, LON, ELEV)
+    feed(synced, s, 0, 4000)
+    assert np.abs(q_free - synced.forecast()[0]).max() < ATOL_FORECAST
     synced = StreamingMayak(m, LAT, LON, ELEV)
     end = 1000 - (s["t0"] + 1000) % 24
     feed(synced, s, 0, end)

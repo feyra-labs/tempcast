@@ -53,7 +53,7 @@ def cold_model():
     """
     m = G.golden_model()
     with torch.no_grad():
-        m.field.head.bias[0] += YAKUTSK_JANUARY
+        m.field.head_mu.bias[0] += YAKUTSK_JANUARY
     return m
 
 

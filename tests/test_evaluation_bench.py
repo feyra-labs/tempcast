@@ -1,6 +1,7 @@
 """Тесты стенда оценки: сырые выходы, сетка длин истории, одна история для всех."""
 import csv
 import math
+import os
 
 import numpy as np
 import pytest
@@ -255,9 +256,12 @@ def test_conformal_table_does_not_touch_the_comparison(results):
     assert raw["calibrated"] is None
     c = cal["calibrated"]
     assert set(c) == {"effect", "report", "gate", "aci"}
-    before, after = c["effect"]["весь горизонт"]["PICP90"]
+    before, _after = c["effect"]["весь горизонт"]["PICP90"]
     assert before == raw["coverage"]["report"]["overall"]["coverage"]
-    assert after != before, "таблица меняет интервалы в своём разделе"
+    # Ширина, а не покрытие: необученная модель может не попадать в интервал ни до, ни
+    # после таблицы, и тогда покрытие одинаково нулевое.
+    w_before, w_after = c["effect"]["весь горизонт"]["Width90"]
+    assert w_after > w_before, "таблица меняет интервалы в своём разделе"
     assert list(c["report"]["dims"]["длина истории"]) == [history_label(L) for L in HISTORY_GRID]
 
 
@@ -336,7 +340,8 @@ def test_result_tables_are_strict_json_with_run_record(results, tmp_path):
     names = {}
     for tag, res in (("raw", raw), ("cal", cal)):
         paths = write_tables(evaluation_tables(res), str(tmp_path / tag), record)
-        names[tag] = sorted(p.rsplit("/", 1)[-1] for p in paths)
+        # names[tag] = sorted(p.rsplit("/", 1)[-1] for p in paths)
+        names[tag] = sorted(os.path.basename(p) for p in paths)
         for p in paths:
             with open(p, encoding="utf-8") as f:
                 blob = json.loads(f.read(), parse_constant=lambda c: pytest.fail(c))

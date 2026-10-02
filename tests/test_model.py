@@ -3,7 +3,7 @@ import math
 import pytest
 import torch
 
-from mayak.config import ModelConfig
+from mayak.config import PERSISTENT_GROUP, Ablations, ModelConfig
 from mayak.constants import L_MAX, H, QUANTILES
 from mayak.model import MAYAK, astro_features
 from mayak.modules.heads import R_MAX
@@ -149,9 +149,15 @@ def test_stage_without_history_does_not_train_correction():
 
 
 def test_site_tau_stays_within_bounds():
-    """Постоянные времени после подстройки паспортом не выходят за границы мод."""
+    """Постоянные времени после подстройки паспортом не выходят за границы своих мод.
+
+    У квазипостоянной группы свои границы: её мода не обрезается общими границами
+    модели и не выходит за собственные.
+    """
+    torch.manual_seed(0)
     model = MAYAK()
-    lo, hi = model.cfg.tau_bounds
+    bounds = torch.tensor(model.cfg.mode_tau_bounds)
+    lo, hi = bounds[:, 0], bounds[:, 1]
     with torch.no_grad():
         model.readout.raw_tau.copy_(torch.linspace(-12.0, 12.0, M))
         model.propagator.site.weight.normal_(0.0, 5.0)
@@ -159,10 +165,83 @@ def test_site_tau_stays_within_bounds():
         tau, omega, _ = model.readout.constants()
         z = 3.0 * torch.randn(256, model.cfg.passport_dim)
         tau_s, _ = model.propagator.site_constants(z, tau, omega)
-    assert tau_s.min() >= lo and tau_s.max() <= hi
-    assert tau_s.max() == hi, "тест вырожден: ни одна мода не упёрлась в верхнюю границу"
-    slowest = torch.exp(-168.0 / tau_s).max()
-    assert slowest <= math.exp(-168.0 / hi) + 1e-6
+    assert (tau >= lo).all() and (tau <= hi).all()
+    assert (tau_s >= lo).all() and (tau_s <= hi).all()
+    weather = torch.tensor(model.cfg.evidence_modes)
+    w_hi = float(hi[weather].max())
+    assert w_hi == model.cfg.tau_bounds[1]
+    assert tau_s[:, weather].max() == w_hi, "тест вырожден: ни одна мода не упёрлась в границу"
+    slowest = torch.exp(-168.0 / tau_s[:, weather]).max()
+    assert slowest <= math.exp(-168.0 / w_hi) + 1e-6
+    p_lo, p_hi = model.cfg.mode_groups[-1].tau_bounds
+    assert model.cfg.mode_groups[-1].name == PERSISTENT_GROUP
+    assert tau_s[:, ~weather].min() >= p_lo and tau_s[:, ~weather].max() <= p_hi
+
+
+def test_default_persistent_group():
+    """Группа P по умолчанию: одна мода без колебаний со своими границами τ."""
+    cfg = ModelConfig()
+    p = cfg.mode_groups[-1]
+    assert p.name == PERSISTENT_GROUP and p.size == 1 and p.period == (0.0,)
+    assert p.tau_bounds[0] > cfg.max_history and p.tau_bounds[0] <= p.tau0[0] <= p.tau_bounds[1]
+    assert cfg.mode_tau_bounds[-1] == p.tau_bounds
+    assert set(cfg.mode_tau_bounds[:-1]) == {cfg.tau_bounds}
+    model = MAYAK()
+    tau, omega, _ = model.readout.constants()
+    assert abs(float(tau[-1]) - p.tau0[0]) < 1.0 and float(omega[-1]) == 0.0
+
+
+def test_field_mean_does_not_depend_on_passport():
+    """Среднее поля одно и то же без паспорта и с любым паспортом; масштаб от него зависит.
+
+    История нормируется полем без паспорта, выпуск - полем с паспортом, поэтому у них
+    должно быть одно среднее: иначе смещение станции учитывается дважды.
+    """
+    model = _shaken_model()
+    batch = _toy_batch(B=4)
+    loc = model.loc(batch["lat"], batch["lon"], batch["elev"])
+    z = 3.0 * torch.randn(4, model.cfg.passport_dim, generator=torch.Generator().manual_seed(1))
+    astro_f = astro_features(batch["doy_fut"], batch["hour_fut"], batch["lat"][:, None],
+                             batch["lon"][:, None])
+    with torch.no_grad():
+        c0, c1 = model.field.coefficients(loc), model.field.coefficients(loc, z)
+        f0, f1 = model.field.evaluate(c0, astro_f), model.field.evaluate(c1, astro_f)
+    assert torch.equal(c0[0], c1[0]) and torch.equal(f0[0], f1[0])
+    assert not torch.allclose(c0[1], c1[1]) and not torch.allclose(f0[1], f1[1])
+    assert not torch.allclose(c0[2], c1[2])
+
+
+def test_old_field_checkpoint_is_rejected():
+    """Чекпойнт поля прежнего устройства (одна голова под FiLM) не загружается."""
+    sd = MAYAK().state_dict()
+    mu_w, sc_w = sd.pop("field.head_mu.weight"), sd.pop("field.head_scale.weight")
+    mu_b, sc_b = sd.pop("field.head_mu.bias"), sd.pop("field.head_scale.bias")
+    sd["field.head.weight"] = torch.cat([mu_w, sc_w])
+    sd["field.head.bias"] = torch.cat([mu_b, sc_b])
+    with pytest.raises(RuntimeError, match="переобучить"):
+        MAYAK().load_state_dict(sd)
+
+
+@pytest.mark.parametrize("ablate", [False, True])
+def test_persistent_mode_is_excluded_from_evidence(ablate):
+    """Масса свидетельств квазипостоянной моды не входит ни в вес поправки, ни во вход голов."""
+    cfg = ModelConfig(ablations=Ablations(no_mode_groups=ablate))
+    heads = _shaken_model().heads if not ablate else MAYAK(cfg).heads
+    keep = torch.tensor(cfg.evidence_modes)
+    assert int((~keep).sum()) == 1 and not keep[-1]
+    e = torch.rand(3, M, generator=torch.Generator().manual_seed(0)) * 50
+    e_p = e.clone()
+    e_p[:, ~keep] = 1e4
+    with torch.no_grad():
+        torch.testing.assert_close(heads.evidence_mass(e), e[:, keep].mean(-1))
+        assert torch.equal(heads.evidence_gate(e), heads.evidence_gate(e_p))
+        zero = torch.zeros(3, M)
+        zero[:, ~keep] = 500.0
+        assert (heads.evidence_gate(zero) == 0).all()
+        args = (torch.randn(3, H), torch.rand(3, H, cfg.n_groups), torch.rand(3, H, 3),
+                torch.zeros(3, H), torch.randn(3, cfg.passport_dim))
+        for a, b in zip(heads(*args, e), heads(*args, e_p)):
+            assert torch.equal(a, b)
 
 
 def test_correction_threshold_is_not_decayed():

@@ -97,14 +97,17 @@ def _compose(overrides=(), hydra_cfg=False):
 def test_default_config_architecture_size():
     """Размер по умолчанию закреплён числом параметров и формами ключевых весов."""
     m = _model()
-    assert sum(p.numel() for p in m.parameters()) == 109379
+    assert sum(p.numel() for p in m.parameters()) == 109596
     sd = m.state_dict()
-    assert len(sd) == 108
-    assert sd["readout.raw_tau"].shape == (24,) and sd["propagator.w_re"].shape == (24,)
+    assert len(sd) == 110
+    assert sd["readout.raw_tau"].shape == (25,) and sd["propagator.w_re"].shape == (25,)
     assert sd["encoder.stem.weight"].shape == (64, 13, 1)
     assert sd["field.fc1.weight"].shape == (128, 98) and sd["field.fc2.weight"].shape == (128, 128)
+    assert sd["field.head_mu.weight"].shape == (36, 128)
+    assert sd["field.head_scale.weight"].shape == (42, 128)
     assert sd["heads.r_kappa"].shape == ()
-    assert sd["heads.fc1.weight"].shape == (48, 16)
+    assert sd["heads.fc1.weight"].shape == (48, 17)
+    assert not {k for k in sd if k.endswith(("tau_lo", "tau_hi", "evidence_w"))}
     assert sd["passport.obs.weight"].shape == (32, 32)
     from mayak.baselines import DLinear, GRUSeq2Seq
     assert sum(p.numel() for p in GRUSeq2Seq().parameters()) == 120754
@@ -113,15 +116,18 @@ def test_default_config_architecture_size():
 
 def test_derived_dimensions_are_computed():
     c = ModelConfig()
-    assert (c.n_modes, c.group_sizes, c.n_groups) == (24, (8, 6, 4, 6), 4)
-    assert c.n_channels == 13 and c.heads_in_dim == 16
+    assert (c.n_modes, c.group_sizes, c.n_groups) == (25, (8, 6, 4, 6, 1), 5)
+    assert c.group_names == ("R", "D", "S", "W", "P")
+    assert c.n_channels == 13 and c.heads_in_dim == 17
+    assert c.evidence_modes == (True,) * 24 + (False,)
     assert c.receptive_field == 2 * sum(c.encoder_dilations) + 1 == 253
     assert c.stream_buffer == 256 >= c.receptive_field
     assert c.history_days == 28
     ns = ModelConfig(ablations=Ablations(no_solar=True))
-    assert ns.n_channels == 10 and ns.heads_in_dim == 13
+    assert ns.n_channels == 10 and ns.heads_in_dim == 14
     ng = ModelConfig(ablations=Ablations(no_mode_groups=True))
-    assert ng.n_groups == 1 and ng.group_sizes == (24,) and ng.heads_in_dim == 13
+    assert ng.n_groups == 2 and ng.group_sizes == (24, 1) and ng.heads_in_dim == 14
+    assert ng.group_names == ("all", "P") and ng.evidence_modes == c.evidence_modes
     fields = {f.name for f in dataclasses.fields(ModelConfig)}
     assert not fields & {"n_modes", "n_channels", "heads_in_dim", "receptive_field", "n_groups"}
 
@@ -158,6 +164,31 @@ def test_changing_mode_groups_keeps_shapes(groups):
     assert all(torch.isfinite(p.grad).all() for p in m.parameters() if p.grad is not None)
 
 
+def test_mode_group_own_tau_bounds():
+    """Свои пределы группы: проверка конфига, разбор словаря и пределы каждой моды."""
+    with pytest.raises(ConfigError, match="tau_bounds"):
+        ModeGroup("P", (2000.0,), tau_bounds=(9000.0, 720.0))
+    cfg = ModelConfig.from_dict({"mode_groups": [
+        {"name": "R", "tau0": [3, 240]},
+        {"name": "P", "tau0": [1000], "tau_bounds": [500, 5000]}]})
+    assert cfg.mode_groups[1].tau_bounds == (500.0, 5000.0)
+    assert cfg.mode_tau_bounds == ((3.0, 240.0), (3.0, 240.0), (500.0, 5000.0))
+    assert ModelConfig.from_dict(json.loads(json.dumps(cfg.to_dict()))) == cfg
+
+
+def test_no_mode_groups_keeps_persistent_group_separate():
+    """При абляции групп моды погоды сливаются, а P остаётся своей группой со своими τ."""
+    base, ng = ModelConfig(), ModelConfig(ablations=Ablations(no_mode_groups=True))
+    p = base.mode_groups[-1]
+    assert ng.effective_mode_groups[-1] == p
+    assert ng.effective_mode_groups[0].size == base.n_modes - p.size
+    assert ng.mode_tau_bounds[-1] == p.tau_bounds
+    m = _model(ng)
+    tau, omega, _ = m.readout.constants()
+    assert abs(float(tau[-1]) - p.tau0[0]) < 1.0 and float(omega[-1]) == 0.0
+    assert float(tau[:-1].max()) <= ng.tau_bounds[1]
+
+
 def test_model_is_parametric_in_horizon_and_quantiles():
     cfg = ModelConfig(horizon=24, quantiles=(0.1, 0.5, 0.9))
     out = _model(cfg)(_batch(horizon=24))
@@ -174,6 +205,10 @@ def test_model_is_parametric_in_horizon_and_quantiles():
     (dict(encoder_width=50), "не делится"),
     (dict(mode_groups=(ModeGroup("R", (1000.0,)),)), "вне"),
     (dict(mode_groups=(ModeGroup("R", (3.0,)), ModeGroup("R", (6.0,)))), "повторяются"),
+    (dict(mode_groups=(ModeGroup("R", (3.0,)), ModeGroup("P", (2000.0,)))), "вне"),
+    (dict(mode_groups=(ModeGroup("R", (3.0,)),
+                       ModeGroup("P", (2000.0,), (24.0,), (720.0, 8760.0)))), "периоды"),
+    (dict(mode_groups=(ModeGroup("P", (2000.0,), (0.0,), (720.0, 8760.0)),)), "хотя бы одна"),
 ])
 def test_invalid_model_config_fails_loudly(bad, match):
     with pytest.raises(ConfigError, match=match):

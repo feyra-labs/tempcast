@@ -6,6 +6,28 @@ import torch.nn.functional as F
 EVIDENCE_FLOOR = 1.0
 
 
+def mode_bounds(tau_bounds, n_modes):
+    """Пределы постоянной времени по модам.
+
+    Args:
+        tau_bounds: одна пара (τ_min, τ_max), ч, на все моды или по паре на каждую моду.
+        n_modes: число мод.
+
+    Returns:
+        Пара тензоров формы (n_modes,): нижние и верхние пределы, ч.
+
+    Raises:
+        ValueError: пар не одна и не по числу мод.
+    """
+    b = torch.as_tensor(tau_bounds, dtype=torch.float32)
+    if b.dim() == 1:
+        b = b[None].expand(n_modes, -1)
+    if tuple(b.shape) != (n_modes, 2):
+        raise ValueError(f"пределы постоянных времени формы {tuple(b.shape)}: нужна одна пара "
+                         f"или {n_modes} пар, по одной на моду")
+    return b[:, 0].clone(), b[:, 1].clone()
+
+
 class LaplaceReadout(nn.Module):
     """Считывание затухающих мод по истории признаков энкодера.
 
@@ -16,8 +38,9 @@ class LaplaceReadout(nn.Module):
         width: ширина признаков энкодера.
         groups: группы мод с начальными постоянными времени и периодами, ч; начальная
             частота - полный оборот за период.
-        tau_bounds: пределы постоянной времени, ч. Обучаемый параметр через сигмоиду
-            отображается внутрь этих пределов.
+        tau_bounds: пределы постоянной времени, ч: одна пара на все моды или по паре на
+            каждую моду. Обучаемый параметр через сигмоиду отображается внутрь пределов
+            своей моды.
         compression: доказательное сжатие: накопленное состояние делится на массу
             свидетельств плюс обучаемую силу сжатия, поэтому при малой массе аномалия
             стягивается к нулю. Ложь - абляция ``no_compression``: деление только на
@@ -27,14 +50,16 @@ class LaplaceReadout(nn.Module):
     def __init__(self, width, groups, tau_bounds=(3.0, 240.0), compression=True):
         super().__init__()
         self.compression = compression
-        self.tau_lo, self.tau_hi = float(tau_bounds[0]), float(tau_bounds[1])
         tau0 = torch.tensor([t for g in groups for t in g.tau0])
         period = torch.tensor([p for g in groups for p in g.period])
         M = len(tau0)
         self.n_modes = M
-        span = self.tau_hi - self.tau_lo
-        self.raw_tau = nn.Parameter(
-            torch.logit(((tau0 - self.tau_lo) / span).clamp(1e-3, 1 - 1e-3)))
+        lo, hi = mode_bounds(tau_bounds, M)
+        # Пределы следуют из конфига, который лежит в чекпойнте, поэтому в состояние
+        # модуля они не пишутся.
+        self.register_buffer("tau_lo", lo, persistent=False)
+        self.register_buffer("tau_hi", hi, persistent=False)
+        self.raw_tau = nn.Parameter(torch.logit(((tau0 - lo) / (hi - lo)).clamp(1e-3, 1 - 1e-3)))
 
         w = 2 * math.pi
         osc = period > 0

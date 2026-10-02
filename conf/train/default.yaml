@@ -11,7 +11,7 @@ weight_decay: 0.01
 betas: [0.9, 0.95]
 lr_schedule: cosine
 grad_clip: 1.0
-precision: bf16-mixed
+precision: "32"
 ema_decay: 0.999
 monitor: val/loss
 val_every: 2000

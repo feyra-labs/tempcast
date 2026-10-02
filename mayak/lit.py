@@ -382,7 +382,8 @@ def checkpoint_protocol(path):
 
     Чекпойнт без протокола в гиперпараметрах обучен до того, как функция потерь стала
     нормироваться климатологическим масштабом из данных, а протокол обучения стал общим
-    для всех архитектур. Сравнивать с таким чекпойнтом нельзя.
+    для всех архитектур. Сравнивать с таким чекпойнтом нельзя. Нельзя и с чекпойнтом,
+    обученным не в точности протокола: модель оценивают, калибруют и экспортируют в fp32.
 
     Args:
         path: путь к чекпойнту.
@@ -391,7 +392,8 @@ def checkpoint_protocol(path):
         Пара: имя архитектуры и протокол.
 
     Raises:
-        ProtocolError: в чекпойнте нет протокола.
+        ProtocolError: в чекпойнте нет протокола или точность обучения не та, что в
+            протоколе.
     """
     ck = torch.load(path, map_location="cpu", weights_only=False)
     hp = ck.get("hyper_parameters") or {}
@@ -400,7 +402,13 @@ def checkpoint_protocol(path):
                             f"единого протокола и нормировки функции потерь "
                             f"климатологическим масштабом; сравнение с ним "
                             f"недействительно, переобучите модель")
-    return hp.get("arch", "mayak"), Protocol.from_dict(hp["protocol"])
+    protocol = Protocol.from_dict(hp["protocol"])
+    if protocol.precision != DEFAULT_PROTOCOL.precision:
+        raise ProtocolError(f"{path}: модель обучена в точности {protocol.precision!r}, протокол "
+                            f"обучает в {DEFAULT_PROTOCOL.precision!r} — в той же точности, в "
+                            f"которой модель оценивают, калибруют и экспортируют; сравнение "
+                            f"с ней недействительно, переобучите модель")
+    return hp.get("arch", "mayak"), protocol
 
 
 SEED_FIELDS = ("seed", "seeds")

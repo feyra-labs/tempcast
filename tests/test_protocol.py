@@ -614,3 +614,22 @@ def test_every_architecture_gets_a_stage_a_report(runs):
         assert a["report_best"]["mse_ratio"] == pytest.approx(
             next(e for e in rep["candidates"] if e["is_best"])["mse_ratio"])
         assert "report" not in b and b["init_from"]["digest"] == a["best_digest"]
+
+
+def test_training_precision_is_fp32_without_tf32():
+    """Протокол обучает в fp32, TF32 не включается ни в умножениях, ни в свёртках."""
+    from mayak.protocol import strict_fp32
+    assert DEFAULT_PROTOCOL.precision == "32"
+    prev = (torch.get_float32_matmul_precision(), torch.backends.cuda.matmul.allow_tf32,
+            torch.backends.cudnn.allow_tf32)
+    try:
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cudnn.allow_tf32 = True
+        strict_fp32()
+        assert torch.get_float32_matmul_precision() == "highest"
+        assert not torch.backends.cuda.matmul.allow_tf32
+        assert not torch.backends.cudnn.allow_tf32
+    finally:
+        torch.set_float32_matmul_precision(prev[0])
+        torch.backends.cuda.matmul.allow_tf32 = prev[1]
+        torch.backends.cudnn.allow_tf32 = prev[2]
