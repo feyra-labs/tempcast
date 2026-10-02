@@ -27,7 +27,8 @@
 | `evaluate/internal/breakdowns.json` | 3–4. Роли станций, сезоны, зоны |
 | `evaluate/internal/zones.json` | 4. Зоны Кёппена на лидах 24 и 72 ч |
 | `evaluate/internal/reliability.json` | 5. Надёжность |
-| `evaluate/internal/calibrated.json`, `calibration/conformal.report.json` | 6. После калибровки |
+| `evaluate/internal/calibrated.json`, `evaluate/internal/reliability.json` | 6. После калибровки: тестовые окна |
+| `calibration/conformal.report.json` | 6. Подгонка таблицы: калибровочные окна, в выборке |
 | `evaluate/internal/coldstart.json` | проверка поля при нулевой истории |
 | `ablations/internal/metrics.json`, `seeds/internal/seeds.json` | 7. Абляции и сиды |
 | `evaluate/external/*.json` | 8. Внешний тест |
