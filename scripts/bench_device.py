@@ -2,7 +2,8 @@ r"""Замеры рантайма на устройстве - один восп�
 
     cargo build --release --manifest-path runtime-rs/Cargo.toml
     python scripts/bench_device.py --ckpt runs/mayak/stageB/best.ckpt \
-        --manifest data/manifest.csv --out-dir runs/bench_device
+        --manifest data/manifest.csv --lat 52.37 --lon 4.90 --elev -2 \
+        --out-dir runs/bench_device
 
 Что меряется (всё на одном устройстве, на одних и тех же входах, 1 поток):
 * задержка потактового шага и выпуска прогноза: медиана, p95, p99 на длинном прогоне -
@@ -288,7 +289,8 @@ def main():
     ap.add_argument("--max-windows", type=int, default=200)
     ap.add_argument("--lat", type=float, default=52.37)
     ap.add_argument("--lon", type=float, default=4.9)
-    ap.add_argument("--elev", type=float, default=0.0)
+    ap.add_argument("--elev", type=float, required=True,
+                    help="высота точки над уровнем моря, м")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -333,7 +335,8 @@ def main():
                trained=bool(args.ckpt), hours=args.hours, forecast_every=args.forecast_every,
                runs=runs, sizes=sizes,
                batch_stream=divergence(model, args.issues, hours=args.equivalence_hours,
-                                       seed=args.seed))
+                                       seed=args.seed, lat=args.lat, lon=args.lon,
+                                       elev=args.elev))
     if args.manifest and os.path.exists(args.manifest):
         print("… метрики fp32 / int8", flush=True)
         res["int8_metrics"] = int8_metrics(args, model)

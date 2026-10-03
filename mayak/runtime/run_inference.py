@@ -29,7 +29,8 @@ def build_parser():
     src.add_argument("--ckpt", help="чекпойнт PyTorch")
     ap.add_argument("--lat", type=float, required=True)
     ap.add_argument("--lon", type=float, required=True)
-    ap.add_argument("--elev", type=float, default=0.0)
+    ap.add_argument("--elev", type=float, required=True,
+                    help="высота точки над уровнем моря, м")
     ap.add_argument("--state-dir", default="runtime",
                     help="каталог двух чередующихся файлов состояния")
     ap.add_argument("--aci", action="store_true",

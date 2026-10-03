@@ -27,21 +27,21 @@ const USAGE: &str = "\
 mayak-rt - потоковый рантайм МАЯК
 
 Использование:
-  mayak-rt run   --model DIR --lat ГРАД --lon ГРАД [ключи]   поток наблюдений со stdin
-  mayak-rt bench --model DIR --lat ГРАД --lon ГРАД --series ФАЙЛ --start-unix-hour Ч
-  mayak-rt info  --model DIR                                 размеры модели и состояния
+  mayak-rt run   --model DIR --lat ГРАД --lon ГРАД --elev М [ключи]   поток наблюдений со stdin
+  mayak-rt bench --model DIR --lat ГРАД --lon ГРАД --elev М --series ФАЙЛ --start-unix-hour Ч
+  mayak-rt info  --model DIR                                          размеры модели и состояния
 
 Справка по команде: mayak-rt <команда> --help
 ";
 
 const USAGE_RUN: &str = "\
-mayak-rt run --model DIR --lat ГРАД --lon ГРАД [--elev М] [--state-dir DIR]
+mayak-rt run --model DIR --lat ГРАД --lon ГРАД --elev М [--state-dir DIR]
              [--aci] [--no-conformal] [--int8] [--threads N]
 
 Ключи:
   --model DIR       каталог экспорта: графы ONNX и манифест
   --lat, --lon      координаты прибора, градусы
-  --elev М          высота прибора, м (по умолчанию 0)
+  --elev М          высота точки над уровнем моря, м
   --state-dir DIR   каталог состояния (по умолчанию runtime)
   --aci             адаптивная калибровка ширины интервалов
   --no-conformal    не применять конформную таблицу из манифеста
@@ -55,8 +55,8 @@ mayak-rt run --model DIR --lat ГРАД --lon ГРАД [--elev М] [--state-dir 
 ";
 
 const USAGE_BENCH: &str = "\
-mayak-rt bench --model DIR --lat ГРАД --lon ГРАД --series ФАЙЛ --start-unix-hour Ч
-               [--elev М] [--forecast-every 24] [--warmup 48] [--int8] [--threads N]
+mayak-rt bench --model DIR --lat ГРАД --lon ГРАД --elev М --series ФАЙЛ --start-unix-hour Ч
+               [--forecast-every 24] [--warmup 48] [--int8] [--threads N]
                [--out ФАЙЛ] [--dump-q ФАЙЛ]
 
 Прогоняет ряд наблюдений (float32 little-endian, три значения на час: T, P, RH;
@@ -152,7 +152,7 @@ impl Args {
             self.req("model")?,
             self.num("lat", None)?,
             self.num("lon", None)?,
-            self.num("elev", Some(0.0))?,
+            self.num("elev", None)?,
             &self.options()?,
         )
     }

@@ -456,7 +456,8 @@ uv run python -m mayak.robustness --ckpt runs/mayak/stageB/best.ckpt \
 
 ```bash
 uv run python scripts/bench_device.py --ckpt runs/mayak/stageB/best.ckpt \
-    --conformal runs/conformal.npy --manifest data/manifest.csv --out-dir runs/bench_device
+    --conformal runs/conformal.npy --manifest data/manifest.csv \
+    --lat 52.37 --lon 4.90 --elev -2 --out-dir runs/bench_device
 cp runs/bench_device/results.json results/device/bench.json
 ```
 
@@ -550,7 +551,11 @@ ssh pi@device /opt/mayak/mayak-rt info --model /opt/mayak/model   # размер
 
 **4. Запуск.** `mayak-rt run` читает команды со stdin по одной на строку и отвечает строкой
 JSON: `obs <секунды UTC> <T> <P> <RH>` (`-` — нет данных), `forecast`, `status`. Для int8-экспорта
-добавьте `--int8`.
+добавьте `--int8`. Координаты и высота точки над уровнем моря (`--lat`, `--lon`, `--elev`)
+обязательны, без любого из них рантайм не запускается: по ним считаются климат-поле и
+проверка давления в QC. Высоту нужно указать сразу: если позже исправить её больше чем на
+порог манифеста (`mayak-rt info`, по умолчанию 100 м), рантайм сочтёт это переносом прибора
+и начнёт с пустой истории.
 
 ```bash
 printf 'obs 1767225600 11 1012.4 81\nforecast\n' | /opt/mayak/mayak-rt run \
@@ -621,7 +626,11 @@ echo forecast > /run/mayak/in && tail -n 1 /var/lib/mayak/out.jsonl
 экспортировать заново.
 
 Хост на Python с тем же протоколом и форматом состояния, для проверки на рабочей машине:
-`uv run python -m mayak.runtime.run_inference --model runtime/model --lat 52.37 --lon 4.90`.
+
+```bash
+uv run python -m mayak.runtime.run_inference --model runtime/model --lat 52.37 --lon 4.90 \
+    --elev -2
+```
 
 
 ## Структура
