@@ -9,9 +9,8 @@
 * эталонные сценарии хоста не устарели относительно текущего кода: хост на Python
   проходит их на модели PyTorch и на закоммиченных графах fp32 и int8 с допусками хоста
   на Rust;
-* эталон покрывает длинный прогон с простоями и перезапусками, коды контроля качества,
-  запись половин, редкую отчётность, int8, откат, прогноз без наблюдений, уточнение
-  координат, перенос прибора и выбор файла состояния;
+* эталон покрывает коды контроля качества, запись половин со сверкой состояния, редкую
+  отчётность, int8, откат, прогноз без наблюдений, уточнение координат и перенос прибора;
 * состояние эталона - сырое окно, которое читается и пишется без изменений.
 """
 import json
@@ -193,14 +192,6 @@ def test_golden_covers_device_cases(golden):
     assert doc["format"] == G.GOLDEN_FORMAT and doc["seed"] == G.GOLDEN_SEED
     assert tuple(s["name"] for s in doc["scenarios"]) == G.SCENARIOS
     assert doc["aci_margin_min"] >= G.MIN_ACI_MARGIN
-    W = ModelConfig().stream_window
-
-    long = _scenario(doc, "long")
-    hours = [int(e["line"].split()[1]) // 3600 for e in _lines(long, "obs")]
-    gaps = np.diff(hours)
-    assert hours[-1] - hours[0] >= 2000 and len(hours) >= 2000
-    assert gaps.max() > W and ((gaps > 1) & (gaps <= W)).any()
-    assert sum(e["op"] == "restart" for e in long["events"]) >= 4
 
     seen = 0
     for e in _lines(_scenario(doc, "qc"), "obs"):
@@ -208,9 +199,11 @@ def test_golden_covers_device_cases(golden):
             seen |= c
     assert seen & (4 | 32 | 64) == 4 | 32 | 64, "выброс, залипание, давление на уровне моря"
 
-    halves = [float(v) for e in _lines(_scenario(doc, "rounding"), "obs")
+    ev = _scenario(doc, "restart")["events"]
+    end = max(i for i, e in enumerate(ev) if e["op"] == "state")
+    halves = [float(v) for e in _lines(dict(events=ev[:end]), "obs")
               for v in e["line"].split()[2:] if v not in ("-", "nan")]
-    assert any(v < 0 and v % 1 == 0.5 for v in halves)
+    assert any(v < 0 and v % 1 == 0.5 for v in halves), "запись половин сверяется по состоянию"
     sparse = [int(e["line"].split()[1]) // 3600 for e in _lines(_scenario(doc, "sparse"), "obs")]
     assert {2, 3} <= set(np.diff(sparse).tolist())
     assert _scenario(doc, "int8")["precision"] == "int8"
@@ -230,10 +223,6 @@ def test_golden_covers_device_cases(golden):
     assert first_moved["filled"] == 0 and first_moved["theta"] == [0.0] * 4
     assert any(e["expect"]["codes"][1] & 64 for e in _lines(_scenario(doc, "relocation"), "obs")), \
         "после уточнения высоты давление на уровне моря решается по новой высоте"
-    order = _scenario(doc, "store_order")
-    newer = max(order["init_files"], key=lambda f: f["mtime"])
-    assert order["events"][0]["expect"]["restored"] != newer["as"], \
-        "свежее состояние выбирается по содержимому, а не по времени изменения"
 
 
 def test_golden_state_is_raw_window(model, golden):

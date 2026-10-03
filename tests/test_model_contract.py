@@ -102,17 +102,43 @@ def test_quantiles_ordered_at_extreme_sites(site):
     assert (out["q"].diff(dim=-1) >= 0).all(), site
 
 
-def test_empty_history_gives_zero_evidence_and_zero_anomaly():
-    """Пустая история: масса свидетельств и амплитуды мод строго нулевые."""
-    torch.manual_seed(0)
+def _shaken_model(seed=7, scale=0.5):
+    """Модель, у которой встряхнуты все слои с нулевой или особой инициализацией.
+
+    Головы, подстройка мод паспортом, модуляция поля паспортом и сам паспорт получают
+    заметный шум. На свежей модели выходной слой голов нулевой, и поправка равна нулю
+    тривиально; здесь она нулевой быть не обязана.
+    """
+    torch.manual_seed(seed)
     model = MAYAK().eval()
     with torch.no_grad():
-        out = model(_uniform_batch(0.0, 0.0, 0.0, valid_hours=0,
-                                   lat=10.0, lon=20.0, elev=0.0))
-    assert torch.equal(out["e"], torch.zeros_like(out["e"]))
-    assert torch.equal(out["a_re"], torch.zeros_like(out["a_re"]))
-    assert torch.equal(out["a_im"], torch.zeros_like(out["a_im"]))
-    assert torch.equal(out["o"], torch.zeros_like(out["o"]))
+        for mod in (model.heads, model.propagator, model.field.film, model.passport):
+            for p in mod.parameters():
+                p.add_(scale * torch.randn_like(p))
+    return model
+
+
+def test_empty_history_gives_zero_anomaly_and_field_median():
+    """Пустая история: свидетельства и аномалия нулевые, медиана равна климат-полю побитно.
+
+    Проверяется на модели со встряхнутыми головами: при любых весах голов их поправка без
+    истории не включается.
+    """
+    model = _shaken_model()
+    batch = _uniform_batch(0.0, 0.0, 0.0, valid_hours=0, lat=10.0, lon=20.0, elev=0.0, B=2)
+    with torch.no_grad():
+        out = model(batch)
+        loc = model.loc(batch["lat"], batch["lon"], batch["elev"])
+        astro_f = astro_features(batch["doy_fut"], batch["hour_fut"], batch["lat"][:, None],
+                                 batch["lon"][:, None])
+        mu_c, _, _ = model.field.evaluate(model.field.coefficients(loc, out["z"]), astro_f)
+        raw = model.heads.fc2(torch.nn.functional.gelu(model.heads.fc1(torch.zeros(
+            1, model.heads.in_dim))))
+    assert raw[0, 0].abs() > 1e-3, "тест вырожден: выход поправки голов нулевой и без веса"
+    for key in ("e", "a_re", "a_im", "o", "r"):
+        assert torch.equal(out[key], torch.zeros_like(out[key])), key
+    assert torch.equal(out["mu"], mu_c)
+    assert torch.equal(out["q"][..., I_MEDIAN], mu_c)
 
 
 W_YEAR, W_DAY = 2 * np.pi / 365.24, 2 * np.pi / 24.0

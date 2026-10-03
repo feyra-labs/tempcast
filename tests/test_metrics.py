@@ -1,4 +1,4 @@
-"""Тесты: знаменатели, макро-оценка, надёжность, значимость."""
+"""Тесты: знаменатели, макро-оценка, надёжность, значимость, ядро калибровки."""
 import csv
 import os
 import subprocess
@@ -11,9 +11,10 @@ import pytest
 from mayak.constants import H, QUANTILES
 from mayak.data import store as S
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL
-from mayak.metrics import (HISTORY_BINS, I_MED, LEAD_BINS, METRICS, NQ, Evaluation,
-                           apply_conformal, breakdown, by_lead, conformal_table,
-                           fit_conformal_shift, lead_bin_index, lead_bin_of, seed_spread, spread)
+from mayak.metrics import (HISTORY_BINS, I_MED, LEAD_BINS, METRICS, NQ, ACIParams, Evaluation,
+                           apply_conformal, breakdown, by_lead, calibrate_forecast,
+                           conformal_table, fit_conformal_shift, lead_bin_index, lead_bin_of,
+                           metric_table, seed_spread, spread)
 from mayak.zones import (KG_TIF_CODE, KOPPEN_ZONES, SEASONS, UNKNOWN_ZONE, koppen_group,
                          koppen_id, normalize_zone, season_of, seasons_of)
 
@@ -409,6 +410,63 @@ def test_fit_conformal_shift_uses_valid_hours_only():
     dirty = np.where(w > 0, y, 1e6).astype(np.float32)
     assert np.allclose(fit_conformal_shift(y, q, w, hist)[0],
                        fit_conformal_shift(dirty, q, w, hist)[0])
+
+
+def test_fitted_median_column_is_zero_and_table_keeps_median():
+    """Подогнанная таблица не сдвигает медиану; таблица и множитель ACI её не трогают."""
+    from scipy.stats import norm
+    rng = np.random.default_rng(0)
+    n = 400
+    mu = rng.normal(0, 3, (n, H))
+    q = (mu[..., None] + norm.ppf(Q)).astype(np.float32)
+    y = (mu + 1.5 * rng.standard_normal((n, H))).astype(np.float32)
+    hist = rng.choice([0, 5, 24, 100, 168, 300, 672], n)
+    shift, rows = fit_conformal_shift(y, q, np.ones((n, H), np.float32), hist)
+    assert shift.shape == (len(LEAD_BINS), len(HISTORY_BINS), NQ)
+    assert not np.any(shift[..., I_MED])
+    assert (shift[..., 0] < 0).all() and (shift[..., -1] > 0).all(), "узкий прогноз расширяется"
+    assert not any(r["marginal"] for r in rows) and sum(r["windows"] for r in rows) == n
+    out = apply_conformal(q, shift, hist)
+    assert np.array_equal(out[..., I_MED], q[..., I_MED])
+    for theta in (-0.4, 0.0, 0.6, (0.2, -0.1, 0.0, 0.5)):
+        cq, med = calibrate_forecast(q, shift, theta, hist)
+        assert np.array_equal(med, q[..., I_MED]) and np.array_equal(cq[..., I_MED], med)
+
+
+def test_aci_step_follows_miss_indicator():
+    """Шаг ACI: промах расширяет на γ(1 − α), попадание сужает на γα, θ во float32 и в границах."""
+    p = ACIParams()
+    th, miss = p.step(0.0, 2.0)
+    assert miss and th == pytest.approx(p.gamma * (1 - p.target), rel=1e-6)
+    th, miss = p.step(0.0, 0.5)
+    assert not miss and th == pytest.approx(-p.gamma * p.target, rel=1e-6)
+    assert th == float(np.float32(th)), "θ живёт во float32, как в состоянии"
+    assert p.update(p.theta_max, True) == p.theta_max
+    assert p.update(p.theta_min, False) == p.theta_min
+
+
+def test_metrics_match_manual_on_valid_pairs():
+    """Метрики лида - по валидным парам; CRPS точечного прогноза равен его MAE."""
+    rng = np.random.default_rng(1)
+    n = 400
+    y = 10 + 5 * rng.standard_normal((n, H))
+    mu = y + rng.standard_normal((n, H))
+    mu_clim = y + 3 * rng.standard_normal((n, H))
+    q = mu[..., None] + np.linspace(-2, 2, NQ)
+    w = (rng.random((n, H)) < 0.5).astype(np.float32)
+    w[:, 0] = 1
+    tbl = metric_table(y, mu, q, mu_clim, w, leads=(24,))[24]
+    k = w[:, 23] > 0
+    e = mu[k, 23] - y[k, 23]
+    assert tbl["MAE"] == pytest.approx(np.abs(e).mean())
+    assert tbl["RMSE"] == pytest.approx(np.sqrt((e ** 2).mean()))
+    mse_c = ((mu_clim[k, 23] - y[k, 23]) ** 2).mean()
+    assert tbl["Skill"] == pytest.approx(1 - (e ** 2).mean() / mse_c)
+    lo, hi = q[k, 23, 0], q[k, 23, 6]
+    assert tbl["PICP90"] == pytest.approx(((y[k, 23] >= lo) & (y[k, 23] <= hi)).mean())
+    assert tbl["n_valid"] == int(k.sum())
+    point = metric_table(y, mu, np.repeat(mu[..., None], NQ, -1), mu_clim, w, leads=(24,))[24]
+    assert point["CRPS"] == pytest.approx(point["MAE"])
 
 
 def test_breakdown_drops_small_strata_and_counts_rows():

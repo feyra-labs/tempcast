@@ -559,6 +559,26 @@ def test_validation_set_is_the_same_for_every_architecture(runs):
             assert st["selection"] == sel["scores"]
 
 
+def test_validation_set_does_not_depend_on_protocol_seeds(manifest):
+    """Набор выбора чекпойнта строится из конфига данных и куррикулума этапа.
+
+    Сиды протокола (поток окон и аугментации) в него не входят, поэтому прогоны с разными
+    сидами выбирают чекпойнт на одних и тех же окнах валидационных станций.
+    """
+    from mayak.config import DataConfig
+    from mayak.data.datamodule import MayakData
+    sets = []
+    for seed, aug_seed in ((0, None), (11, 12)):
+        dm = MayakData(manifest, curriculum="full", windows_per_epoch=4, num_workers=0, seed=seed,
+                       aug_seed=aug_seed, data_config=DataConfig(manifest=manifest,
+                                                                 val_windows_per_station=8))
+        dm.setup()
+        sets.append(dm.val_ds)
+    assert {sid for sid, _t in sets[0].items} == {"v0", "v1"}
+    assert sets[0].fingerprint() == sets[1].fingerprint()
+    assert sets[0].requested == sets[1].requested
+
+
 def test_every_validation_pass_covers_the_whole_set(runs, manifest, store):
     from mayak.evaluate import EvalSet
     _, res = runs

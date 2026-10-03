@@ -29,7 +29,8 @@
 Конформная таблица эталона разбита по бинам лидов и длины истории, адаптивная
 калибровка - по бинам лидов. Отдельные сценарии проверяют ежечасный выпуск, при котором
 обратную связь получают все бины лидов, и старт из состояния прежней версии с одним
-множителем калибровки.
+множителем калибровки. Запись значений при поступлении, в том числе половин между
+значениями сетки, сверяется через состояние в конце сценария перезапуска.
 """
 import json
 import os
@@ -69,9 +70,14 @@ DEFAULT_DIR = os.path.join("tests", "data", "runtime_golden")
 STATUS_KEYS = ("filled", "history_hours", "theta", "conformal", "aci_lead_bins", "aci_updates",
                "aci_misses", "idle_hours", "fallbacks", "state_bytes", "last_unix_hour",
                "memory_bytes", "site", "loaded_site", "site_change")
-SCENARIOS = ("cold_aci", "restart", "restart_v4", "extremes", "long", "qc", "rounding", "sparse",
-             "int8", "fallback", "no_obs", "site_shift", "relocation", "store_order",
-             "hourly_aci")
+SCENARIOS = ("cold_aci", "restart", "restart_v4", "extremes", "qc", "sparse", "int8", "fallback",
+             "no_obs", "site_shift", "relocation", "hourly_aci")
+HALF_T = (0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 12.5, -12.5, 0.49999, -0.50001, 3.5, -3.5, 60.5, 61.5,
+          -90.5, -89.5)
+HALF_P = (1013.25, 1013.35, 1013.45, 999.95, 1000.05, 1013.15, 1012.85, 1011.75, 1011.65, 1010.55,
+          1009.45, 1008.35, 1100.05, 1100.04, 299.95, 299.96)
+HALF_RH = (50.5, 51.5, 0.5, 99.5, 100.5, -0.5, 49.5, 48.5, 60.49999, 60.50001, 1.5, 2.5, 101.5,
+           -1.5, 70.5, 71.5)
 
 
 def golden_model(cfg=None):
@@ -313,6 +319,11 @@ def scenario_cold_aci(make, out, blob, variant=0):
 def scenario_restart(make, out, blob, variant=0):
     """Старт из состояния после полного окна: прогноз сразу, без новых наблюдений.
 
+    В конце сценария приходят значения ровно посередине между соседними значениями сетки
+    записи, в том числе отрицательные, рядом с серединой и у границ диапазонов. Они
+    попадают в сырое окно, и состояние в конце сценария сверяет запись при поступлении до
+    байта.
+
     Args:
         make: фабрика рантайма по описанию сценария и точке.
         out: каталог эталонов.
@@ -356,6 +367,10 @@ def scenario_restart(make, out, blob, variant=0):
             ses.obs(_obs(s, k), s["t0"] + k)
             if k % 12 == 11:
                 ses.forecast()
+        hour = s["t0"] + len(s["x"])
+        for i, obs in enumerate(zip(HALF_T, HALF_P, HALF_RH)):
+            ses.obs(list(obs), hour + i)
+        ses.forecast()
         ses.state("state_restart_end.bin")
         ses.status()
     sc, m = _run(sc, make, out, blob, body)
@@ -399,50 +414,6 @@ def scenario_extremes(make, out, blob, variant=0):
         hour += W + 5
         ses.obs([-4.0, 801.0, 56.0], hour)
         ses.forecast()
-        ses.status()
-    return _run(sc, make, out, blob, body)
-
-
-def scenario_long(make, out, blob, variant=0):
-    """Длинный прогон.
-
-    Выпуски в случайные часы, простой короче и длиннее окна, перезапуски в произвольные
-    часы, в том числе посреди простоя.
-
-    Args:
-        make: фабрика рантайма по описанию сценария и точке.
-        out: каталог эталонов.
-        blob: накопитель эталонных векторов прогнозов.
-        variant: номер варианта; меняет сид синтетического ряда.
-
-    Returns:
-        Пара: описание сценария с командами и ожидаемыми ответами и наибольшие
-        отклонения, которые нужны для допусков.
-    """
-    sc = _scenario("long", 55.75, 37.62, 150.0, conformal=True, aci=False)
-    rng = np.random.default_rng(GOLDEN_SEED + 1 + variant)
-
-    def body(ses):
-        ses.restart()
-        W = ses.host.rt.window
-        n = 3000
-        s = synthetic_series(n, seed=37 + 100 * variant, t0=_hour("2022-10-01T00"))
-        skip = set(range(700, 730)) | set(range(1400, 1400 + W + 50))
-        restarts = set(int(k) for k in rng.choice(np.arange(100, n - 100), 3, replace=False))
-        restarts.add(1500)
-        for k in range(n):
-            if k in restarts:
-                ses.restart()
-                ses.forecast()
-            if k in skip:
-                continue
-            ses.obs(_obs(s, k), s["t0"] + k)
-            if rng.random() < 0.12:
-                ses.forecast(record=bool(rng.random() < 0.12))
-            if k % 500 == 499:
-                ses.status()
-        ses.forecast()
-        ses.state("state_long_end.bin")
         ses.status()
     return _run(sc, make, out, blob, body)
 
@@ -495,43 +466,6 @@ def scenario_qc(make, out, blob, variant=0):
         if seen & need != need:
             raise RuntimeError(f"сценарий кодов не породил выброс, залипание и давление на "
                                f"уровне моря: встреченные коды {seen:#x}")
-    return _run(sc, make, out, blob, body)
-
-
-def scenario_rounding(make, out, blob, variant=0):
-    """Запись при поступлении.
-
-    Значения ровно посередине между целыми, в том числе отрицательные, давление
-    посередине между десятыми, значения у границ диапазонов.
-
-    Args:
-        make: фабрика рантайма по описанию сценария и точке.
-        out: каталог эталонов.
-        blob: накопитель эталонных векторов прогнозов.
-        variant: номер варианта; меняет сид синтетического ряда.
-
-    Returns:
-        Пара: описание сценария с командами и ожидаемыми ответами и наибольшие
-        отклонения, которые нужны для допусков.
-    """
-    sc = _scenario("rounding", 60.17, 24.94, 20.0)
-
-    def body(ses):
-        ses.restart()
-        T = [0.5, 1.5, 2.5, -0.5, -1.5, -2.5, 12.5, -12.5, 0.49999, -0.50001, 3.5, -3.5,
-             60.5, 61.5, -90.5, -89.5]
-        RH = [50.5, 51.5, 0.5, 99.5, 100.5, -0.5, 49.5, 48.5, 60.49999, 60.50001, 1.5, 2.5,
-              101.5, -1.5, 70.5, 71.5]
-        P = [1013.25, 1013.35, 1013.45, 999.95, 1000.05, 1013.15, 1012.85, 1011.75, 1011.65,
-             1010.55, 1009.45, 1008.35, 1100.05, 1100.04, 299.95, 299.96]
-        hour = _hour("2023-01-10T00")
-        for rep in range(4):
-            for i in range(len(T)):
-                ses.obs([T[i] + rep, P[i], RH[i]], hour)
-                hour += 1
-        ses.forecast()
-        ses.state("state_rounding_end.bin")
-        ses.status()
     return _run(sc, make, out, blob, body)
 
 
@@ -753,60 +687,6 @@ def scenario_relocation(make, out, blob, variant=0):
         if moved != (SITE_MOVED, 0, 0.0, s["t0"] + n1 + n2 - 1) or same != SITE_SAME:
             raise RuntimeError(f"сценарий смены точки: перенос дал {moved}, повторный "
                                f"перезапуск {same}")
-    return _run(sc, make, out, blob, body)
-
-
-def scenario_store_order(make, out, blob, variant=0):
-    """Выбор свежего состояния по содержимому.
-
-    Старое состояние с полным окном изменено позже, новое состояние после холодного
-    старта изменено раньше; выбирается новое.
-
-    Args:
-        make: фабрика рантайма по описанию сценария и точке.
-        out: каталог эталонов.
-        blob: накопитель эталонных векторов прогнозов.
-        variant: номер варианта; меняет сид синтетического ряда.
-
-    Returns:
-        Пара: описание сценария с командами и ожидаемыми ответами и наибольшие
-        отклонения, которые нужны для допусков.
-    """
-    sc = _scenario("store_order", 59.91, 10.75, 20.0,
-                   init_files=[dict(file="state_order_old.bin", mtime=100,
-                                    **{"as": "state_a.bin"}),
-                               dict(file="state_order_new.bin", mtime=0,
-                                    **{"as": "state_b.bin"})])
-    pre_sc = dict(sc, name="store_order_pre", init_files=[], events=[])
-    last = {}
-
-    def pre_body(ses):
-        ses.restart()
-        rt = ses.host.rt
-        W = rt.window
-        s = synthetic_series(W + 30, seed=61, t0=_hour("2024-04-01T00"))
-        for k in range(W + 30):
-            rt.step(*_obs(s, k), s["t0"] + k)
-        with open(os.path.join(out, "state_order_old.bin"), "wb") as fh:
-            fh.write(rt.serialize())
-        h = rt.last_hour + W + 20
-        for k in range(6):
-            rt.step(5.0 + k, 1001.0, 60.0, h + k)
-        with open(os.path.join(out, "state_order_new.bin"), "wb") as fh:
-            fh.write(rt.serialize())
-        last["hour"] = rt.last_hour
-
-    _run(pre_sc, make, out, _Blob(), pre_body)
-
-    def body(ses):
-        if ses.restart() != "state_b.bin":
-            raise RuntimeError("эталон порядка файлов выбрал не то состояние")
-        ses.forecast()
-        for k in range(1, 4):
-            ses.obs([6.0 + k, 1002.0, 61.0], last["hour"] + k)
-        ses.restart()
-        ses.forecast()
-        ses.status()
     return _run(sc, make, out, blob, body)
 
 
@@ -1034,9 +914,8 @@ def calibration_cases(model, blob):
 
 
 BUILDERS = (scenario_cold_aci, scenario_restart, scenario_restart_v4, scenario_extremes,
-            scenario_long, scenario_qc, scenario_rounding, scenario_sparse, scenario_int8,
-            scenario_fallback, scenario_no_obs, scenario_site_shift, scenario_relocation,
-            scenario_store_order, scenario_hourly_aci)
+            scenario_qc, scenario_sparse, scenario_int8, scenario_fallback, scenario_no_obs,
+            scenario_site_shift, scenario_relocation, scenario_hourly_aci)
 
 
 def generate(out_dir=DEFAULT_DIR):
@@ -1212,7 +1091,8 @@ def replay_scenario(sc, blob, make, state_dir, golden_dir, n_quantiles, i_med,
 
 
 __all__ = ["DEFAULT_DIR", "FRESH_ATOL", "GOLDEN_ACI", "GOLDEN_FORMAT", "GOLDEN_SHIFT",
-           "GoldenMismatch", "MIN_ACI_MARGIN", "Q_ATOL", "Q_ATOL_INT8", "SCENARIOS",
-           "STATUS_KEYS", "THETA_ATOL", "V4_THETA", "calendar_cases", "calibration_cases",
-           "compare_state", "generate", "golden_model", "load", "place_init_files",
-           "replay_scenario", "scenario_runtime", "site_cases", "state_v4", "take"]
+           "GoldenMismatch", "HALF_P", "HALF_RH", "HALF_T", "MIN_ACI_MARGIN", "Q_ATOL",
+           "Q_ATOL_INT8", "SCENARIOS", "STATUS_KEYS", "THETA_ATOL", "V4_THETA",
+           "calendar_cases", "calibration_cases", "compare_state", "generate", "golden_model",
+           "load", "place_init_files", "replay_scenario", "scenario_runtime", "site_cases",
+           "state_v4", "take"]

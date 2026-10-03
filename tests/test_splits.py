@@ -11,8 +11,9 @@ import torch
 
 from mayak.constants import H, L_MAX
 from mayak.data import store as S
-from mayak.data.splits import (MIN_GAP_HOURS, ROLE_TEST, ROLE_TRAIN, ROLE_VAL, ROLES,
-                               TIME_KEYS, assign_roles, strata_report, stratum_of, time_layout)
+from mayak.data.splits import (MIN_GAP_HOURS, ROLE_EXTERNAL, ROLE_TEST, ROLE_TRAIN, ROLE_VAL,
+                               ROLES, TIME_KEYS, TimeLayout, assign_roles, strata_report,
+                               stratum_of, time_layout)
 from mayak.leakage import (SELECTION_KEY, LeakageError, check_checkpoint, check_climatology,
                            check_conformal, check_time_layout, check_windows, conformal_record,
                            run_checklist, save_conformal, selection_record)
@@ -88,6 +89,12 @@ class _Fake:
         return iter(self.fps)
 
 
+def _fp(key, lo, t, sid, n=N_HOURS):
+    """След одного окна: история с часа lo, горизонт с часа t."""
+    return dict(sid=sid, N=n, time_key=key, lo=np.array([lo]), t=np.array([t]),
+                hi=np.array([t + H]))
+
+
 @pytest.mark.parametrize("n", [8_000, 12_000, 17_531, 87_660, 200_000])
 def test_time_layout_ordered_disjoint_and_gapped(n):
     lay = check_time_layout(n)
@@ -98,6 +105,21 @@ def test_time_layout_ordered_disjoint_and_gapped(n):
     for k in TIME_KEYS:
         for lo, hi in lay.blocks[k]:
             assert hi - lo > H, "блок не вмещает ни одной цели"
+
+
+def test_layout_check_catches_broken_layout(monkeypatch):
+    import mayak.leakage as LK
+    good = time_layout(N_HOURS)
+    val, calib = good.blocks["val"], good.blocks["calib"]
+    swapped = TimeLayout(N_HOURS, dict(good.blocks, val=calib, calib=val))
+    monkeypatch.setattr(LK, "time_layout", lambda n: swapped)
+    with pytest.raises(LeakageError, match="не чередуются"):
+        check_time_layout(N_HOURS)
+    lo, hi = good.span("train")
+    close = TimeLayout(N_HOURS, dict(good.blocks, train=((lo, hi + 100),)))
+    monkeypatch.setattr(LK, "time_layout", lambda n: close)
+    with pytest.raises(LeakageError, match="зазор между обучением"):
+        check_time_layout(N_HOURS)
 
 
 def test_time_layout_rejects_small_gap_odd_blocks_and_short_series():
@@ -302,17 +324,35 @@ def test_checklist_catches_target_crossing_block_boundary(store, manifest):
         check_windows([ds], store)
 
 
+@pytest.mark.parametrize("key, sid, forbidden", [("val", "v0", "train"), ("calib", "v0", "train"),
+                                                 ("test", "x0", "calib")])
+def test_checklist_catches_evaluation_history_in_forbidden_window(store, key, sid, forbidden):
+    lay = time_layout(N_HOURS)
+    t = lay.blocks[key][0][0]
+    if key != "test":
+        check_windows([_Fake([_fp(key, t - L_MAX, t, sid)])], store)
+    bad = _fp(key, lay.span(forbidden)[1] - 1, t, sid)
+    with pytest.raises(LeakageError, match=f"заходит в окно {forbidden}"):
+        check_windows([_Fake([bad])], store)
+
+
 def test_checklist_catches_foreign_station_in_train_or_calib_window(store):
-    lo, _ = time_layout(N_HOURS).span("train")
-    fp = dict(sid="x0", N=N_HOURS, time_key="train", lo=np.array([lo]), t=np.array([lo]),
-              hi=np.array([lo + H]))
+    """Станция читается только в окнах своей роли; внешняя - только в окне теста."""
+    lay = time_layout(N_HOURS)
+    lo, _ = lay.span("train")
     with pytest.raises(LeakageError, match="роли unseen_test в окне train"):
-        check_windows([_Fake([fp])], store)
-    clo, _ = time_layout(N_HOURS).blocks["calib"][0]
-    fp = dict(sid="t0", N=N_HOURS, time_key="calib", lo=np.array([clo]), t=np.array([clo]),
-              hi=np.array([clo + H]))
+        check_windows([_Fake([_fp("train", lo, lo, "x0")])], store)
+    clo, _ = lay.blocks["calib"][0]
     with pytest.raises(LeakageError, match="окне calib"):
-        check_windows([_Fake([fp])], store)
+        check_windows([_Fake([_fp("calib", clo, clo, "t0")])], store)
+    ext = _clone(store)
+    ext.stations["x0"]["role"] = ROLE_EXTERNAL
+    for key in ("train", "val", "calib"):
+        t = lay.blocks[key][0][0]
+        with pytest.raises(LeakageError, match="x0"):
+            check_windows([_Fake([_fp(key, t, t, "x0")])], ext)
+    t = lay.span("test")[0]
+    check_windows([_Fake([_fp("test", t - L_MAX, t, "x0")])], ext)
 
 
 def test_checklist_requires_footprints():

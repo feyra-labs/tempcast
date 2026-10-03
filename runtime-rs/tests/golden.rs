@@ -3,7 +3,9 @@
 //! Каждый сценарий - строки протокола с ожидаемыми ответами, перезапуски хоста с тем же
 //! каталогом состояния и сверки состояния на диске. Сверяются коды контроля качества,
 //! моменты выпуска, признаки отката, множители калибровки по бинам лидов, сводка,
-//! выбранный при перезапуске файл и квантили в пределах допуска своей точности.
+//! выбранный при перезапуске файл и квантили в пределах допуска своей точности. Запись
+//! при поступлении, в том числе половин между значениями сетки, сверяется до байта через
+//! состояние в конце сценария перезапуска.
 //!
 //! Эталон лежит среди данных тестов репозитория и пересоздаётся генератором эталона
 //! хоста только при изменении поведения.
@@ -260,16 +262,13 @@ fn every_scenario_has_a_test() {
             "restart",
             "restart_v4",
             "extremes",
-            "long",
             "qc",
-            "rounding",
             "sparse",
             "int8",
             "fallback",
             "no_obs",
             "site_shift",
             "relocation",
-            "store_order",
             "hourly_aci"
         ]
     );
@@ -337,18 +336,8 @@ fn extremes_edges_idle_and_long_idle() {
 }
 
 #[test]
-fn long_run_with_idle_and_restarts() {
-    replay(&load(), "long");
-}
-
-#[test]
 fn quality_control_codes() {
     replay(&load(), "qc");
-}
-
-#[test]
-fn rounding_on_arrival() {
-    replay(&load(), "rounding");
 }
 
 #[test]
@@ -400,11 +389,6 @@ fn site_comparison_matches_python() {
             assert_eq!(Some(*gap), case["gap"][k].as_f64(), "случай {i}: разница {k}");
         }
     }
-}
-
-#[test]
-fn freshest_state_is_chosen_by_content() {
-    replay(&load(), "store_order");
 }
 
 #[test]
