@@ -54,7 +54,7 @@ report/*.png.
     python scripts/diagnose_stage_a.py --ckpt runs/mayak/stageA/best.ckpt
 
 Абляции переобучением (прогон в runs/mayak-<флаги>):
-    python scripts/train.py --arch mayak --ablate no_anchor --accelerator gpu
+    python scripts/train.py --arch mayak --ablate no_compression --accelerator gpu
 
 Бейзлайны, их источники и отличия от оригиналов: MODELS.md. Композиция конфигов,
 переопределения и групповые запуски: python scripts/run.py --help.

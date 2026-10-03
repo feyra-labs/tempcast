@@ -110,25 +110,3 @@ class ClimateField(nn.Module):
         sigma = (0.8 + F.softplus(torch.einsum("bi,bki->bk", c_sig, b21))).clamp(max=12.0)
         defc = F.softplus(torch.einsum("bi,bki->bk", c_def, b21))
         return mu, sigma, defc
-
-
-class ConstantAnchor(nn.Module):
-    """Абляция ``no_anchor``: вместо климат-поля - общие обучаемые константы."""
-
-    def __init__(self):
-        super().__init__()
-        self.anchor_mu = nn.Parameter(torch.zeros(1))
-        self.anchor_sig = nn.Parameter(inv_softplus(torch.tensor([SIGMA_INIT])))
-        self.anchor_def = nn.Parameter(torch.zeros(1))
-
-    def coefficients(self, loc, z=None):
-        B = loc.shape[0]
-        return tuple(p.expand(B, 1) for p in (self.anchor_mu, self.anchor_sig, self.anchor_def))
-
-    def evaluate(self, coefs, astro):
-        c_mu, c_sig, c_def = coefs
-        like = astro[0]
-        mu = c_mu.expand_as(like)
-        sigma = (0.8 + F.softplus(c_sig)).clamp(max=12.0).expand_as(like)
-        defc = F.softplus(c_def).expand_as(like)
-        return mu, sigma, defc

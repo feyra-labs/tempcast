@@ -90,7 +90,7 @@ def test_export_keeps_model_in_eval(model, tmp_path):
         "batch_stream_max_abs"] <= 5e-4
 
 
-ABLATIONS = [None, "no_anchor", "no_passport", "no_solar", "no_mode_groups", "no_compression"]
+ABLATIONS = [None, "no_passport", "no_solar", "no_mode_groups", "no_compression"]
 
 
 @pytest.mark.parametrize("ablation", ABLATIONS)

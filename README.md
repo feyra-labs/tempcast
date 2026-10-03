@@ -133,7 +133,7 @@ uv run python scripts/train.py --arch mayak --stages B \
 Абляции и сиды — через Hydra, каждый прогон в `runs/mayak-<абляция>-s<сид>/`:
 
 ```bash
-for a in none no_anchor no_compression; do uv run python scripts/run.py ablation=$a train.seed=0; done
+for a in none no_compression; do uv run python scripts/run.py ablation=$a train.seed=0; done
 for s in 1 2; do uv run python scripts/run.py train.seed=$s; done
 ```
 
@@ -342,10 +342,18 @@ uv run python -m mayak.calibration --preds DIR/internal.npz \
 <details>
 <summary>7. Абляции и сиды — <code>results/ablations/internal/metrics.json</code>, <code>results/seeds/internal/seeds.json</code></summary>
 
+Абляции снимают по одному компоненту МАЯК при прочих равных. Варианта без климат-поля
+среди них нет: другого пути для климатического среднего у модели нет, и такой вариант
+проигрывал бы по построению. Тезис о разложении прогноза на якорь и аномалию проверяется
+сравнением с LRU в таблицах 1, 2 и 8: у LRU та же линейная память с затухающими модами,
+но нет якоря. LRU отличается от МАЯК не только отсутствием якоря — у неё другой энкодер,
+нет паспорта станции и голов, — поэтому сравнение проверяет тезис в целом, а не вклад
+одного якоря.
+
 ```bash
 uv run python -m mayak.evaluate --ckpt runs/mayak-none-s0/stageB/best.ckpt \
-    --ablation-ckpt runs/mayak-no_anchor-s0/stageB/best.ckpt \
-                    runs/mayak-no_compression-s0/stageB/best.ckpt --results-dir results/ablations
+    --ablation-ckpt runs/mayak-no_compression-s0/stageB/best.ckpt \
+    --results-dir results/ablations
 uv run python -m mayak.evaluate --ckpt runs/mayak-none-s0/stageB/best.ckpt \
     runs/mayak-none-s1/stageB/best.ckpt runs/mayak-none-s2/stageB/best.ckpt \
     --results-dir results/seeds
@@ -354,7 +362,6 @@ uv run python -m mayak.evaluate --ckpt runs/mayak-none-s0/stageB/best.ckpt \
 | вариант | Skill@24 | Skill@72 | Skill@168 | CRPS@24 | PICP90@24 |
 |---|:-:|:-:|:-:|:-:|:-:|
 | МАЯК (эталон абляций, `mayak-none-s0`) | — | — | — | — | — |
-| МАЯК [mayak-no_anchor] | — | — | — | — | — |
 | МАЯК [mayak-no_compression] | — | — | — | — | — |
 
 | метрика, 3 сида | среднее | мин | макс | ст. откл. |

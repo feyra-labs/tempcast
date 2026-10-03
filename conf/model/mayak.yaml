@@ -29,7 +29,6 @@ field_hidden: 128
 heads_hidden: 48
 heads_z_proj: 4
 ablations:
-  no_anchor: false
   no_compression: false
   no_passport: false
   no_solar: false

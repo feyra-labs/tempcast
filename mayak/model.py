@@ -5,7 +5,7 @@ from mayak.astro import astro_features
 from mayak.config import N_DAILY_SUMMARY, SOLAR_CHANNELS, ModelConfig
 from mayak.features import dewpoint_deficit, future_channels, history_channels, lag_valid
 from mayak.modules.loc import LocEncoder
-from mayak.modules.field import ClimateField, ConstantAnchor
+from mayak.modules.field import ClimateField
 from mayak.modules.passport import Fingerprint
 from mayak.modules.encoder import SynopticEncoder
 from mayak.modules.readout import LaplaceReadout
@@ -39,7 +39,7 @@ class MAYAK(nn.Module):
     Args:
         cfg: конфиг модели; None - значения по умолчанию.
     """
-    NO_WD_SUFFIX = ("raw_tau", "p_w", "p_k", "r_kappa", "anchor_mu", "anchor_sig", "anchor_def")
+    NO_WD_SUFFIX = ("raw_tau", "p_w", "p_k", "r_kappa")
     FIELD_WEIGHT_DECAY = 0.5
 
     def __init__(self, cfg=None):
@@ -51,8 +51,7 @@ class MAYAK(nn.Module):
         self.cfg = cfg
         abl = cfg.ablations
         self.loc = LocEncoder(cfg.loc_freqs, cfg.loc_freq_scale, cfg.loc_freq_max, cfg.loc_seed)
-        self.field = (ConstantAnchor() if abl.no_anchor
-                      else ClimateField(self.loc.out_dim, cfg.passport_dim, cfg.field_hidden))
+        self.field = ClimateField(self.loc.out_dim, cfg.passport_dim, cfg.field_hidden)
         self.passport = Fingerprint(cfg.passport_dim, cfg.passport_hidden, N_DAILY_SUMMARY,
                                     enabled=not abl.no_passport)
         self.encoder = SynopticEncoder(cfg.n_channels, cfg.encoder_width, cfg.encoder_dilations,
