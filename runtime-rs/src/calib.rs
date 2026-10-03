@@ -8,7 +8,9 @@
 //!
 //! Адаптивная калибровка держит множитель на каждый бин лидов и кольцо по
 //! часам-мишеням: для каждого из следующих часов горизонта и каждого бина - медиана и
-//! границы интервала из последнего выпуска, чей лид до этого часа попадает в бин.
+//! границы интервала одной записи. Выпуск пишет бин, только когда сумма момента выпуска
+//! и первого лида бина делится на ширину бина, и тогда пишет все лиды бина: каждый час
+//! получает ровно одну запись на бин, а лиды записей идут по кругу через весь бин.
 //! Валидный час обновляет каждый бин не больше одного раза. Кольцо на диск не пишется.
 
 /// Число бинов лидов адаптивной калибровки: столько множителей хранит состояние.
@@ -64,6 +66,22 @@ pub fn lead_bin_of(lead_bins: &[[usize; 2]], horizon: usize) -> Vec<usize> {
                 .unwrap_or(lead_bins.len() - 1)
         })
         .collect()
+}
+
+/// Первый лид, считая с единицы, и число лидов каждого бина в пределах горизонта.
+/// Лиды бина идут подряд: это гарантирует проверка бинов в манифесте. У бина без лидов
+/// на горизонте первый лид ноль и ширина единица; записей у него всё равно нет.
+fn lead_bin_spans(lead_bin: &[usize]) -> ([i64; N_LEAD_BINS], [i64; N_LEAD_BINS]) {
+    let mut lo = [0i64; N_LEAD_BINS];
+    let mut width = [1i64; N_LEAD_BINS];
+    for (k, &b) in lead_bin.iter().enumerate() {
+        let lead = k as i64 + 1;
+        if lo[b] == 0 {
+            lo[b] = lead;
+        }
+        width[b] = lead - lo[b] + 1;
+    }
+    (lo, width)
 }
 
 /// Конформная поправка квантилей таблицей, развёрнутой по лидам: меняется ширина
@@ -158,6 +176,10 @@ pub struct Adaptive {
     horizon: usize,
     /// Номер бина для каждого лида горизонта.
     pub lead_bin: Vec<usize>,
+    // первый лид и ширина каждого бина в пределах горизонта: по ним выбираются выпуски,
+    // которые пишут бин в кольцо
+    bin_lo: [i64; N_LEAD_BINS],
+    bin_width: [i64; N_LEAD_BINS],
     pub theta: [f32; N_LEAD_BINS],
     pub updates: [u64; N_LEAD_BINS],
     pub misses: [u64; N_LEAD_BINS],
@@ -169,10 +191,14 @@ pub struct Adaptive {
 impl Adaptive {
     pub fn new(params: Option<AciParams>, lead_bins: &[[usize; 2]], horizon: usize) -> Self {
         let n = if params.is_some() { horizon * N_LEAD_BINS } else { 0 };
+        let lead_bin = lead_bin_of(lead_bins, horizon);
+        let (bin_lo, bin_width) = lead_bin_spans(&lead_bin);
         Adaptive {
             params,
             horizon,
-            lead_bin: lead_bin_of(lead_bins, horizon),
+            lead_bin,
+            bin_lo,
+            bin_width,
             theta: [0.0; N_LEAD_BINS],
             updates: [0; N_LEAD_BINS],
             misses: [0; N_LEAD_BINS],
@@ -204,13 +230,18 @@ impl Adaptive {
     }
 
     /// Запись выпуска в кольцо: квантили после конформной таблицы и до множителя, лиды
-    /// подряд, горизонт начинается после часа `after`.
+    /// подряд, горизонт начинается после часа `after`. Пишутся только бины, для которых
+    /// сумма `after` и первого лида бина делится на ширину бина; у такого бина - все лиды.
     pub fn record(&mut self, after: i64, q: &[f32], nq: usize, i_med: usize) {
         let Some(p) = self.params else { return };
         let [i, j] = p.interval;
         for k in 0..self.horizon {
+            let b = self.lead_bin[k];
+            if (after + self.bin_lo[b]).rem_euclid(self.bin_width[b]) != 0 {
+                continue;
+            }
             let h = after + 1 + k as i64;
-            let s = h.rem_euclid(self.horizon as i64) as usize * N_LEAD_BINS + self.lead_bin[k];
+            let s = h.rem_euclid(self.horizon as i64) as usize * N_LEAD_BINS + b;
             let row = &q[k * nq..(k + 1) * nq];
             self.ring_hour[s] = h;
             self.ring[s] = [row[i], row[i_med], row[j]];

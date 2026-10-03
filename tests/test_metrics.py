@@ -7,10 +7,10 @@ import pytest
 from mayak.constants import H, QUANTILES
 from mayak.data import store as S
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL
-from mayak.metrics import (HISTORY_BINS, I_MED, LEAD_BINS, METRICS, NQ, ACIParams, Evaluation,
-                           apply_conformal, breakdown, by_lead, calibrate_forecast,
-                           conformal_table, fit_conformal_shift, lead_bin_index, lead_bin_of,
-                           metric_table, seed_spread, spread)
+from mayak.metrics import (HISTORY_BINS, I_MED, LEAD_BINS, METRICS, NQ, ACIParams,
+                           AdaptiveCalibration, Evaluation, apply_conformal, breakdown, by_lead,
+                           calibrate_forecast, conformal_table, fit_conformal_shift,
+                           lead_bin_index, lead_bin_of, metric_table, seed_spread, spread)
 from mayak.zones import KOPPEN_ZONES, UNKNOWN_ZONE, normalize_zone, season_of
 
 Q = np.asarray(QUANTILES, np.float64)
@@ -364,6 +364,32 @@ def test_aci_step_follows_miss_indicator():
     assert th == float(np.float32(th)), "θ живёт во float32, как в состоянии"
     assert p.update(p.theta_max, True) == p.theta_max
     assert p.update(p.theta_min, False) == p.theta_min
+
+
+def test_aci_hourly_feedback_covers_bin_leads_evenly():
+    """Ежечасный выпуск: каждый час - по связи на бин, лиды бина получают её поровну.
+
+    После прогрева в горизонт каждый валидный час обновляет каждый бин ровно один раз, а
+    число обратных связей по лидам внутри бина различается не больше чем на единицу.
+    В медиане лида записан его номер, нижняя граница интервала на единицу ниже, поэтому
+    оценка факта, равного нулю, - это номер лида записи.
+    """
+    cal = AdaptiveCalibration(ACIParams(), H, LEAD_BINS)
+    q = (np.arange(1, H + 1)[:, None] + np.linspace(-1.0, 1.0, NQ)).astype(np.float32)
+    t0, n = 1_000_003, H + 500
+    seen = np.zeros(H + 1, np.int64)
+    for t in range(t0, t0 + n):
+        got, before = cal.scores(0.0, t), list(cal.updates)
+        cal.feedback(0.0, t)
+        if t >= t0 + H:
+            assert sorted(b for b, _ in got) == list(range(len(LEAD_BINS))), t
+            assert [a - b for a, b in zip(cal.updates, before)] == [1] * len(LEAD_BINS)
+            for _, lead in got:
+                seen[int(lead)] += 1
+        cal.record(t, q)
+    for lo, hi in LEAD_BINS:
+        c = seen[lo:hi + 1]
+        assert c.min() > 0 and c.max() - c.min() <= 1, f"бин {lo}-{hi}: {c.tolist()}"
 
 
 def test_metrics_match_manual_on_valid_pairs():

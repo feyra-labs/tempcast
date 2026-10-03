@@ -346,10 +346,12 @@ def scenario_restart(make, out, blob, variant=0):
         ses.restart()
         n = ses.host.rt.window + 88
         s = synthetic_series(n + 100, seed=29 + 100 * variant, t0=_hour("2023-03-24T05"))
+        # Выпуск каждый час, как рассчитан прибор: при более редком выпуске бин лидов
+        # пишется в кольцо только в часы, согласованные с его шириной, и θ могут
+        # остаться нулевыми, а состояние должно нести ненулевые θ.
         for k in range(n):
             ses.obs(_obs(s, k), s["t0"] + k)
-            if k % 8 == 7:
-                ses.forecast(record=False)
+            ses.forecast(record=False)
         with open(os.path.join(out, "state_restart.bin"), "wb") as fh:
             fh.write(ses.host.rt.serialize())
         ses.sc["_n"] = n

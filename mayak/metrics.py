@@ -203,6 +203,36 @@ def lead_bin_of(horizon=H, lead_bins=LEAD_BINS):
     return np.array([lead_bin_index(h + 1, lead_bins) for h in range(horizon)], np.int64)
 
 
+def _lead_bin_spans(lead_bin, n_bins):
+    """Первый лид и число лидов каждого бина в пределах горизонта.
+
+    Границы берутся по фактическим лидам горизонта, а не по объявленным бинам: лиды за
+    последним бином относятся к последнему, а бин, который горизонт обрезает, короче
+    объявленного. У бина без лидов на горизонте первый лид ноль и ширина единица; записей
+    у него всё равно нет.
+
+    Args:
+        lead_bin: номер бина для каждого лида горизонта.
+        n_bins: число бинов.
+
+    Returns:
+        Пара массивов int64 по бинам: первый лид, считая с единицы, и число лидов.
+
+    Raises:
+        ValueError: лиды какого-то бина идут не подряд.
+    """
+    lead_bin = np.asarray(lead_bin, np.int64)
+    lo, width = np.zeros(n_bins, np.int64), np.ones(n_bins, np.int64)
+    for b in range(n_bins):
+        leads = np.flatnonzero(lead_bin == b) + 1
+        if not leads.size:
+            continue
+        if leads[-1] - leads[0] + 1 != leads.size:
+            raise ValueError(f"лиды бина {b} идут не подряд: {leads.tolist()}")
+        lo[b], width[b] = leads[0], leads.size
+    return lo, width
+
+
 def check_history_bins(history_bins=HISTORY_BINS):
     """Проверяет, что бины длины истории идут подряд с нуля без пропусков и наложений.
 
@@ -622,10 +652,18 @@ class AdaptiveCalibration:
 
     У каждого бина лидов свой логарифм множителя ширины. Обратная связь идёт через
     кольцо по часам-мишеням: для каждого из следующих часов горизонта и каждого бина
-    лежат медиана и границы интервала из последнего выпуска, у которого лид до этого
-    часа попадает в бин. Валидный час сверяется со всеми записями на него, и каждый бин
-    обновляется этим часом не больше одного раза. Так при ежечасном выпуске обратную
-    связь получают все бины лидов, а не только первый лид.
+    лежат медиана и границы интервала одной записи.
+
+    Выпуск пишет бин в кольцо не всегда, а только когда сумма момента выпуска и первого
+    лида бина делится на ширину бина; тогда он пишет все лиды бина. Записи таких выпусков
+    стыкуются без наложений: каждый час получает ровно одну запись на бин, а её лид
+    пробегает лиды бина подряд и повторяется с периодом, равным ширине бина. Так при
+    ежечасном выпуске множитель бина подстраивается по всем его лидам поровну, а не по
+    самому короткому. При выпуске реже бин получает обратную связь только с выпусков,
+    попавших на такие часы.
+
+    Валидный час сверяется со всеми записями на него, и каждый бин обновляется этим часом
+    не больше одного раза.
 
     Записи берутся после конформной таблицы и до множителя, как и прежде. Кольцо живёт
     только в памяти и после перезапуска пусто.
@@ -640,6 +678,9 @@ class AdaptiveCalibration:
         lead_bins: бины лидов.
 
     Attributes:
+        lead_bin: номер бина для каждого лида горизонта.
+        bin_lo: первый лид каждого бина в пределах горизонта, считая с единицы.
+        bin_width: число лидов каждого бина в пределах горизонта.
         theta: логарифмы множителей по бинам лидов, значения float32.
         updates: число обратных связей по бинам с последнего сброса.
         misses: число промахов по бинам с последнего сброса.
@@ -652,6 +693,7 @@ class AdaptiveCalibration:
         self.lead_bins = tuple(tuple(b) for b in lead_bins)
         self.lead_bin = lead_bin_of(self.horizon, self.lead_bins)
         nb = len(self.lead_bins)
+        self.bin_lo, self.bin_width = _lead_bin_spans(self.lead_bin, nb)
         self.ring_hour = None if params is None else np.full((self.horizon, nb), NO_HOUR,
                                                              np.int64)
         self.ring = None if params is None else np.zeros((self.horizon, nb, 3), np.float32)
@@ -696,6 +738,9 @@ class AdaptiveCalibration:
     def record(self, after_hour, q):
         """Записать выпуск в кольцо.
 
+        Пишутся только бины, для которых сумма момента выпуска и первого лида бина
+        делится на ширину бина; у такого бина - все его лиды.
+
         Args:
             after_hour: абсолютный час, после которого начинается горизонт выпуска.
             q: квантили выпуска после конформной таблицы и до множителя, форма
@@ -705,10 +750,15 @@ class AdaptiveCalibration:
             return
         q = np.asarray(q, np.float32)
         i, j = self.params.interval
-        hours = int(after_hour) + 1 + np.arange(self.horizon, dtype=np.int64)
-        slot = hours % self.horizon
-        self.ring_hour[slot, self.lead_bin] = hours
-        self.ring[slot, self.lead_bin] = np.stack([q[:, i], q[:, I_MED], q[:, j]], -1)
+        t = int(after_hour)
+        b = self.lead_bin
+        lead = np.flatnonzero((t + self.bin_lo[b]) % self.bin_width[b] == 0)
+        if not lead.size:
+            return
+        hours = t + 1 + lead
+        slot, b = hours % self.horizon, b[lead]
+        self.ring_hour[slot, b] = hours
+        self.ring[slot, b] = np.stack([q[lead, i], q[lead, I_MED], q[lead, j]], -1)
 
     def scores(self, y, hour):
         """Нормированные выходы факта за интервал по записям кольца на этот час.
