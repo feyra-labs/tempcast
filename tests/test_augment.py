@@ -150,18 +150,19 @@ def test_firing_frequencies_follow_probabilities():
         assert abs(fired[name] / n - p) <= tol, (name, fired[name] / n, p)
 
 
-def test_drift_starts_calibrated_and_reaches_current_offset():
+def test_drift_profile_joins_given_offsets():
     for walk in (False, True):
-        for b in (2.0, -1.5):
-            d = A.drift_profile(300, b, walk, seed=1)
-            assert d.shape == (300,) and d[0] == 0.0, "в первом часе истории прибор точен"
+        for a, b in ((0.0, 2.0), (0.5, -1.5)):
+            d = A.drift_profile(300, a, b, walk, seed=1)
+            assert d.shape == (300,) and d[0] == np.float32(a), "первый час - смещение начала"
             assert d[-1] == np.float32(b), "к последнему часу смещение равно текущему"
-    lin = A.drift_profile(301, 3.0, False, 0)
+    lin = A.drift_profile(301, 1.0, 4.0, False, 0)
     np.testing.assert_allclose(np.diff(lin), 0.01, atol=1e-6)
-    mids = [A.drift_profile(501, 2.0, True, s)[250] - 1.0 for s in range(400)]
-    assert 0.7 < np.sqrt(np.mean(np.square(mids))) < 1.3, "блуждание в середине около b / 2"
-    assert A.drift_profile(1, 0.7, True, 0).tolist() == [np.float32(0.7)]
-    assert A.drift_profile(0, 0.7, True, 0).shape == (0,)
+    mids = [A.drift_profile(501, 1.0, 3.0, True, s)[250] - 2.0 for s in range(400)]
+    assert 0.7 < np.sqrt(np.mean(np.square(mids))) < 1.3, \
+        "блуждание в середине около половины набранного смещения"
+    assert A.drift_profile(1, 0.7, 0.7, True, 0).tolist() == [np.float32(0.7)]
+    assert A.drift_profile(0, 0.7, 0.7, True, 0).shape == (0,)
 
 
 @pytest.mark.parametrize("L", [1, 30, L_MAX])
@@ -171,71 +172,48 @@ def test_scale_and_drift_change_target_by_expected_amount(L):
     w = apply_one(_copy(w0), "scale", dict(k=[1.03, 1.0, 1.1]))
     np.testing.assert_array_equal(w.y[ok], w0.y[ok] * np.float32(1.03))
     assert np.array_equal(w.y[~ok], w0.y[~ok]) and np.array_equal(w.y_mask, w0.y_mask)
-    rate = (-0.05, 0.02, 0.15)
+    rate, age = (-0.05, 0.02, 0.15), 48
     for walk in (False, True):
-        w = apply_one(_copy(w0), "drift", dict(rate=list(rate), walk=walk, seed=2))
-        want = w0.y + A.drift_target(L, rate[0])
+        w = apply_one(_copy(w0), "drift", dict(rate=list(rate), walk=walk, seed=2, age=age))
+        want = w0.y + A.drift_target(L, rate[0], age)
         np.testing.assert_allclose(w.y[ok], want[ok], atol=1e-5)
         assert np.array_equal(w.y[~ok], w0.y[~ok]) and np.array_equal(w.y_mask, w0.y_mask)
         last = L_MAX - 1
         for ch, r in enumerate(rate):
             if w0.m[last, ch] > 0:
-                assert w.x[last, ch] - w0.x[last, ch] == pytest.approx(A.drift_offset(L, r),
-                                                                       abs=1e-4)
+                assert w.x[last, ch] - w0.x[last, ch] == pytest.approx(
+                    A.drift_offset(L, r, age), abs=1e-4)
     for name, p in (("scale", dict(k=[1.03, 1.0, 1.1])), ("offset", dict(b=2.0)),
-                    ("drift", dict(rate=[0.05, 0.0, 0.0], walk=False, seed=0))):
+                    ("drift", dict(rate=[0.05, 0.0, 0.0], walk=False, seed=0, age=0))):
         w = apply_one(_copy(w0), name, dict(p, target=False))
         assert np.array_equal(w.y, w0.y), f"{name}: вариант без цели трогает цель"
 
 
-def test_drift_offset_is_proportional_to_history_length():
-    """Дрейф задан скоростью: смещение в момент выпуска - скорость на длину истории.
-
-    При короткой истории смещение мало и не похоже на быстрый скачок погоды; при полной
-    истории наибольшая скорость профиля даёт смещение около прежних полутора градусов.
-    """
-    rate = 0.05
-    assert A.drift_offset(0, rate) == 0.0 and A.drift_offset(1, rate) == 0.0
-    for L in (2, 25, 169, L_MAX):
-        assert A.drift_offset(L, rate) == pytest.approx(rate * (L - 1) / 24)
-        w0 = _window(0, L=L)
-        w = apply_one(_copy(w0), "drift", dict(rate=[rate, 0.0, 0.0], walk=False, seed=0))
-        d = w.x[:, 0] - w0.x[:, 0]
-        assert d[-1] == pytest.approx(A.drift_offset(L, rate), abs=1e-4)
-        np.testing.assert_allclose(np.diff(d[w0.h0:]), rate / 24, atol=1e-4)
-        assert np.all(d[:w0.h0] == 0), "левее начала истории дрейфа нет"
-    assert A.drift_offset(L_MAX, 2 * rate) == pytest.approx(2 * A.drift_offset(L_MAX, rate))
-    agg = AugmentConfig()
-    full = A.drift_offset(L_MAX, agg.drift_rate_max[0])
-    assert 1.2 < full < 1.6, f"при полной истории наибольший дрейф T {full:.2f} °C"
-    assert A.drift_offset(24, agg.drift_rate_max[0]) < 0.1, "за сутки истории дрейф мал"
-    cfg = AugmentConfig.only("drift")
-    for seed in range(30):
-        w = augment_window(_window(seed, L=(24, 168, L_MAX)[seed % 3]), cfg,
-                           np.random.default_rng(seed))
-        r = w.applied["drift"]["rate"]
-        assert len(r) == 3 and all(abs(v) <= m for v, m in zip(r, cfg.drift_rate_max))
-
-
 @pytest.mark.parametrize("walk", [False, True])
-@pytest.mark.parametrize("L", [0, 1, 30, L_MAX])
-def test_drift_target_grows_linearly_with_lead(L, walk):
-    """На горизонте цели смещение не замораживается, а растёт с той же скоростью."""
+@pytest.mark.parametrize("age", [0, 200])
+@pytest.mark.parametrize("L", [1, 30, A.DRIFT_GROWTH_MIN_HISTORY - 1,
+                               A.DRIFT_GROWTH_MIN_HISTORY, L_MAX])
+def test_drift_counts_from_calibration_and_grows_on_horizon_only_with_long_history(L, age,
+                                                                                   walk):
+    """Дрейф отсчитывается от калибровки прибора, а не от начала окна.
+
+    В первом часе истории смещение - скорость на возраст калибровки. При истории короче
+    порога цель держит смещение последнего часа истории, при длинной - растёт дальше с
+    той же скоростью без скачка на границе истории и горизонта.
+    """
     rate = -0.08
     w0 = _window(3, L=L)
-    w = apply_one(_copy(w0), "drift", dict(rate=[rate, 0.0, 0.0], walk=walk, seed=4))
-    dy = (w.y.astype(np.float64) - w0.y)
-    want = A.drift_target(L, rate)
-    np.testing.assert_allclose(dy, want, atol=1e-5)
-    if L == 0:
-        assert not np.any(dy), "без истории момент калибровки не определён - цель не трогаем"
-        return
-    np.testing.assert_allclose(np.diff(dy), rate / 24, atol=1e-5)
-    assert dy[0] == pytest.approx(A.drift_offset(L, rate) + rate / 24, abs=1e-5), \
-        "первый час горизонта - продолжение истории без скачка"
-    if w0.m[-1, 0] > 0:
-        assert dy[0] - (w.x[-1, 0] - w0.x[-1, 0]) == pytest.approx(rate / 24, abs=1e-4)
-    assert dy[-1] == pytest.approx(rate * (L - 1 + H) / 24, abs=1e-4)
+    w = apply_one(_copy(w0), "drift", dict(rate=[rate, 0.0, 0.0], walk=walk, seed=4, age=age))
+    d = w.x[:, 0].astype(np.float64) - w0.x[:, 0]
+    dy = w.y.astype(np.float64) - w0.y
+    assert np.all(d[:w0.h0] == 0), "левее начала истории дрейфа нет"
+    assert d[w0.h0] == pytest.approx(rate * age / 24, abs=1e-4), "прибор уже смещён"
+    if L < A.DRIFT_GROWTH_MIN_HISTORY:
+        np.testing.assert_allclose(dy, d[-1], atol=1e-4,
+                                   err_msg="короткая история: цель держит её смещение")
+    else:
+        np.testing.assert_allclose(np.diff(dy), rate / 24, atol=1e-5)
+        assert dy[0] - d[-1] == pytest.approx(rate / 24, abs=1e-4), "рост без скачка"
 
 
 @pytest.mark.parametrize("name", INSTRUMENT_ON_TARGET)
@@ -417,7 +395,7 @@ def test_dataset_aggressive_keeps_contract(manifest):
             y = np.where(ym0 > 0, y * info["scale"]["k"][0], y)
         if "drift" in info:
             L = (0, 24, 200, L_MAX)[i % 4]
-            y = y + A.drift_target(L, info["drift"]["rate"][0]) * ym0
+            y = y + A.drift_target(L, info["drift"]["rate"][0], info["drift"]["age"]) * ym0
         if "offset" in info:
             y = y + info["offset"]["b"] * ym0
         got = it["y"].numpy()

@@ -12,8 +12,11 @@
   аугментаций окно записывается так, как его пишет прибор (``record_window``), затем
   вызывающий код восстанавливает инвариант ``enforce_invariant`` и прогоняет QC окна.
 * Цель трогают все свойства прибора - смещение, масштаб, дрейф - и только они. Маска
-  цели не меняется никогда. Дрейф задан скоростью: прибор точен в первом часе истории,
-  его смещение растёт с этой скоростью через всю историю и продолжает расти на горизонте.
+  цели не меняется никогда. Дрейф задан скоростью и возрастом калибровки: прибор
+  откалиброван за случайное число часов до первого часа истории, начало окна с
+  калибровкой не связано. Смещение растёт с этой скоростью через всю историю; на
+  горизонте оно растёт дальше только при истории не короче
+  ``DRIFT_GROWTH_MIN_HISTORY``, иначе держится на уровне последнего часа истории.
 * Каждая аугментация берёт случайные числа из своего подпотока, выведенного из
   одного числа основного генератора аугментаций. Отсюда два свойства: окно
   потребляет из ``rng`` ровно одно число, а включение, выключение или смена
@@ -56,6 +59,7 @@ from mayak.data.qc import QC_CODES, P_SEA_LEVEL, QCCode, qc_window, station_pres
 from mayak.data.recording import RECORD_SCALE, record_channel, record_values, round_half_even
 
 T, P, RH = 0, 1, 2
+DRIFT_GROWTH_MIN_HISTORY = 168
 
 AUG_ORDER = ("coords", "scale", "drift", "offset", "noise", "rh_dewpoint", "spike", "stuck",
              "units", "dropout", "gap", "outage", "drop_pressure", "drop_humidity")
@@ -200,7 +204,8 @@ def _s_scale(r, c, w):
 
 def _s_drift(r, c, w):
     return dict(rate=[_sym(r, a) for a in c.drift_rate_max],
-                walk=bool(r.random() < c.drift_rw_frac), seed=int(r.integers(2 ** 31)))
+                walk=bool(r.random() < c.drift_rw_frac), seed=int(r.integers(2 ** 31)),
+                age=int(r.integers(0, c.drift_age_max + 1)))
 
 
 def _s_offset(r, c, w):
@@ -294,34 +299,45 @@ def _a_scale(w, p):
         w.y[:] = np.where(w.y_mask > 0, w.y * k[T], w.y)
 
 
-def drift_offset(L, rate_per_day):
+def _drift_after(hours, rate_per_day):
+    """Смещение прибора через заданное число часов после калибровки."""
+    return float(rate_per_day) * hours / 24.0
+
+
+def drift_offset(L, rate_per_day, age=0):
     """Смещение прибора в последнем часе истории при дрейфе с постоянной скоростью.
 
-    Прибор откалиброван в первом часе фактической истории и к её последнему часу
-    уходит на скорость, умноженную на прошедшее время. Одна функция для аугментации и
-    сценария робастности.
+    Прибор откалиброван за ``age`` часов до первого часа фактической истории и к её
+    последнему часу уходит на скорость, умноженную на время от калибровки. Одна функция
+    для аугментации и сценария робастности.
 
     Args:
         L: длина истории, ч.
         rate_per_day: скорость дрейфа в единицах канала за сутки.
+        age: возраст калибровки прибора к первому часу истории, ч.
 
     Returns:
-        Смещение в последнем часе истории. Без истории и при истории в один час - ноль.
+        Смещение в последнем часе истории; при истории не длиннее часа - смещение в её
+        первом часе.
     """
-    return float(rate_per_day) * max(int(L) - 1, 0) / 24.0
+    return _drift_after(int(age) + max(int(L) - 1, 0), rate_per_day)
 
 
-def drift_target(L, rate_per_day, n=H):
+def drift_target(L, rate_per_day, age=0, n=H):
     """Смещение прибора на часах горизонта цели при дрейфе с постоянной скоростью.
 
-    Отсчёт времени тот же, что в истории, - от её первого часа, поэтому на горизонте
-    смещение продолжает расти с той же скоростью без скачка: на первом часе горизонта
-    оно на час дрейфа больше, чем в последнем часе истории. Без истории момент
-    калибровки не определён, и цель не смещается: дрейф без истории не выучить.
+    Отсчёт времени тот же, что в истории, - от калибровки прибора. При истории не короче
+    ``DRIFT_GROWTH_MIN_HISTORY`` смещение на горизонте продолжает расти с той же скоростью
+    без скачка: на первом часе горизонта оно на час дрейфа больше, чем в последнем часе
+    истории. При более короткой истории оно держится на уровне последнего часа истории:
+    смещение, видимое в истории, переносится в цель, а рост, который по короткой истории
+    не оценить, не добавляется. Без истории смещение прибора не видно, и цель не
+    смещается.
 
     Args:
         L: длина истории, ч.
         rate_per_day: скорость дрейфа в единицах канала за сутки.
+        age: возраст калибровки прибора к первому часу истории, ч.
         n: число часов горизонта.
 
     Returns:
@@ -329,52 +345,59 @@ def drift_target(L, rate_per_day, n=H):
     """
     if int(L) <= 0 or rate_per_day == 0:
         return np.zeros(n, np.float32)
+    last = drift_offset(L, rate_per_day, age)
+    if int(L) < DRIFT_GROWTH_MIN_HISTORY:
+        return np.full(n, last, np.float32)
     k = np.arange(1, n + 1, dtype=np.float64)
-    return (float(rate_per_day) * (int(L) - 1 + k) / 24.0).astype(np.float32)
+    return (last + _drift_after(k, rate_per_day)).astype(np.float32)
 
 
-def drift_profile(L, b, walk, seed):
+def drift_profile(L, start, end, walk, seed):
     """Смещение прибора на часах истории.
 
-    В первом часе истории прибор откалиброван, к последнему смещение нарастает до b.
+    В первом часе истории смещение равно start, к последнему нарастает до end.
     Нарастание линейное либо случайным блужданием, которое закреплено на обоих концах.
-    Размах блуждания в середине истории в среднем около половины b.
+    Размах блуждания в середине истории в среднем около половины смещения, набранного за
+    историю.
 
     Args:
         L: длина истории, ч.
-        b: смещение прибора в последнем часе истории.
+        start: смещение прибора в первом часе истории.
+        end: смещение прибора в последнем часе истории.
         walk: нарастание случайным блужданием, иначе линейное.
         seed: сид блуждания.
 
     Returns:
-        Массив float32 длины L.
+        Массив float32 длины L; при истории в один час - смещение end.
     """
-    if L == 0 or b == 0:
-        return np.zeros(L, np.float32)
-    if L == 1:
-        return np.full(1, b, np.float32)
+    if L <= 1 or start == end:
+        return np.full(max(L, 0), end, np.float32)
     k = np.arange(L, dtype=np.float64)
-    out = float(b) * k / (L - 1)
+    out = float(start) + (float(end) - float(start)) * k / (L - 1)
     if walk:
         steps = np.random.default_rng(seed).standard_normal(L - 1)
         path = np.concatenate([[0.0], np.cumsum(steps)])
         bridge = path - path[-1] * k / (L - 1)
-        out = out + abs(float(b)) / np.sqrt(L - 1) * bridge
-    out[-1] = float(b)
+        out = out + abs(float(end) - float(start)) / np.sqrt(L - 1) * bridge
+    out[0] = float(start)
+    out[-1] = float(end)
     return out.astype(np.float32)
 
 
 def _a_drift(w, p):
-    """Дрейф каналов с заданными скоростями; цель - температура - дрейфует дальше.
+    """Дрейф каналов с заданными скоростями; цель - температура - смещается тоже.
 
-    На истории смещение нарастает от нуля до текущего - линейно или блужданием, на
-    горизонте растёт с той же скоростью линейно.
+    Прибор откалиброван за ``age`` часов до первого часа истории. На истории смещение
+    нарастает от смещения первого часа до смещения последнего - линейно или блужданием;
+    на горизонте оно растёт дальше или держится по правилу ``drift_target``.
     """
+    age = int(p["age"])
     for ch, rate in enumerate(p["rate"]):
-        d = drift_profile(w.L, drift_offset(w.L, rate), p["walk"], p["seed"] + ch)
+        d = drift_profile(w.L, _drift_after(age, rate), drift_offset(w.L, rate, age),
+                          p["walk"], p["seed"] + ch)
         w.x[w.h0:, ch] += d * (w.m[w.h0:, ch] > 0)
     if _on_target(p):
-        w.y[:] = w.y + drift_target(w.L, p["rate"][T], w.y.shape[0]) * (w.y_mask > 0)
+        w.y[:] = w.y + drift_target(w.L, p["rate"][T], age, w.y.shape[0]) * (w.y_mask > 0)
 
 
 def _a_offset(w, p):
@@ -634,9 +657,10 @@ REFERENCE_CASES = (
     ("drop_pressure", "drop_pressure", {}, 200.0, P, (0, L_MAX)),
     ("drop_humidity", "drop_humidity", {}, 200.0, RH, (0, L_MAX)),
     ("scale", "scale", dict(k=[1.03, 1.0005, 1.05]), 200.0, None, None),
-    ("drift_linear", "drift", dict(rate=[0.07, 0.05, 0.2], walk=False, seed=0), 200.0, None,
-     None),
-    ("drift_walk", "drift", dict(rate=[0.07, 0.05, 0.2], walk=True, seed=1), 200.0, None, None),
+    ("drift_linear", "drift", dict(rate=[0.07, 0.05, 0.2], walk=False, seed=0, age=168),
+     200.0, None, None),
+    ("drift_walk", "drift", dict(rate=[0.07, 0.05, 0.2], walk=True, seed=1, age=336), 200.0,
+     None, None),
     ("offset", "offset", dict(b=3.0), 200.0, None, None),
     ("noise", "noise", dict(sd=[0.2, 0.3, 2.0], seed=5), 200.0, None, None),
     ("rh_dewpoint", "rh_dewpoint", {}, 200.0, None, None),
@@ -726,7 +750,7 @@ def qc_effect(name, before, after, ch=None, rows=None):
 
 
 __all__ = ["AUG_KIND", "AUG_ORDER", "AugWindow", "EXPECTED_QC", "REFERENCE_CASES", "SIDE_QC",
-           "DITHER_BEFORE", "apply_one", "aug_streams", "augment_window", "clean_history",
-           "dither_window", "drift_offset", "drift_profile", "drift_target",
-           "make_window", "qc_effect", "record_window", "reference_windows",
+           "DITHER_BEFORE", "DRIFT_GROWTH_MIN_HISTORY", "apply_one", "aug_streams",
+           "augment_window", "clean_history", "dither_window", "drift_offset", "drift_profile",
+           "drift_target", "make_window", "qc_effect", "record_window", "reference_windows",
            "rh_via_dewpoint", "sea_level_ratio", "window_codes"]

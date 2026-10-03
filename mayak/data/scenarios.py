@@ -42,14 +42,16 @@ def _offset_input(w, level, rng, p):
 
 
 def _drift_params(level, target):
-    return dict(rate=[float(level), 0.0, 0.0], walk=False, seed=0, target=target)
+    return dict(rate=[float(level), 0.0, 0.0], walk=False, seed=0, age=0, target=target)
 
 
 def _drift(w, level, rng, p):
     """Дрейф температуры со скоростью ``level`` в сутки той же функцией, что в обучении.
 
-    История нарастает от нуля до текущего смещения, на горизонте цель смещается дальше с
-    той же скоростью.
+    Прибор откалиброван в первом часе истории: смещение на истории нарастает от нуля до
+    текущего. На горизонте цель смещается по тому же правилу, что в обучении: при
+    длинной истории дальше с той же скоростью, при короткой - на уровне последнего часа
+    истории.
     """
     apply_one(w, "drift", _drift_params(level, True))
 
