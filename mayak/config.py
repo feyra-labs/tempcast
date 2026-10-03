@@ -142,7 +142,7 @@ DEFAULT_MODE_GROUPS = (
     ModeGroup(PERSISTENT_GROUP, (2000.0,), (0.0,), (720.0, 8760.0)),
 )
 
-ENCODER_CHANNELS = ("aT", "adef", "dP3", "dP24", "rh", "sin_d", "cos_d", "czp",
+ENCODER_CHANNELS = ("aT", "aTc", "adef", "dP3", "dP24", "rh", "sin_d", "cos_d", "czp",
                     "sin_y", "cos_y", "vt", "vp", "vr")
 SOLAR_CHANNELS = ("sin_d", "cos_d", "czp")
 N_SOLAR_HEAD = 3
@@ -207,7 +207,8 @@ class ModelConfig:
         quantiles: уровни квантилей по возрастанию, среди них медиана.
         mode_groups: группы затухающих мод. Группа с именем ``P`` - квазипостоянная:
             её мода не колеблется и затухает медленнее всех, через неё идёт устойчивое
-            смещение станции. В среднюю массу свидетельств голов она не входит.
+            смещение станции в градусах. В среднюю массу свидетельств голов она не
+            входит.
         tau_bounds: общие пределы постоянных времени мод, ч; группа может задать свои.
         passport_dim: размер паспорта станции.
         passport_hidden: ширина скрытого слоя кодировщика паспорта.
@@ -337,6 +338,19 @@ class ModelConfig:
                      for _ in range(g.size))
 
     @property
+    def persistent_modes(self):
+        """Моды квазипостоянной группы.
+
+        Их вклад в медиану переводится в градусы постоянным масштабом, а не
+        климатологическим разбросом точки: через них идёт устойчивое смещение станции.
+
+        Returns:
+            Кортеж флагов по модам в порядке мод модели.
+        """
+        return tuple(g.name == PERSISTENT_GROUP for g in self.effective_mode_groups
+                     for _ in range(g.size))
+
+    @property
     def evidence_modes(self):
         """Моды, по которым головы считают среднюю массу свидетельств.
 
@@ -347,8 +361,7 @@ class ModelConfig:
         Returns:
             Кортеж флагов по модам в порядке мод модели.
         """
-        return tuple(g.name != PERSISTENT_GROUP for g in self.effective_mode_groups
-                     for _ in range(g.size))
+        return tuple(not f for f in self.persistent_modes)
 
     @property
     def n_modes(self):

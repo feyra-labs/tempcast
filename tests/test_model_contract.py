@@ -10,7 +10,7 @@ from mayak.constants import L_MAX, QUANTILES, H
 from mayak.data.climatology import Climatology
 from mayak.data.dataset import footprint, history_len, slice_history, slice_target
 from mayak.data.qc import PHYS
-from mayak.model import MAYAK
+from mayak.model import MAYAK, P_MODE_SCALE
 from mayak.timeaxis import doy_hour, from_utc_hour, to_utc_hour, window_calendar
 
 NQ = len(QUANTILES)
@@ -139,6 +139,48 @@ def test_empty_history_gives_zero_anomaly_and_field_median():
         assert torch.equal(out[key], torch.zeros_like(out[key])), key
     assert torch.equal(out["mu"], mu_c)
     assert torch.equal(out["q"][..., I_MEDIAN], mu_c)
+
+
+def test_station_offset_in_degrees_does_not_depend_on_passport_or_hour():
+    """Смещение через квазипостоянную моду - одни и те же градусы на любом часе и паспорте.
+
+    Мод погоды нет, свидетельств о погоде нет, поэтому поправка голов равна нулю.
+    Разность медианы и среднего поля, делённая на затухание моды по лиду, обязана быть
+    одним числом на всех лидах, в окнах с разным часом суток и с разными паспортами.
+    Затухание само зависит от паспорта: он подстраивает постоянную времени моды.
+    """
+    model = _shaken_model()
+    cfg = model.cfg
+    p = torch.tensor(cfg.persistent_modes)
+    assert p.sum() == 1, "тест рассчитан на одну квазипостоянную моду"
+    B = 2
+    lat, lon, elev = torch.full((B,), 48.0), torch.full((B,), 11.0), torch.full((B,), 500.0)
+    h = torch.arange(1, H + 1, dtype=torch.float32)
+    start = torch.tensor([[2000.0], [4100.0 + 7.0]])
+    hoy = start + h[None]
+    astro_f = astro_features(hoy / 24.0, hoy % 24.0, lat[:, None], lon[:, None])
+    z = 1.5 * torch.randn(B, cfg.passport_dim, generator=torch.Generator().manual_seed(5))
+    a_re = torch.where(p, torch.tensor(0.7), torch.tensor(0.0)).expand(B, -1)
+    a_im = torch.where(p, torch.tensor(-0.3), torch.tensor(0.0)).expand(B, -1)
+    e = torch.where(p, torch.tensor(50.0), torch.tensor(0.0)).expand(B, -1)
+    with torch.no_grad():
+        loc = model.loc(lat, lon, elev)
+        coefs = model.field.coefficients(loc)
+        out = model.issue(loc, z, coefs, a_re, a_im, e, astro_f)
+        mu_c, sigma_0, _ = model.field.evaluate(coefs, astro_f)
+        tau, omega, _ = model.readout.constants()
+        tau_s, _ = model.propagator.site_constants(z, tau, omega)
+    sigma_z = out["sigma_c"]
+    assert (sigma_0.amax(-1) - sigma_0.amin(-1)).min() > 1e-3, "тест вырожден: σ без хода"
+    assert (sigma_z[0] - sigma_z[1]).abs().max() > 1e-3, "тест вырожден: паспорт не влияет"
+    assert not torch.allclose(tau_s[0, p], tau_s[1, p]), "тест вырожден: τ моды одна"
+
+    assert torch.equal(out["r"], torch.zeros_like(out["r"]))
+    level = (out["mu"] - mu_c) / torch.exp(-h[None] / tau_s[:, p])
+    w = model.propagator
+    expect = P_MODE_SCALE * float((w.w_re[p] * 0.7 - w.w_im[p] * 0.3).sum().detach())
+    assert abs(expect) > 0.1, "тест вырожден: вклад моды почти нулевой"
+    torch.testing.assert_close(level, torch.full_like(level, expect), rtol=1e-5, atol=1e-5)
 
 
 W_YEAR, W_DAY = 2 * np.pi / 365.24, 2 * np.pi / 24.0

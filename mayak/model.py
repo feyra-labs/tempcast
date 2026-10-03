@@ -14,13 +14,21 @@ from mayak.modules.heads import Heads
 from mayak.loss import mayak_regularizers
 
 DAY_LAG = 24
+ATC_SCALE = 5.0
+ATC_CLAMP = 8.0
+P_MODE_SCALE = 3.0
 
 
 class MAYAK(nn.Module):
     """МАЯК: климат-поле плюс аномалия из затухающих мод и поправка.
 
-    Аномалия и поправка измеряются в единицах климатологического разброса точки и
-    переводятся в градусы умножением на него. Формула - в описании модели.
+    Аномалия мод погоды и поправка измеряются в единицах климатологического разброса
+    точки без паспорта - того же, что нормирует историю, - и переводятся в градусы
+    умножением на него. Вклад квазипостоянных мод переводится в градусы постоянным
+    масштабом ``P_MODE_SCALE``: устойчивое смещение станции на выходе одно и то же на
+    всех часах суток и не зависит от паспорта. Паспорт задаёт ширину интервала через
+    разброс поля с паспортом и подстраивает постоянные времени мод. Формула - в описании
+    модели.
 
     Вся архитектура задаётся конфигом модели: размеры, группы мод, квантили, флаги
     абляций. Производные размерности - каналы энкодера, вход голов, число групп -
@@ -52,11 +60,24 @@ class MAYAK(nn.Module):
         self.readout = LaplaceReadout(cfg.encoder_width, cfg.effective_mode_groups,
                                       cfg.mode_tau_bounds, compression=not abl.no_compression)
         self.propagator = ModalPropagator(cfg.n_modes, cfg.passport_dim, cfg.group_sizes,
-                                          cfg.horizon, cfg.mode_tau_bounds)
+                                          cfg.horizon, cfg.mode_tau_bounds,
+                                          cfg.persistent_modes)
         self.heads = Heads(cfg.passport_dim, cfg.n_groups, cfg.n_solar_head, cfg.quantiles,
                            cfg.heads_hidden, cfg.heads_z_proj, cfg.evidence_modes)
         assert self.heads.in_dim == cfg.heads_in_dim
         self._ch_index = {n: i for i, n in enumerate(cfg.channel_names)}
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        key = prefix + "encoder.stem.weight"
+        n_ch = self.encoder.stem.weight.shape[1]
+        if key in state_dict and state_dict[key].shape[1] != n_ch:
+            raise RuntimeError(
+                f"{key}: в чекпойнте энкодер на {state_dict[key].shape[1]} входных каналов, у "
+                f"модели {n_ch}. Веса обучены, когда смещение станции хранилось в единицах "
+                f"климатологического разброса и переводилось в градусы разбросом поля с "
+                f"паспортом, а канала аномалии в градусах у энкодера не было; модель нужно "
+                f"переобучить.")
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
 
     def regularization(self, out):
         return mayak_regularizers(out)
@@ -103,8 +124,10 @@ class MAYAK(nn.Module):
         """Входные каналы энкодера в порядке имён каналов конфига.
 
         Каналы, не зависящие от поля, берутся из общего построителя признаков. Здесь
-        добавляются только аномалии температуры и дефицита точки росы относительно поля,
-        в единицах климатологического разброса.
+        добавляются только аномалии относительно поля: температуры и дефицита точки росы в
+        единицах климатологического разброса и температуры в фиксированной нормировке
+        ``ATC_SCALE``. В последнем канале постоянное смещение прибора постоянно и не
+        промодулировано суточным ходом разброса.
 
         Args:
             x: наблюдения, форма (B, L, 3).
@@ -121,8 +144,9 @@ class MAYAK(nn.Module):
         shared = history_channels(x, mask, astro_h)
         vt, vr = shared["vt"], shared["vr"]
         aT = ((x[..., 0] - mu_c) / sigma_c).clamp(-8, 8) * vt
+        aTc = ((x[..., 0] - mu_c) / ATC_SCALE).clamp(-ATC_CLAMP, ATC_CLAMP) * vt
         adef = ((dewpoint_deficit(x, mask) - defc) / sigma_c).clamp(-8, 8) * vt * vr
-        all_ch = dict(shared, aT=aT, adef=adef)
+        all_ch = dict(shared, aT=aT, aTc=aTc, adef=adef)
         ch = torch.stack([all_ch[n] for n in self.cfg.channel_names], dim=1)
         return ch, aT, vt
 
@@ -156,28 +180,38 @@ class MAYAK(nn.Module):
         fut = future_channels(astro_f)
         return torch.stack([fut[n] for n in SOLAR_CHANNELS], dim=-1)
 
-    def issue(self, loc, z, a_re, a_im, e, astro_f):
+    def issue(self, loc, z, coefs, a_re, a_im, e, astro_f):
         """Выпуск прогноза из состояния мод и паспорта; общий для пакета и потока.
+
+        Поле на часах горизонта считается дважды: без паспорта - его разброс переводит
+        аномалию мод погоды и поправку в градусы, как при нормировке истории, - и с
+        паспортом - его разброс задаёт ширину интервала. Среднее у обоих одно.
 
         Args:
             loc: признаки точки, форма (B, loc_dim).
             z: паспорт станции, форма (B, dz).
+            coefs: коэффициенты климат-поля точки без паспорта, те же, что нормировали
+                историю.
             a_re: действительные амплитуды мод, форма (B, M).
             a_im: мнимые амплитуды мод, форма (B, M).
             e: масса свидетельств по модам, форма (B, M).
             astro_f: солнечно-календарные признаки часов горизонта.
 
         Returns:
-            Словарь: квантили (B, H, число квантилей), медиана, климатологический
-            разброс, аномалия из мод, поправка, масштаб интервала и энергии групп мод.
+            Словарь: квантили (B, H, число квантилей), медиана, среднее поля ``mu_c``,
+            разброс поля с паспортом ``sigma_c`` и без него ``sigma_0``, аномалия мод
+            погоды ``o``, вклад квазипостоянных мод ``o_p``, поправка, масштаб
+            интервала и энергии групп мод.
         """
-        mu_c, sigma_c, _ = self.field.evaluate(self.field.coefficients(loc, z), astro_f)
+        mu_c, sigma_0, _ = self.field.evaluate(coefs, astro_f)
+        _, sigma_z, _ = self.field.evaluate(self.field.coefficients(loc, z), astro_f)
         tau, omega, _ = self.readout.constants()
-        o, Eg = self.propagator(a_re, a_im, z, tau, omega)
-        r, ratio, off = self.heads(o, Eg, self.solar_future(astro_f), torch.log(sigma_c), z, e)
-        mu = mu_c + sigma_c * (o + r)
-        q = mu[..., None] + (sigma_c * ratio)[..., None] * off
-        return dict(q=q, mu=mu, sigma_c=sigma_c, o=o, r=r, ratio=ratio, Eg=Eg)
+        o, o_p, Eg = self.propagator(a_re, a_im, z, tau, omega)
+        r, ratio, off = self.heads(o, Eg, self.solar_future(astro_f), torch.log(sigma_z), z, e)
+        mu = mu_c + P_MODE_SCALE * o_p + sigma_0 * (o + r)
+        q = mu[..., None] + (sigma_z * ratio)[..., None] * off
+        return dict(q=q, mu=mu, mu_c=mu_c, sigma_c=sigma_z, sigma_0=sigma_0, o=o, o_p=o_p,
+                    r=r, ratio=ratio, Eg=Eg)
 
     @staticmethod
     def daily_summaries(aT, adP24, vt, vp24):
@@ -288,7 +322,7 @@ class MAYAK(nn.Module):
             d_re, d_im, d_e = self.readout.accumulate(edge["u"], edge["v"], lag0)
             n_re, n_im, e = n_re + d_re, n_im + d_im, e + d_e
         a_re, a_im = self.readout.normalize(n_re, n_im, e)
-        out = self.issue(loc, z, a_re, a_im, e, astro_f)
+        out = self.issue(loc, z, coefs, a_re, a_im, e, astro_f)
         out.update(z=z, e=e)
         return out
 
@@ -302,7 +336,8 @@ class MAYAK(nn.Module):
         astro_f = astro_features(batch["doy_fut"], batch["hour_fut"],
                                  lat[:, None], lon[:, None])
 
-        mu0, sg0, df0 = self.field.evaluate(self.field.coefficients(loc), astro_h)
+        coefs = self.field.coefficients(loc)
+        mu0, sg0, df0 = self.field.evaluate(coefs, astro_h)
         ch, aT, vt = self.build_channels(x, mask, astro_h, mu0, sg0, df0)
 
         summ, day_mask = self.daily_summaries(aT, self.channel(ch, "dP24"), vt,
@@ -312,6 +347,6 @@ class MAYAK(nn.Module):
         feats = self.encoder(ch)
         a_re, a_im, e = self.readout(feats, vt)
 
-        out = self.issue(loc, z, a_re, a_im, e, astro_f)
+        out = self.issue(loc, z, coefs, a_re, a_im, e, astro_f)
         out.update(a_re=a_re, a_im=a_im, e=e, kl=kl, z=z)
         return out

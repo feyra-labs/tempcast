@@ -150,7 +150,7 @@ class SynopticEncoder(nn.Module):
         norm_groups: число групп канальной нормализации.
     """
 
-    def __init__(self, n_ch=13, width=48, dilations=(1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 32, 32),
+    def __init__(self, n_ch=14, width=48, dilations=(1, 1, 2, 2, 4, 4, 8, 8, 16, 16, 32, 32),
                  kernel=3, norm_groups=4):
         super().__init__()
         self.width = width

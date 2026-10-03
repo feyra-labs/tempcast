@@ -11,6 +11,8 @@
   качества; простой заполняется пустыми часами, долгий простой - холодный старт;
 * состояние - только сырое окно без потерь на сетке записи, повреждённое отвергается.
 """
+import copy
+
 import numpy as np
 import pytest
 import torch
@@ -218,25 +220,28 @@ def test_forward_with_buffer_matches_prefill(model, n):
 def _history(model, x, m, t0):
     from mayak.astro import astro_features
     from mayak.timeaxis import window_calendar
+    dt = next(model.parameters()).dtype
+    t = lambda a: torch.as_tensor(a, dtype=dt)
     doy, hour = window_calendar(t0, np.arange(len(x)))
-    astro = astro_features(torch.from_numpy(doy)[None], torch.from_numpy(hour)[None],
-                           torch.tensor([[LAT]]), torch.tensor([[LON]]))
-    loc = model.loc(torch.tensor([LAT]), torch.tensor([LON]), torch.tensor([ELEV]))
+    astro = astro_features(t(doy)[None], t(hour)[None], t([[LAT]]), t([[LON]]))
+    loc = model.loc(t([LAT]), t([LON]), t([ELEV]))
     with torch.no_grad():
-        return model.history_pass(torch.from_numpy(x)[None], torch.from_numpy(m)[None], astro,
-                                  model.field.coefficients(loc))
+        return model.history_pass(t(x)[None], t(m)[None], astro, model.field.coefficients(loc))
 
 
 def test_edge_features_depend_on_window_start_tail_features_do_not(model):
     """Почему край пересчитывается при выпуске.
 
     У пакета признаки ранних часов окна зависят от того, что было до окна, у поздних - нет.
+    Считается во float64: вклад самого старого часа рецептивного поля в последний час края
+    проходит через крайние отводы всех слоёв и бывает меньше разрешения float32.
     """
     cfg = model.cfg
+    m64 = copy.deepcopy(model).double()
     s = synthetic_series(L_MAX + 200, seed=21, p_valid=1.0)
     x, m = s["x"], s["m"]
-    long = _history(model, x, m, s["t0"])["u"][0, 200:]
-    win = _history(model, x[200:], m[200:], s["t0"] + 200)["u"][0]
+    long = _history(m64, x, m, s["t0"])["u"][0, 200:]
+    win = _history(m64, x[200:], m[200:], s["t0"] + 200)["u"][0]
     E = cfg.stream_edge
     tail_err = float((long[E:] - win[E:]).abs().max())
     edge_err = float((long[:E] - win[:E]).abs().max())

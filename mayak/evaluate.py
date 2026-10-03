@@ -141,10 +141,10 @@ def gather(model, dataset, device="cpu", batch_size=128):
 
 @torch.no_grad()
 def _gather_full(model, ds, device="cpu", batch_size=128):
-    """Как gather, но дополнительно тащит o, r, e, sigma_c (нужны для L=0-проверки)."""
+    """Как gather, но дополнительно тащит o, o_p, r, e и mu_c (нужны для L=0-проверки)."""
     model.eval().to(device)
     dl = DataLoader(ds, batch_size=batch_size)
-    keys = ["mu", "q", "o", "r", "e", "sigma_c"]
+    keys = ["mu", "q", "o", "o_p", "r", "e", "mu_c"]
     acc = {k: [] for k in keys}
     acc["y"] = []
     acc["y_mask"] = []
@@ -1038,13 +1038,13 @@ def coldstart_L0_check(model, ds):
         Словарь чисел проверки.
     """
     D = _gather_full(model, ds)
-    o_abs = float(np.abs(D["o"]).mean())
+    o_abs = float(np.abs(D["o"]).mean() + np.abs(D["o_p"]).mean())
     e_mean = float(np.abs(D["e"]).mean())
-    dev = np.abs(D["sigma_c"] * (D["o"] + D["r"]))
+    dev = np.abs(D["mu"] - D["mu_c"])
     p_before = coverage90(D["y"], D["q"], D["y_mask"])
     diff_clim = float(np.abs(D["mu"] - D["mu_clim"]).mean())
 
-    print(f"  средний модуль аномалии мод = {o_abs:.3f} в долях масштаба (ожидается около 0)")
+    print(f"  средний модуль вклада мод = {o_abs:.3f} (ожидается около 0)")
     print(f"  средняя масса свидетельств = {e_mean:.3f} (ожидается около 0)")
     print(f"  |медиана − поле модели| = {dev.mean():.3f} °C  (макс {dev.max():.2f})")
     print(f"  |медиана − эмпирич. климатология| = {diff_clim:.3f} °C  "
@@ -1132,20 +1132,22 @@ def l0_decompose(model, clims, manifest="data/manifest.csv", station_split="trai
     ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest, time_key=time_key, L=0)
     model.eval()
     Z = []
-    sr = oo = ee = 0.0
+    sr = oo = op = ee = 0.0
     n = 0
     for b in DataLoader(ds, batch_size=128):
         out = model(b)
         Z.append(out["z"])
-        sr += float((out["sigma_c"] * out["r"]).abs().sum())
+        sr += float((out["sigma_0"] * out["r"]).abs().sum())
         oo += float(out["o"].abs().sum())
+        op += float(out["o_p"].abs().sum())
         ee += float(out["e"].abs().sum())
         n += out["mu"].numel()
     Z = torch.cat(Z, 0)
     print(f"[{station_split}] std(z) по станциям = {float(Z.std(0).mean()):.3f}  "
           f"(≈0 → прайор глобальный; >0 → прайор зависит от loc = меморизатор)")
-    print(f"        |σ·r| = {sr / n:.3f}°C  (≈0 → r заглушён; >0 → r ещё активен и фитит)")
-    print(f"        |o| = {oo / n:.3f}   e = {ee / Z.numel() * Z.shape[1]:.3f}  (ждём ≈0 при L=0)")
+    print(f"        |σ₀·r| = {sr / n:.3f}°C  (≈0 → r заглушён; >0 → r ещё активен и фитит)")
+    print(f"        |o| = {oo / n:.3f}   |o_P| = {op / n:.3f}   "
+          f"e = {ee / Z.numel() * Z.shape[1]:.3f}  (ждём ≈0 при L=0)")
 
 
 def compare_ablation(model_full, model_ablated, clims, manifest="data/manifest.csv", lead=24):
