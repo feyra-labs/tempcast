@@ -47,7 +47,7 @@ Runtime: один бинарник, фиксированная память, с�
 
 ## Установка
 
-Нужны Python 3.10+, [uv](https://docs.astral.sh/uv/) и, для рантайма, Rust 1.88+.
+Нужны Python 3.11+, [uv](https://docs.astral.sh/uv/) и, для рантайма, Rust 1.88+.
 
 ```bash
 git clone https://github.com/feyra-labs/tempcast.git
@@ -511,8 +511,8 @@ uv run python scripts/export_runtime.py --ckpt runs/mayak/stageB/best.ckpt --int
     --conformal runs/conformal_int8.npy --aci --out runtime/model
 ```
 
-**2. Сборка бинарника.** Для Linux x86_64 и aarch64 ONNX Runtime скачивается при сборке и
-вшивается в бинарник. Это любая 64-битная ОС, в том числе Raspberry Pi 3/4/5 с 64-битной
+**2. Сборка бинарника.** Для Linux x86_64 и aarch64 ONNX Runtime 1.28 скачивается при сборке
+и вшивается в бинарник. Это любая 64-битная ОС, в том числе Raspberry Pi 3/4/5 с 64-битной
 Raspberry Pi OS.
 
 ```bash
@@ -530,7 +530,7 @@ CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 ```
 
 Для других платформ (например, 32-битной armv7) готовой сборки ONNX Runtime нет. Нужна своя
-`libonnxruntime.so` версии 1.24 или новее, собранная по
+`libonnxruntime.so` версии 1.28 или новее, собранная по
 [инструкции ONNX Runtime](https://onnxruntime.ai/docs/build/inferencing.html), и сборка с
 загрузкой библиотеки при старте:
 

@@ -507,7 +507,12 @@ q_k(t+h) = T(t+h) + σ_z(h) · ratio(h) · off_k(h)
 - **Квантизация int8.** B. Jacob, S. Kligys, B. Chen et al. *Quantization and Training of
   Neural Networks for Efficient Integer-Arithmetic-Only Inference*. CVPR 2018.
   arXiv:1712.05877. Отличие: динамическая квантизация весов после обучения средствами ONNX
-  Runtime, без обучения с квантизацией.
+  Runtime, без обучения с квантизацией. Веса и активации беззнаковые, целочисленное
+  умножение должно быть точным, и тогда int8-графы совпадают на любом процессоре. Это
+  верно не для всех версий ONNX Runtime: в 1.24 на x86 с VNNI/AMX `MatMulInteger` u8×u8 с
+  сотнями строк (проекция энкодера в графах `window` и `issue`) ошибается в части
+  элементов, в 1.28 и 1.30 результат точен. Поэтому версия ONNX Runtime в обоих рантаймах
+  одна — 1.28: в `pyproject.toml` и в сборке `ort` для Rust.
 
 ## Оценка
 
