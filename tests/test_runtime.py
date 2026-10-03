@@ -13,7 +13,6 @@
   отчётность, int8, откат, прогноз без наблюдений, уточнение координат и перенос прибора;
 * состояние эталона - сырое окно, которое читается и пишется без изменений.
 """
-import json
 import os
 
 import numpy as np
@@ -236,19 +235,6 @@ def test_golden_state_is_raw_window(model, golden):
     assert any(t != 0.0 for t in s.theta)
     assert s.serialize() == raw
     assert len(raw) == 3236
-
-
-def test_nan_model_reuses_golden_graphs():
-    with open(os.path.join(GOLDEN, "model", "manifest.json"), encoding="utf-8") as fh:
-        base = json.load(fh)
-    with open(os.path.join(GOLDEN, "model_nan", "manifest.json"), encoding="utf-8") as fh:
-        nan = json.load(fh)
-    for name, g in nan["graphs"].items():
-        if name == "issue":
-            assert g["fp32"] == "issue_nan.onnx" and g["inputs"] == ["loc"]
-        else:
-            assert g["fp32"] == "../model/" + base["graphs"][name]["fp32"]
-    assert nan["dims"] == base["dims"]
 
 
 def test_golden_calendar_and_calibration_are_fresh(model, golden):

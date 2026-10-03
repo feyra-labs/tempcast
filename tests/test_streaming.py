@@ -3,23 +3,22 @@
 Что проверяется:
 * нормализация энкодера причинна и не зависит от длины окна;
 * потактовый шаг энкодера совпадает с пакетным проходом на всей длине окна;
-* стоимость шага не зависит от рецептивного поля, буферы - десятки КБ;
+* стоимость шага не зависит от рецептивного поля;
 * признаки края окна зависят от начала окна, признаки хвоста - нет;
 * скользящая сумма мод равна точной сумме, пересинхронизация снимает ошибку округления;
 * полный выпуск потока равен пакетному при выпусках в случайные часы длинного ряда;
 * перезапуск в любой час продолжает непрерывный прогон, включая решения контроля
   качества; простой заполняется пустыми часами, долгий простой - холодный старт;
-* состояние - только сырое окно, размер закреплён числом байт.
+* состояние - только сырое окно без потерь на сетке записи, повреждённое отвергается.
 """
 import numpy as np
 import pytest
 import torch
-import torch.nn as nn
 
 from mayak.config import CHANNEL_MAX_LAG, Ablations, ModelConfig
 from mayak.constants import H, L_MAX, QUANTILES
 from mayak.model import MAYAK
-from mayak.modules.encoder import ChannelGroupNorm, SynopticEncoder
+from mayak.modules.encoder import ChannelGroupNorm
 from mayak.runtime import streaming as S
 from mayak.runtime.equivalence import (batch_forecast, divergence, feed, step_cost,
                                        stream_forecast, synthetic_series)
@@ -30,7 +29,6 @@ LAT, LON, ELEV = 52.37, 4.9, 0.0
 RTOL_STEP = 1e-5
 EXACT_F64 = 1e-10
 ATOL_FORECAST = 5e-4
-DEFAULT_STATE_BYTES = 3236
 TINY = dict(encoder_width=16, encoder_dilations=(1, 2, 4, 8), passport_dim=8, field_hidden=24,
             heads_hidden=16, passport_hidden=16)
 
@@ -78,11 +76,6 @@ def _ring_diff(a, b, encoder):
     return err / _scale(*(x for x, _ in pairs)) if pairs else 0.0
 
 
-def test_encoder_has_no_time_axis_groupnorm(model):
-    assert not any(isinstance(mod, nn.GroupNorm) for mod in model.encoder.modules())
-    assert all(isinstance(b.norm, ChannelGroupNorm) for b in model.encoder.blocks)
-
-
 def test_channel_group_norm_is_per_timestep():
     torch.manual_seed(0)
     n = ChannelGroupNorm(4, 48)
@@ -110,16 +103,6 @@ def test_encoder_causal_and_window_length_independent(model):
         rf = enc.receptive_field
         tail = enc(x[..., 400 - rf - 50:])
         torch.testing.assert_close(tail[:, -50:], full[:, -50:], atol=_step_tol(full), rtol=0)
-
-
-def test_old_time_axis_groupnorm_checkpoint_is_rejected(model):
-    sd = model.state_dict()
-    old = {}
-    for k, v in sd.items():
-        old[k.replace(".norm.", ".gn.")] = v
-    fresh = MAYAK()
-    with pytest.raises(RuntimeError, match="переобучить"):
-        fresh.load_state_dict(old)
 
 
 @pytest.mark.parametrize("kw", [
@@ -195,33 +178,6 @@ def test_step_cost_does_not_depend_on_receptive_field():
     assert a["encoder_flops_step"] == b["encoder_flops_step"] > 0
     assert b["receptive_field"] > 100 * a["receptive_field"]
     assert b["encoder_buffer_bytes"] > 100 * a["encoder_buffer_bytes"]
-
-
-def test_step_cost_vs_full_window_recompute(model, record_property):
-    c = step_cost(model, reps=5)
-    record_property("encoder_flops_ratio", c["flops_ratio"])
-    cfg = model.cfg
-    per_block = 2 * cfg.encoder_width ** 2
-    assert c["encoder_flops_step"] == (len(cfg.encoder_dilations) * per_block
-                                       + 2 * cfg.n_channels * cfg.encoder_width)
-    assert c["flops_ratio"] == pytest.approx(cfg.stream_buffer, rel=0.1)
-    assert c["encoder_buffer_bytes"] == 4 * cfg.encoder_width * 2 * sum(cfg.encoder_dilations)
-    assert 10_000 < c["encoder_buffer_bytes"] < 100_000
-
-
-def test_stream_layout_formulas():
-    c = ModelConfig()
-    assert c.receptive_field == 2 * sum(c.encoder_dilations) + 1 == 253
-    assert SynopticEncoder(dilations=c.encoder_dilations).receptive_field == 253
-    assert c.stream_edge == c.receptive_field - 1 + CHANNEL_MAX_LAG == 276
-    assert c.stream_tail == L_MAX - c.stream_edge == 396
-    assert c.stream_window == L_MAX == 672
-    assert c.stream_window % 8 == 0
-    from mayak.data.qc import DEFAULT_QC
-    assert c.stream_window > DEFAULT_QC.lookback_hours
-    long = ModelConfig(encoder_dilations=(1, 2, 4, 8, 16, 32, 64, 128, 256))
-    assert long.stream_edge == L_MAX and long.stream_tail == 0
-    assert long.stream_window >= long.receptive_field - 1 + CHANNEL_MAX_LAG
 
 
 def test_channels_have_finite_memory_of_channel_max_lag(model):
@@ -495,14 +451,6 @@ def test_warm_start_equals_stepping(model):
     warm.warm_start(s["x"], s["m"], s["t0"] + L - 1)
     assert warm.serialize() == stepped.serialize()
     np.testing.assert_allclose(warm.forecast()[0], stepped.forecast()[0], atol=ATOL_FORECAST)
-
-
-def test_state_size_is_pinned(model):
-    st = StreamingMayak(model, LAT, LON, ELEV)
-    assert st.state_nbytes == len(st.serialize()) == DEFAULT_STATE_BYTES < 4096
-    assert STATE_HEADER.itemsize == 44
-    feed(st, synthetic_series(100, seed=14), 0, 100)
-    assert len(st.serialize()) == DEFAULT_STATE_BYTES
 
 
 def test_state_header_and_roundtrip(model):

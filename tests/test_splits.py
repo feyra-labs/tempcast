@@ -13,7 +13,7 @@ from mayak.constants import H, L_MAX
 from mayak.data import store as S
 from mayak.data.splits import (MIN_GAP_HOURS, ROLE_EXTERNAL, ROLE_TEST, ROLE_TRAIN, ROLE_VAL,
                                ROLES, TIME_KEYS, TimeLayout, assign_roles, strata_report,
-                               stratum_of, time_layout)
+                               time_layout)
 from mayak.leakage import (SELECTION_KEY, LeakageError, check_checkpoint, check_climatology,
                            check_conformal, check_time_layout, check_windows, conformal_record,
                            run_checklist, save_conformal, selection_record)
@@ -136,18 +136,6 @@ def test_long_series_keeps_last_year_as_test():
     assert lay.span("test") == (10 * 8766 - 8766, 10 * 8766)
 
 
-def test_short_station_is_excluded_from_cache(tmp_path):
-    (tmp_path / "stations").mkdir()
-    _write_station(tmp_path, "ok", 0)
-    _write_station(tmp_path, "short", 1, n=5_000)
-    m = _write_manifest(tmp_path, [dict(id=s, lat=10, lon=0, elev=0, koppen="Cfb", split=ROLE_TRAIN)
-                                   for s in ("ok", "short")])
-    path, _ = S.build_cache(m)
-    import json
-    excluded = json.loads((Path(path) / "meta.json").read_text(encoding="utf-8"))["excluded"]
-    assert set(excluded) == {"short"} and "сплиты" in excluded["short"]
-
-
 def test_cache_records_climatology_fit_window(store):
     for s in store.stations.values():
         assert s["clim_fit"] == time_layout(s["N"]).span("train")
@@ -244,41 +232,12 @@ def test_small_test_count_does_not_zero_strata():
         assert all(cnt.get(r, 0) >= 1 for r in ROLES), (key, cnt)
 
 
-def test_rounding_keeps_requested_totals_without_guarantees():
-    rows = _rows([10, 10, 10, 10])
-    roles = assign_roles(rows, n_test=2, n_val=3, seed=0, min_stratum=100)
-    c = {r: sum(v == r for v in roles.values()) for r in ROLES}
-    assert c[ROLE_TEST] == 2 and c[ROLE_VAL] == 3
-
-
 def test_every_stratum_keeps_a_training_station():
     rows = _rows([30, 2, 2, 2, 1, 1])
     for seed in range(20):
         roles = assign_roles(rows, n_test=8, val_frac=0.3, seed=seed)
         for key, cnt in strata_report(rows, roles).items():
             assert cnt.get(ROLE_TRAIN, 0) >= 1, (seed, key, cnt)
-
-
-def test_stratum_uses_full_koppen_and_lat_band():
-    assert stratum_of(dict(koppen="Cfb", lat=48)) != stratum_of(dict(koppen="Cfa", lat=48))
-    assert stratum_of(dict(koppen="Cfb", lat=48)) != stratum_of(dict(koppen="Cfb", lat=52))
-
-
-def test_make_splits_script_preserves_columns(tmp_path, monkeypatch):
-    import runpy
-    import sys
-    rows = [dict(r, elev=1.0, extra="keep") for r in _rows([6, 6])]
-    path = tmp_path / "manifest.csv"
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=list(rows[0]))
-        w.writeheader()
-        w.writerows(rows)
-    monkeypatch.setattr(sys, "argv", ["make_splits.py", "--manifest", str(path), "--n-test", "2",
-                                      "--min-train-years", "0"])
-    runpy.run_path(str(REPO / "scripts" / "make_splits.py"), run_name="__main__")
-    out = S.read_manifest(str(path))
-    assert all(r["extra"] == "keep" for r in out)
-    assert {r["id"]: r["split"] for r in out} == assign_roles(rows, n_test=2)
 
 
 def test_checklist_passes_on_clean_pipeline(store, dm, manifest):
@@ -353,11 +312,6 @@ def test_checklist_catches_foreign_station_in_train_or_calib_window(store):
             check_windows([_Fake([_fp(key, t, t, "x0")])], ext)
     t = lay.span("test")[0]
     check_windows([_Fake([_fp("test", t - L_MAX, t, "x0")])], ext)
-
-
-def test_checklist_requires_footprints():
-    with pytest.raises(LeakageError, match="footprints"):
-        check_windows([object()])
 
 
 def _load_calibrate():

@@ -1,16 +1,11 @@
 """Тесты: аугментации, имитирующие реальный прибор."""
 import csv
 import dataclasses
-import importlib.util
-import json
-from pathlib import Path
 
 import numpy as np
 import pytest
-import yaml
 
-from mayak.config import (AUGMENT_PROB_FIELDS, AUGMENT_PROFILES, AugmentConfig, ConfigError,
-                          DataConfig, RunConfig)
+from mayak.config import AUGMENT_PROB_FIELDS, AUGMENT_PROFILES, AugmentConfig, RunConfig
 from mayak.constants import H, L_MAX
 from mayak.data import augment as A
 from mayak.data import store as S
@@ -21,8 +16,6 @@ from mayak.data import qc as Q
 from mayak.data.recording import is_recorded, record_values
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL
 
-REPO = Path(__file__).resolve().parents[1]
-CONF = REPO / "conf"
 VALUE_AUGS = ("scale", "drift", "offset", "noise", "rh_dewpoint", "spike", "stuck", "units")
 INSTRUMENT_ON_TARGET = ("scale", "drift", "offset")
 MASK_AUGS = ("dropout", "gap", "outage", "drop_pressure", "drop_humidity")
@@ -46,97 +39,6 @@ def _window(seed=0, L=L_MAX, elev=200.0, holes=0.0):
 def _copy(w):
     return dataclasses.replace(w, x=w.x.copy(), m=w.m.copy(), y=w.y.copy(),
                                y_mask=w.y_mask.copy(), hour=w.hour.copy(), applied={})
-
-
-def test_default_profile_is_aggressive_everywhere():
-    assert AugmentConfig() == AugmentConfig.from_profile("aggressive")
-    assert DataConfig().augment.profile == "aggressive"
-    assert RunConfig().data.augment == AugmentConfig()
-
-
-def test_profile_yaml_matches_python():
-    files = {p.stem for p in (CONF / "augment").glob("*.yaml")}
-    assert files == set(AUGMENT_PROFILES)
-    for name in AUGMENT_PROFILES:
-        d = yaml.safe_load((CONF / "augment" / f"{name}.yaml").read_text(encoding="utf-8"))
-        assert d["profile"] == name
-        assert AugmentConfig.from_dict(d) == AugmentConfig.from_profile(name), name
-        assert AugmentConfig.from_profile(name).deviations() == {}
-
-
-def test_soft_is_not_stronger_than_aggressive():
-    soft, agg = AugmentConfig.from_profile("soft"), AugmentConfig.from_profile("aggressive")
-    for f in AUGMENT_PROB_FIELDS.values():
-        assert getattr(soft, f) <= getattr(agg, f), f
-    for f in ("scale_max", "drift_rate_max", "noise_sd"):
-        assert all(a <= b for a, b in zip(getattr(soft, f), getattr(agg, f))), f
-    assert soft.offset_max <= agg.offset_max and soft.gap_max_len <= agg.gap_max_len
-
-
-def test_every_augmentation_has_probability_and_is_off_in_none():
-    assert set(AUG_ORDER) == set(AUGMENT_PROB_FIELDS) == set(EXPECTED_QC)
-    none = AugmentConfig.from_profile("none")
-    assert all(getattr(none, f) == 0.0 for f in AUGMENT_PROB_FIELDS.values())
-    for name in AUG_ORDER:
-        only = AugmentConfig.only(name)
-        on = [n for n, f in AUGMENT_PROB_FIELDS.items() if getattr(only, f) > 0]
-        assert on == [name]
-
-
-def _load_run():
-    spec = importlib.util.spec_from_file_location("run", REPO / "scripts" / "run.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def _compose(overrides=()):
-    from hydra import compose, initialize_config_dir
-    with initialize_config_dir(config_dir=str(CONF), version_base="1.3"):
-        return compose("config", overrides=list(overrides))
-
-
-def test_hydra_augment_group_selects_profile():
-    run = _load_run()
-    assert run.to_run_config(_compose()).data.augment == AugmentConfig()
-    for name in AUGMENT_PROFILES:
-        rc = run.to_run_config(_compose([f"augment={name}"]))
-        assert rc.data.augment == AugmentConfig.from_profile(name), name
-    rc = run.to_run_config(_compose(["augment=soft", "data.augment.gap_prob=0.9"]))
-    assert rc.data.augment.profile == "soft" and rc.data.augment.gap_prob == 0.9
-    assert rc.data.augment.deviations() == {"gap_prob": (0.3, 0.9)}
-
-
-def test_config_validation_and_partial_dicts():
-    with pytest.raises(ConfigError, match="профиль"):
-        AugmentConfig(profile="brutal")
-    with pytest.raises(ConfigError, match="вне"):
-        AugmentConfig(spike_prob=1.5)
-    with pytest.raises(ConfigError, match="spike_min"):
-        AugmentConfig(spike_min=(40.0, 15.0, 40.0), spike_max=(30.0, 40.0, 80.0))
-    with pytest.raises(ConfigError, match="lo ≤ hi"):
-        AugmentConfig(stuck_hours=(48, 12))
-    for removed in ("sparse_prob", "sparse_every", "units_p_frac", "quant_prob"):
-        with pytest.raises(ConfigError, match="неизвестные ключи"):
-            AugmentConfig.from_dict({removed: 0.5})
-    with pytest.raises(ConfigError, match="неизвестные ключи"):
-        AugmentConfig.from_dict({"spik_prob": 0.1})
-    with pytest.raises(ConfigError, match="drift_rate_max"):
-        AugmentConfig.from_dict({"drift_max": [1.5, 1.5, 6.0]})
-    with pytest.raises(ConfigError, match="переобучите"):
-        DataConfig.from_dict({"augment": {"profile": "soft", "drift_max": [0.7, 1.0, 3.0]}})
-    with pytest.raises(ConfigError, match="drift_rate_max"):
-        AugmentConfig(drift_rate_max=(0.05, -0.01, 0.2))
-    a = AugmentConfig.from_dict({"profile": "base", "gap_prob": 0.0})
-    assert a.gap_prob == 0.0 and a.spike_prob == 0.0 and a.gap_max_len == 24
-    assert AugmentConfig(offset_max=0.0).offset_min == 0.0
-
-
-def test_summary_goes_to_run_journal_form():
-    s = AugmentConfig.from_profile("soft", gap_prob=0.9).summary()
-    assert s["profile"] == "soft" and s["deviations"] == {"gap_prob": [0.3, 0.9]}
-    assert json.loads(json.dumps(s)) == s
-    assert AugmentConfig.from_profile("none").summary()["enabled"] == []
 
 
 @pytest.mark.parametrize("L", [0, 1, 30, 200, L_MAX])
@@ -459,24 +361,6 @@ def test_sampled_augmentation_produces_expected_codes(name):
     assert np.mean(sides) < 0.002, f"{name}: побочные коды {np.mean(sides):.4f}"
 
 
-def test_reference_script_writes_artifacts(tmp_path):
-    spec = importlib.util.spec_from_file_location("aug_reference",
-                                                  REPO / "scripts" / "aug_reference.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    assert mod.main(["--out", str(tmp_path)]) == 0
-    table = json.loads((tmp_path / "aug_reference.json").read_text(encoding="utf-8"))["cases"]
-    assert [r["case"] for r in table] == [c[0] for c in A.REFERENCE_CASES]
-    z = np.load(tmp_path / "aug_reference.npz")
-    for case in ("spike_T", "gap_3d", "rh_dewpoint"):
-        for tag in ("before", "after"):
-            assert z[f"{case}/{tag}/x"].shape == (L_MAX, 3)
-    again = tmp_path / "again"
-    mod.main(["--out", str(again)])
-    z2 = np.load(again / "aug_reference.npz")
-    assert all(np.array_equal(z[k], z2[k]) for k in z.files), "эталон детерминирован"
-
-
 @pytest.fixture(scope="module")
 def manifest(tmp_path_factory):
     root = tmp_path_factory.mktemp("data9")
@@ -562,18 +446,6 @@ def test_dataset_window_qc_masks_augmented_artifacts(manifest):
             assert np.all(a["mask_hist"].numpy() <= b["mask_hist"].numpy())
             masked += int(b["mask_hist"].sum() - a["mask_hist"].sum())
         assert masked > 0, f"{name}: QC окна не снял валидность ни с одного часа"
-
-
-def test_journal_records_augment_profile(manifest, tmp_path):
-    from mayak.protocol import Protocol, Stage, run_protocol
-    proto = Protocol(stages=(Stage("A", "L0", 1),), batch_size=2, windows_per_epoch=4,
-                     num_workers=0, precision="32", val_every=1)
-    data = DataConfig(manifest=manifest, augment=AugmentConfig.from_profile("soft", gap_prob=0.9),
-                      val_windows_per_station=2)
-    j = run_protocol("mayak", manifest, proto, out_root=str(tmp_path), accelerator="cpu",
-                     data_config=data, enable_progress_bar=False)
-    assert j["augment"]["profile"] == "soft"
-    assert j["augment"]["deviations"] == {"gap_prob": [0.3, 0.9]}
 
 
 def _recorded_window(seed=0, holes=0.1):

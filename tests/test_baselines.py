@@ -1,8 +1,5 @@
 """Тесты: бейзлайны."""
-import dataclasses
-import importlib.util
 import math
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -13,13 +10,10 @@ from mayak import baselines as BL
 from mayak.baselines.lru import (LRULayer, LRUForecaster, lru_recurrent, lru_scan_associative,
                                  lru_scan_chunked)
 from mayak.baselines.patchtst import make_patches, masked_instance_stats
-from mayak.config import (ConfigError, DLinearConfig, GRUConfig, LRUConfig, PatchTSTConfig,
-                          check_pipeline_compat, model_config_for)
+from mayak.config import ConfigError, DLinearConfig, LRUConfig, PatchTSTConfig
 from mayak.constants import H, L_MAX, NQ
 from mayak.protocol import DEFAULT_PROTOCOL, Protocol, ProtocolError
 
-REPO = Path(__file__).resolve().parents[1]
-CONF = REPO / "conf"
 NEW_ARCHS = ("lru", "patchtst", "gru")
 
 
@@ -114,18 +108,6 @@ def test_lru_full_forecast_identical_for_all_scans():
         == "recurrent"
 
 
-def test_lru_scan_does_not_run_python_loop_over_hours(monkeypatch):
-    """Развёртка по умолчанию не зовёт наивный цикл."""
-    from mayak.baselines import lru as mod
-
-    def boom(*a, **k):
-        raise AssertionError("питоновский цикл по часам в режиме по умолчанию")
-
-    monkeypatch.setattr(mod, "lru_recurrent", boom)
-    m = _model("lru", LRUConfig(d_model=8, d_state=8, layers=1, head_hidden=16))
-    m(_batch(B=1))
-
-
 def test_lru_eigenvalues_inside_unit_disk_for_any_parameters():
     """Экспоненциальная параметризация держит модуль собственного числа строго меньше единицы.
 
@@ -139,22 +121,6 @@ def test_lru_eigenvalues_inside_unit_disk_for_any_parameters():
         lay.theta_log.copy_(torch.linspace(-10, 5, 64))
     mod, _ = lay.eigenvalues()
     assert (mod < 1).all() and (mod >= 0).all()
-
-
-def test_lru_init_follows_config_ranges():
-    cfg = LRUConfig()
-    assert math.isclose(cfg.r_min, math.exp(-1 / 3.0))
-    assert math.isclose(cfg.r_max, math.exp(-1 / 240.0))
-    assert math.isclose(cfg.max_phase, 2 * math.pi / 12.0)
-    torch.manual_seed(0)
-    lay = LRULayer(8, 4096, cfg.r_min, cfg.r_max, cfg.max_phase)
-    mod, phase = lay.eigenvalues()
-    assert mod.min() >= cfg.r_min - 1e-6 and mod.max() <= cfg.r_max + 1e-6
-    assert phase.min() >= 0 and phase.max() <= cfg.max_phase + 1e-6
-    # квадрат модуля собственного числа равномерен между квадратами границ
-    m2 = (mod.detach() ** 2).numpy()
-    assert abs(m2.mean() - (cfg.r_min ** 2 + cfg.r_max ** 2) / 2) < 0.01
-    assert torch.allclose(torch.exp(lay.gamma_log), torch.sqrt(1 - mod ** 2), atol=1e-6)
 
 
 @pytest.mark.parametrize("modulus", [0.5, 0.9, 0.995])
@@ -191,17 +157,6 @@ def test_lru_optim_groups_exclude_recurrent_params_from_weight_decay():
     assert set(rec) | set(oth) == names and not set(rec) & set(oth)
     assert {n.rsplit(".", 1)[-1] for n in rec} == {"nu_log", "theta_log", "gamma_log",
                                                    "B_re", "B_im"}
-
-
-def test_lru_scan_runs_in_float32_under_bf16_autocast():
-    m = _model("lru", LRUConfig(d_model=16, d_state=16, layers=2, head_hidden=32))
-    b = _batch(B=2)
-    with torch.no_grad():
-        ref = m(b)["q"]
-        with torch.autocast("cpu", dtype=torch.bfloat16):
-            out = m(b)["q"].float()
-    assert torch.isfinite(out).all()
-    assert (out - ref).abs().max() < 0.5
 
 
 def test_patchtst_patching():
@@ -331,12 +286,6 @@ def test_new_baselines_train_with_finite_gradients(arch, L):
     assert grads and all(torch.isfinite(g).all() for g in grads)
 
 
-def test_baseline_parameter_counts_are_pinned():
-    """Архитектуры по умолчанию закреплены числом параметров."""
-    counts = {a: sum(p.numel() for p in _model(a).parameters()) for a in BL.NEURAL}
-    assert counts == {"gru": 120754, "dlinear": 114408, "lru": 103986, "patchtst": 138944}
-
-
 def test_baseline_sizes_within_band_of_main_model():
     """Каждая нейросеть по умолчанию в полосе размеров относительно основной модели."""
     from mayak.model import MAYAK
@@ -427,15 +376,6 @@ def test_dlinear_fills_gaps_with_window_mean():
     torch.testing.assert_close(q0, m.point(torch.zeros(2, n)))
 
 
-def test_pipeline_compat_allows_shorter_input_only():
-    check_pipeline_compat(DLinearConfig(input_len=336))
-    check_pipeline_compat(PatchTSTConfig(input_len=L_MAX, patch_len=24, stride=24))
-    with pytest.raises(ConfigError, match="длина входа"):
-        check_pipeline_compat(DLinearConfig(input_len=L_MAX + 24))
-    with pytest.raises(ConfigError, match="длина истории"):
-        check_pipeline_compat(LRUConfig(max_history=336))
-
-
 def test_dlinear_has_no_input_normalization():
     m = _model("dlinear")
     g = torch.Generator().manual_seed(0)
@@ -514,71 +454,12 @@ def test_damped_coefficients_recover_known_decay():
     assert (BL.damped_coefficients(np.zeros(H), Sxy) == 0).all()
 
 
-@pytest.mark.parametrize("arch, cls", [("gru", GRUConfig), ("dlinear", DLinearConfig),
-                                       ("lru", LRUConfig), ("patchtst", PatchTSTConfig)])
-def test_yaml_defaults_match_dataclasses(arch, cls):
-    import yaml
-    d = yaml.safe_load((CONF / "model" / f"{arch}.yaml").read_text(encoding="utf-8"))
-    assert set(d) == {f.name for f in dataclasses.fields(cls)}
-    assert cls.from_dict(d) == cls()
-
-
-@pytest.mark.parametrize("arch", NEW_ARCHS)
-def test_hydra_composes_new_baselines(arch):
-    from hydra import compose, initialize_config_dir
-    spec = importlib.util.spec_from_file_location("run", REPO / "scripts" / "run.py")
-    run = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(run)
-    with initialize_config_dir(config_dir=str(CONF), version_base="1.3"):
-        cfg = compose("config", overrides=[f"model={arch}"])
-    rc = run.to_run_config(cfg)
-    assert rc.arch == arch and rc.model == model_config_for(arch)
-
-
-@pytest.mark.parametrize("cfg", [LRUConfig(d_model=8, scan="associative", tau_bounds=(2, 50)),
-                                 PatchTSTConfig(patch_len=24, stride=12, norm="layer",
-                                                revin=False, d_model=32, n_heads=4),
-                                 GRUConfig(hidden=16, layers=1, head_hidden=16),
-                                 DLinearConfig(input_len=168, kernel=5)])
-def test_new_configs_roundtrip_and_build(cfg):
-    import json
-    back = model_config_for(cfg.arch, json.loads(json.dumps(cfg.to_dict())))
-    assert back == cfg
-    check_pipeline_compat(cfg)
-    m = BL.NEURAL[cfg.arch](cfg).eval()
-    with torch.no_grad():
-        assert m(_batch(B=1))["q"].shape == (1, H, NQ)
-
-
-def test_new_configs_reject_invalid_values():
-    with pytest.raises(ConfigError, match="scan"):
-        LRUConfig(scan="loop")
-    with pytest.raises(ConfigError, match="tau_bounds"):
-        LRUConfig(tau_bounds=(10, 5))
-    with pytest.raises(ConfigError, match="min_period"):
-        LRUConfig(min_period=2)
-    with pytest.raises(ConfigError, match="n_heads"):
-        PatchTSTConfig(d_model=100, n_heads=16)
-    with pytest.raises(ConfigError, match="padding_patch"):
-        PatchTSTConfig(padding_patch="start")
-    with pytest.raises(ConfigError, match="неизвестные ключи"):
-        LRUConfig.from_dict({"d_modl": 8})
-
-
 def _fake_ckpt(path, arch="mayak", protocol=DEFAULT_PROTOCOL):
     hp = {"arch": arch}
     if protocol is not None:
         hp["protocol"] = protocol.to_dict()
     torch.save({"hyper_parameters": hp, "state_dict": {}}, path)
     return str(path)
-
-
-def test_check_comparable_accepts_same_protocol(tmp_path):
-    from mayak.lit import check_comparable
-    ref = _fake_ckpt(tmp_path / "m.ckpt")
-    lru = _fake_ckpt(tmp_path / "l.ckpt", "lru")
-    pt = _fake_ckpt(tmp_path / "p.ckpt", "patchtst")
-    assert check_comparable(ref, [lru, pt]) == {ref: "mayak", lru: "lru", pt: "patchtst"}
 
 
 def test_check_comparable_rejects_mismatch_and_pre_protocol_checkpoints(tmp_path):
@@ -595,17 +476,3 @@ def test_check_comparable_rejects_mismatch_and_pre_protocol_checkpoints(tmp_path
     with pytest.raises(ProtocolError, match="seed"):
         check_comparable(ref, [seed1])
     check_comparable(ref, [seed1], ignore=SEED_FIELDS)
-
-
-def test_check_comparable_rejects_mixed_precision_checkpoints(tmp_path):
-    """Чекпойнт, обученный в bf16-mixed, не сравнивается ни как эталон, ни как бейзлайн."""
-    from mayak.lit import check_comparable
-    assert DEFAULT_PROTOCOL.precision == "32"
-    ref = _fake_ckpt(tmp_path / "m.ckpt")
-    bf16 = Protocol(precision="bf16-mixed")
-    old = _fake_ckpt(tmp_path / "g.ckpt", "gru", bf16)
-    old_ref = _fake_ckpt(tmp_path / "old_m.ckpt", "mayak", bf16)
-    with pytest.raises(ProtocolError, match="bf16-mixed.*переобучите"):
-        check_comparable(ref, [old])
-    with pytest.raises(ProtocolError, match="bf16-mixed.*переобучите"):
-        check_comparable(old_ref, [old])

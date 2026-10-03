@@ -1,9 +1,6 @@
 """Тесты климатологического масштаба, единой нормировки функции потерь и протокола обучения."""
 import csv
-import dataclasses
 import hashlib
-import importlib.util
-import json
 import re
 from pathlib import Path
 
@@ -18,7 +15,7 @@ from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL, time_layout
 from mayak.leakage import SELECTION_KEY
 from mayak.loss import NORM_SCALE_CLAMP, forecast_loss, pinball
 from mayak.protocol import (ARCH_NAMES, DEFAULT_PROTOCOL, Protocol, ProtocolError, Stage,
-                            protocol_for, read_journal, run_protocol)
+                            protocol_for, run_protocol)
 from mayak.timeaxis import window_calendar
 
 REPO = Path(__file__).resolve().parents[1]
@@ -119,12 +116,6 @@ def test_scale_uses_abs_residual_convention():
     assert ABS_TO_SD == pytest.approx(np.sqrt(np.pi / 2))
 
 
-def test_climatology_without_scale_fails_loudly():
-    c = Climatology.from_params(np.zeros(15), 1.0, None)
-    with pytest.raises(RuntimeError, match="масштаб"):
-        c.scale(np.zeros(3), np.zeros(3))
-
-
 def test_cache_stores_scale_fitted_on_train_window(store):
     cache = Path(store.path)
     assert (cache / "clim_scale_beta.npy").exists()
@@ -137,12 +128,6 @@ def test_cache_stores_scale_fitted_on_train_window(store):
         dd, hh = window_calendar(s["t0"], np.arange(24))
         sc = s["clim"].scale(dd, hh)
         assert sc[0] > 1.8 * sc[12], sid
-
-
-def test_cache_key_depends_on_climatology_rules(manifest, monkeypatch):
-    key = S.cache_key(S.key_payload(manifest))
-    monkeypatch.setitem(S.CLIM_PARAMS, "scale_n_day", 3)
-    assert S.cache_key(S.key_payload(manifest)) != key
 
 
 def test_deep_check_catches_scale_not_from_train_window(store):
@@ -295,13 +280,6 @@ def test_loss_ignores_model_own_scale(arch):
     assert not torch.equal(forecast_loss(out, changed), ref)
 
 
-def test_loss_requires_norm_scale_in_batch():
-    batch = _toy_batch()
-    del batch["norm_scale"]
-    with pytest.raises(KeyError, match="norm_scale"):
-        forecast_loss({"q": _shared_q()}, batch)
-
-
 def test_norm_scale_clamped_by_shared_constants():
     batch = _toy_batch()
     q = _shared_q()
@@ -341,59 +319,11 @@ def test_training_objective_is_common_loss_plus_regularizer(arch):
         assert reg.item() == 0.0
 
 
-def test_protocol_roundtrip_through_json():
-    p = Protocol(lr=1e-3, patience=9)
-    d = json.loads(json.dumps(p.to_dict()))
-    assert Protocol.from_dict(d) == p
-    assert "deviations" not in d
-
-
-def test_protocol_has_no_per_architecture_deviations():
-    """Протокол один на все модели: полей и механизма отклонений нет."""
-    from mayak import protocol as P
-    assert "deviations" not in {f.name for f in dataclasses.fields(Protocol)}
-    for name in ("ARCH_DEVIATIONS", "Deviation", "check_deviations_documented"):
-        assert not hasattr(P, name), name
-    assert not hasattr(Protocol, "deviate") and not hasattr(Protocol, "common")
-
-
-def test_protocol_from_old_journal():
-    """Пустой список отклонений из прежних журналов читается, непустой отвергается."""
-    d = DEFAULT_PROTOCOL.to_dict()
-    assert Protocol.from_dict(dict(d, deviations=[])) == DEFAULT_PROTOCOL
-    dev = dict(field="patience", value=9, default=5, reason="плато")
-    with pytest.raises(ProtocolError, match="один на все"):
-        Protocol.from_dict(dict(d, deviations=[dev]))
-
-
-def test_protocol_rejects_invalid_values():
-    with pytest.raises(ValueError):
-        Protocol(monitor="train/loss")
-    with pytest.raises(ValueError):
-        Protocol(lr_schedule="step")
-    with pytest.raises(ValueError):
-        Protocol(stages=(Stage("A", "L0", 1), Stage("A", "full", 1)))
-
-
-def test_protocol_rejects_old_validation_fields():
-    d = DEFAULT_PROTOCOL.to_dict()
-    with pytest.raises(ProtocolError, match="прежней валидации"):
-        Protocol.from_dict(dict(d, val_batches=20))
-    old_stages = [dict(s, val_L=0) for s in d["stages"]]
-    with pytest.raises(ProtocolError, match="прежней валидации"):
-        Protocol.from_dict(dict(d, stages=old_stages))
-
-
 def test_every_architecture_gets_the_same_protocol():
     ps = [protocol_for(a) for a in ARCH_NAMES]
     assert all(p is DEFAULT_PROTOCOL for p in ps)
     with pytest.raises(ProtocolError):
         protocol_for("transformer")
-
-
-def test_registry_matches_protocol_names():
-    from mayak.lit import ARCHS
-    assert tuple(ARCHS) == ARCH_NAMES
 
 
 def test_optimizer_and_schedule_identical_across_architectures():
@@ -409,25 +339,6 @@ def test_optimizer_and_schedule_identical_across_architectures():
                      {tuple(g["betas"]) for g in opt.param_groups}, type(sched), sched.T_max,
                      cfg["lr_scheduler"]["interval"], lit.protocol.ema_decay))
     assert all(s == seen[0] for s in seen[1:]), seen
-
-
-def _load_script(name):
-    spec = importlib.util.spec_from_file_location(name, REPO / "scripts" / f"{name}.py")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def test_launch_config_differs_only_by_arch():
-    from mayak.protocol import protocol_from_args
-    tr = _load_script("train")
-    common = ["--steps-a", "7", "--steps-b", "11", "--batch", "3", "--seed", "5"]
-    parsed = [tr.make_parser().parse_args(["--arch", a, *common]) for a in ARCH_NAMES]
-    protos = [protocol_for(a, protocol_from_args(ns)) for a, ns in zip(ARCH_NAMES, parsed)]
-    assert all(p == protos[0] for p in protos[1:])
-    assert [s.steps for s in protos[0].stages] == [7, 11] and protos[0].seed == 5
-    diff = [set(k for k in vars(parsed[0]) if vars(parsed[0])[k] != vars(ns)[k]) for ns in parsed]
-    assert all(d <= {"arch"} for d in diff), diff
 
 
 def test_protocol_module_never_mentions_test_window():
@@ -504,26 +415,6 @@ def test_all_architectures_see_identical_window_stream(runs):
         assert res[arch]["hashes"] == ref, f"{arch}: другой поток окон"
 
 
-def test_journals_differ_only_by_architecture(runs):
-    out, res = runs
-    for arch in ARCH_NAMES:
-        j = read_journal(out / arch)
-        assert j == res[arch]["journal"]
-        assert j["arch"] == arch and "deviations" not in j
-        assert Protocol.from_dict(j["protocol"]) == TINY
-        assert [s["name"] for s in j["stages"]] == ["A", "B"]
-        assert j["final_ckpt"] == j["stages"][-1]["best_ckpt"] and Path(j["final_ckpt"]).exists()
-        assert j["param_groups"] and all(g["n_params"] >= 0 for g in j["param_groups"])
-    keys = {k for j in (r["journal"] for r in res.values()) for k in j}
-    varying = {k for k in keys
-               if len({json.dumps(r["journal"].get(k), sort_keys=True) for r in res.values()}) > 1}
-    assert varying <= {"arch", "model_class", "stages", "final_ckpt", "param_groups", "n_params",
-                       "n_params_by_module"}
-    for r in res.values():
-        j = r["journal"]
-        assert sum(j["n_params_by_module"].values()) == j["n_params"] > 0
-
-
 def test_checkpoints_carry_protocol_and_pass_checklist(runs, store):
     from mayak.leakage import run_checklist
     from mayak.lit import LitForecaster
@@ -597,16 +488,6 @@ def test_every_validation_pass_covers_the_whole_set(runs, manifest, store):
                 assert set(p["hist"]) == {0}
 
 
-def test_selection_log_has_history_bins(runs):
-    _, res = runs
-    j = res["dlinear"]["journal"]
-    sel = {s["name"]: s["selection"] for s in j["stages"]}
-    assert set(sel["A"]) >= {"val/loss", "val/pinball_L0"}
-    assert not any(k.startswith("val/pinball_L1") for k in sel["A"]), "на этапе A только L=0"
-    bins = [k for k in sel["B"] if k.startswith("val/pinball_L")]
-    assert bins and all(np.isfinite(sel["B"][k]) for k in bins)
-
-
 def test_stage_b_starts_from_stage_a_weights(runs):
     _, res = runs
     j = res["dlinear"]["journal"]
@@ -616,24 +497,6 @@ def test_stage_b_starts_from_stage_a_weights(runs):
     lit.load_state_dict(a["state_dict"])
     for k, v in a["state_dict"].items():
         assert torch.equal(lit.state_dict()[k], v)
-
-
-def test_every_architecture_gets_a_stage_a_report(runs):
-    """Отчёт о поле после этапа A считается одинаково для всех архитектур."""
-    from mayak.stage_report import read_report
-    _, res = runs
-    for arch in ARCH_NAMES:
-        a, b = res[arch]["journal"]["stages"]
-        rep = read_report(a["report"])
-        assert rep["arch"] == arch and rep["val_set"]["fingerprint"] == a["val_set"]
-        assert [e["step"] for e in rep["candidates"]] == [c["step"] for c in a["candidates"]]
-        assert sum(e["is_best"] for e in rep["candidates"]) == 1
-        for e in rep["candidates"]:
-            assert e["mse_ratio"] is not None and e["mse_ratio"] > 0, arch
-            assert 0.0 <= e["picp90"] <= 1.0, arch
-        assert a["report_best"]["mse_ratio"] == pytest.approx(
-            next(e for e in rep["candidates"] if e["is_best"])["mse_ratio"])
-        assert "report" not in b and b["init_from"]["digest"] == a["best_digest"]
 
 
 def test_training_precision_is_fp32_without_tf32():

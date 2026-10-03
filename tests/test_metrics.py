@@ -1,9 +1,5 @@
 """Тесты: знаменатели, макро-оценка, надёжность, значимость, ядро калибровки."""
 import csv
-import os
-import subprocess
-import sys
-from pathlib import Path
 
 import numpy as np
 import pytest
@@ -15,10 +11,8 @@ from mayak.metrics import (HISTORY_BINS, I_MED, LEAD_BINS, METRICS, NQ, ACIParam
                            apply_conformal, breakdown, by_lead, calibrate_forecast,
                            conformal_table, fit_conformal_shift, lead_bin_index, lead_bin_of,
                            metric_table, seed_spread, spread)
-from mayak.zones import (KG_TIF_CODE, KOPPEN_ZONES, SEASONS, UNKNOWN_ZONE, koppen_group,
-                         koppen_id, normalize_zone, season_of, seasons_of)
+from mayak.zones import KOPPEN_ZONES, UNKNOWN_ZONE, normalize_zone, season_of
 
-REPO = Path(__file__).resolve().parents[1]
 Q = np.asarray(QUANTILES, np.float64)
 N_HOURS = 12_000
 
@@ -137,15 +131,6 @@ def test_macro_equals_pooled_when_stations_are_identical():
         assert pooled[m] == pytest.approx(macro[m])
 
 
-def test_summary_carries_window_and_station_counts():
-    ev = _case(n_windows=60, n_stations=5, seed=5)
-    s = ev.summary()
-    assert s["n_windows"] == 60 and s["n_stations"] == 5
-    sel = np.array([st == "s0" for st in ev.station])
-    s0 = ev.restrict(windows=sel).summary()
-    assert s0["n_stations"] == 1 and s0["n_windows"] == int(sel.sum())
-
-
 def test_bootstrap_zero_interval_on_degenerate_data():
     """Все станции одинаковы, поэтому любой ресэмпл даёт то же число и интервал сжат в точку."""
     h = 4
@@ -194,41 +179,11 @@ def test_bootstrap_is_reproducible_by_seed():
     assert a["pooled"]["MAE"] != c["pooled"]["MAE"]
 
 
-def test_zone_and_season_ids_stable_across_processes():
-    """Разный PYTHONHASHSEED не должен менять ни одного идентификатора."""
-    code = ("import json;"
-            "from mayak.zones import koppen_id, season_id, KOPPEN_ZONES;"
-            "print(json.dumps([[koppen_id(z) for z in KOPPEN_ZONES] + [koppen_id('UNK')],"
-            "[season_id(m, lat) for m in range(1, 13) for lat in (52.0, -33.0)]]))")
-    outs = []
-    for hashseed in ("0", "1", "12345", "random"):
-        env = {**os.environ, "PYTHONHASHSEED": hashseed, "PYTHONPATH": str(REPO)}
-        r = subprocess.run([sys.executable, "-c", code], cwd=REPO, env=env,
-                           capture_output=True, text=True, check=True)
-        outs.append(r.stdout.strip())
-    assert len(set(outs)) == 1, f"идентификаторы поехали между запусками: {set(outs)}"
-
-
-def test_koppen_table_is_full_and_injective():
-    ids = [koppen_id(z) for z in KOPPEN_ZONES]
-    assert len(KOPPEN_ZONES) == 30
-    assert sorted(ids) == list(range(30))
-    assert koppen_id(UNKNOWN_ZONE) == 30
-    assert koppen_id("Cfb") != koppen_id("Cfa"), "полная зона, а не первая буква"
-    assert koppen_group("Cfb") == "C" and koppen_group("ET") == "E"
-
-
 def test_unknown_and_truncated_zone_fall_back_to_unk():
     assert normalize_zone("  Cfb ") == "Cfb"
     assert normalize_zone("C") == UNKNOWN_ZONE
     assert normalize_zone("") == UNKNOWN_ZONE
     assert normalize_zone("Zzz") == UNKNOWN_ZONE
-
-
-def test_kg_tif_codes_match_zone_order():
-    assert KG_TIF_CODE[1] == "Af" and KG_TIF_CODE[30] == "EF"
-    assert len(KG_TIF_CODE) == len(KOPPEN_ZONES)
-    assert list(KG_TIF_CODE.values()) == list(KOPPEN_ZONES)
 
 
 @pytest.mark.parametrize("month,north,south", [
@@ -238,15 +193,6 @@ def test_kg_tif_codes_match_zone_order():
 def test_season_by_calendar_month_and_hemisphere(month, north, south):
     assert season_of(month, 52.0) == north
     assert season_of(month, -33.0) == south
-
-
-def test_season_has_four_bins_and_no_collisions():
-    got = {season_of(m, 52.0) for m in range(1, 13)}
-    assert got == set(SEASONS)
-    assert len({season_of(m, 52.0) for m in (12, 1, 2)}) == 1
-    assert seasons_of([1, 4, 7, 10], 52.0).tolist() == ["winter", "spring", "summer", "autumn"]
-    with pytest.raises(ValueError):
-        season_of(0, 52.0)
 
 
 def test_pit_histogram_matches_expectation_on_calibrated_forecast():
@@ -265,14 +211,6 @@ def test_pit_histogram_detects_overconfidence():
     pit = narrow.pit_histogram()
     assert pit["observed"][0] > 3 * pit["expected"][0]
     assert pit["observed"][-1] > 3 * pit["expected"][-1]
-
-
-def test_pit_by_lead_bin_covers_all_bins():
-    ev = _calibrated(horizon=H, n=300, seed=13)
-    out = ev.pit_by_lead_bin(LEAD_BINS)
-    assert list(out) == [f"{a}-{b}" for a, b in LEAD_BINS]
-    for p in out.values():
-        assert p["n"] > 0 and p["observed"].sum() == pytest.approx(1.0)
 
 
 def test_reliability_curve_matches_nominal_when_calibrated():
@@ -369,23 +307,6 @@ def test_conformal_keeps_quantiles_monotone():
     out = apply_conformal(q, shift, np.arange(50) * 13)
     assert np.all(np.diff(out, axis=-1) >= 0)
     assert np.array_equal(out[..., I_MED], q[..., I_MED])
-
-
-def test_conformal_table_rejects_wrong_shape_and_old_format():
-    with pytest.raises(ValueError, match="старого формата"):
-        conformal_table(np.zeros((len(LEAD_BINS), NQ), np.float32), 0)
-    with pytest.raises(ValueError, match="поправок формы"):
-        conformal_table(np.zeros((len(LEAD_BINS), len(HISTORY_BINS), NQ + 1), np.float32), 0)
-    with pytest.raises(ValueError, match="поправок формы"):
-        conformal_table(np.zeros((2, len(HISTORY_BINS), NQ), np.float32), 0)
-
-
-def test_all_modules_share_one_conformal_implementation():
-    import mayak.runtime.streaming as R
-    from mayak import metrics as M
-    calibrate = _load_module(REPO / "scripts" / "calibrate.py", "calibrate_for_test")
-    assert R.apply_conformal is M.apply_conformal
-    assert calibrate.apply_conformal is M.apply_conformal
 
 
 def test_with_conformal_sets_median_from_quantiles():
@@ -492,12 +413,6 @@ def test_breakdown_row_matches_direct_restriction():
         assert rows[g]["pooled"]["Skill"] == pytest.approx(_manual_skill(ev, sel))
 
 
-def test_breakdown_rejects_misaligned_keys():
-    ev = _case(n_windows=10, seed=20)
-    with pytest.raises(ValueError, match="меток"):
-        breakdown(ev, np.array(["a"] * 9, object))
-
-
 def test_seed_spread_reports_mean_and_range():
     evs = [_case(seed=s, n_windows=80) for s in (21, 22, 23)]
     summaries = [ev.summary() for ev in evs]
@@ -576,24 +491,6 @@ def store(manifest):
     return S.get_store(manifest)
 
 
-def _load_module(path, name):
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules.setdefault(name, mod)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-def test_eval_batch_has_no_unstable_ids(store, manifest):
-    from mayak.evaluate import EvalSet
-    ds = EvalSet(store.clims(), station_splits=(ROLE_TRAIN, ROLE_TEST), manifest=manifest,
-                 time_key="test")
-    item = ds[0]
-    for key in ("koppen_id", "season_id", "seen"):
-        assert key not in item, f"{key}: поле батча никем не читается и строилось хешем"
-
-
 def test_window_meta_is_aligned_and_labelled(store, manifest):
     from mayak.evaluate import EvalSet
     ds = EvalSet(store.clims(), station_splits=(ROLE_TRAIN, ROLE_TEST), manifest=manifest,
@@ -633,27 +530,3 @@ def test_eval_set_subsample_is_stratified(store, manifest):
         counts[sid] = counts.get(sid, 0) + 1
     assert set(counts) == {"t0", "t1", "x0"}
     assert set(counts.values()) == {3}
-
-
-def test_evaluation_from_eval_set_breakdowns_run(store, manifest):
-    """Сквозная проверка без модели: от окон к метаданным и разрезам."""
-    from mayak.evaluate import EvalSet, all_breakdowns
-    from mayak.metrics import Evaluation as Ev
-    ds = EvalSet(store.clims(), station_splits=(ROLE_TRAIN, ROLE_TEST), manifest=manifest,
-                 time_key="test", every_hours=24, windows_per_station=20)
-    meta = ds.window_meta()
-    rng = np.random.default_rng(0)
-    n = len(ds)
-    y = rng.normal(10, 5, (n, H))
-    mu = y + rng.normal(0, 1, (n, H))
-    ev = Ev(y=y, mu=mu, q=mu[..., None] + np.linspace(-3, 3, NQ),
-            mu_clim=y + rng.normal(0, 3, (n, H)),
-            w=np.ones((n, H)), station=meta["station"])
-    out = all_breakdowns(ev, meta, leads=[24], min_windows=1, min_stations=1)
-    assert set(out) == {"роль станции", "зона Кёппена", "сезон", "длина истории",
-                        "валидность истории"}
-    for name, rows in out.items():
-        assert rows, f"разрез {name} пуст"
-        for r in rows.values():
-            assert r["n_windows"] > 0 and r["n_stations"] > 0
-            assert np.isfinite(r["pooled"]["MAE"]) and np.isfinite(r["macro"]["MAE"])

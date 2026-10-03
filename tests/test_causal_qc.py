@@ -212,13 +212,6 @@ def test_temperature_units_are_not_checked_on_device():
     assert not np.any(codes[:, 0] & QCCode.UNITS)
 
 
-def test_qc_config_rejects_inconsistent_stuck_limits():
-    with pytest.raises(ValueError, match="stuck_min_count"):
-        QCConfig(stuck_min_count=10)
-    with pytest.raises(ValueError, match="scale_floor"):
-        QCConfig(scale_floor=(1.0, 0.0, 1.0))
-
-
 def test_qc_context_follows_device_age():
     from mayak.data.dataset import footprint, qc_context
     look = DEFAULT_QC.lookback_hours

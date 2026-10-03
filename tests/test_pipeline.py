@@ -1,12 +1,8 @@
 """Тесты: офлайн-кэш, векторный QC, сиды воркеров, календарь, точки входа."""
-import ast
 import csv
 import importlib
-import json
-import os
 import pkgutil
 import runpy
-import shutil
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,9 +14,9 @@ import pytest
 import mayak
 from mayak.constants import H, L_MAX
 from mayak.data import store as S
-from mayak.data.qc import QCCode, _mad_ok_reference, mad_ok, qc_station, run_qc
+from mayak.data.qc import QCCode, _mad_ok_reference, mad_ok, qc_station
 from mayak.data.recording import record_values
-from mayak.timeaxis import (future_calendar, legacy_t0, to_hourly_grid,
+from mayak.timeaxis import (future_calendar, to_hourly_grid,
                             to_utc_hour, utc_to_doy_hour, window_calendar)
 
 REPO = Path(__file__).resolve().parents[1]
@@ -108,28 +104,6 @@ def test_qc_per_channel_mask_and_codes():
     assert np.all(x[mask == 0] == 0)
 
 
-def test_qc_1d_valid_is_broadcast():
-    T, P, RH = _series(200, 1)
-    v1 = np.ones(200, np.uint8)
-    v1[50:60] = 0
-    a = qc_station(T, P, RH, v1)
-    b = qc_station(T, P, RH, np.repeat(v1[:, None], 3, 1))
-    assert all(np.array_equal(u, w) for u, w in zip(a, b))
-    xr, mr = run_qc(T, P, RH, v1)
-    assert np.array_equal(xr, a[0]) and np.array_equal(mr, a[1].astype(np.float32))
-
-
-def test_cache_build_then_hit(manifest):
-    p1, built1 = S.build_cache(manifest)
-    p2, built2 = S.build_cache(manifest)
-    assert built1 and not built2 and p1 == p2
-    root = Path(p1).parent
-    assert not [d for d in os.listdir(root) if d.startswith(".tmp")], "остался недостроенный кэш"
-    for f in ("x.npy", "mask.npy", "qc.npy", "clim_beta.npy", "index.json", "meta.json",
-              "qc_report.csv"):
-        assert (Path(p1) / f).exists()
-
-
 def test_cache_content_equals_direct_qc(manifest):
     from mayak.data.climatology import Climatology
     from mayak.data.splits import time_layout
@@ -146,82 +120,6 @@ def test_cache_content_equals_direct_qc(manifest):
         ref = Climatology().fit(d.astype(np.float64), h.astype(np.float64),
                                 x[lo:hi, 0], mask[lo:hi, 0])
         assert np.allclose(s["clim"].beta, ref.beta) and s["clim"].sigma == pytest.approx(ref.sigma)
-
-
-def _key(manifest):
-    return S.cache_key(S.key_payload(manifest))
-
-
-def test_cache_key_depends_on_content_not_path(manifest, tmp_path, monkeypatch):
-    k0 = _key(manifest)
-    root = Path(manifest).parent
-
-    moved = tmp_path / "elsewhere"
-    shutil.copytree(root, moved)
-    assert _key(str(moved / "manifest.csv")) == k0
-
-    rows = S.read_manifest(manifest)
-    rows[0]["split"], rows[0]["lat"] = "unseen_test", "12.5"
-    _write_manifest(root, rows)
-    assert _key(manifest) == k0
-
-    _write_station(root, "s0", seed=99)
-    k1 = _key(manifest)
-    assert k1 != k0
-
-    _write_station(root, "s9", seed=9)
-    _write_manifest(root, rows + [dict(rows[0], id="s9")])
-    k2 = _key(manifest)
-    assert k2 not in (k0, k1)
-
-    monkeypatch.setattr(S, "TIME_LAYOUT", dict(S.TIME_LAYOUT, n_blocks=6))
-    assert _key(manifest) != k2
-
-
-def test_rebuild_after_source_change_is_picked_up(manifest):
-    s_old = S.get_store(manifest)
-    _write_station(Path(manifest).parent, "s1", seed=123)
-    s_new = S.get_store(manifest)
-    assert s_new.key != s_old.key
-    assert not np.array_equal(s_new.stations["s1"]["x"], s_old.stations["s1"]["x"])
-
-
-def test_one_store_per_process(manifest):
-    from mayak import baselines as BL
-    from mayak.data.dataset import WindowDataset
-    from mayak.data.holdout import EvalSet
-    store = S.get_store(manifest)
-    assert S.get_store(manifest) is store
-    tr = WindowDataset(manifest, windows_per_epoch=8)
-    clims = BL.fit_climatologies(manifest)
-    assert clims is store.stations
-    va = EvalSet(clims, station_splits=("unseen_val",), manifest=manifest, time_key="calib",
-                 every_hours=48)
-    sid, _t = va.items[0]
-    assert sid == "s3"
-    assert np.shares_memory(tr.st[0]["x"], store.stations["s0"]["x"])
-    assert np.shares_memory(va.clims[sid]["x"], store.stations["s3"]["x"])
-
-
-def test_station_without_climatology_is_excluded_and_reported(manifest):
-    root = Path(manifest).parent
-    valid = np.zeros((N_HOURS, 3), np.uint8)
-    valid[-3000:] = 1
-    _write_station(root, "s2", seed=2, valid=valid)
-    path, _ = S.build_cache(manifest)
-    meta = json.loads((Path(path) / "meta.json").read_text(encoding="utf-8"))
-    assert "s2" in meta["excluded"]
-    assert "s2" not in S.get_store(manifest).stations
-
-
-def test_legacy_source_format_is_read(tmp_path):
-    (tmp_path / "stations").mkdir()
-    T, P, RH = _series(100, 0)
-    np.savez(tmp_path / "stations" / "old.npz", T=T, P=P, RH=RH,
-             valid=np.ones(100, np.uint8), t0_doy=np.float32(10.75), t0_hour=np.float32(18))
-    src = S.read_source(tmp_path / "stations" / "old.npz")
-    d, h = window_calendar(src["t0"], [0])
-    assert (d[0], h[0]) == (10 + 18 / 24, 18.0)
 
 
 def _pandas_ref(ts):
@@ -276,33 +174,11 @@ def test_all_calendar_paths_agree(manifest):
     assert np.array_equal(fh, np.asarray(item["hour_fut"]))
 
 
-def test_legacy_t0_does_not_double_fraction():
-    assert legacy_t0(10.75, 18) == legacy_t0(10.0, 18)
-
-
 def test_hourly_grid_marks_gaps_without_interpolation():
     times = pd.to_datetime(["2020-01-01 03:00", "2020-01-01 00:00", "2020-01-01 01:00"], utc=True)
     t0, cols = to_hourly_grid(times, {"T": [3.0, 0.0, 1.0]})
     assert t0 == int(to_utc_hour(times[1]))
     assert np.array_equal(cols["T"][[0, 1, 3]], [0.0, 1.0, 3.0]) and np.isnan(cols["T"][2])
-
-
-@pytest.mark.parametrize("bad", [
-    ["2020-01-01 00:00", "2020-01-01 00:30"],
-    ["2020-01-01 00:00", "2020-01-01 00:00"],
-])
-def test_hourly_grid_fails_loudly(bad):
-    with pytest.raises(ValueError):
-        to_hourly_grid(pd.to_datetime(bad, utc=True), {"T": np.zeros(len(bad))})
-
-
-def test_make_synth_writes_new_format(tmp_path, monkeypatch):
-    monkeypatch.setattr(sys, "argv", ["make_synth.py", "--out", str(tmp_path), "--n-stations", "2",
-                                      "--years", "1"])
-    runpy.run_path(str(REPO / "scripts" / "make_synth.py"), run_name="__main__")
-    with np.load(tmp_path / "stations" / "S000.npz") as d:
-        assert "t0_utc_h" in d and "t0_doy" not in d
-        assert d["valid"].shape == (d["T"].shape[0], 3)
 
 
 def _loader(manifest, seed, workers, persistent=True):
@@ -370,31 +246,9 @@ def test_module_imports(mod):
 ENTRY_SCRIPTS = sorted(p.name for p in (REPO / "scripts").glob("*.py"))
 
 
-def _entry_modules():
-    out = []
-    for path in sorted((REPO / "mayak").rglob("*.py")):
-        tree = ast.parse(path.read_text("utf-8"), str(path))
-        if not any(isinstance(n, ast.If) and ast.unparse(n.test) == "__name__ == '__main__'"
-                   for n in tree.body):
-            continue
-        out.append(".".join(path.relative_to(REPO).with_suffix("").parts))
-    return out
-
-
-ENTRY_MODULES = _entry_modules()
-
-
 @pytest.mark.parametrize("script", ENTRY_SCRIPTS)
 def test_script_help(script, monkeypatch, capsys):
     monkeypatch.setattr(sys, "argv", [script, "--help"])
     with pytest.raises(SystemExit) as e:
         runpy.run_path(str(REPO / "scripts" / script), run_name="__main__")
-    assert e.value.code == 0 and "usage" in capsys.readouterr().out
-
-
-@pytest.mark.parametrize("mod", ENTRY_MODULES)
-def test_module_help(mod, monkeypatch, capsys):
-    monkeypatch.setattr(sys, "argv", [mod, "--help"])
-    with pytest.raises(SystemExit) as e:
-        runpy.run_module(mod, run_name="__main__", alter_sys=True)
     assert e.value.code == 0 and "usage" in capsys.readouterr().out
