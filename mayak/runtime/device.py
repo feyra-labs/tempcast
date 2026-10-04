@@ -1,76 +1,65 @@
-"""Потоковый рантайм МАЯК для устройства.
+"""Рантайм МАЯК на устройстве: часовой цикл и пакетный выпуск.
 
-Прогноз потока равен пакетному прогнозу по последним часам истории модели при любом
-моменте выпуска. Пакетное окно истории делится на две части.
+Каждый час наблюдения проходят причинный контроль качества и пишутся в сырое окно.
+Выпуск строит входы модели по последним часам окна теми же функциями, что окно оценки:
+значения и маски после контроля качества за историю модели, выровненные по правому
+краю буфера, календарь истории и горизонта, координаты точки. Затем один проход графа
+прогноза. Выход устройства поэтому равен выходу модели на окне оценки с той же
+историей.
 
-* Хвост - поздние часы окна. Признаки энкодера для них не зависят от того, где окно
-  начинается, и совпадают у пакета и потока. Поток держит их вклад в моды скользящей
-  суммой: на каждом часе вклад нового часа добавляется, вклад часа, вышедшего из
-  хвоста, вычитается. Раз в сутки сумма пересчитывается точно по кольцу вкладов, чтобы
-  ошибка округления от вычитания не копилась.
-* Край - ранние часы окна. У пакета энкодер видит перед ними нули, а каналы с лагом не
-  знают часов до окна, поэтому их признаки зависят от момента выпуска. Вклад края
-  пересчитывается при каждом выпуске пакетным проходом по часам края.
-
-Паспорт тоже считается при выпуске: по кольцу строк суточного накопителя за всю
-историю, сутки заканчиваются в момент выпуска.
-
-Шаг часа стоит один потактовый шаг энкодера и сумма по модам; выпуск - проход энкодера
-по краю окна, суточные сводки и паспорт.
+Длина истории выпуска - число часов после холодного старта, но не больше истории
+модели. Более ранние часы буфера пусты, как у окна с короткой историей в обучении.
 
 Персистентное состояние - только сырое окно и заголовок. В заголовке абсолютный час
 последнего шага, число часов окна после холодного старта, множители адаптивной
 калибровки по бинам лидов и координаты точки, для которой состояние записано. Состояние
-прежней версии с одним множителем читается: множитель переносится во все бины. В окне для каждого
-часа записанные прибором значения до отбраковки, маска наличия и маска годности после
-причинного контроля качества. Температура и влажность занимают по байту со знаком,
-давление - два байта в десятых гектопаскаля, маски упакованы по битам. Моды, кольца,
-буфер энкодера и кольцо контроля качества восстанавливаются из окна одним пакетным
-проходом при загрузке.
+прежней версии с одним множителем читается: множитель переносится во все бины. В окне
+для каждого часа записанные прибором значения до отбраковки, маска наличия и маска
+годности после причинного контроля качества. Температура и влажность занимают по байту
+со знаком, давление - два байта в десятых гектопаскаля, маски упакованы по битам. При
+загрузке кольцо контроля качества заполняется последними часами окна.
 
-Холодный старт - это окно из пустых часов, как у пакета при короткой истории. Простой
-заполняется пустыми часами, простой не короче окна опустошает окно. Множители
-калибровки при этом сохраняются: они относятся к прибору, а не к истории.
+Холодный старт - это окно из пустых часов. Простой заполняется пустыми часами, простой
+не короче окна опустошает окно. Множители калибровки при этом сохраняются: они
+относятся к прибору, а не к истории.
 
 Калибровка интервалов: квантили модели, затем конформная таблица, затем адаптивный
 множитель своего бина лидов. Строка конформной таблицы выбирается по длине истории
-выпуска: числу часов после холодного старта, но не больше истории модели. Множители
-подстраиваются онлайн, если рантайм создан с параметрами адаптивной калибровки:
-каждый валидный час температуры сверяется с кольцом по часам-мишеням, где для каждого
-бина лидов лежит последний выпуск, чей лид до этого часа попадает в бин. Кольцо живёт
-только в памяти.
+выпуска. Множители подстраиваются онлайн, если рантайм создан с параметрами адаптивной
+калибровки: каждый валидный час температуры сверяется с кольцом по часам-мишеням, где
+для каждого бина лидов лежит последний выпуск, чей лид до этого часа попадает в бин.
+Кольцо живёт только в памяти.
 
 Смена точки. Состояние помнит координаты и высоту, для которых оно записано. При загрузке
 они сравниваются с текущими. Сдвиг в пределах порогов рантайма - уточнение метаданных:
-окно сохраняется, всё модельное состояние восстанавливается из него уже для новой точки,
-множитель калибровки сохраняется, в лог пишется предупреждение. Сдвиг больше порога -
-прибор перенесён: окно опустошается, множитель калибровки обнуляется, абсолютный час
-последнего шага сохраняется. Контроль качества новых часов всегда берёт текущую высоту.
+окно сохраняется, прогноз по нему строится уже для новой точки, множитель калибровки
+сохраняется, в лог пишется предупреждение. Сдвиг больше порога - прибор перенесён: окно
+опустошается, множитель калибровки обнуляется, абсолютный час последнего шага
+сохраняется. Контроль качества новых часов всегда берёт текущую высоту.
 
 Момент выпуска - последний шаг. До первого шага, в том числе после старта без
 состояния, момент выпуска задаёт вызывающий по часам устройства, и прогноз строится по
-пустому окну, которое этим часом заканчивается. Само состояние при этом не меняется.
+пустому окну, которое этим часом заканчивается.
 
-Откат. При старте граф точки возвращает таблицу климатологии: среднее и масштаб
+Откат. При старте граф климатологии возвращает таблицу точки: среднее и масштаб
 климат-поля с паспортом холодного старта на каждый час года. Если выпуск не удался или
 дал нечисловые квантили, прогноз - квантили нормального распределения с этими средним
-и масштабом на часах горизонта. Таблица своя у каждой точки, поэтому откат - это
-климатология той точки, где стоит прибор.
+и масштабом на часах горизонта.
 """
 import logging
 from typing import NamedTuple
 
 import numpy as np
 
-from mayak.config import CHANNEL_MAX_LAG
-from mayak.data.qc import PHYS, CausalQC, qc_window
-from mayak.data.recording import RECORD_SCALE, record_values
+from mayak.data.qc import PHYS, CausalQC
+from mayak.data.recording import RECORD_SCALE
+from mayak.data.window import issue_calendar, place_history
 from mayak.leakage import load_conformal
 from mayak.metrics import (LEAD_BINS, ACIParams, AdaptiveCalibration, apply_adaptive,
                            apply_conformal, check_conformal_shape)
 from mayak.runtime.site import (SITE_MOVED, SITE_REFINED, as_site, describe_gap,
                                 load_runtime_config, site_change)
-from mayak.timeaxis import hour_of_year, window_calendar
+from mayak.timeaxis import hour_of_year
 
 log = logging.getLogger(__name__)
 
@@ -86,8 +75,6 @@ STATE_HEADER_V4 = np.dtype([("magic", "S3"), ("version", "u1"), ("filled", "<u2"
                             ("lat", "<f4"), ("lon", "<f4"), ("elev", "<f4")])
 STATE_HEADERS = {4: STATE_HEADER_V4, STATE_VERSION: STATE_HEADER}
 NO_HOUR = int(np.iinfo(np.int64).min)
-RESYNC_HOURS = 24
-CTX = CHANNEL_MAX_LAG + 1
 
 RAW_CHANNELS = ("T", "P", "RH")
 STORE_DTYPES = (np.dtype("i1"), np.dtype("<u2"), np.dtype("i1"))
@@ -97,6 +84,9 @@ STORE_HI = np.array([127.0, 65535.0, 127.0])
 PHYS_LO = np.array([PHYS[c][0] for c in RAW_CHANNELS], np.float32)
 PHYS_HI = np.array([PHYS[c][1] for c in RAW_CHANNELS], np.float32)
 HOURS_OF_YEAR = 366 * 24
+FORECAST_INPUTS = ("lat", "lon", "elev", "x_hist", "mask_hist", "doy_hist", "hour_hist",
+                   "doy_fut", "hour_fut")
+CLIMATOLOGY_INPUTS = ("lat", "lon", "elev")
 
 
 class StateSnapshot(NamedTuple):
@@ -170,7 +160,7 @@ def parse_state(raw, window):
 
 
 def check_climatology(clim_mu, clim_sig):
-    """Проверка таблицы климатологии точки, которую вернул граф старта.
+    """Проверка таблицы климатологии точки, которую вернул граф климатологии.
 
     Без годной таблицы откат невозможен, поэтому негодная таблица - ошибка
     конфигурации, а не повод работать дальше.
@@ -189,10 +179,10 @@ def check_climatology(clim_mu, clim_sig):
     mu = np.asarray(clim_mu, np.float32).ravel()
     sig = np.asarray(clim_sig, np.float32).ravel()
     if mu.size != HOURS_OF_YEAR or sig.size != HOURS_OF_YEAR:
-        raise RuntimeError(f"граф старта: таблица климатологии на {mu.size} и {sig.size} ч, "
+        raise RuntimeError(f"граф климатологии: таблица климатологии на {mu.size} и {sig.size} ч, "
                            f"нужно {HOURS_OF_YEAR}; графы экспортированы другой версией")
     if not (np.all(np.isfinite(mu)) and np.all(np.isfinite(sig)) and np.all(sig > 0)):
-        raise RuntimeError("граф старта: таблица климатологии точки негодна (нечисловые "
+        raise RuntimeError("граф климатологии: таблица климатологии точки негодна (нечисловые "
                            "значения или неположительный масштаб); это ошибка конфигурации "
                            "модели или координат")
     return mu, sig
@@ -251,7 +241,7 @@ def state_nbytes(cfg):
     Returns:
         Число байт.
     """
-    return window_nbytes(cfg.stream_window)
+    return window_nbytes(cfg.device_window)
 
 
 def encode_window(raw, present, valid):
@@ -299,11 +289,13 @@ def decode_window(buf, n_hours):
     return np.stack(cols, axis=-1), masks[0], masks[1]
 
 
-class StreamingMayak:
-    """Потоковый рантайм на PyTorch.
+class Device:
+    """Устройство: часовой цикл, пакетный выпуск, откат и состояние на диске.
 
     Args:
-        model: модель в режиме eval.
+        backend: исполнитель графов с методом ``run(name, feed)``: имя графа и словарь
+            входов, на выходе список массивов.
+        cfg: конфиг модели.
         lat: широта точки.
         lon: долгота точки.
         elev: высота точки, м.
@@ -325,24 +317,18 @@ class StreamingMayak:
         clim_mu: среднее климат-поля точки на каждый час года, для отката.
         clim_sig: масштаб климат-поля точки на каждый час года, для отката.
         fallbacks: сколько выпусков в этом процессе заменено откатом.
+
+    Raises:
+        RuntimeError: граф климатологии не дал годной таблицы.
     """
 
-    def __init__(self, model, lat, lon, elev, conformal=None, aci=None, runtime_cfg=None):
-        from mayak.runtime.graphs import TorchBackend
-        self.m = model.eval()
-        self._setup(TorchBackend(model), model.cfg, lat, lon, elev, conformal, aci, runtime_cfg)
-
-    def _setup(self, backend, cfg, lat, lon, elev, conformal, aci, runtime_cfg=None):
+    def __init__(self, backend, cfg, lat, lon, elev, conformal=None, aci=None,
+                 runtime_cfg=None):
         self.b, self.cfg = backend, cfg
-        self.window, self.history = cfg.stream_window, cfg.max_history
-        self.edge, self.tail = cfg.stream_edge, cfg.stream_tail
-        self.horizon, self.n_modes = cfg.horizon, cfg.n_modes
+        self.window, self.history = cfg.device_window, cfg.max_history
+        self.horizon = cfg.horizon
         self.lat, self.lon, self.elev = float(lat), float(lon), float(elev)
-        f = lambda v: np.array([[v]], np.float32)
-        self._lat, self._lon = f(lat), f(lon)
-        self.loc, c_mu, c_sig, c_def, self.z0, clim_mu, clim_sig = backend.run(
-            "init", self._lat, self._lon, f(elev))
-        self.coefs = [c_mu, c_sig, c_def]
+        clim_mu, clim_sig = backend.run("climatology", self._site_inputs())
         self.clim_mu, self.clim_sig = check_climatology(clim_mu, clim_sig)
         from mayak.baselines.statistical import ZQ
         self.zq = np.asarray(ZQ, np.float32)
@@ -357,6 +343,11 @@ class StreamingMayak:
         self.fallbacks = 0
         self.reset_calibration()
         self.reset()
+
+    def _site_inputs(self):
+        """Координаты и высота точки как входы графов, форма (1,) каждая."""
+        f = lambda v: np.array([v], np.float32)
+        return dict(lat=f(self.lat), lon=f(self.lon), elev=f(self.elev))
 
     def reset_calibration(self, theta=0.0):
         """Сброс адаптивной калибровки прибора: множители, счётчики и кольцо.
@@ -383,6 +374,11 @@ class StreamingMayak:
         return tuple(self.cal.misses)
 
     @property
+    def aci_coverage(self):
+        """Фактическое покрытие по обратной связи в каждом бине лидов с последнего сброса."""
+        return self.cal.coverage()
+
+    @property
     def history_length(self):
         """Длина истории выпуска: часы после холодного старта, не больше истории модели."""
         return min(int(self.filled), int(self.history))
@@ -391,26 +387,17 @@ class StreamingMayak:
         """Холодный старт: окно состоит из пустых часов. Множители калибровки сохраняются.
 
         Args:
-            last_hour: час, которым заканчивается пустое окно. None - момент ещё не
-                известен, окно строится при первом шаге.
+            last_hour: абсолютный час последнего шага, который сохраняется после
+                опустошения окна, или None - шагов не было.
         """
-        W, M = self.window, self.n_modes
+        W = self.window
         self.cal.clear()
         self.qc.reset()
         self.raw = np.zeros((W, 3), np.float32)
         self.present = np.zeros((W, 3), np.uint8)
         self.valid = np.zeros((W, 3), np.uint8)
         self.filled = 0
-        self.last_hour = None
-        self.modes = [np.zeros((1, M), np.float32) for _ in range(3)]
-        self.u_ring = np.zeros((self.tail, 2 * M), np.float32)
-        self.v_ring = np.zeros(self.tail, np.float32)
-        self.rows = np.zeros((self.history, 4), np.float32)
-        pads = (self.cfg.encoder_kernel - 1) * sum(self.cfg.encoder_dilations)
-        self.enc_buf = np.zeros((1, self.cfg.encoder_width, pads), np.float32)
-        if last_hour is not None:
-            self.last_hour = int(last_hour)
-            self._rebuild(seed_qc=False)
+        self.last_hour = None if last_hour is None else int(last_hour)
 
     @property
     def site(self):
@@ -419,51 +406,19 @@ class StreamingMayak:
 
     @property
     def memory_nbytes(self):
-        """Размер колец, буфера энкодера и таблицы климатологии в памяти, байт.
+        """Размер окна, таблицы климатологии и кольца калибровки в памяти, байт.
 
-        Кольцо адаптивной калибровки считается, если она включена. На диск ничего из
-        этого не пишется: всё восстанавливается из окна и графа старта, кольцо
-        калибровки после перезапуска пусто.
+        Кольцо адаптивной калибровки считается, если она включена.
         """
-        return int(self.u_ring.nbytes + self.v_ring.nbytes + self.rows.nbytes
-                   + self.enc_buf.nbytes + self.clim_mu.nbytes + self.clim_sig.nbytes
-                   + self.cal.nbytes)
+        return int(self.raw.nbytes + self.present.nbytes + self.valid.nbytes
+                   + self.clim_mu.nbytes + self.clim_sig.nbytes + self.cal.nbytes)
 
     def _hours(self, n):
         """Абсолютные часы последних n часов окна, от старых к новым."""
         return self.last_hour - n + 1 + np.arange(n, dtype=np.int64)
 
-    def _window_arrays(self, hours):
-        """Значения, маски годности и календарь часов окна."""
-        pos = hours % self.window
-        m = self.valid[pos].astype(np.float32)
-        x = np.where(m > 0, self.raw[pos], 0.0).astype(np.float32)
-        doy, hour = window_calendar(0, hours)
-        return x, m, doy, hour
-
-    def _window_pass(self, x, m, hours):
-        """Пакетный проход графом полного окна по часам окна."""
-        doy, hour = window_calendar(0, hours)
-        return self.b.run("window", x[None], m[None], doy[None], hour[None], self._lat,
-                          self._lon, *self.coefs)
-
-    def _rebuild(self, seed_qc):
-        """Всё модельное состояние из сырого окна одним пакетным проходом."""
-        W = self.window
-        hours = self._hours(W)
-        x, m, _, _ = self._window_arrays(hours)
-        enc, u, v, rows, n_re, n_im, e = self._window_pass(x, m, hours)
-        self.enc_buf, self.modes = enc, [n_re, n_im, e]
-        if self.tail:
-            slot = hours[W - self.tail:] % self.tail
-            self.u_ring[slot], self.v_ring[slot] = u[0], v[0]
-        self.rows[hours[W - self.history:] % self.history] = rows[0]
-        if seed_qc:
-            pos = hours[-self.qc.size:] % W
-            self.qc.seed(self.raw[pos], self.present[pos])
-
     def step(self, T, P, RH, hour):
-        """Новый час наблюдений.
+        """Новый час наблюдений: контроль качества, запись в окно, обратная связь калибровки.
 
         Пропущенные часы между прошлым шагом и этим заполняются пустыми. Простой не
         короче окна - холодный старт.
@@ -481,17 +436,16 @@ class StreamingMayak:
             ValueError: час не позже последнего шага.
         """
         hour = int(hour)
-        if self.last_hour is None:
-            self.reset(hour - 1)
-        elif hour <= self.last_hour:
-            raise ValueError(f"час {hour} не позже последнего шага {self.last_hour}")
-        else:
+        if self.last_hour is not None:
+            if hour <= self.last_hour:
+                raise ValueError(f"час {hour} не позже последнего шага {self.last_hour}")
             gap = hour - self.last_hour - 1
             if gap >= self.window:
                 log.info("простой %d ч не короче окна %d ч: холодный старт", gap, self.window)
-                self.reset(hour - 1)
-            for h in range(self.last_hour + 1, hour):
-                self._push((None, None, None), h)
+                self.reset()
+            else:
+                for h in range(self.last_hour + 1, hour):
+                    self._push((None, None, None), h)
             self.idle_hours += gap
         return self._push((T, P, RH), hour)
 
@@ -504,40 +458,9 @@ class StreamingMayak:
         j = hour % self.window
         self.raw[j] = np.where(present > 0, to_store(raw), 0.0)
         self.present[j], self.valid[j] = present, valid
-        self._ingest(hour)
-        return codes
-
-    def _ingest(self, hour):
-        """Один час окна через граф шага: буфер энкодера, сумма мод, кольца."""
         self.last_hour = hour
         self.filled = min(self.window, self.filled + 1)
-        x, m, _, _ = self._window_arrays(self._hours(CTX))
-        doy, hr = window_calendar(0, np.array([hour]))
-        M = self.n_modes
-        if self.tail:
-            slot = hour % self.tail
-            u_old, v_old = self.u_ring[slot][None], np.array([[self.v_ring[slot]]], np.float32)
-        else:
-            u_old, v_old = np.zeros((1, 2 * M), np.float32), np.zeros((1, 1), np.float32)
-        enc, n_re, n_im, e, u, v, row = self.b.run(
-            "step", x[None], m[None], doy[None], hr[None], self._lat, self._lon, *self.coefs,
-            self.enc_buf, *self.modes, u_old, v_old)
-        self.enc_buf, self.modes = enc, [n_re, n_im, e]
-        if self.tail:
-            self.u_ring[slot], self.v_ring[slot] = u[0], v[0, 0]
-        self.rows[hour % self.history] = row[0]
-        if self.tail and (hour + 1) % RESYNC_HOURS == 0:
-            self.resync()
-
-    def resync(self):
-        """Точная сумма мод по кольцу вкладов хвоста вместо скользящей."""
-        slot = self._hours(self.tail) % self.tail
-        self.modes = list(self.b.run("resync", self.u_ring[slot][None], self.v_ring[slot][None]))
-
-    @property
-    def aci_coverage(self):
-        """Фактическое покрытие по обратной связи в каждом бине лидов с последнего сброса."""
-        return self.cal.coverage()
+        return codes
 
     def issue_hour(self, now_hour=None):
         """Момент выпуска: последний шаг, а до первого шага - текущий час устройства.
@@ -558,17 +481,29 @@ class StreamingMayak:
                              "определён")
         return int(now_hour)
 
-    def _empty_history(self, last):
-        """Строки накопителя, сумма мод и край истории пустого окна, которое кончается часом last.
+    def model_inputs(self, now_hour=None):
+        """Входы графа прогноза по окну, как у окна оценки с той же историей.
 
-        Состояние рантайма не меняется.
+        Args:
+            now_hour: текущий абсолютный час UTC по часам устройства; нужен только до
+                первого шага, тогда история пустая.
+
+        Returns:
+            Словарь массивов float32 с осью батча длины 1: координаты, значения и маски
+            годности истории, выровненные по правому краю буфера истории модели,
+            календарь истории и горизонта.
+
+        Raises:
+            ValueError: момент выпуска не определён.
         """
-        W, L, E = self.window, self.history, self.edge
-        hours = last - W + 1 + np.arange(W, dtype=np.int64)
-        zeros = np.zeros((W, 3), np.float32)
-        _enc, _u, _v, rows, n_re, n_im, e = self._window_pass(zeros, zeros, hours)
-        de, he = window_calendar(0, hours[W - L:W - L + E])
-        return rows, [n_re, n_im, e], (zeros[:E], zeros[:E], de, he)
+        last = self.issue_hour(now_hour)
+        n = self.history_length
+        pos = (last - n + 1 + np.arange(n, dtype=np.int64)) % self.window
+        x, m = place_history(self.raw[pos], self.valid[pos], self.history)
+        doy_h, hour_h, doy_f, hour_f = issue_calendar(0, last + 1, self.history, self.horizon)
+        return dict(self._site_inputs(), x_hist=x[None], mask_hist=m[None],
+                    doy_hist=doy_h[None], hour_hist=hour_h[None], doy_fut=doy_f[None],
+                    hour_fut=hour_f[None])
 
     def raw_forecast(self, now_hour=None):
         """Квантили модели до калибровки на часы после момента выпуска.
@@ -582,21 +517,11 @@ class StreamingMayak:
 
         Raises:
             ValueError: момент выпуска не определён.
-            FloatingPointError: выход графа выпуска не конечен.
+            FloatingPointError: выход графа прогноза не конечен.
         """
-        last = self.issue_hour(now_hour)
-        L, E = self.history, self.edge
-        if self.last_hour is None:
-            rows, modes, (xe, me, de, he) = self._empty_history(last)
-        else:
-            hours = self._hours(L)
-            rows, modes = self.rows[hours % L][None], self.modes
-            xe, me, de, he = self._window_arrays(hours[:E])
-        df, hf = window_calendar(0, last + 1 + np.arange(self.horizon))
-        (q,) = self.b.run("issue", self.loc, self._lat, self._lon, *self.coefs, rows,
-                          *modes, xe[None], me[None], de[None], he[None], df[None], hf[None])
+        (q,) = self.b.run("forecast", self.model_inputs(now_hour))
         if not np.all(np.isfinite(q)):
-            raise FloatingPointError("выход графа выпуска не конечен")
+            raise FloatingPointError("выход графа прогноза не конечен")
         return q[0]
 
     def forecast(self, now_hour=None):
@@ -653,34 +578,6 @@ class StreamingMayak:
             q, mu = self.climatology_forecast(last)
             return q, mu, True
 
-    def warm_start(self, x_hist, mask_hist, last_hour):
-        """Прогрев по сырой истории: то же состояние, что после шага по каждому часу.
-
-        Значения записываются так, как их пишет прибор, и проходят причинный контроль
-        качества по всей переданной истории.
-
-        Args:
-            x_hist: сырые значения, форма (L, 3).
-            mask_hist: маска наличия, форма (L, 3).
-            last_hour: абсолютный час UTC последнего часа истории.
-        """
-        self.reset()
-        x = np.asarray(x_hist, np.float32).reshape(-1, 3)
-        present = ((np.asarray(mask_hist) > 0) & np.isfinite(x)).astype(np.uint8)
-        n = x.shape[0]
-        if n == 0:
-            return
-        raw = np.where(present > 0, record_values(np.where(present > 0, x, 0.0)), 0.0)
-        valid, _ = qc_window(raw, present, elev=self.elev)
-        take = min(self.window, n)
-        self.last_hour = int(last_hour)
-        pos = self._hours(take) % self.window
-        self.raw[pos] = np.where(present > 0, to_store(raw), 0.0)[-take:]
-        self.present[pos] = present[-take:]
-        self.valid[pos] = (valid[-take:] > 0).astype(np.uint8)
-        self.filled = take
-        self._rebuild(seed_qc=True)
-
     @staticmethod
     def _conformal(conformal):
         """Таблица поправок для выходов модели.
@@ -719,15 +616,18 @@ class StreamingMayak:
         return hdr.tobytes() + encode_window(self.raw[pos], self.present[pos], self.valid[pos])
 
     def load_state(self, raw):
-        """Состояние с диска и восстановление всего остального одним проходом по окну.
+        """Состояние с диска: окно, момент последнего шага, множители калибровки.
+
+        Кольцо контроля качества заполняется последними часами окна.
 
         Args:
             raw: байты состояния.
 
         Если состояние записано для другой точки, сдвиг в пределах порогов рантайма -
-        уточнение: окно сохраняется и пересчитывается для новой точки. Больше порога -
-        перенос: окно пустое, множители калибровки нулевые, момент последнего шага
-        сохраняется. Состояние версии 4 читается, его множитель идёт во все бины лидов.
+        уточнение: окно сохраняется, прогноз по нему строится для новой точки. Больше
+        порога - перенос: окно пустое, множители калибровки нулевые, момент последнего
+        шага сохраняется. Состояние версии 4 читается, его множитель идёт во все бины
+        лидов.
 
         Raises:
             ValueError: байты не состояние этого формата, не подходят конфигу модели или
@@ -741,15 +641,12 @@ class StreamingMayak:
             log.warning("прибор перенесён: %s; холодный старт, множитель калибровки сброшен",
                         describe_gap(gap, self.runtime_cfg))
             self.reset_calibration(0.0)
-            try:
-                self.reset(snap.last_hour)
-            except Exception:
-                self.reset()
-                raise
+            self.reset(snap.last_hour)
             return
         if kind == SITE_REFINED:
-            log.warning("координаты уточнены: %s; окно пересчитано для новой точки, множитель "
-                        "калибровки сохранён", describe_gap(gap, self.runtime_cfg))
+            log.warning("координаты уточнены: %s; окно сохранено, прогноз строится для новой "
+                        "точки, множитель калибровки сохранён",
+                        describe_gap(gap, self.runtime_cfg))
         self.reset_calibration(snap.theta)
         if snap.last_hour is None:
             return
@@ -758,14 +655,11 @@ class StreamingMayak:
         pos = self._hours(W) % W
         self.raw[pos], self.present[pos], self.valid[pos] = snap.raw, snap.present, snap.valid
         self.filled = snap.filled
-        try:
-            self._rebuild(seed_qc=True)
-        except Exception:
-            self.reset()
-            raise
+        pos = self._hours(self.qc.size) % W
+        self.qc.seed(self.raw[pos], self.present[pos])
 
 
-__all__ = ["CTX", "HOURS_OF_YEAR", "NO_HOUR", "N_LEAD_BINS", "RAW_CHANNELS", "RESYNC_HOURS",
-           "STATE_HEADER", "STATE_HEADERS", "STATE_HEADER_V4", "STATE_VERSION", "StateSnapshot",
-           "StreamingMayak", "check_climatology", "decode_window", "encode_window", "mask_bytes",
-           "parse_state", "state_nbytes", "to_store", "window_nbytes"]
+__all__ = ["CLIMATOLOGY_INPUTS", "FORECAST_INPUTS", "HOURS_OF_YEAR", "NO_HOUR", "N_LEAD_BINS",
+           "RAW_CHANNELS", "STATE_HEADER", "STATE_HEADERS", "STATE_HEADER_V4", "STATE_VERSION",
+           "Device", "StateSnapshot", "check_climatology", "decode_window", "encode_window",
+           "mask_bytes", "parse_state", "state_nbytes", "to_store", "window_nbytes"]

@@ -31,7 +31,7 @@ import os
 import sys
 import time
 
-from mayak.runtime.streaming import parse_state
+from mayak.runtime.device import parse_state
 
 log = logging.getLogger(__name__)
 
@@ -186,10 +186,10 @@ def _f32(v):
 
 
 class Host:
-    """Хост устройства поверх потокового рантайма.
+    """Хост поверх устройства: команды протокола и состояние на диске.
 
     Args:
-        runtime: потоковый рантайм.
+        runtime: устройство.
         store: файлы состояния или None, если состояние на диск не пишется.
         clock: функция без аргументов, текущее время UTC в секундах от эпохи.
     """

@@ -1,6 +1,7 @@
 r"""Хост устройства на Python: построчный протокол на stdin, ответы JSON на stdout.
 
-Модель берётся либо из каталога экспорта графов ONNX, либо из чекпойнта PyTorch.
+Модель берётся либо из каталога экспорта графов ONNX, либо из чекпойнта PyTorch: тогда
+те же графы исполняются в PyTorch.
 
 Запуск:
     python -m mayak.runtime.run_inference --model runtime/model \
@@ -48,13 +49,13 @@ def build_parser():
 
 
 def open_runtime(args):
-    """Потоковый рантайм по аргументам командной строки.
+    """Устройство по аргументам командной строки.
 
     Args:
         args: разобранные аргументы.
 
     Returns:
-        Потоковый рантайм.
+        Устройство на графах экспорта или на графах PyTorch из чекпойнта.
     """
     if args.model:
         from mayak.runtime.graphs import runtime_from_export
@@ -62,16 +63,18 @@ def open_runtime(args):
                                    threads=args.threads, conformal=not args.no_conformal,
                                    aci=args.aci)
     from mayak.lit import load_model
-    from mayak.runtime.streaming import StreamingMayak
+    from mayak.runtime.device import Device
+    from mayak.runtime.graphs import TorchBackend
     aci = None
     if args.aci:
         from mayak.calibration import load_config
         aci = load_config(args.calibration_config).aci()
     from mayak.runtime.site import load_runtime_config
     conformal = None if args.no_conformal else args.conformal
-    return StreamingMayak(load_model(args.ckpt).eval(), args.lat, args.lon, args.elev,
-                          conformal=conformal, aci=aci,
-                          runtime_cfg=load_runtime_config(args.runtime_config))
+    model = load_model(args.ckpt).eval()
+    return Device(TorchBackend(model), model.cfg, args.lat, args.lon, args.elev,
+                  conformal=conformal, aci=aci,
+                  runtime_cfg=load_runtime_config(args.runtime_config))
 
 
 def main(argv=None):

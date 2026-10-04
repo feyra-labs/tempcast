@@ -180,7 +180,7 @@ class MAYAK(nn.Module):
         return torch.stack([fut[n] for n in SOLAR_CHANNELS], dim=-1)
 
     def issue(self, loc, z, coefs, a_re, a_im, e, astro_f):
-        """Выпуск прогноза из состояния мод и паспорта; общий для пакета и потока.
+        """Выпуск прогноза из состояния мод и паспорта.
 
         Поле на часах горизонта считается дважды: без паспорта - его разброс переводит
         аномалию мод погоды и поправку в градусы, как при нормировке истории, - и с
@@ -245,86 +245,6 @@ class MAYAK(nn.Module):
         s = torch.stack([mean, mx, mn, mp, n / 24.0, has], dim=-1)
         return s, has
 
-    def history_pass(self, x, mask, astro_h, coefs):
-        """Пакетный проход по отрезку часов без выпуска прогноза.
-
-        Отрезок обрабатывается так же, как пакетное окно истории: энкодер видит слева
-        нули, у первых часов нет прошлого для каналов с лагом.
-
-        Args:
-            x: наблюдения, форма (B, L, 3).
-            mask: маски годности, форма (B, L, 3).
-            astro_h: солнечно-календарные признаки часов отрезка.
-            coefs: коэффициенты климат-поля точки без паспорта.
-
-        Returns:
-            Словарь: ``u`` вклады часов в моды (B, L, 2M), ``v`` маска температуры
-            (B, L), ``rows`` строки суточного накопителя (B, L, 4) и ``enc_buf`` буфер
-            энкодера после последнего часа.
-        """
-        mu0, sg0, df0 = self.field.evaluate(coefs, astro_h)
-        ch, aT, vt = self.build_channels(x, mask, astro_h, mu0, sg0, df0)
-        rows = torch.stack([aT, self.channel(ch, "dP24"), vt,
-                            self.lag_valid(mask[..., 1], DAY_LAG)], dim=-1)
-        feats, enc_buf = self.encoder.forward_with_buffer(ch)
-        return dict(u=self.readout.project(feats), v=vt, rows=rows, enc_buf=enc_buf)
-
-    def passport_from_rows(self, loc, rows):
-        """Паспорт по строкам суточного накопителя за всю историю.
-
-        Строки приходят от потока, который видел часы до начала окна. У пакета первые
-        сутки окна не знают давления сутками раньше, поэтому изменение давления за
-        сутки и его маска в них обнуляются. Остальные столбцы от начала окна не зависят.
-
-        Args:
-            loc: признаки точки, форма (B, loc_dim).
-            rows: строки от старых часов к новым, форма (B, L, 4); L кратно 24.
-
-        Returns:
-            Паспорт формы (B, dz).
-        """
-        L = rows.shape[1]
-        pos = torch.arange(L, device=rows.device)
-        lag_ok = (pos >= DAY_LAG).to(rows.dtype)[None, :]
-        summ, has = self.daily_summaries(rows[..., 0], rows[..., 1] * lag_ok, rows[..., 2],
-                                         rows[..., 3] * lag_ok)
-        z, _ = self.passport(loc, summ, has, sample=False)
-        return z
-
-    def stream_issue(self, loc, coefs, lat, lon, rows, tail, x_edge, m_edge, astro_edge,
-                     astro_f):
-        """Выпуск из потокового состояния, равный пакетному выпуску по той же истории.
-
-        Хвост истории приходит готовой суммой мод. Край истории, признаки которого
-        зависят от начала окна, пересчитывается здесь пакетным проходом по его часам.
-
-        Args:
-            loc: признаки точки, форма (B, loc_dim).
-            coefs: коэффициенты климат-поля точки без паспорта.
-            lat: широта, форма (B, 1).
-            lon: долгота, форма (B, 1).
-            rows: строки суточного накопителя за всю историю, форма (B, L, 4).
-            tail: тройка состояния мод по хвосту истории, каждая часть формы (B, M).
-            x_edge: значения часов края, форма (B, E, 3).
-            m_edge: маски годности часов края, форма (B, E, 3).
-            astro_edge: солнечно-календарные признаки часов края.
-            astro_f: солнечно-календарные признаки часов горизонта.
-
-        Returns:
-            Словарь выпуска, как у пакетного пути.
-        """
-        z = self.passport_from_rows(loc, rows)
-        n_re, n_im, e = tail
-        if self.cfg.stream_edge:
-            edge = self.history_pass(x_edge, m_edge, astro_edge, coefs)
-            lag0 = rows.shape[1] - x_edge.shape[1]
-            d_re, d_im, d_e = self.readout.accumulate(edge["u"], edge["v"], lag0)
-            n_re, n_im, e = n_re + d_re, n_im + d_im, e + d_e
-        a_re, a_im = self.readout.normalize(n_re, n_im, e)
-        out = self.issue(loc, z, coefs, a_re, a_im, e, astro_f)
-        out.update(z=z, e=e)
-        return out
-
     def forward(self, batch):
         lat, lon, elev = batch["lat"], batch["lon"], batch["elev"]
         x, mask = batch["x_hist"], batch["mask_hist"]
@@ -340,7 +260,7 @@ class MAYAK(nn.Module):
         ch, aT, vt = self.build_channels(x, mask, astro_h, mu0, sg0, df0)
 
         summ, day_mask = self.daily_summaries(aT, self.channel(ch, "dP24"), vt,
-                                              self.lag_valid(mask[..., 1], 24))
+                                              self.lag_valid(mask[..., 1], DAY_LAG))
         z, kl = self.passport(loc, summ, day_mask, sample=self.training)
 
         feats = self.encoder(ch)

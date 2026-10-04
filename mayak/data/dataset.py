@@ -13,7 +13,7 @@ from mayak.data.masking import (DEFAULT_TARGET_MASK, FilterStats, enforce_invari
 from mayak.data.qc import DEFAULT_QC, qc_window
 from mayak.data.splits import ROLE_TRAIN, time_layout
 from mayak.data.store import get_store
-from mayak.timeaxis import window_calendar
+from mayak.data.window import issue_calendar, place_history
 from mayak.zones import normalize_zone
 
 log = logging.getLogger(__name__)
@@ -120,12 +120,8 @@ def slice_history(x, mask, t, L):
         Пара массивов формы (наибольшая длина истории, 3): значения и маски; слева
         нули.
     """
-    x_hist = np.zeros((L_MAX, 3), np.float32)
-    mask_hist = np.zeros((L_MAX, 3), np.float32)
-    if L > 0:
-        src = np.arange(t - L, t)
-        x_hist[L_MAX - L:], mask_hist[L_MAX - L:] = enforce_invariant(x[src], mask[src])
-    return x_hist, mask_hist
+    src = np.arange(t - L, t)
+    return place_history(x[src], mask[src], L_MAX)
 
 
 def qc_context(t, L, floor, lookback=None):
@@ -414,13 +410,9 @@ class WindowDataset(Dataset):
         Returns:
             Словарь тензоров окна.
         """
-        k = np.arange(L_MAX)
-        abs_h = t - L_MAX + k
-        doy_h, hour_h = window_calendar(s["t0"], abs_h)
+        doy_h, hour_h, doy_f, hour_f = issue_calendar(s["t0"], t, L_MAX, H)
         x_hist, mask_hist = slice_history(s["raw"], s["present"], t, L)
 
-        fut = np.arange(t, t + H)
-        doy_f, hour_f = window_calendar(s["t0"], fut)
         y, y_mask = slice_target(s["x"], s["mask"], t)
         scale = norm_scale(s["clim"], doy_f, hour_f)
 

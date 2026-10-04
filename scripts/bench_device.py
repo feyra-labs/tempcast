@@ -4,14 +4,15 @@ r"""Замеры рантайма на устройстве - один восп�
         --lat 52.37 --lon 4.90 --elev -2 --out-dir runs/bench_device
 
 Что меряется (всё на одном устройстве, на одних и тех же входах, 1 поток):
-* задержка потактового шага и выпуска прогноза: медиана, p95, p99 на длинном прогоне -
-  для эталонного потокового рантайма на PyTorch и для Python с ONNX Runtime на графах
-  экспорта;
+* стоимость часа (контроль качества и запись в окно) и стоимость выпуска (один проход
+  графа прогноза с калибровкой): медиана, p95, p99 на длинном прогоне - для графов на
+  PyTorch (эталон) и для Python с ONNX Runtime на графах экспорта;
 * пиковая резидентная память процесса (каждая реализация - в отдельном процессе);
-* размер графов экспорта, размер состояния и буфера энкодера - точным числом байт;
+* размер графов экспорта, размер состояния и рабочей памяти устройства - точным числом
+  байт;
 * расхождение выходов ONNX Runtime с эталоном на тех же входах;
-* расхождение пакетного и потокового путей при выпусках в случайные часы длинного ряда
-  и его изменение во времени.
+* наибольшее расхождение выпуска устройства на ONNX Runtime с проходом модели на окне
+  оценки при выпусках в случайные часы длинного ряда.
 
 Итог: out-dir/results.json и out-dir/results.md. Без --ckpt замер идёт на модели со
 случайными весами: задержки, память и размеры честные, и отчёт это помечает.
@@ -114,12 +115,10 @@ def worker(args):
     model = load_model(args.ckpt, args.seed)
     series = np.fromfile(args.series, "<f4").reshape(-1, 3)
     t0 = time.perf_counter()
-    if args.backend == "torch":
-        from mayak.runtime.streaming import StreamingMayak
-        rt = StreamingMayak(model, args.lat, args.lon, args.elev)
-    else:
-        from mayak.runtime.graphs import GraphRuntime, OnnxBackend
-        rt = GraphRuntime(OnnxBackend(args.model_dir), model.cfg, args.lat, args.lon, args.elev)
+    from mayak.runtime.device import Device
+    from mayak.runtime.graphs import OnnxBackend, TorchBackend
+    backend = TorchBackend(model) if args.backend == "torch" else OnnxBackend(args.model_dir)
+    rt = Device(backend, model.cfg, args.lat, args.lon, args.elev)
     startup_ms = (time.perf_counter() - t0) * 1e3
     start = args.start_unix_hour
     t_step, t_fc, dump = [], [], []
@@ -142,10 +141,54 @@ def worker(args):
                step=stats_us(t_step), forecast=stats_us(t_fc), startup_ms=startup_ms,
                peak_rss_bytes=peak_rss_bytes())
     rep["state_bytes"] = len(rt.serialize())
+    rep["memory_bytes"] = int(rt.memory_nbytes)
     t = time.perf_counter()
     rt.load_state(rt.serialize())
     rep["restore_ms"] = (time.perf_counter() - t) * 1e3
     print(json.dumps(rep))
+
+
+def eval_divergence(model_dir, model, n_issues, hours, seed, lat, lon, elev):
+    """Расхождение выпуска устройства с проходом модели на окне оценки.
+
+    Устройство на графах ONNX идёт по ряду час за часом. В случайные часы ряда, начиная
+    с пустой истории, его квантили до калибровки сравниваются с проходом модели в
+    PyTorch на окне оценки с тем же моментом выпуска.
+
+    Args:
+        model_dir: каталог экспорта.
+        model: модель в PyTorch.
+        n_issues: число выпусков.
+        hours: длина ряда, часы.
+        seed: сид ряда и моментов выпуска.
+        lat: широта.
+        lon: долгота.
+        elev: высота, м.
+
+    Returns:
+        Словарь: число выпусков, длина ряда, наибольшее расхождение по всем лидам и
+        расхождение каждого выпуска вместе с его строкой ряда.
+    """
+    import torch
+
+    from mayak.runtime.device import Device
+    from mayak.runtime.graphs import OnnxBackend, eval_inputs, eval_set, feed, synthetic_series
+    H = model.cfg.horizon
+    rng = np.random.default_rng(seed)
+    s = synthetic_series(hours + H, seed=seed)
+    ends = np.sort(rng.choice(np.arange(1, hours + 1), size=min(n_issues, hours), replace=False))
+    ds = eval_set(s, ends, lat, lon, elev)
+    dev = Device(OnnxBackend(model_dir), model.cfg, lat, lon, elev)
+    by_issue, done = [], 0
+    for i, end in enumerate(int(e) for e in ends):
+        feed(dev, s, done, end)
+        done = end
+        b = {k: torch.from_numpy(v) for k, v in eval_inputs(ds, i).items()}
+        with torch.no_grad():
+            q_ref = model(b)["q"][0].numpy()
+        by_issue.append((end, float(np.abs(dev.raw_forecast() - q_ref).max())))
+    return dict(n_issues=len(by_issue), hours=int(hours),
+                max_abs=max(e for _, e in by_issue), by_issue=by_issue)
 
 
 def run_worker(args, backend, dump):
@@ -186,7 +229,7 @@ def markdown(res):
          f"Устройство: {res['device']['cpu'] or res['device']['machine']} "
          f"({res['device']['system']}); модель: {res['model']}; "
          f"{res['hours']} ч, выпуск каждые {res['forecast_every']} ч, 1 поток.", "",
-         "| Реализация | шаг p50, мкс | шаг p95 | шаг p99 | выпуск p50, мкс | выпуск p99 | "
+         "| Реализация | час p50, мкс | час p95 | час p99 | выпуск p50, мкс | выпуск p99 | "
          "пик RSS, МБ | старт, мс | max\\|Δq\\| к эталону, °C |",
          "|---|---|---|---|---|---|---|---|---|"]
     for name, r in res["runs"].items():
@@ -196,14 +239,13 @@ def markdown(res):
                  f"{fmt(r.get('startup_ms'))} | {r.get('max_abs_dq_vs_python', '—')} |")
     s = res["sizes"]
     L += ["", "| Размер | байт |", "|---|---|"]
-    for k in ("model_bytes", "state_bytes", "encoder_buffer_bytes"):
+    for k in ("model_bytes", "state_bytes", "memory_bytes"):
         L.append(f"| {k} | {s.get(k)} |")
-    eq = res["batch_stream"]
-    L += ["", f"Пакет и поток: {eq['n_issues']} выпусков в случайные часы ряда длиной "
-              f"{eq['hours']} ч, max|Δq| = {eq['batch_stream_max_abs']:.2e} °C по всем лидам; "
-              f"после перезапуска {eq['restart_max_abs']:.2e} °C."]
+    eq = res["device_vs_eval"]
+    L += ["", f"Устройство и окно оценки: {eq['n_issues']} выпусков в случайные часы ряда "
+              f"длиной {eq['hours']} ч, max|Δq| = {eq['max_abs']:.2e} °C по всем лидам."]
     L += ["", "| Выпуск, час ряда | max\\|Δq\\|, °C |", "|---|---|"]
-    L += [f"| {end} | {err:.2e} |" for end, err in eq["batch_stream_by_issue"]]
+    L += [f"| {end} | {err:.2e} |" for end, err in eq["by_issue"]]
     if not res["trained"]:
         L += ["", "**Модель не обучена (случайные веса): задержки, память и размеры честные.**"]
     return "\n".join(L) + "\n"
@@ -228,9 +270,9 @@ def main():
     ap.add_argument("--warmup", type=int, default=48)
     ap.add_argument("--forecast-every", type=int, default=24)
     ap.add_argument("--issues", type=int, default=40,
-                    help="выпусков в случайные часы для сравнения пакета и потока")
+                    help="выпусков в случайные часы для сравнения устройства с окном оценки")
     ap.add_argument("--equivalence-hours", type=int, default=10_000,
-                    help="длина ряда для сравнения пакета и потока, часы")
+                    help="длина ряда для сравнения устройства с окном оценки, часы")
     ap.add_argument("--lat", type=float, default=52.37)
     ap.add_argument("--lon", type=float, default=4.9)
     ap.add_argument("--elev", type=float, required=True,
@@ -240,8 +282,7 @@ def main():
 
     import torch
     torch.set_num_threads(1)
-    from mayak.runtime.equivalence import divergence, synthetic_series
-    from mayak.runtime.graphs import export_graphs
+    from mayak.runtime.graphs import export_graphs, synthetic_series
     os.makedirs(args.out_dir, exist_ok=True)
     model = load_model(args.ckpt, args.seed)
     args.model_dir = os.path.join(args.out_dir, "model")
@@ -254,28 +295,27 @@ def main():
     args.start_unix_hour = start_hour()
 
     runs, dumps = {}, {}
-    for name, backend in (("Python (PyTorch, эталон)", "torch"),
+    for name, backend in (("PyTorch (эталон)", "torch"),
                           ("Python + ONNX Runtime", "onnx")):
         dumps[name] = os.path.join(args.out_dir, f"q_{len(dumps)}.f32")
         print("…", name, flush=True)
         runs[name] = run_worker(args, backend, dumps[name])
-    ref = np.fromfile(dumps["Python (PyTorch, эталон)"], "<f4")
+    ref = np.fromfile(dumps["PyTorch (эталон)"], "<f4")
     for name, path in dumps.items():
         dq = float(np.abs(np.fromfile(path, '<f4') - ref).max())
         runs[name]["max_abs_dq_vs_python"] = f"{dq:.2e}"
 
     size = lambda p: os.path.getsize(os.path.join(args.model_dir, p))
-    d = man["dims"]
     sizes = dict(model_bytes=sum(size(v["file"]) for v in man["graphs"].values()),
                  state_bytes=runs["Python + ONNX Runtime"]["state_bytes"],
-                 encoder_buffer_bytes=4 * d["encoder_width"] * d["enc_buf_len"])
-    print("… пакет ↔ поток", flush=True)
+                 memory_bytes=runs["Python + ONNX Runtime"]["memory_bytes"])
+    print("… устройство ↔ окно оценки", flush=True)
     res = dict(device=device_info(), model=args.ckpt or "случайные веса",
                trained=bool(args.ckpt), hours=args.hours, forecast_every=args.forecast_every,
                runs=runs, sizes=sizes,
-               batch_stream=divergence(model, args.issues, hours=args.equivalence_hours,
-                                       seed=args.seed, lat=args.lat, lon=args.lon,
-                                       elev=args.elev))
+               device_vs_eval=eval_divergence(args.model_dir, model, args.issues,
+                                              args.equivalence_hours, args.seed, args.lat,
+                                              args.lon, args.elev))
     with open(os.path.join(args.out_dir, "results.json"), "w", encoding="utf-8") as fh:
         json.dump(res, fh, ensure_ascii=False, indent=1)
     md = markdown(res)

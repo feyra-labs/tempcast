@@ -1,24 +1,14 @@
-"""МАЯК как пять графов без состояния для рантайма устройства.
+"""МАЯК как два графа без состояния для устройства, экспорт и исполнители графов.
 
-Устройство вызывает модель в разных ритмах, поэтому модель режется на графы, а всё
-состояние ходит через их входы и выходы:
+* ``forecast``    - проход модели (``MAYAK.forward``) по окну истории: координаты,
+  значения и маски истории после контроля качества, календарь истории и горизонта. На
+  выходе квантили до калибровки.
+* ``climatology`` - таблица климатологии точки для отката: среднее и масштаб
+  климат-поля с паспортом холодного старта на каждый час високосного года. Считается
+  один раз при старте устройства.
 
-* ``init``   - при старте: признаки точки, коэффициенты климат-поля без паспорта и
-  таблица климатологии точки для отката: среднее и масштаб климат-поля с паспортом
-  холодного старта на каждый час високосного года;
-* ``step``   - раз в час: хвост сырого окна, календарь часа, буфер энкодера, сумма мод по
-  хвосту истории и вклад часа, который из хвоста выходит. На выходе новый буфер, новая
-  сумма, вклад этого часа в моды для кольца хоста и строка суточного накопителя;
-* ``window`` - при загрузке состояния и холодном старте: пакетный проход по всему окну.
-  На выходе буфер энкодера, вклады часов хвоста, строки накопителя и сумма мод по хвосту;
-* ``resync`` - раз в сутки: точная сумма мод по кольцу вкладов хвоста;
-* ``issue``  - по запросу: паспорт по строкам накопителя за всю историю, вклад края
-  истории пакетным проходом по его часам, выпуск квантилей до калибровки.
-
-Каждый граф - тонкая обёртка над методами модели, которыми пользуется пакетный путь.
-Своей арифметики в обёртках нет. Хост держит сырое окно, кольца вкладов и строк,
-причинный контроль качества, калибровку и сериализацию. Буфер энкодера хранится в
-хронологическом порядке и сдвигается внутри графа.
+Своей арифметики модели в обёртках нет. Окно, контроль качества, калибровку и
+сериализацию держит устройство.
 """
 from __future__ import annotations
 
@@ -30,36 +20,27 @@ import torch
 import torch.nn as nn
 
 from mayak.astro import astro_features
-from mayak.runtime.streaming import (CTX, RAW_CHANNELS, RESYNC_HOURS, STATE_HEADER,
-                                     STATE_VERSION, StreamingMayak, state_nbytes)
+from mayak.runtime.device import (CLIMATOLOGY_INPUTS, FORECAST_INPUTS, HOURS_OF_YEAR,
+                                  RAW_CHANNELS, STATE_HEADER, STATE_VERSION, Device,
+                                  state_nbytes)
+from mayak.timeaxis import to_utc_hour, window_calendar
 
-GRAPH_FORMAT = 6
-GRAPH_NAMES = ("init", "step", "window", "resync", "issue")
-COEFS = ("c_mu", "c_sig", "c_def")
-HOURS_OF_YEAR = 366 * 24
+GRAPH_FORMAT = 7
+GRAPH_NAMES = ("forecast", "climatology")
 GRAPH_IO = {
-    "init": (("lat", "lon", "elev"),
-             ("loc", "c_mu", "c_sig", "c_def", "z0", "clim_mu", "clim_sig")),
-    "step": (("x_ctx", "m_ctx", "doy", "hour", "lat", "lon", *COEFS,
-              "enc_buf", "n_re", "n_im", "e", "u_old", "v_old"),
-             ("enc_buf_out", "n_re_out", "n_im_out", "e_out", "u", "v", "row")),
-    "window": (("x_win", "m_win", "doy_win", "hour_win", "lat", "lon", *COEFS),
-               ("enc_buf", "u_tail", "v_tail", "rows", "n_re", "n_im", "e")),
-    "resync": (("u_ring", "v_ring"),
-               ("n_re", "n_im", "e")),
-    "issue": (("loc", "lat", "lon", *COEFS, "rows", "n_re", "n_im", "e",
-               "x_edge", "m_edge", "doy_edge", "hour_edge", "doy_fut", "hour_fut"),
-              ("q",)),
+    "forecast": (FORECAST_INPUTS, ("q",)),
+    "climatology": (CLIMATOLOGY_INPUTS, ("clim_mu", "clim_sig")),
 }
-DAY_ROW = ("aT", "dP24", "vt", "vp24")
+SYNTHETIC_START = "2021-12-27T00"
+EVAL_STATION = "device"
 
 
 class _Graph(nn.Module):
     """Обёртка в режиме eval.
 
     Экспорт восстанавливает режим экспортируемого модуля рекурсивно: обёртка в режиме
-    train после экспорта перевела бы в train и общую модель, паспорт начал бы
-    сэмплировать, и пакетный путь перестал бы совпадать с потоковым.
+    train после экспорта перевела бы в train и общую модель, и паспорт начал бы
+    сэмплировать.
     """
 
     def __init__(self, model):
@@ -81,12 +62,22 @@ def year_calendar():
     return (sec / 86400.0).astype(np.float32), ((sec % 86400) / 3600.0).astype(np.float32)
 
 
-class InitGraph(_Graph):
-    """Старт устройства: всё, что зависит только от точки.
+class ForecastGraph(_Graph):
+    """Выпуск: проход модели по окну истории, на выходе квантили."""
 
-    Таблица климатологии - то, что выдаёт модель при пустой истории без мод и поправки:
-    климат-поле с паспортом холодного старта. Хост берёт из неё среднее и масштаб по
-    часу года, когда выпуск не удался, и своей арифметики модели не делает.
+    def forward(self, lat, lon, elev, x_hist, mask_hist, doy_hist, hour_hist, doy_fut,
+                hour_fut):
+        batch = dict(lat=lat, lon=lon, elev=elev, x_hist=x_hist, mask_hist=mask_hist,
+                     doy_hist=doy_hist, hour_hist=hour_hist, doy_fut=doy_fut,
+                     hour_fut=hour_fut)
+        return self.m(batch)["q"]
+
+
+class ClimatologyGraph(_Graph):
+    """Таблица климатологии точки для отката.
+
+    Таблица - то, что выдаёт модель при пустой истории без мод и поправки: климат-поле
+    с паспортом по пустым суточным сводкам.
     """
 
     def __init__(self, model):
@@ -96,77 +87,25 @@ class InitGraph(_Graph):
         self.register_buffer("year_hour", torch.from_numpy(hour)[None], persistent=False)
 
     def forward(self, lat, lon, elev):
-        m, D = self.m, self.m.cfg.history_days
-        loc = m.loc(lat[:, 0], lon[:, 0], elev[:, 0])
-        c_mu, c_sig, c_def = m.field.coefficients(loc)
-        z0 = m.passport_from_rows(loc, loc.new_zeros(1, D * 24, len(DAY_ROW)))
+        m = self.m
+        loc = m.loc(lat, lon, elev)
+        empty = lat.new_zeros(lat.shape[0], m.cfg.max_history)
+        summ, has = m.daily_summaries(empty, empty, empty, empty)
+        z, _ = m.passport(loc, summ, has, sample=False)
         # Календарь года привязан к входу нулевым слагаемым: иначе экспорт развернул бы
         # все его производные в константы и граф вырос бы в несколько раз.
-        zero = lat * 0.0
-        astro = astro_features(self.year_doy + zero, self.year_hour + zero, lat, lon)
-        clim_mu, clim_sig, _ = m.field.evaluate(m.field.coefficients(loc, z0), astro)
-        return loc, c_mu, c_sig, c_def, z0, clim_mu, clim_sig
+        zero = lat[:, None] * 0.0
+        astro = astro_features(self.year_doy + zero, self.year_hour + zero, lat[:, None],
+                               lon[:, None])
+        clim_mu, clim_sig, _ = m.field.evaluate(m.field.coefficients(loc, z), astro)
+        return clim_mu, clim_sig
 
 
-class StepGraph(_Graph):
-    """Один час.
-
-    Календарь хвоста окна не нужен: выход считается для последнего часа хвоста, а
-    каналы с лагом зависят только от давления и маски. Календарь часа растягивается на
-    весь хвост.
-    """
-
-    def forward(self, x_ctx, m_ctx, doy, hour, lat, lon, c_mu, c_sig, c_def,
-                enc_buf, n_re, n_im, e, u_old, v_old):
-        m = self.m
-        n = x_ctx.shape[1]
-        astro_h = astro_features(doy.expand(-1, n), hour.expand(-1, n), lat, lon)
-        mu0, sg0, df0 = m.field.evaluate((c_mu, c_sig, c_def), astro_h)
-        ch, aT, vt = m.build_channels(x_ctx, m_ctx, astro_h, mu0, sg0, df0)
-        dp24, vp24 = m.channel(ch, "dP24"), m.lag_valid(m_ctx[..., 1], 24)
-        feat, enc_buf = m.encoder.step_shift(ch[..., -1], enc_buf)
-        u = m.readout.project(feat)
-        v = vt[:, -1:]
-        n_re, n_im, e = m.readout.step_window((n_re, n_im, e), u, v, u_old, v_old,
-                                              m.cfg.stream_tail)
-        row = torch.stack([aT[:, -1], dp24[:, -1], vt[:, -1], vp24[:, -1]], dim=-1)
-        return enc_buf, n_re, n_im, e, u, v, row
-
-
-class WindowGraph(_Graph):
-    """Пакетный проход по всему сырому окну."""
-
-    def forward(self, x_win, m_win, doy_win, hour_win, lat, lon, c_mu, c_sig, c_def):
-        m, cfg = self.m, self.m.cfg
-        astro_h = astro_features(doy_win, hour_win, lat, lon)
-        out = m.history_pass(x_win, m_win, astro_h, (c_mu, c_sig, c_def))
-        W, T, L = x_win.shape[1], cfg.stream_tail, cfg.max_history
-        u_tail, v_tail = out["u"][:, W - T:], out["v"][:, W - T:]
-        n_re, n_im, e = m.readout.accumulate(u_tail, v_tail)
-        return out["enc_buf"], u_tail, v_tail, out["rows"][:, W - L:], n_re, n_im, e
-
-
-class ResyncGraph(_Graph):
-    def forward(self, u_ring, v_ring):
-        return self.m.readout.accumulate(u_ring, v_ring)
-
-
-class IssueGraph(_Graph):
-    def forward(self, loc, lat, lon, c_mu, c_sig, c_def, rows, n_re, n_im, e,
-                x_edge, m_edge, doy_edge, hour_edge, doy_fut, hour_fut):
-        m = self.m
-        astro_e = astro_features(doy_edge, hour_edge, lat, lon)
-        astro_f = astro_features(doy_fut, hour_fut, lat, lon)
-        return m.stream_issue(loc, (c_mu, c_sig, c_def), lat, lon, rows, (n_re, n_im, e),
-                              x_edge, m_edge, astro_e, astro_f)["q"]
-
-
-GRAPH_MODULES = dict(init=InitGraph, step=StepGraph, window=WindowGraph, resync=ResyncGraph,
-                     issue=IssueGraph)
+GRAPH_MODULES = dict(forecast=ForecastGraph, climatology=ClimatologyGraph)
 
 
 def dims(cfg):
-    """Размеры входов и выходов графов и состояния хоста для конфига модели.
+    """Размеры входов и выходов графов и окна устройства для конфига модели.
 
     Args:
         cfg: конфиг модели.
@@ -174,63 +113,131 @@ def dims(cfg):
     Returns:
         Словарь размеров.
     """
-    from mayak.config import N_DAILY_SUMMARY
-    from mayak.modules.loc import LocEncoder
-    loc_dim = LocEncoder(cfg.loc_freqs).out_dim
-    enc_buf = (cfg.encoder_kernel - 1) * sum(cfg.encoder_dilations)
-    return dict(horizon=cfg.horizon, n_quantiles=cfg.n_quantiles, n_modes=cfg.n_modes,
-                passport_dim=cfg.passport_dim, history=cfg.max_history,
-                history_days=cfg.history_days, n_daily_summary=N_DAILY_SUMMARY,
-                day_row=len(DAY_ROW), stream_window=cfg.stream_window,
-                stream_edge=cfg.stream_edge, stream_tail=cfg.stream_tail, ctx=CTX,
-                loc_dim=loc_dim, encoder_width=cfg.encoder_width, enc_buf_len=enc_buf,
-                hours_of_year=HOURS_OF_YEAR)
+    return dict(horizon=cfg.horizon, n_quantiles=cfg.n_quantiles, history=cfg.max_history,
+                window=cfg.device_window, hours_of_year=HOURS_OF_YEAR)
+
+
+def default_start():
+    """Абсолютный час начала синтетических рядов.
+
+    Конец декабря, чтобы ряды переходили через Новый год.
+    """
+    return int(to_utc_hour(np.datetime64(SYNTHETIC_START, "s")))
+
+
+def synthetic_series(n, seed=0, t0=None, p_valid=0.9):
+    """Почасовой синтетический ряд.
+
+    Args:
+        n: длина ряда, часы.
+        seed: сид.
+        t0: абсолютный час UTC первого часа; по умолчанию конец декабря.
+        p_valid: доля часов с наблюдением в каждом канале.
+
+    Returns:
+        Словарь: ``x`` значения (n, 3) с нулями на месте пропусков, ``m`` маска наличия
+        (n, 3), ``t0`` абсолютный час первого часа.
+    """
+    rng = np.random.default_rng(seed)
+    t = np.arange(n)
+    T = (8 + 6 * np.sin(2 * np.pi * t / 24) + 3 * np.sin(2 * np.pi * t / 170)
+         + rng.standard_normal(n))
+    P = 1005 + 8 * np.sin(2 * np.pi * t / 130 + rng.uniform(0, 6)) + 0.4 * rng.standard_normal(n)
+    RH = np.clip(70 - 2 * (T - 8) + 5 * rng.standard_normal(n), 5, 100)
+    x = np.stack([T, P, RH], -1).astype(np.float32)
+    m = (rng.random((n, 3)) < p_valid).astype(np.float32)
+    gap = rng.integers(0, max(n - 30, 1))
+    m[gap:gap + 20, 0] = 0.0
+    t0 = default_start() if t0 is None else int(t0)
+    return dict(x=x * m, m=m, t0=t0)
+
+
+def feed(device, series, k0, k1):
+    """Подать часы ряда устройству через шаг часа.
+
+    Args:
+        device: устройство.
+        series: ряд со значениями, масками и первым часом.
+        k0: первая строка.
+        k1: строка после последней.
+
+    Returns:
+        То же устройство.
+    """
+    x, m = series["x"], series["m"]
+    for k in range(k0, k1):
+        v = [float(x[k, j]) if m[k, j] > 0 else None for j in range(3)]
+        device.step(*v, series["t0"] + k)
+    return device
+
+
+def eval_set(series, ends, lat, lon, elev):
+    """Набор окон оценки по одной станции из синтетического ряда.
+
+    Станция - ряд, записанный так, как его пишет прибор, с климатологией по нему же.
+    Окно номер i начинает горизонт со строки ``ends[i]``; история - полный буфер, самый
+    ранний доступный час - начало ряда. Ряд должен вмещать горизонт после каждого окна.
+
+    Args:
+        series: синтетический ряд.
+        ends: строки начала горизонта.
+        lat: широта, градусы.
+        lon: долгота, градусы.
+        elev: высота, м.
+
+    Returns:
+        Набор окон оценки.
+    """
+    from mayak.data.climatology import Climatology
+    from mayak.data.holdout import EvalSet
+    from mayak.data.recording import record_values
+    m = np.asarray(series["m"], np.float32)
+    raw = np.where(m > 0, record_values(np.where(m > 0, series["x"], 0.0)), 0.0)
+    raw = raw.astype(np.float32)
+    doy, hour = window_calendar(series["t0"], np.arange(len(raw)))
+    clim = Climatology().fit(doy, hour, raw[:, 0], m[:, 0], min_valid=1)
+    station = dict(raw=raw, present=m, x=raw, mask=m, clim=clim, t0=int(series["t0"]),
+                   lat=float(lat), lon=float(lon), elev=float(elev), N=len(raw))
+    ds = EvalSet.__new__(EvalSet)
+    ds.clims, ds.floor = {EVAL_STATION: station}, {EVAL_STATION: 0}
+    ds.items = [(EVAL_STATION, int(e)) for e in ends]
+    ds.requested = [None] * len(ds.items)
+    return ds
+
+
+def eval_inputs(ds, i):
+    """Входы модели окна оценки с осью батча длины 1.
+
+    Args:
+        ds: набор окон оценки.
+        i: номер окна.
+
+    Returns:
+        Словарь массивов float32 по входам графа прогноза.
+    """
+    b = ds[i]
+    return {k: b[k][None].numpy().astype(np.float32) for k in FORECAST_INPUTS}
 
 
 def example_inputs(model, seed=0):
-    """Правдоподобные входы всех графов для трассировки и сверки экспорта.
+    """Правдоподобные входы графов для трассировки и сверки экспорта.
+
+    Входы прогноза - окно оценки синтетического ряда с историей короче полного буфера,
+    чтобы в окне были и пустые, и заполненные часы.
 
     Args:
         model: модель МАЯК.
-        seed: сид генератора.
+        seed: сид ряда.
 
     Returns:
-        Словарь: имя графа и кортеж его входов.
+        Словарь: имя графа и словарь его входов.
     """
     cfg = model.cfg
-    g = torch.Generator().manual_seed(seed)
-    r = lambda *s: torch.randn(*s, generator=g)
-    lat, lon, elev = torch.tensor([[52.37]]), torch.tensor([[4.9]]), torch.tensor([[12.0]])
-    with torch.no_grad():
-        loc, c_mu, c_sig, c_def, *_ = (t.detach() for t in InitGraph(model)(lat, lon, elev))
-    coefs = (c_mu, c_sig, c_def)
-    M, W, Hh = cfg.n_modes, cfg.encoder_width, cfg.horizon
-    Wn, E, T, L = cfg.stream_window, cfg.stream_edge, cfg.stream_tail, cfg.max_history
-
-    def obs(n):
-        x = torch.stack([(8 + 5 * r(1, n)).round(), (1005 + 5 * r(1, n)),
-                         (70 + 10 * r(1, n)).clamp(1, 100).round()], dim=-1)
-        m = (torch.rand(1, n, 3, generator=g) < 0.85).float()
-        hoy = 4000 + torch.arange(n, dtype=torch.float32)[None]
-        return x * m, m, hoy / 24.0, hoy % 24
-
-    x_ctx, m_ctx, _, _ = obs(CTX)
-    x_win, m_win, d_win, h_win = obs(Wn)
-    x_edge, m_edge, d_edge, h_edge = obs(E)
-    hoy_f = 4000 + Wn + torch.arange(Hh, dtype=torch.float32)[None]
-    enc_buf = 0.5 * r(1, W, sum(model.encoder.buffer_pads))
-    modes = [r(1, M), r(1, M), 5 + torch.rand(1, M, generator=g)]
-    vmask = lambda *s: (torch.rand(*s, generator=g) < 0.9).float()
-    rows = torch.cat([r(1, L, 2), vmask(1, L, 2)], dim=-1)
-    return dict(
-        init=(lat, lon, elev),
-        step=(x_ctx, m_ctx, torch.tensor([[166.5]]), torch.tensor([[12.0]]), lat, lon, *coefs,
-              enc_buf, *modes, r(1, 2 * M), vmask(1, 1)),
-        window=(x_win, m_win, d_win, h_win, lat, lon, *coefs),
-        resync=(r(1, T, 2 * M), vmask(1, T)),
-        issue=(loc, lat, lon, *coefs, rows, *modes, x_edge, m_edge, d_edge, h_edge,
-               hoy_f / 24.0, hoy_f % 24),
-    )
+    lat, lon, elev = 52.37, 4.9, 12.0
+    end = cfg.max_history - cfg.max_history // 4
+    s = synthetic_series(end + cfg.horizon, seed=seed)
+    inp = eval_inputs(eval_set(s, [end], lat, lon, elev), 0)
+    return dict(forecast=inp, climatology={k: inp[k] for k in CLIMATOLOGY_INPUTS})
 
 
 def calibration_bins():
@@ -281,7 +288,7 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, opset=17, check_a
 
     Каждый граф при экспорте сверяется с PyTorch на правдоподобных входах. Входы, от
     которых граф не зависит, экспорт выбрасывает; манифест перечисляет фактические входы
-    графа, и хост подаёт только их.
+    графа, и исполнитель подаёт только их.
 
     Args:
         model: модель.
@@ -307,32 +314,30 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, opset=17, check_a
     """
     import onnx
     import onnxruntime as ort
+    from mayak.baselines.statistical import ZQ
     from mayak.data.qc import DEFAULT_QC, PHYS
     from mayak.metrics import I_MED, conformal_table
     from mayak.provenance import provenance
     from mayak.runtime.site import load_runtime_config
 
     runtime = load_runtime_config() if runtime is None else runtime
+    was_training = model.training
     model = model.eval()
     cfg = model.cfg
-    if cfg.stream_tail < 1 or cfg.stream_edge < 1:
-        raise ValueError(f"история {cfg.max_history} ч не длиннее рецептивного поля энкодера "
-                         f"с лагом каналов ({cfg.stream_edge} ч): хвоста для потоковой суммы "
-                         f"нет, графы устройства для такой модели не экспортируются")
     table = None if conformal is None else conformal_for_export(conformal, checkpoint)
     os.makedirs(out_dir, exist_ok=True)
     inputs = example_inputs(model, seed)
     graphs, checks = {}, {}
-    was_training = model.training
     for name in GRAPH_NAMES:
         mod = GRAPH_MODULES[name](model)
         names_in, names_out = GRAPH_IO[name]
+        args = tuple(torch.from_numpy(inputs[name][n]) for n in names_in)
         path = os.path.join(out_dir, f"{name}.onnx")
         with torch.no_grad():
-            torch.onnx.export(mod, inputs[name], path, input_names=list(names_in),
+            torch.onnx.export(mod, args, path, input_names=list(names_in),
                               output_names=list(names_out), opset_version=opset,
                               dynamo=False, do_constant_folding=True)
-            ref = mod(*inputs[name])
+            ref = mod(*args)
         ref = ref if isinstance(ref, tuple) else (ref,)
         proto = onnx.load(path)
         used = [i.name for i in proto.graph.input]
@@ -340,20 +345,18 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, opset=17, check_a
         meta.key, meta.value = "mayak_graph", name
         onnx.save(proto, path)
         sess = ort.InferenceSession(path, providers=["CPUExecutionProvider"])
-        out = sess.run(None, {n: t.detach().numpy() for n, t in zip(names_in, inputs[name])
-                              if n in used})
-        err = max(float(np.abs(o - r.detach().numpy()).max()
-                        / max(1.0, float(np.abs(r.detach().numpy()).max()))) if o.size else 0.0
+        out = sess.run(None, {n: inputs[name][n] for n in names_in if n in used})
+        err = max(float(np.abs(o - r.numpy()).max() / max(1.0, float(np.abs(r.numpy()).max())))
                   for o, r in zip(out, ref))
         if err > check_atol:
             raise RuntimeError(f"граф {name}: расхождение ONNX и PyTorch {err:.2e} в единицах "
                                f"масштаба выхода, допуск {check_atol}")
         checks[name] = err
         graphs[name] = dict(file=f"{name}.onnx", inputs=used, outputs=list(names_out),
-                            shapes_in={n: list(t.shape) for n, t in zip(names_in, inputs[name])},
+                            shapes_in={n: list(inputs[name][n].shape) for n in names_in},
                             shapes_out={n: list(r.shape) for n, r in zip(names_out, ref)})
-
     model.train(was_training)
+
     lead_bins, history_bins = calibration_bins()
     cal = dict(conformal=None, aci=None, lead_bins=lead_bins, history_bins=history_bins)
     if table is not None:
@@ -363,16 +366,13 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, opset=17, check_a
     if aci is not None:
         cal["aci"] = dict(target=aci.target, gamma=aci.gamma, max_factor=aci.max_factor,
                           interval=list(aci.interval))
-    from mayak.baselines.statistical import ZQ
-    d = dims(cfg)
-    d["n_coef"] = [int(inputs["step"][i].shape[-1]) for i in (6, 7, 8)]
     manifest = dict(
-        format=GRAPH_FORMAT, model_config=cfg.to_dict(), dims=d,
+        format=GRAPH_FORMAT, model_config=cfg.to_dict(), dims=dims(cfg),
         quantiles=list(cfg.quantiles), i_med=I_MED, zq=[float(v) for v in ZQ],
         raw_channels=list(RAW_CHANNELS), phys={c: list(PHYS[c]) for c in RAW_CHANNELS},
         qc=dict(DEFAULT_QC.to_dict(), lookback_hours=DEFAULT_QC.lookback_hours),
         state=dict(version=STATE_VERSION, header_bytes=STATE_HEADER.itemsize,
-                   nbytes=state_nbytes(cfg), resync_hours=RESYNC_HOURS),
+                   nbytes=state_nbytes(cfg)),
         graphs=graphs, calibration=cal, runtime=runtime.to_dict(),
         export_check_max_rel=checks, opset=opset,
         provenance=provenance())
@@ -382,17 +382,32 @@ def export_graphs(model, out_dir, *, conformal=None, aci=None, opset=17, check_a
 
 
 class TorchBackend:
+    """Исполнитель графов на PyTorch: те же обёртки, что идут в экспорт.
+
+    Args:
+        model: модель МАЯК.
+    """
+
     def __init__(self, model):
         self.mods = {n: GRAPH_MODULES[n](model) for n in GRAPH_NAMES}
 
     @torch.no_grad()
-    def run(self, name, *args):
-        out = self.mods[name](*(torch.from_numpy(np.ascontiguousarray(a)) for a in args))
+    def run(self, name, feed):
+        args = (torch.from_numpy(np.ascontiguousarray(feed[k], np.float32))
+                for k in GRAPH_IO[name][0])
+        out = self.mods[name](*args)
         out = out if isinstance(out, tuple) else (out,)
         return [o.detach().numpy() for o in out]
 
 
 class OnnxBackend:
+    """Исполнитель графов экспорта на ONNX Runtime.
+
+    Args:
+        model_dir: каталог экспорта с графами и манифестом.
+        threads: число потоков внутри операции.
+    """
+
     def __init__(self, model_dir, threads=1):
         import onnxruntime as ort
         with open(os.path.join(model_dir, "manifest.json"), encoding="utf-8") as fh:
@@ -407,34 +422,9 @@ class OnnxBackend:
                                                 providers=["CPUExecutionProvider"])
             self.names[n] = set(g["inputs"])
 
-    def run(self, name, *args):
-        feed = {k: np.ascontiguousarray(a, np.float32) for k, a in zip(GRAPH_IO[name][0], args)
-                if k in self.names[name]}
-        return self.sess[name].run(None, feed)
-
-
-class GraphRuntime(StreamingMayak):
-    """Хост потока поверх исполнителя графов.
-
-    Логика хоста та же, что у потокового рантайма на PyTorch: отличается только
-    исполнитель графов. По умолчанию без калибровки интервалов.
-
-    Args:
-        backend: исполнитель графов с методом ``run(name, *arrays)``.
-        cfg: конфиг модели.
-        lat: широта точки.
-        lon: долгота точки.
-        elev: высота точки, м.
-        conformal: таблица поправок или None.
-        aci: параметры адаптивной калибровки или None.
-        runtime_cfg: параметры хоста с порогами смены точки или None - конфиг рантайма
-            по умолчанию.
-    """
-
-    def __init__(self, backend, cfg, lat, lon, elev, conformal=None, aci=None,
-                 runtime_cfg=None):
-        self.m = None
-        self._setup(backend, cfg, lat, lon, elev, conformal, aci, runtime_cfg)
+    def run(self, name, feed):
+        return self.sess[name].run(None, {k: np.ascontiguousarray(a, np.float32)
+                                          for k, a in feed.items() if k in self.names[name]})
 
 
 def manifest_conformal(manifest, model_dir):
@@ -497,7 +487,9 @@ def check_manifest_bins(manifest):
 
 
 def runtime_from_export(model_dir, lat, lon, elev, threads=1, conformal=True, aci=False):
-    """Хост потока на графах экспорта - те же входы, что у рантайма устройства.
+    """Устройство на графах экспорта.
+
+    Пороги смены точки берутся из манифеста.
 
     Args:
         model_dir: каталог экспорта с графами и манифестом.
@@ -508,15 +500,13 @@ def runtime_from_export(model_dir, lat, lon, elev, threads=1, conformal=True, ac
         conformal: применять конформную таблицу экспорта.
         aci: подстраивать множитель калибровки с параметрами из манифеста.
 
-    Пороги смены точки берутся из манифеста, как у рантайма устройства.
-
     Returns:
-        Хост потока на графах.
+        Устройство на графах ONNX.
 
     Raises:
         ValueError: манифест другого формата или калибровка включена, а её параметров в
             манифесте нет.
-        RuntimeError: граф старта не дал годной таблицы климатологии.
+        RuntimeError: граф климатологии не дал годной таблицы.
     """
     from mayak.config import ModelConfig, RuntimeConfig
     from mayak.metrics import ACIParams
@@ -536,12 +526,13 @@ def runtime_from_export(model_dir, lat, lon, elev, threads=1, conformal=True, ac
         if list(params.interval) != list(a["interval"]):
             raise ValueError(f"манифест: интервал ACI {a['interval']} не соответствует цели "
                              f"{a['target']}")
-    return GraphRuntime(backend, ModelConfig.from_dict(man["model_config"]), lat, lon, elev,
-                        conformal=table, aci=params,
-                        runtime_cfg=RuntimeConfig.from_dict(man["runtime"]))
+    return Device(backend, ModelConfig.from_dict(man["model_config"]), lat, lon, elev,
+                  conformal=table, aci=params,
+                  runtime_cfg=RuntimeConfig.from_dict(man["runtime"]))
 
 
-__all__ = ["DAY_ROW", "GRAPH_IO", "GRAPH_NAMES", "HOURS_OF_YEAR", "GraphRuntime", "OnnxBackend",
-           "TorchBackend", "calibration_bins", "check_manifest_bins", "conformal_for_export",
-           "dims", "example_inputs", "export_graphs", "manifest_conformal",
-           "runtime_from_export", "state_nbytes", "year_calendar"]
+__all__ = ["GRAPH_FORMAT", "GRAPH_IO", "GRAPH_NAMES", "ClimatologyGraph", "ForecastGraph",
+           "OnnxBackend", "TorchBackend", "calibration_bins", "check_manifest_bins",
+           "conformal_for_export", "default_start", "dims", "eval_inputs", "eval_set",
+           "example_inputs", "export_graphs", "feed", "manifest_conformal",
+           "runtime_from_export", "synthetic_series", "year_calendar"]

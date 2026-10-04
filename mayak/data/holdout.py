@@ -23,7 +23,8 @@ from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats, enforce_invaria
 from mayak.data.qc import qc_window
 from mayak.data.splits import time_layout
 from mayak.data.store import read_manifest
-from mayak.timeaxis import window_calendar, window_month
+from mayak.data.window import issue_calendar
+from mayak.timeaxis import window_month
 from mayak.zones import SEASON_RU, normalize_zone, season_of
 
 HISTORY_GRID = (0, 6, 24, 72, 168, 336, L_MAX)
@@ -409,16 +410,12 @@ class EvalSet(Dataset):
         s = self.clims[sid]
         clim = s["clim"]
         t0 = s["t0"]
-        k = np.arange(L_MAX)
-        abs_h = t - L_MAX + k
-        doy_h, hour_h = window_calendar(t0, abs_h)
+        doy_h, hour_h, doy_f, hour_f = issue_calendar(t0, t, L_MAX, H)
         w = self.raw_window(i)
         x_hist, mask_hist = w["x"], w["m"]
         if w["L"] > 0:
             mask_hist, _ = qc_window(x_hist, mask_hist, elev=w["qc_elev"], past=w["past"])
             x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
-        fut = np.arange(t, t + H)
-        doy_f, hour_f = window_calendar(t0, fut)
         y, y_mask = slice_target(s["x"], s["mask"], t)
         mu_clim_fut = clim.predict(doy_f, hour_f).astype(np.float32)
         a_recent, a_ok = BL.recent_anomaly(x_hist[:, 0], mask_hist[:, 0], clim, L_MAX,

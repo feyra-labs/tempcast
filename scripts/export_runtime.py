@@ -1,4 +1,4 @@
-r"""Экспорт модели для устройства: графы ONNX и манифест.
+r"""Экспорт модели для устройства: графы прогноза и климатологии, манифест.
 
     python scripts/export_runtime.py --ckpt runs/mayak/stageB/best.ckpt \
         --conformal runs/conformal.npy --aci --out runtime/model
@@ -7,7 +7,8 @@ r"""Экспорт модели для устройства: графы ONNX и 
 ``python -m mayak.runtime.run_inference --model runtime/model ...``. Архитектура берётся
 из конфига в чекпойнте; манифест хранит конфиг, размеры, пределы QC, формат состояния,
 параметры калибровки и пороги смены координат прибора. Конформная таблица должна быть
-подогнана по тому же чекпойнту. Каждый граф при экспорте сверяется с PyTorch.
+подогнана по тому же чекпойнту. Каждый граф при экспорте сверяется с PyTorch на окне
+оценки синтетического ряда.
 """
 import argparse
 
@@ -43,7 +44,7 @@ def main():
     cal = man["calibration"]
     print(f"  конформная таблица: {'есть' if cal['conformal'] else 'нет'}")
     for name, err in man["export_check_max_rel"].items():
-        print(f"  {name:9s} расхождение ONNX и PyTorch в единицах масштаба выхода {err:.2e}")
+        print(f"  {name:11s} расхождение ONNX и PyTorch в единицах масштаба выхода {err:.2e}")
     print(f"  состояние на диске: {man['state']['nbytes']} Б (v{man['state']['version']})")
     rt = man["runtime"]
     print(f"  уточнение координат: до {rt['site_max_dlat_deg']:g}° по широте, "

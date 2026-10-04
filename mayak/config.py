@@ -147,7 +147,6 @@ ENCODER_CHANNELS = ("aT", "aTc", "adef", "dP3", "dP24", "rh", "sin_d", "cos_d", 
 SOLAR_CHANNELS = ("sin_d", "cos_d", "czp")
 N_SOLAR_HEAD = 3
 N_DAILY_SUMMARY = 6
-CHANNEL_MAX_LAG = 24
 UNSTRUCTURED_PERIODS = (12.0, 240.0)
 
 
@@ -418,54 +417,18 @@ class ModelConfig:
         return self.max_history // 24
 
     @property
-    def stream_buffer(self):
-        """Рецептивное поле энкодера, округлённое вверх до 16 ч.
+    def device_window(self):
+        """Длина сырого окна наблюдений, которое устройство хранит на диске, часы.
 
-        Нижняя граница истории, которую видит выход энкодера. Сырое окно рантайма
-        длиннее на лаг входных каналов.
-        """
-        return 16 * math.ceil(self.receptive_field / 16)
-
-    @property
-    def stream_edge(self):
-        """Край окна истории, часы.
-
-        Признаки первых часов пакетного окна зависят от того, где окно начинается:
-        энкодер видит слева нули, а у каналов с лагом нет прошлого. Край - это столько
-        часов, сколько нужно рецептивному полю энкодера вместе с наибольшим лагом
-        каналов. Поток пересчитывает вклад края при каждом выпуске.
-
-        Returns:
-            Число часов, не больше длины истории.
-        """
-        return min(self.max_history, self.receptive_field - 1 + CHANNEL_MAX_LAG)
-
-    @property
-    def stream_tail(self):
-        """Хвост окна истории, часы: часы после края.
-
-        Признаки этих часов не зависят от начала окна и совпадают у пакета и потока,
-        поэтому поток держит их вклад в моды скользящей суммой.
-
-        Returns:
-            Число часов, может быть нулём.
-        """
-        return self.max_history - self.stream_edge
-
-    @property
-    def stream_window(self):
-        """Длина сырого окна наблюдений, которое рантайм хранит на диске, часы.
-
-        Окно вмещает всю историю модели, рецептивное поле энкодера с лагом каналов и
-        прошлое, которое нужно причинному контролю качества. Длина кратна восьми, чтобы
-        битовые маски окна занимали целое число байт.
+        Окно вмещает всю историю модели и прошлое, которое нужно причинному контролю
+        качества, плюс текущий час. Длина кратна восьми, чтобы битовые маски окна
+        занимали целое число байт.
 
         Returns:
             Число часов.
         """
         from mayak.data.qc import DEFAULT_QC
-        need = max(self.max_history, self.receptive_field - 1 + CHANNEL_MAX_LAG,
-                   DEFAULT_QC.lookback_hours + 1)
+        need = max(self.max_history, DEFAULT_QC.lookback_hours + 1)
         return 8 * math.ceil(need / 8)
 
     def to_dict(self):
@@ -1614,7 +1577,7 @@ class RuntimeConfig:
 
     Состояние на диске помнит координаты и высоту, для которых оно записано. Если при
     перезапуске они отличаются от текущих не больше порогов, это уточнение метаданных:
-    окно сохраняется и пересчитывается для новой точки. Больше любого порога - прибор
+    окно сохраняется, прогноз строится уже для новой точки. Больше любого порога - прибор
     перенесён, окно и калибровка начинаются заново. Пороги взяты по порядку дрожания
     метаданных в аугментациях обучения.
 
@@ -1644,7 +1607,7 @@ class RuntimeConfig:
 
 
 __all__ = ["ABLATION_NAMES", "AUGMENT_PROB_FIELDS", "AUGMENT_PROFILES", "Ablations",
-           "AugmentConfig", "CALIBRATION_NOMINALS", "CHANNEL_MAX_LAG", "COVERAGE_DIMS",
+           "AugmentConfig", "CALIBRATION_NOMINALS", "COVERAGE_DIMS",
            "COVERAGE_DIMS_EXTERNAL", "COVERAGE_DIMS_INTERNAL", "CalibrationConfig", "ConfigError",
            "DEFAULT_MODE_GROUPS",
            "DLinearConfig", "DataConfig", "ENCODER_CHANNELS", "GRUConfig", "LRUConfig",
