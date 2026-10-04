@@ -8,7 +8,7 @@ r"""Обучение нейробейзлайнов по тому же прот�
     python scripts/train_neurobaselines.py --models lru patchtst --accelerator gpu
 Отладка:
     python scripts/train_neurobaselines.py --models lru --steps-a 200 --steps-b 1000 \
-        --batch 32 --windows 2000 --workers 0 --accelerator cpu --precision 32 --val-every 200
+        --batch 32 --windows 2000 --workers 0 --accelerator cpu --val-every 200
 """
 import argparse
 import logging

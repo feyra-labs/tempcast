@@ -9,5 +9,4 @@ stages:
 batch_size: 32
 windows_per_epoch: 2000
 num_workers: 0
-precision: "32"
 val_every: 200

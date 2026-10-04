@@ -1,8 +1,5 @@
 """Хост устройства на Python: команды, состояние на диске, откат.
 
-Хост говорит тем же построчным протоколом и пишет то же состояние, что хост на Rust.
-Совпадение двух хостов закреплено общими эталонными сценариями, которые проходят оба.
-
 Команды, по одной на строку:
 
 * ``obs <секунды UTC> <T> <P> <RH>`` - наблюдение часа. Значение: число, ``-`` (нет
@@ -214,12 +211,12 @@ class Host:
             try:
                 self.rt.load_state(raw)
             except Exception as e:
-                print(f"mayak-rt: состояние {f} не принято: {e}", file=sys.stderr)
+                print(f"mayak: состояние {f} не принято: {e}", file=sys.stderr)
                 continue
-            print(f"mayak-rt: состояние восстановлено из {f} ({len(raw)} Б)", file=sys.stderr)
+            print(f"mayak: состояние восстановлено из {f} ({len(raw)} Б)", file=sys.stderr)
             self.store.mark_restored(f)
             return f
-        print("mayak-rt: чистый старт (история пуста)", file=sys.stderr)
+        print("mayak: чистый старт (история пуста)", file=sys.stderr)
         return None
 
     def _now_hour(self, arg=None):

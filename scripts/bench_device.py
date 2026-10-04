@@ -1,23 +1,20 @@
 r"""Замеры рантайма на устройстве - один воспроизводимый прогон.
 
-    cargo build --release --manifest-path runtime-rs/Cargo.toml
     python scripts/bench_device.py --ckpt runs/mayak/stageB/best.ckpt \
-        --manifest data/manifest.csv --lat 52.37 --lon 4.90 --elev -2 \
-        --out-dir runs/bench_device
+        --lat 52.37 --lon 4.90 --elev -2 --out-dir runs/bench_device
 
 Что меряется (всё на одном устройстве, на одних и тех же входах, 1 поток):
 * задержка потактового шага и выпуска прогноза: медиана, p95, p99 на длинном прогоне -
-  для Rust fp32, Rust int8, эталонного потокового рантайма на PyTorch и Python с
-  ONNX Runtime (те же графы, что у Rust; отделяет выигрыш от языка хоста и от движка);
+  для эталонного потокового рантайма на PyTorch и для Python с ONNX Runtime на графах
+  экспорта;
 * пиковая резидентная память процесса (каждая реализация - в отдельном процессе);
-* размер бинарника, размер модели fp32 и int8, размер состояния - точным числом байт;
-* расхождение выходов Rust fp32 / int8 с эталоном на тех же входах;
+* размер графов экспорта, размер состояния и буфера энкодера - точным числом байт;
+* расхождение выходов ONNX Runtime с эталоном на тех же входах;
 * расхождение пакетного и потокового путей при выпусках в случайные часы длинного ряда
-  и его изменение во времени;
-* метрики fp32 против int8 на тестовой выборке (если есть --manifest с кэшем данных).
+  и его изменение во времени.
 
-Итог: out-dir/results.json и out-dir/results.md. Без --ckpt замер идёт на модели эталона
-(случайные веса): задержки и память честные, метрики - нет, и отчёт это помечает.
+Итог: out-dir/results.json и out-dir/results.md. Без --ckpt замер идёт на модели со
+случайными весами: задержки, память и размеры честные, и отчёт это помечает.
 """
 from __future__ import annotations
 
@@ -33,6 +30,7 @@ import numpy as np
 
 START_UTC = "2025-01-01T00"
 PCTL = (0.50, 0.95, 0.99)
+UNTRAINED_PERTURB = 0.05
 
 
 def peak_rss_bytes():
@@ -72,12 +70,30 @@ def stats_us(v):
                 mean_us=float(v.mean()) if v.size else None)
 
 
-def load_model(ckpt):
+def load_model(ckpt, seed):
+    """Модель замера: из чекпойнта или со случайными весами.
+
+    Случайные веса - инициализация с сидом и шум на всех параметрах, чтобы нулевые
+    инициализации голов не делали выход тривиальным.
+
+    Args:
+        ckpt: путь к чекпойнту или None.
+        seed: сид случайных весов.
+
+    Returns:
+        Модель в режиме вывода.
+    """
+    import torch
     if ckpt:
         from mayak.lit import load_model as _load
         return _load(ckpt).eval()
-    from mayak.runtime.golden import golden_model
-    return golden_model()
+    from mayak.model import MAYAK
+    torch.manual_seed(seed)
+    m = MAYAK().eval()
+    with torch.no_grad():
+        for p in m.parameters():
+            p.add_(UNTRAINED_PERTURB * torch.randn_like(p))
+    return m
 
 
 def start_hour():
@@ -95,7 +111,7 @@ def worker(args):
     """
     import torch
     torch.set_num_threads(1)
-    model = load_model(args.ckpt)
+    model = load_model(args.ckpt, args.seed)
     series = np.fromfile(args.series, "<f4").reshape(-1, 3)
     t0 = time.perf_counter()
     if args.backend == "torch":
@@ -103,8 +119,7 @@ def worker(args):
         rt = StreamingMayak(model, args.lat, args.lon, args.elev)
     else:
         from mayak.runtime.graphs import GraphRuntime, OnnxBackend
-        rt = GraphRuntime(OnnxBackend(args.model_dir, args.precision), model.cfg,
-                          args.lat, args.lon, args.elev)
+        rt = GraphRuntime(OnnxBackend(args.model_dir), model.cfg, args.lat, args.lon, args.elev)
     startup_ms = (time.perf_counter() - t0) * 1e3
     start = args.start_unix_hour
     t_step, t_fc, dump = [], [], []
@@ -123,9 +138,8 @@ def worker(args):
                 t_fc.append(dt)
             dump.append(np.asarray(q, np.float32))
     np.concatenate([q.ravel() for q in dump]).astype("<f4").tofile(args.dump_q)
-    rep = dict(runtime=f"python-{args.backend}", precision=args.precision,
-               hours=int(series.shape[0]), step=stats_us(t_step), forecast=stats_us(t_fc),
-               startup_ms=startup_ms,
+    rep = dict(runtime=f"python-{args.backend}", hours=int(series.shape[0]),
+               step=stats_us(t_step), forecast=stats_us(t_fc), startup_ms=startup_ms,
                peak_rss_bytes=peak_rss_bytes())
     rep["state_bytes"] = len(rt.serialize())
     t = time.perf_counter()
@@ -134,76 +148,18 @@ def worker(args):
     print(json.dumps(rep))
 
 
-def run_worker(args, backend, precision, dump):
+def run_worker(args, backend, dump):
     cmd = [sys.executable, os.path.abspath(__file__), "_worker", "--backend", backend,
-           "--precision", precision, "--series", args.series, "--dump-q", dump,
+           "--series", args.series, "--dump-q", dump,
            "--start-unix-hour", str(args.start_unix_hour), "--lat", str(args.lat),
            "--lon", str(args.lon), "--elev", str(args.elev), "--warmup", str(args.warmup),
-           "--forecast-every", str(args.forecast_every), "--model-dir", args.model_dir]
+           "--forecast-every", str(args.forecast_every), "--model-dir", args.model_dir,
+           "--seed", str(args.seed)]
     if args.ckpt:
         cmd += ["--ckpt", args.ckpt]
     out = subprocess.run(cmd, check=True, capture_output=True, text=True,
                          env=dict(os.environ, OMP_NUM_THREADS="1"))
     return json.loads(out.stdout.strip().splitlines()[-1])
-
-
-def run_rust(args, precision, dump):
-    cmd = [args.rust_bin, "bench", "--model", args.model_dir, "--lat", str(args.lat),
-           "--lon", str(args.lon), "--elev", str(args.elev), "--series", args.series,
-           "--start-unix-hour", str(args.start_unix_hour), "--warmup", str(args.warmup),
-           "--forecast-every", str(args.forecast_every), "--no-conformal", "--dump-q", dump,
-           "--threads", "1"]
-    if precision == "int8":
-        cmd.append("--int8")
-    out = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    return json.loads(out.stdout)
-
-
-# --------------------------------------------------------------------------- метрики int8
-
-def int8_metrics(args, model):
-    """Метрики fp32 и int8 на тестовой выборке через графы ONNX, как на устройстве.
-
-    Args:
-        args: аргументы командной строки замера.
-        model: модель МАЯК.
-
-    Returns:
-        Словарь метрик по точностям.
-    """
-    import torch
-    from mayak.data.store import get_store
-    from mayak.evaluate import EvalSet
-    from mayak.metrics import Evaluation
-    from mayak.runtime.graphs import GraphModel, OnnxBackend
-    store = get_store(args.manifest)
-    ds = EvalSet(store.clims(), manifest=args.manifest, time_key="test",
-                 max_windows=args.max_windows)
-    models = {p: GraphModel(OnnxBackend(args.model_dir, p), model.cfg) for p in ("fp32", "int8")}
-    qs = {p: [] for p in models}
-    ys, ws, mucl, st = [], [], [], []
-    meta = ds.window_meta()
-    for i in range(len(ds)):
-        b = ds[i]
-        one = {k: (v[None] if torch.is_tensor(v) else np.asarray(v)[None]) for k, v in b.items()}
-        for p, gm in models.items():
-            qs[p].append(gm(one)["q"][0].numpy())
-        ys.append(np.asarray(b["y"]))
-        ws.append(np.asarray(b["y_mask"]))
-        mucl.append(np.asarray(b["mu_clim_fut"]))
-        st.append(meta["station"][i])
-    out = {}
-    from mayak.metrics import I_MED
-    for p in qs:
-        q = np.stack(qs[p])
-        ev = Evaluation(y=np.stack(ys), mu=q[..., I_MED], q=q, mu_clim=np.stack(mucl),
-                        w=np.stack(ws), station=np.array(st, object))
-        out[p] = ev.pooled()
-    q32, q8 = np.stack(qs["fp32"]), np.stack(qs["int8"])
-    out["delta"] = {k: out["int8"][k] - out["fp32"][k] for k in out["fp32"]}
-    out["max_abs_dq"] = float(np.abs(q32 - q8).max())
-    out["n_windows"] = len(ds)
-    return out
 
 
 # --------------------------------------------------------------------------- отчёт
@@ -240,8 +196,7 @@ def markdown(res):
                  f"{fmt(r.get('startup_ms'))} | {r.get('max_abs_dq_vs_python', '—')} |")
     s = res["sizes"]
     L += ["", "| Размер | байт |", "|---|---|"]
-    for k in ("binary_bytes", "model_fp32_bytes", "model_int8_bytes", "state_bytes",
-              "encoder_buffer_bytes"):
+    for k in ("model_bytes", "state_bytes", "encoder_buffer_bytes"):
         L.append(f"| {k} | {s.get(k)} |")
     eq = res["batch_stream"]
     L += ["", f"Пакет и поток: {eq['n_issues']} выпусков в случайные часы ряда длиной "
@@ -249,35 +204,26 @@ def markdown(res):
               f"после перезапуска {eq['restart_max_abs']:.2e} °C."]
     L += ["", "| Выпуск, час ряда | max\\|Δq\\|, °C |", "|---|---|"]
     L += [f"| {end} | {err:.2e} |" for end, err in eq["batch_stream_by_issue"]]
-    if res.get("int8_metrics"):
-        m = res["int8_metrics"]
-        L += ["", f"fp32 против int8 на тесте ({m['n_windows']} окон, max|Δq| "
-                  f"{m['max_abs_dq']:.3f} °C):", "", "| метрика | fp32 | int8 | Δ |",
-              "|---|---|---|---|"]
-        for k in ("MAE", "RMSE", "CRPS", "PICP90", "Skill"):
-            L.append(f"| {k} | {m['fp32'][k]:.4f} | {m['int8'][k]:.4f} | {m['delta'][k]:+.4f} |")
     if not res["trained"]:
-        L += ["", "**Модель не обучена (веса эталона): задержки, память и размеры честные, "
-                  "метрики и расхождение int8 - нет.**"]
+        L += ["", "**Модель не обучена (случайные веса): задержки, память и размеры честные.**"]
     return "\n".join(L) + "\n"
 
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "_worker":
         ap = argparse.ArgumentParser()
-        for k in ("--backend", "--precision", "--series", "--dump-q", "--model-dir", "--ckpt"):
+        for k in ("--backend", "--series", "--dump-q", "--model-dir", "--ckpt"):
             ap.add_argument(k, default=None)
-        for k in ("--start-unix-hour", "--warmup", "--forecast-every"):
+        for k in ("--start-unix-hour", "--warmup", "--forecast-every", "--seed"):
             ap.add_argument(k, type=int)
         for k in ("--lat", "--lon", "--elev"):
             ap.add_argument(k, type=float)
         return worker(ap.parse_args(sys.argv[2:]))
 
     ap = argparse.ArgumentParser(description="замеры рантайма на устройстве")
-    ap.add_argument("--ckpt", default=None, help="чекпойнт; без него - модель эталона")
+    ap.add_argument("--ckpt", default=None, help="чекпойнт; без него - случайные веса")
     ap.add_argument("--conformal", default=None)
     ap.add_argument("--out-dir", default="runs/bench_device")
-    ap.add_argument("--rust-bin", default="runtime-rs/target/release/mayak-rt")
     ap.add_argument("--hours", type=int, default=2000)
     ap.add_argument("--warmup", type=int, default=48)
     ap.add_argument("--forecast-every", type=int, default=24)
@@ -285,8 +231,6 @@ def main():
                     help="выпусков в случайные часы для сравнения пакета и потока")
     ap.add_argument("--equivalence-hours", type=int, default=10_000,
                     help="длина ряда для сравнения пакета и потока, часы")
-    ap.add_argument("--manifest", default=None, help="data/manifest.csv для метрик int8")
-    ap.add_argument("--max-windows", type=int, default=200)
     ap.add_argument("--lat", type=float, default=52.37)
     ap.add_argument("--lon", type=float, default=4.9)
     ap.add_argument("--elev", type=float, required=True,
@@ -299,9 +243,9 @@ def main():
     from mayak.runtime.equivalence import divergence, synthetic_series
     from mayak.runtime.graphs import export_graphs
     os.makedirs(args.out_dir, exist_ok=True)
-    model = load_model(args.ckpt)
+    model = load_model(args.ckpt, args.seed)
     args.model_dir = os.path.join(args.out_dir, "model")
-    man = export_graphs(model, args.model_dir, conformal=args.conformal, int8=True)
+    man = export_graphs(model, args.model_dir, conformal=args.conformal)
 
     s = synthetic_series(args.hours, seed=args.seed)
     x = np.where(s["m"] > 0, s["x"], np.nan).astype("<f4")
@@ -310,36 +254,28 @@ def main():
     args.start_unix_hour = start_hour()
 
     runs, dumps = {}, {}
-    for name, fn in (("Python (PyTorch, эталон)", lambda d: run_worker(args, "torch", "fp32", d)),
-                     ("Python + ONNX Runtime fp32", lambda d: run_worker(args, "onnx", "fp32", d)),
-                     ("Rust fp32", lambda d: run_rust(args, "fp32", d)),
-                     ("Rust int8", lambda d: run_rust(args, "int8", d))):
+    for name, backend in (("Python (PyTorch, эталон)", "torch"),
+                          ("Python + ONNX Runtime", "onnx")):
         dumps[name] = os.path.join(args.out_dir, f"q_{len(dumps)}.f32")
         print("…", name, flush=True)
-        runs[name] = fn(dumps[name])
+        runs[name] = run_worker(args, backend, dumps[name])
     ref = np.fromfile(dumps["Python (PyTorch, эталон)"], "<f4")
     for name, path in dumps.items():
         dq = float(np.abs(np.fromfile(path, '<f4') - ref).max())
         runs[name]["max_abs_dq_vs_python"] = f"{dq:.2e}"
 
     size = lambda p: os.path.getsize(os.path.join(args.model_dir, p))
-    g = man["graphs"]
-    rust32 = runs["Rust fp32"]
-    sizes = dict(binary_bytes=rust32["binary_bytes"],
-                 model_fp32_bytes=sum(size(v["fp32"]) for v in g.values()),
-                 model_int8_bytes=sum(size(v["int8"]) for v in g.values()),
-                 state_bytes=rust32["state_bytes"],
-                 encoder_buffer_bytes=rust32["encoder_buffer_bytes"])
+    d = man["dims"]
+    sizes = dict(model_bytes=sum(size(v["file"]) for v in man["graphs"].values()),
+                 state_bytes=runs["Python + ONNX Runtime"]["state_bytes"],
+                 encoder_buffer_bytes=4 * d["encoder_width"] * d["enc_buf_len"])
     print("… пакет ↔ поток", flush=True)
-    res = dict(device=device_info(), model=args.ckpt or "эталон (случайные веса)",
+    res = dict(device=device_info(), model=args.ckpt or "случайные веса",
                trained=bool(args.ckpt), hours=args.hours, forecast_every=args.forecast_every,
                runs=runs, sizes=sizes,
                batch_stream=divergence(model, args.issues, hours=args.equivalence_hours,
                                        seed=args.seed, lat=args.lat, lon=args.lon,
                                        elev=args.elev))
-    if args.manifest and os.path.exists(args.manifest):
-        print("… метрики fp32 / int8", flush=True)
-        res["int8_metrics"] = int8_metrics(args, model)
     with open(os.path.join(args.out_dir, "results.json"), "w", encoding="utf-8") as fh:
         json.dump(res, fh, ensure_ascii=False, indent=1)
     md = markdown(res)

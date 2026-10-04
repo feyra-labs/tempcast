@@ -194,8 +194,6 @@ class LRULayer(nn.Module):
     def states(self, x, scan=None):
         """Комплексные состояния рекуррентности.
 
-        Считаются в точности параметров, без понижения точности при смешанном обучении.
-
         Args:
             x: вход, форма (B, L, d_model).
             scan: способ развёртки; None - способ из конструктора.
@@ -207,7 +205,6 @@ class LRULayer(nn.Module):
             ValueError: неизвестный способ развёртки.
         """
         scan = scan or self.scan
-        x = x.to(self.B_re.dtype)
         g = torch.exp(self.gamma_log)[:, None]
         u_re, u_im = x @ (self.B_re * g).T, x @ (self.B_im * g).T
         nu, theta = lambda_polar(self.nu_log, self.theta_log)
@@ -221,9 +218,8 @@ class LRULayer(nn.Module):
         raise ValueError(f"неизвестная развёртка {scan!r}")
 
     def forward(self, x, scan=None):
-        with torch.autocast(device_type=x.device.type, enabled=False):
-            h_re, h_im = self.states(x, scan)
-            return h_re @ self.C_re.T - h_im @ self.C_im.T + self.D * x.to(self.D.dtype)
+        h_re, h_im = self.states(x, scan)
+        return h_re @ self.C_re.T - h_im @ self.C_im.T + self.D * x
 
 
 class LRUBlock(nn.Module):
@@ -243,7 +239,7 @@ class LRUBlock(nn.Module):
         self.drop = nn.Dropout(cfg.dropout)
 
     def forward(self, x, scan=None):
-        z = self.lru(self.norm(x), scan).to(x.dtype)
+        z = self.lru(self.norm(x), scan)
         z = self.drop(F.gelu(z))
         z = self.out1(z) * torch.sigmoid(self.out2(z))
         return x + self.drop(z)

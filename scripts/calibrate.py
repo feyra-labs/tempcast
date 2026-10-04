@@ -13,10 +13,9 @@
 Поправка медианы равна нулю: таблица меняет только ширину интервалов, точечный прогноз
 остаётся прогнозом модели.
 
-Прогноз для подгонки считается на той точности, на которой таблицу будут применять:
-fp32 - модель из чекпойнта, int8 - int8-графы готового экспорта. Точность, отпечаток
-чекпойнта и, для int8, отпечаток графов пишутся в запись о подгонке рядом с таблицей.
-Рядом же ложится отчёт: покрытие до и после таблицы по сезонам и длине истории.
+Прогноз для подгонки считает модель из чекпойнта. Отпечаток чекпойнта пишется в запись
+о подгонке рядом с таблицей. Рядом же ложится отчёт: покрытие до и после таблицы по
+сезонам и длине истории.
 """
 import argparse
 import os
@@ -33,12 +32,8 @@ from mayak.metrics import LEAD_BINS, apply_conformal, coverage, fit_conformal_sh
 
 USAGE = """примеры:
   python scripts/calibrate.py --ckpt runs/mayak/stageB/best.ckpt --out runs/conformal.npy
-
-  python scripts/export_runtime.py --ckpt runs/mayak/stageB/best.ckpt --int8 --out runtime/model
-  python scripts/calibrate.py --ckpt runs/mayak/stageB/best.ckpt --precision int8 \\
-      --model-dir runtime/model --out runs/conformal_int8.npy
-  python scripts/export_runtime.py --ckpt runs/mayak/stageB/best.ckpt --int8 \\
-      --conformal runs/conformal_int8.npy --aci --out runtime/model
+  python scripts/export_runtime.py --ckpt runs/mayak/stageB/best.ckpt \\
+      --conformal runs/conformal.npy --aci --out runtime/model
 """
 
 
@@ -90,42 +85,12 @@ def checkpoint_setup(path):
     return curriculum, data.target_mask
 
 
-def predictor(model, precision, model_dir=None):
-    """Модель, по выходам которой подгоняется таблица, и отпечаток её графов.
-
-    Args:
-        model: модель из чекпойнта.
-        precision: точность, на которой таблицу будут применять.
-        model_dir: каталог экспорта с int8-графами; нужен только для int8.
-
-    Returns:
-        Пара: объект с пакетным интерфейсом модели и отпечаток графов (None для fp32).
-
-    Raises:
-        ValueError: для int8 не задан каталог экспорта или в нём нет int8-графов.
-    """
-    if precision == "fp32":
-        return model, None
-    from mayak.runtime.graphs import GraphModel, OnnxBackend, graphs_digest
-    if not model_dir:
-        raise ValueError("для --precision int8 нужен --model-dir: каталог экспорта с "
-                         "int8-графами (python scripts/export_runtime.py --int8)")
-    try:
-        digest = graphs_digest(model_dir, precision)
-    except KeyError:
-        raise ValueError(f"{model_dir}: в экспорте нет int8-графов; экспортируйте модель "
-                         f"с --int8") from None
-    return GraphModel(OnnxBackend(model_dir, precision), model.cfg), digest
-
-
-def fit(model, ds, precision="fp32", model_dir=None, checkpoint=None, min_windows=None):
+def fit(model, ds, checkpoint=None, min_windows=None):
     """Подгонка таблицы на калибровочном наборе.
 
     Args:
         model: модель из чекпойнта.
         ds: калибровочный набор окон.
-        precision: точность, на которой таблицу будут применять.
-        model_dir: каталог экспорта с int8-графами для точности int8.
         checkpoint: путь к чекпойнту для записи о подгонке.
         min_windows: наименьшее число окон бина длины истории для своей строки
             таблицы; None - из конфига калибровки по умолчанию.
@@ -137,13 +102,11 @@ def fit(model, ds, precision="fp32", model_dir=None, checkpoint=None, min_window
     from mayak.config import CalibrationConfig
     if min_windows is None:
         min_windows = CalibrationConfig().fit_min_windows
-    net, graphs = predictor(model, precision, model_dir)
-    D = gather(net, ds)
+    D = gather(model, ds)
     D["history"] = np.asarray(ds.window_meta()["history"], np.int64)
     shift, history_fit = fit_conformal_shift(D["y"], D["q"], D["y_mask"], D["history"],
                                              LEAD_BINS, min_windows=min_windows)
-    rec = conformal_record(ds, checkpoint=checkpoint, precision=precision, graphs=graphs,
-                           history_fit=history_fit)
+    rec = conformal_record(ds, checkpoint=checkpoint, history_fit=history_fit)
     rec["min_windows"] = int(min_windows)
     return shift, rec, D
 
@@ -188,17 +151,11 @@ def main(argv=None):
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--manifest", default="data/manifest.csv")
     ap.add_argument("--out", default="runs/conformal.npy")
-    ap.add_argument("--precision", choices=("fp32", "int8"), default="fp32",
-                    help="точность, на которой таблицу будут применять")
-    ap.add_argument("--model-dir", default=None,
-                    help="каталог экспорта с int8-графами (для --precision int8)")
     ap.add_argument("--config", default=None,
                     help="YAML калибровки (по умолчанию conf/calibration/default.yaml)")
     ap.add_argument("--bootstrap", type=int, default=None,
                     help="повторов бутстрапа для отчёта (по умолчанию из конфига; 0 - без)")
     args = ap.parse_args(argv)
-    if args.precision == "int8" and not args.model_dir:
-        ap.error("--precision int8 требует --model-dir с int8-графами")
 
     from dataclasses import replace
     cfg = load_config(args.config)
@@ -209,11 +166,10 @@ def main(argv=None):
     ds = calibration_set(store.clims(), args.manifest, curriculum, cfg, target_mask)
     run_checklist(store, datasets=[ds], checkpoints=[args.ckpt])
     print(f"Калибровочный набор: окон {len(ds)}, станций {len({s for s, _t in ds.items})}, "
-          f"куррикулум {curriculum!r}, сид {cfg.fit_seed}, точность {args.precision}")
+          f"куррикулум {curriculum!r}, сид {cfg.fit_seed}")
 
     model = load_model(args.ckpt)
-    shift, rec, D = fit(model, ds, args.precision, args.model_dir, checkpoint=args.ckpt,
-                        min_windows=cfg.fit_min_windows)
+    shift, rec, D = fit(model, ds, checkpoint=args.ckpt, min_windows=cfg.fit_min_windows)
     save_conformal(args.out, shift, rec)
     print("Таблица поправок по бинам длины истории (бины лидов × квантили), °C; столбец "
           "медианы - нули:")

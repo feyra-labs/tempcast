@@ -347,8 +347,7 @@ def test_protocol_module_never_mentions_test_window():
 
 
 TINY = Protocol(stages=(Stage("A", "L0", 2), Stage("B", "full", 2)),
-                batch_size=2, windows_per_epoch=8, num_workers=0, seed=3, precision="32",
-                val_every=1)
+                batch_size=2, windows_per_epoch=8, num_workers=0, seed=3, val_every=1)
 TINY_DATA = dict(val_windows_per_station=3)
 
 
@@ -499,10 +498,9 @@ def test_stage_b_starts_from_stage_a_weights(runs):
         assert torch.equal(lit.state_dict()[k], v)
 
 
-def test_training_precision_is_fp32_without_tf32():
-    """Протокол обучает в fp32, TF32 не включается ни в умножениях, ни в свёртках."""
+def test_strict_fp32_disables_tf32():
+    """TF32 не включается ни в умножениях, ни в свёртках."""
     from mayak.protocol import strict_fp32
-    assert DEFAULT_PROTOCOL.precision == "32"
     prev = (torch.get_float32_matmul_precision(), torch.backends.cuda.matmul.allow_tf32,
             torch.backends.cudnn.allow_tf32)
     try:

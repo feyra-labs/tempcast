@@ -65,7 +65,7 @@ import numpy as np
 from mayak.config import CHANNEL_MAX_LAG
 from mayak.data.qc import PHYS, CausalQC, qc_window
 from mayak.data.recording import RECORD_SCALE, record_values
-from mayak.leakage import load_conformal, precision_mismatch
+from mayak.leakage import load_conformal
 from mayak.metrics import (LEAD_BINS, ACIParams, AdaptiveCalibration, apply_adaptive,
                            apply_conformal, check_conformal_shape)
 from mayak.runtime.site import (SITE_MOVED, SITE_REFINED, as_site, describe_gap,
@@ -683,10 +683,7 @@ class StreamingMayak:
 
     @staticmethod
     def _conformal(conformal):
-        """Таблица поправок, которую можно применять к выходам этой модели.
-
-        Модель здесь считает во fp32. Таблица, подогнанная на другой точности, не
-        применяется, причина пишется в лог.
+        """Таблица поправок для выходов модели.
 
         Args:
             conformal: None, путь к таблице с записью о подгонке рядом или сама таблица.
@@ -701,11 +698,7 @@ class StreamingMayak:
             return None
         if not isinstance(conformal, str):
             return check_conformal_shape(conformal)
-        shift, rec = load_conformal(conformal)
-        why = precision_mismatch(rec, "fp32")
-        if why:
-            log.warning("конформная таблица %s не применяется: %s", conformal, why)
-            return None
+        shift, _rec = load_conformal(conformal)
         return shift
 
     @property

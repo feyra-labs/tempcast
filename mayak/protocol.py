@@ -128,7 +128,6 @@ class Protocol:
     betas: tuple = (0.9, 0.95)
     lr_schedule: str = "cosine"
     grad_clip: float = 1.0
-    precision: str = "32"
     ema_decay: float = 0.999
     monitor: str = "val/loss"
     val_every: int = 2000
@@ -229,8 +228,8 @@ _CLI = [
     ("--batch", "batch_size", int), ("--windows", "windows_per_epoch", int),
     ("--workers", "num_workers", int), ("--seed", "seed", int),
     ("--lr", "lr", float), ("--weight-decay", "weight_decay", float),
-    ("--grad-clip", "grad_clip", float), ("--precision", "precision", str),
-    ("--ema-decay", "ema_decay", float), ("--val-every", "val_every", int),
+    ("--grad-clip", "grad_clip", float), ("--ema-decay", "ema_decay", float),
+    ("--val-every", "val_every", int),
     ("--patience", "patience", int),
 ]
 
@@ -460,7 +459,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
             # Пробный запуск короче этапа, но расписание скорости обучения и частота
             # валидации у него полные, поэтому он совпадает с началом полного этапа.
             max_steps=probe or stage.steps, accelerator=accelerator, devices=1,
-            precision=protocol.precision, gradient_clip_val=protocol.grad_clip,
+            precision="32-true", gradient_clip_val=protocol.grad_clip,
             val_check_interval=min(protocol.val_every, stage.steps), check_val_every_n_epoch=None,
             # Проход валидации идёт по всему набору: размер набора задаётся числом
             # окон на станцию, обрезка по батчам выбросила бы последние станции.

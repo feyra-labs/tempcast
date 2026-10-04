@@ -1,8 +1,6 @@
 r"""Хост устройства на Python: построчный протокол на stdin, ответы JSON на stdout.
 
-Протокол, формат и выбор файлов состояния, откат к климатологии точки - те же, что у
-компилируемого рантайма, и проверяются одними эталонными сценариями. Модель берётся
-либо из каталога экспорта графов ONNX, либо из чекпойнта PyTorch.
+Модель берётся либо из каталога экспорта графов ONNX, либо из чекпойнта PyTorch.
 
 Запуск:
     python -m mayak.runtime.run_inference --model runtime/model \
@@ -37,7 +35,6 @@ def build_parser():
                     help="адаптивная калибровка интервалов по собственным промахам прибора")
     ap.add_argument("--no-conformal", action="store_true",
                     help="не применять конформную таблицу")
-    ap.add_argument("--int8", action="store_true", help="int8-графы экспорта")
     ap.add_argument("--threads", type=int, default=1)
     ap.add_argument("--conformal", default=None,
                     help="конформная таблица с записью о подгонке рядом, только с --ckpt")
@@ -62,7 +59,6 @@ def open_runtime(args):
     if args.model:
         from mayak.runtime.graphs import runtime_from_export
         return runtime_from_export(args.model, args.lat, args.lon, args.elev,
-                                   precision="int8" if args.int8 else "fp32",
                                    threads=args.threads, conformal=not args.no_conformal,
                                    aci=args.aci)
     from mayak.lit import load_model
@@ -81,26 +77,26 @@ def open_runtime(args):
 def main(argv=None):
     ap = build_parser()
     args = ap.parse_args(argv)
-    if args.ckpt and (args.int8 or args.threads != 1):
-        ap.error("--int8 и --threads относятся к графам экспорта: нужен --model")
+    if args.ckpt and args.threads != 1:
+        ap.error("--threads относится к графам экспорта: нужен --model")
     if args.model and args.conformal:
         ap.error("--conformal относится к чекпойнту: у экспорта таблица лежит в манифесте")
     if args.model and args.runtime_config:
         ap.error("--runtime-config относится к чекпойнту: у экспорта пороги лежат в манифесте")
-    # Ответы и сообщения идут в UTF-8 на любой системе, как у рантайма на Rust: иначе на
-    # Windows с однобайтовой кодовой страницей вывода сообщение по-русски роняет хост.
+    # Ответы и сообщения идут в UTF-8 на любой системе: иначе на Windows с однобайтовой
+    # кодовой страницей вывода сообщение по-русски роняет хост.
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError, OSError):
             pass
     import logging
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="mayak-rt: %(message)s")
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format="mayak: %(message)s")
     from mayak.runtime.host import Host, StateStore
     try:
         rt = open_runtime(args)
     except Exception as e:
-        print(f"mayak-rt: {e}", file=sys.stderr)
+        print(f"mayak: {e}", file=sys.stderr)
         return 1
     host = Host(rt, StateStore(args.state_dir))
     host.restore()

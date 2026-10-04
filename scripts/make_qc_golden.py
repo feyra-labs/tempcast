@@ -4,7 +4,7 @@
 возврат к прежнему уровню, залипание, насыщение влажности, давление на уровне моря,
 пропуск каждого второго и каждого третьего часа. Температура и влажность записаны целыми
 числами, давление - десятыми. Коды каждого часа посчитаны пакетным причинным QC.
-По этому файлу сверяются пакетный QC и поток на Python и порт на Rust.
+По этому файлу сверяются пакетный и потоковый QC.
 
 Запускать осознанно: только когда меняются правила или пороги QC.
 """
@@ -107,7 +107,7 @@ def main():
     ap = argparse.ArgumentParser(
         description="эталонные векторы кодов причинного QC",
         epilog="запуск: python scripts/make_qc_golden.py; после пересоздания - "
-               "cargo test --release --manifest-path runtime-rs/Cargo.toml")
+               "pytest tests/test_causal_qc.py")
     ap.add_argument("--out", default="tests/data/qc_causal/golden.json")
     args = ap.parse_args()
     doc = generate(args.out)

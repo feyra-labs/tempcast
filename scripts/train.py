@@ -34,7 +34,7 @@ report/*.png.
 
 Отладка:
     python scripts/train.py --arch mayak --steps-a 200 --steps-b 1000 --batch 32 \\
-        --windows 2000 --workers 0 --accelerator cpu --precision 32
+        --windows 2000 --workers 0 --accelerator cpu
 
 Полный прогон одной командой (для бейзлайнов те же флаги, другое --arch):
     python scripts/train.py --arch mayak --accelerator gpu

@@ -1,35 +1,30 @@
-r"""Экспорт модели для компилируемого рантайма: графы ONNX и манифест.
+r"""Экспорт модели для устройства: графы ONNX и манифест.
 
     python scripts/export_runtime.py --ckpt runs/mayak/stageB/best.ckpt \
-        --conformal runs/conformal_int8.npy --aci --int8 --out runtime/model
+        --conformal runs/conformal.npy --aci --out runtime/model
 
-Каталог --out целиком - то, что копируется на устройство вместе с бинарником
-рантайма: ``mayak-rt run --model runtime/model ...``. Архитектура берётся из
-конфига в чекпойнте; манифест хранит конфиг, размеры, пределы QC, формат состояния,
+Каталог --out целиком - то, что копируется на устройство:
+``python -m mayak.runtime.run_inference --model runtime/model ...``. Архитектура берётся
+из конфига в чекпойнте; манифест хранит конфиг, размеры, пределы QC, формат состояния,
 параметры калибровки и пороги смены координат прибора. Конформная таблица должна быть
-подогнана на той точности, которую объявляет экспорт: с --int8 - на int8-графах этого же
-экспорта, без него - на fp32.
-Каждый граф при экспорте сверяется с PyTorch.
+подогнана по тому же чекпойнту. Каждый граф при экспорте сверяется с PyTorch.
 """
 import argparse
 
 
 def main():
-    ap = argparse.ArgumentParser(description="экспорт графов ONNX для mayak-rt")
+    ap = argparse.ArgumentParser(description="экспорт графов ONNX для устройства")
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out", default="runtime/model")
     ap.add_argument("--conformal", default=None,
-                    help="конформная таблица с записью о подгонке рядом (runs/conformal.npy). "
-                         "Без --int8 нужна таблица fp32, с --int8 - таблица, подогнанная на "
-                         "int8-графах этого экспорта: python scripts/calibrate.py "
-                         "--precision int8 --model-dir <каталог экспорта>")
+                    help="конформная таблица с записью о подгонке рядом (runs/conformal.npy), "
+                         "подогнанная по экспортируемому чекпойнту")
     ap.add_argument("--aci", action="store_true", help="записать параметры ACI в манифест")
     ap.add_argument("--calibration-config", default=None,
                     help="YAML с параметрами ACI (по умолчанию conf/calibration/default.yaml)")
     ap.add_argument("--runtime-config", default=None,
                     help="YAML с порогами смены координат (по умолчанию "
                          "conf/runtime/default.yaml)")
-    ap.add_argument("--int8", action="store_true", help="дополнительно int8-копии графов")
     args = ap.parse_args()
 
     from mayak.lit import load_model
@@ -41,13 +36,12 @@ def main():
         aci = load_config(args.calibration_config).aci()
     try:
         man = export_graphs(load_model(args.ckpt), args.out, conformal=args.conformal, aci=aci,
-                            int8=args.int8, checkpoint=args.ckpt,
-                            runtime=load_runtime_config(args.runtime_config))
+                            checkpoint=args.ckpt, runtime=load_runtime_config(args.runtime_config))
     except ValueError as e:
         ap.error(str(e))
     print("Экспортировано:", args.out)
     cal = man["calibration"]
-    print(f"  конформная таблица: {cal['precision'] if cal['conformal'] else 'нет'}")
+    print(f"  конформная таблица: {'есть' if cal['conformal'] else 'нет'}")
     for name, err in man["export_check_max_rel"].items():
         print(f"  {name:9s} расхождение ONNX и PyTorch в единицах масштаба выхода {err:.2e}")
     print(f"  состояние на диске: {man['state']['nbytes']} Б (v{man['state']['version']})")

@@ -13,8 +13,8 @@
 4. конформная таблица построена только по калибровочным блокам и только на
    валидационных станциях, длины истории её окон взяты из распределения куррикулума,
    таблица разбита по бинам лидов и тем же бинам длины истории, что в коде, для каждого
-   бина длины истории записано, своя у него строка или маргинальная, поправка медианы
-   равна нулю, а точность модели, на которой она подогнана, записана;
+   бина длины истории записано, своя у него строка или маргинальная, а поправка
+   медианы равна нулю;
 5. чекпойнт выбран по метрике на валидационных станциях в валидационных блоках, а
    длины истории окон валидации взяты из распределения куррикулума, а не одной длиной;
 6. окна внешних станций - только в тестовом окне; внешние станции не встречаются в
@@ -41,7 +41,6 @@ log = logging.getLogger(__name__)
 
 SELECTION_KEY = "mayak_selection"          # ключ записи о выборе чекпойнта в .ckpt
 SELECTION_TIME_KEY, CONFORMAL_TIME_KEY = "val", "calib"
-PRECISIONS = ("fp32", "int8")
 ALLOWED_ROLES = {"train": {ROLE_TRAIN}, "calib": {ROLE_VAL}}
 EXTERNAL_TIME_KEYS = {"test"}
 
@@ -313,32 +312,23 @@ def history_bins_record(history_bins=None):
     return [[int(b[0]), int(b[1])] for b in (history_bins or HISTORY_BINS)]
 
 
-def conformal_record(ds, checkpoint=None, precision="fp32", graphs=None, history_fit=None):
+def conformal_record(ds, checkpoint=None, history_fit=None):
     """Запись о том, на чём подогнана конформная таблица.
 
     Args:
         ds: калибровочный набор окон.
         checkpoint: путь к чекпойнту модели; если файл есть, пишется и его отпечаток.
-        precision: точность модели, по выходам которой подогнана таблица.
-        graphs: отпечаток графов, по которым считался прогноз; для int8 обязателен.
         history_fit: сведения о подгонке по бинам длины истории: подпись и границы бина,
             число окон и признак маргинальной строки.
 
     Returns:
         Словарь для записи рядом с таблицей.
-
-    Raises:
-        ValueError: неизвестная точность или int8 без отпечатка графов.
     """
-    if precision not in PRECISIONS:
-        raise ValueError(f"точность {precision!r}; допустимо {PRECISIONS}")
-    if precision == "int8" and not graphs:
-        raise ValueError("таблица для int8 подгоняется на int8-графах: нужен их отпечаток")
     stations = sorted({fp["sid"] for fp in ds.footprints()})
     digest = file_digest(checkpoint) if checkpoint and os.path.isfile(checkpoint) else None
     return dict(station_roles=sorted(ds.station_splits), time_key=ds.time_key,
                 stations=stations, checkpoint=checkpoint, checkpoint_digest=digest,
-                precision=precision, graphs=graphs, history=ds.history_spec(),
+                history=ds.history_spec(),
                 history_bins=history_bins_record(), history_fit=history_fit,
                 windows=len(ds), windows_digest=ds.fingerprint(), **_split_state())
 
@@ -379,7 +369,7 @@ def load_conformal(path):
     meta = conformal_meta_path(path)
     if not os.path.exists(meta):
         _fail(f"конформная таблица {path}: нет метаданных {meta} — неизвестно, на каких "
-              f"данных и какой точности она подогнана")
+              f"данных и по какому чекпойнту она подогнана")
     with open(meta) as f:
         rec = json.load(f)
     shift = np.load(path).astype(np.float32)
@@ -388,25 +378,6 @@ def load_conformal(path):
     except ValueError as e:
         raise ValueError(f"конформная таблица {path}: {e}") from None
     return shift, rec
-
-
-def precision_mismatch(record, precision):
-    """Причина, по которой таблицу нельзя применять к модели заданной точности.
-
-    Args:
-        record: запись о подгонке таблицы.
-        precision: точность модели, к выходам которой таблицу собираются применить.
-
-    Returns:
-        Текст причины или None, если точности совпадают.
-    """
-    got = (record or {}).get("precision")
-    if got == precision:
-        return None
-    if got is None:
-        return (f"точность, на которой подогнана таблица, не записана; модель считает в "
-                f"{precision}")
-    return f"таблица подогнана на {got}, модель считает в {precision}"
 
 
 def check_conformal(path, store):
@@ -424,8 +395,6 @@ def check_conformal(path, store):
         _fail(f"{what}: подогнана на окнах с одной длиной истории "
               f"{(rec.get('history') or {}).get('L')!r}; длины истории калибровочных окон "
               f"должны следовать куррикулуму")
-    if rec.get("precision") not in PRECISIONS:
-        _fail(f"{what}: точность модели {rec.get('precision')!r} не из {PRECISIONS}")
     if rec.get("history_bins") != history_bins_record():
         _fail(f"{what}: подогнана по бинам длины истории {rec.get('history_bins')}, в коде "
               f"{history_bins_record()}; подгоните таблицу заново")

@@ -93,7 +93,7 @@ def test_lookback_covers_every_rule():
 
 
 def test_reference_vectors_are_reproduced():
-    """Пакет и поток на Python воспроизводят эталон, по которому сверяется порт на Rust."""
+    """Пакетный и потоковый QC воспроизводят регрессионный вектор кодов."""
     doc = json.loads(GOLDEN.read_text(encoding="utf-8"))
     cfg = dict(DEFAULT_QC.to_dict(), lookback_hours=DEFAULT_QC.lookback_hours)
     assert doc["config"] == cfg, "пороги изменились: python scripts/make_qc_golden.py"

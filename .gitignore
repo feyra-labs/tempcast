@@ -14,9 +14,6 @@ results/**
 !results/**/*.json
 !results/README.md
 
-# Rust
-runtime-rs/target/
-
 # IDE
 .vscode/
 .idea/

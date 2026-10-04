@@ -1,4 +1,4 @@
-"""Экспорт МАЯК в ONNX + динамическая int8-квантизация.
+"""Экспорт МАЯК в ONNX одним графом.
 
 Архитектура и размеры входов берутся из конфига модели, сохранённого в чекпойнте;
 тот же конфиг записывается в метаданные ONNX-файла (ключ mayak_model_config).
@@ -34,7 +34,7 @@ def dummy_inputs(cfg, B=1):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="экспорт МАЯК в ONNX (+ int8)")
+    ap = argparse.ArgumentParser(description="экспорт МАЯК в ONNX")
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out", default="runtime/mayak.onnx")
     args = ap.parse_args()
@@ -68,22 +68,6 @@ def main():
         q_torch = wrap(*args_in)[0].numpy()
     err = float(np.abs(q_onnx - q_torch).max())
     print(f"max|ONNX − PyTorch| по q: {err:.2e}  (норма: доли °C)")
-
-    try:
-        import onnx
-        from onnxruntime.quantization import quantize_dynamic, QuantType
-        from onnxruntime.quantization.shape_inference import quant_pre_process
-        prep = args.out.replace(".onnx", "_prep.onnx")
-        quant_pre_process(args.out, prep)
-        q8 = args.out.replace(".onnx", "_int8.onnx")
-        quantize_dynamic(prep, q8, weight_type=QuantType.QInt8,
-                         extra_options={"DefaultTensorType": onnx.TensorProto.FLOAT})
-        import os
-        s0 = os.path.getsize(args.out) / 1024
-        s8 = os.path.getsize(q8) / 1024
-        print(f"Размер: fp32 {s0:.0f} КБ → int8 {s8:.0f} КБ  ({q8})")
-    except Exception as e:
-        print("int8-квантизация пропущена:", e)
 
 
 if __name__ == "__main__":

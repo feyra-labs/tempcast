@@ -1447,12 +1447,8 @@ def main():
     n_params = print_parameter_counts(named_all)
     shift = None
     if args.conformal:
-        from mayak.leakage import load_conformal, precision_mismatch
-        shift, rec = load_conformal(args.conformal)
-        why = precision_mismatch(rec, "fp32")
-        if why:
-            ap.error(f"--conformal {args.conformal}: {why}; стенд оценки считает модели во "
-                     f"fp32, нужна таблица, подогнанная без --precision int8")
+        from mayak.leakage import load_conformal
+        shift, _rec = load_conformal(args.conformal)
     boot = dict(n_boot=args.bootstrap, seed=eval_seed, level=args.ci_level)
     ci = args.bootstrap > 0
     record = run_record(ckpt=args.ckpt, baselines=baseline_ckpts, ablations=args.ablation_ckpt,
