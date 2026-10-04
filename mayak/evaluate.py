@@ -31,6 +31,7 @@ from mayak import baselines as BL
 from mayak.constants import H, QUANTILES
 from mayak.data.holdout import (HISTORY_GRID, NOMINAL_HISTORY, EvalSet, check_history_grid,
                                 history_label, history_strata)
+from mayak.loss import NORM_SCALE_CLAMP
 from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, breakdown, by_lead, coverage,
                            metric_table, seed_spread, skill, wmean)
 from mayak.results import evaluation_tables, run_record, transfer_tables, write_tables
@@ -76,7 +77,7 @@ def coverage90(y, q, w):
 
 _AUX_KEYS = (("y", "y"), ("y_mask", "y_mask"), ("mu_clim", "mu_clim_fut"),
              ("a_recent", "a_recent"), ("a_recent_ok", "a_recent_ok"),
-             ("sigma_clim", "sigma_clim"), ("x_hist", "x_hist"),
+             ("norm_scale", "norm_scale"), ("x_hist", "x_hist"),
              ("mask_hist", "mask_hist"))
 _OPTIONAL_AUX_KEYS = (("mu_ref", "mu_ref_fut"),)
 
@@ -97,8 +98,8 @@ def gather_all(named, dataset, device="cpu", batch_size=128):
     Returns:
         Пара: словарь из имени модели в её медиану формы (N, H) и квантили формы
         (N, H, 7), и словарь с целью, маской цели, климатологией на горизонте, недавней
-        аномалией, климатологическим масштабом и историей окон. Если набор окон даёт
-        отдельный эталон скилла, он лежит в том же словаре под ключом mu_ref.
+        аномалией, нормировочным масштабом на часах горизонта и историей окон. Если набор
+        окон даёт отдельный эталон скилла, он лежит в том же словаре под ключом mu_ref.
     """
     for m in named.values():
         m.eval().to(device)
@@ -177,6 +178,22 @@ def collect_predictions(named, ds, device="cpu"):
     return preds, aux
 
 
+def baseline_scale(aux):
+    """Масштаб интервалов статистических эталонов на часах горизонта.
+
+    Это масштаб, на который функция потерь делит ошибку: масштаб остатка климатологии
+    станции на часах горизонта, обрезанный теми же пределами. У всех моделей и эталонов
+    поэтому один масштаб разброса.
+
+    Args:
+        aux: данные окон с нормировочным масштабом формы (N, H).
+
+    Returns:
+        Масштаб, °C, форма (N, H), float32.
+    """
+    return np.clip(np.asarray(aux["norm_scale"], np.float32), *NORM_SCALE_CLAMP)
+
+
 def history_free_baselines(aux):
     """Эталоны, которым история окна не нужна.
 
@@ -186,7 +203,7 @@ def history_free_baselines(aux):
     Returns:
         Словарь из имени эталона в его медиану и квантили.
     """
-    mu, q = BL.climatology_forecast(aux["mu_clim"], aux["sigma_clim"])
+    mu, q = BL.climatology_forecast(aux["mu_clim"], baseline_scale(aux))
     return {CLIMATOLOGY: dict(mu=mu, q=q)}
 
 
@@ -205,7 +222,7 @@ def history_baselines(aux, r_damped=None):
     Returns:
         Словарь из имени эталона в его медиану и квантили.
     """
-    mucl, sig = aux["mu_clim"], aux["sigma_clim"]
+    mucl, sig = aux["mu_clim"], baseline_scale(aux)
     out = {}
     if r_damped is not None:
         mu, q = BL.damped_persistence_forecast(aux["a_recent"], mucl, sig, r_damped,
@@ -713,7 +730,7 @@ class Bench:
 
 
 def _same_targets(a, b):
-    return all(np.array_equal(a[k], b[k]) for k in ("y", "y_mask", "mu_clim", "sigma_clim"))
+    return all(np.array_equal(a[k], b[k]) for k in ("y", "y_mask", "mu_clim", "norm_scale"))
 
 
 def run_bench(named, base, grid=HISTORY_GRID, r_damped=None, leads=HISTORY_LEADS, ci=True,

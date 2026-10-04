@@ -393,7 +393,8 @@ def test_seasonal_naive_matches_textbook_formula_on_complete_history():
     B = 2
     x = rng.normal(10, 5, (B, L_MAX, 3)).astype(np.float32)
     m = np.ones_like(x)
-    mu, q = BL.seasonal_naive_forecast(x, m, np.zeros((B, H), np.float32), np.ones(B, np.float32))
+    mu, q = BL.seasonal_naive_forecast(x, m, np.zeros((B, H), np.float32),
+                                       np.ones((B, H), np.float32))
     T_last = L_MAX - 1
     for h in range(1, H + 1):
         k = (h - 1) // 24
@@ -409,7 +410,7 @@ def test_seasonal_naive_falls_back_to_earlier_day_then_climatology():
     x[0, L_MAX - 48 + 5, 0], m[0, L_MAX - 48 + 5, 0] = 7.0, 1
     x[0, L_MAX - 24 + 6, 0], m[0, L_MAX - 24 + 6, 0] = 9.0, 1
     clim = np.full((B, H), -3.0, np.float32)
-    mu, _ = BL.seasonal_naive_forecast(x, m, clim, np.ones(B, np.float32))
+    mu, _ = BL.seasonal_naive_forecast(x, m, clim, np.ones((B, H), np.float32))
     assert mu[0, 5] == 7.0 and mu[0, 29] == 7.0
     assert mu[0, 6] == 9.0
     assert mu[0, 0] == -3.0 and mu[0, 7] == -3.0
@@ -418,7 +419,8 @@ def test_seasonal_naive_falls_back_to_earlier_day_then_climatology():
 def test_damped_persistence_formula():
     B = 3
     clim = np.tile(np.linspace(0, 5, H, dtype=np.float32), (B, 1))
-    sig = np.array([1.0, 2.0, 3.0], np.float32)
+    day = 1.5 + np.cos(2 * np.pi * np.arange(H) / 24)
+    sig = (np.array([1.0, 2.0, 3.0])[:, None] * day[None, :]).astype(np.float32)
     a = np.array([2.0, -1.0, 0.5], np.float32)
     r0, r1 = np.zeros(H, np.float32), np.ones(H, np.float32)
     mu, q = BL.damped_persistence_forecast(a, clim, sig, r0)
@@ -428,12 +430,12 @@ def test_damped_persistence_formula():
     assert np.allclose(mu, clim + a[:, None])
     width = q[..., -1] - q[..., 0]
     z = BL.ZQ[-1] - BL.ZQ[0]
-    assert np.allclose(width, z * sig[:, None] * math.sqrt(BL.DAMPED_VAR_FLOOR), rtol=1e-5)
+    assert np.allclose(width, z * sig * math.sqrt(BL.DAMPED_VAR_FLOOR), rtol=1e-5)
     r = np.linspace(0.9, 0.1, H).astype(np.float32)
     mu, q = BL.damped_persistence_forecast(a, clim, sig, r)
     assert np.allclose(mu, clim + r * a[:, None])
     assert np.allclose(q[..., 3], mu)
-    assert np.allclose(q[..., -1] - q[..., 0], z * sig[:, None] * np.sqrt(1 - r ** 2), rtol=1e-5)
+    assert np.allclose(q[..., -1] - q[..., 0], z * sig * np.sqrt(1 - r ** 2), rtol=1e-5)
 
 
 def test_damped_coefficients_recover_known_decay():

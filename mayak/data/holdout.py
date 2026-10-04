@@ -436,7 +436,6 @@ class EvalSet(Dataset):
             "y_mask": torch.from_numpy(y_mask),
             "norm_scale": torch.from_numpy(norm_scale(clim, doy_f, hour_f)),
             "mu_clim_fut": torch.from_numpy(mu_clim_fut),
-            "sigma_clim": torch.tensor(clim.sigma, dtype=torch.float32),
             "a_recent": torch.tensor(a_recent, dtype=torch.float32),
             "a_recent_ok": torch.tensor(bool(a_ok)),
             "hist_len": torch.tensor(w["L"], dtype=torch.int64),

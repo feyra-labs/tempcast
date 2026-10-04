@@ -1,7 +1,8 @@
 """Статистические эталоны: климатология, затухающая персистентность, сезонно-наивный.
 
-У всех трёх интервал нормальный с климатологическим масштабом станции. Это тот же
-масштаб, что нормирует функцию потерь, поэтому второго эталона разброса не возникает.
+У всех трёх интервал нормальный с гармоническим масштабом остатка климатологии станции
+на часах горизонта: масштаб меняется по году и суткам. Это тот же масштаб, что нормирует
+функцию потерь, поэтому второго эталона разброса не возникает.
 """
 import numpy as np
 from scipy.stats import norm
@@ -67,7 +68,31 @@ def quantiles_from_normal(mu, sigma):
     return mu[..., None] + ZQ * sigma[..., None]
 
 
-def climatology_forecast(mu_clim_fut, sigma_clim):
+def _horizon_scale(scale, shape):
+    """Масштаб интервала на часах горизонта в виде массива той же формы, что медиана.
+
+    Масштаб задаётся на каждый час горизонта каждого окна. Скаляр станции или масштаб
+    другой формы не растягивается молча: при числе окон, равном длине горизонта, такой
+    масштаб лёг бы вдоль лидов, а не вдоль окон.
+
+    Args:
+        scale: масштаб остатка на часах горизонта, °C.
+        shape: форма медианы, (B, H).
+
+    Returns:
+        Масштаб формы shape, float32.
+
+    Raises:
+        ValueError: форма масштаба не совпадает с формой медианы.
+    """
+    sig = np.asarray(scale, np.float32)
+    if sig.shape != tuple(shape):
+        raise ValueError(f"масштаб интервала формы {sig.shape}, нужна {tuple(shape)}: эталоны "
+                         f"берут масштаб остатка на каждом часе горизонта, а не скаляр станции")
+    return sig
+
+
+def climatology_forecast(mu_clim_fut, scale):
     """Прогноз климатологией станции на часах горизонта.
 
     Климатология гармоническая: годовые и суточные гармоники среднего и масштаба. Она
@@ -76,15 +101,17 @@ def climatology_forecast(mu_clim_fut, sigma_clim):
 
     Args:
         mu_clim_fut: климатологическое среднее на часах горизонта, форма (B, H).
-        sigma_clim: климатологический масштаб станции, форма (B,).
+        scale: масштаб остатка климатологии на часах горизонта, °C, форма (B, H).
 
     Returns:
         Пара: медиана формы (B, H) и квантили формы (B, H, nq) нормального
-        распределения с климатологическим масштабом.
+        распределения с масштабом своего часа горизонта.
+
+    Raises:
+        ValueError: форма масштаба не совпадает с формой среднего.
     """
     mu = np.asarray(mu_clim_fut, np.float32)
-    sig = np.broadcast_to(np.asarray(sigma_clim, np.float32).reshape(-1, 1), mu.shape)
-    return mu, quantiles_from_normal(mu, sig)
+    return mu, quantiles_from_normal(mu, _horizon_scale(scale, mu.shape))
 
 
 def damped_coefficients(Sxx, Sxy):
@@ -150,13 +177,14 @@ def fit_damped_persistence(clims, n_windows=20000, seed=0):
     return damped_coefficients(Sxx, Sxy)
 
 
-def damped_persistence_forecast(a_recent, mu_clim_fut, sigma_clim, r, valid=None):
+def damped_persistence_forecast(a_recent, mu_clim_fut, scale, r, valid=None):
     """Прогноз затухающей персистентностью аномалии.
 
     Недавняя аномалия прибавляется к климатологии с коэффициентом своего лида. Разброс
-    интервала - климатологический масштаб, уменьшенный так, как уменьшается условный
-    разброс аномалии, которая затухает с тем же коэффициентом. Снизу доля разброса
-    ограничена, иначе при коэффициенте около единицы интервал схлопывается в точку.
+    интервала - масштаб остатка климатологии на часе горизонта, уменьшенный так, как
+    уменьшается условный разброс аномалии, которая затухает с тем же коэффициентом. Снизу
+    доля разброса ограничена, иначе при коэффициенте около единицы интервал схлопывается в
+    точку.
 
     Если в истории окна не хватило валидных часов, аномалия неизвестна. Тогда прогноз
     окна - климатология целиком, вместе с её разбросом: сузить интервал нечем.
@@ -164,25 +192,27 @@ def damped_persistence_forecast(a_recent, mu_clim_fut, sigma_clim, r, valid=None
     Args:
         a_recent: недавняя аномалия каждого окна, форма (B,).
         mu_clim_fut: климатологическое среднее на часах горизонта, форма (B, H).
-        sigma_clim: климатологический масштаб станции, форма (B,).
+        scale: масштаб остатка климатологии на часах горизонта, °C, форма (B, H).
         r: коэффициенты затухания по лидам, форма (H,).
         valid: признак того, что аномалия окна определена, форма (B,); None значит, что
             определена у всех окон.
 
     Returns:
         Пара: медиана формы (B, H) и квантили формы (B, H, nq).
+
+    Raises:
+        ValueError: форма масштаба не совпадает с формой среднего.
     """
     a = np.asarray(a_recent, np.float32)[:, None]
     r = np.broadcast_to(np.asarray(r, np.float32)[None, :], (a.shape[0], len(r)))
     if valid is not None:
         r = np.where(np.asarray(valid, bool)[:, None], r, np.float32(0.0))
     mu = np.asarray(mu_clim_fut, np.float32) + r * a
-    sig = np.asarray(sigma_clim, np.float32)[:, None] * np.sqrt(
-        np.clip(1 - r ** 2, DAMPED_VAR_FLOOR, 1.0))
+    sig = _horizon_scale(scale, mu.shape) * np.sqrt(np.clip(1 - r ** 2, DAMPED_VAR_FLOOR, 1.0))
     return mu, quantiles_from_normal(mu, sig)
 
 
-def seasonal_naive_forecast(x_hist, mask_hist, mu_clim_fut, sigma_clim, period=24):
+def seasonal_naive_forecast(x_hist, mask_hist, mu_clim_fut, scale, period=24):
     """Сезонно-наивный прогноз: последнее наблюдение в тот же час суток.
 
     История выровнена по правому краю окна. Для каждого часа суток берутся последние
@@ -192,11 +222,14 @@ def seasonal_naive_forecast(x_hist, mask_hist, mu_clim_fut, sigma_clim, period=2
         x_hist: наблюдения истории, форма (B, L, 3).
         mask_hist: маски наличия, форма (B, L, 3).
         mu_clim_fut: климатологическое среднее на часах горизонта, форма (B, H).
-        sigma_clim: климатологический масштаб станции, форма (B,).
+        scale: масштаб остатка климатологии на часах горизонта, °C, форма (B, H).
         period: период повтора в часах.
 
     Returns:
         Пара: медиана формы (B, H) и квантили формы (B, H, nq).
+
+    Raises:
+        ValueError: форма масштаба не совпадает с формой среднего.
     """
     B, Lh = x_hist.shape[:2]
     D = Lh // period
@@ -208,5 +241,4 @@ def seasonal_naive_forecast(x_hist, mask_hist, mu_clim_fut, sigma_clim, period=2
     slot = np.arange(H) % period
     mu = np.where(has[:, slot], last[:, slot], np.asarray(mu_clim_fut, np.float32))
     mu = mu.astype(np.float32)
-    sig = np.broadcast_to(np.asarray(sigma_clim, np.float32).reshape(-1, 1), mu.shape)
-    return mu, quantiles_from_normal(mu, sig)
+    return mu, quantiles_from_normal(mu, _horizon_scale(scale, mu.shape))
