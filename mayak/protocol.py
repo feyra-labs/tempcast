@@ -6,9 +6,13 @@ run_protocol. Для любой архитектуры одинаковы:
 * этапы обучения и число шагов каждого: этап A только без истории, этап B - полный
   куррикулум длины истории;
 * размер батча, число окон в эпохе, число воркеров и сид, то есть поток окон;
-* оптимизатор AdamW (lr, betas, базовое весовое затухание), косинусное расписание,
+* оптимизатор AdamW (betas, базовое весовое затухание), косинусное расписание,
   обрезка градиента, точность вычислений: fp32 без TF32, та же, в которой модель
   оценивают, калибруют и экспортируют;
+* сетка скоростей обучения ``lr_grid`` и число шагов последнего этапа при подборе
+  ``lr_search_steps``. Скорость обучения ``lr`` каждая архитектура получает подбором по
+  этой сетке (``mayak.tuning``), поэтому ``lr`` - единственное поле протокола, которое у
+  сравниваемых моделей различается;
 * функция потерь и метрика выбора чекпойнта ``val/loss`` - общий нормированный
   pinball на всём наборе валидации: одинаковое число окон с каждой
   валидационной станции в валидационном окне, длина истории каждого окна - из того же
@@ -20,21 +24,25 @@ run_protocol. Для любой архитектуры одинаковы:
 в журнал прогона и в чекпойнт.
 
 Этапы можно запускать по отдельности: этап A, потом, после просмотра отчёта о поле,
-этап B с выбранного человеком чекпойнта этапа A. Какие этапы запускать, с какого
-чекпойнта стартовать, порог ворот, пробный запуск и сохранение кандидатов в протокол не
-входят: этап B, запущенный отдельной командой с лучшего чекпойнта A, получает тот же
-протокол и тот же сид, что в прогоне одной командой, и даёт тот же чекпойнт.
+этап B с выбранного человеком чекпойнта этапа A. При подборе скорости обучения этапы идут
+одной командой, и этап B стартует с лучшего по валидации чекпойнта этапа A.
 
-Различается только архитектура (``arch``). Что архитектура определяет сама:
-регуляризаторы, не зависящие от цели, и отличия от общего правила весового затухания.
-Группы затухания с именами параметров и число параметров записываются в журнал
-прогона. Отдельных настроек протокола для отдельных архитектур нет: протокол один на
-все модели.
+Какие этапы запускать, с какого чекпойнта стартовать, порог ворот, пробный запуск и
+сохранение кандидатов в протокол не входят: этап B, запущенный отдельной командой с
+лучшего чекпойнта A, получает тот же протокол и тот же сид, что в прогоне одной командой,
+и даёт тот же чекпойнт.
+
+Различаются только архитектура (``arch``) и выбранная подбором скорость обучения. Что
+архитектура определяет сама: регуляризаторы, не зависящие от цели, и отличия от общего
+правила весового затухания. Группы затухания с именами параметров и число параметров
+записываются в журнал прогона. Отдельных настроек протокола для отдельных архитектур
+нет: протокол один на все модели.
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import asdict, dataclass, fields, replace
 from typing import Optional
@@ -46,6 +54,8 @@ CURRICULA = ("L0", "full")
 LR_SCHEDULES = ("cosine",)
 JOURNAL = "protocol.json"
 CONFIG_FILE = "config.json"
+SEED_FIELDS = ("seed", "seeds")
+LR_FIELDS = ("lr",)
 
 
 class ProtocolError(RuntimeError):
@@ -125,6 +135,8 @@ class Protocol:
     num_workers: int = 8
     seed: int = 0
     lr: float = 3e-3
+    lr_grid: tuple = (3e-4, 1e-3, 3e-3)
+    lr_search_steps: int = 20_000
     weight_decay: float = 1e-2
     betas: tuple = (0.9, 0.95)
     lr_schedule: str = "cosine"
@@ -141,6 +153,14 @@ class Protocol:
         if not isinstance(self.seeds, Seeds):
             object.__setattr__(self, "seeds", Seeds(**dict(self.seeds or {})))
         object.__setattr__(self, "betas", tuple(float(b) for b in self.betas))
+        grid = tuple(sorted(float(v) for v in self.lr_grid))
+        object.__setattr__(self, "lr_grid", grid)
+        if not grid or len(set(grid)) != len(grid):
+            raise ValueError(f"сетка скоростей обучения {grid}: нужна непустая без повторов")
+        if not all(math.isfinite(v) and v > 0 for v in grid):
+            raise ValueError(f"сетка скоростей обучения {grid}: нужны конечные числа больше нуля")
+        if int(self.lr_search_steps) < 1:
+            raise ValueError("число шагов подбора скорости обучения < 1")
         if not st:
             raise ValueError("протокол без этапов")
         if len({s.name for s in st}) != len(st):
@@ -210,11 +230,32 @@ def protocol_for(arch, base=DEFAULT_PROTOCOL):
     return base
 
 
+def protocol_diff(a, b, ignore=()):
+    """Поля, в которых два протокола различаются.
+
+    Args:
+        a: первый протокол.
+        b: второй протокол.
+        ignore: поля, которые не сравниваются.
+
+    Returns:
+        Отсортированный список имён полей.
+    """
+    da, db = ({k: v for k, v in p.to_dict().items() if k not in ignore} for p in (a, b))
+    return sorted(k for k in set(da) | set(db) if da.get(k) != db.get(k))
+
+
+_CLI_HELP = {
+    "lr": "скорость обучения прогона; при подборе её заменяет выбранное значение сетки",
+    "lr_search_steps": "шаги последнего этапа на каждом значении сетки при подборе",
+}
+
 # (флаг, поле протокола, тип)
 _CLI = [
     ("--batch", "batch_size", int), ("--windows", "windows_per_epoch", int),
     ("--workers", "num_workers", int), ("--seed", "seed", int),
-    ("--lr", "lr", float), ("--weight-decay", "weight_decay", float),
+    ("--lr", "lr", float), ("--lr-search-steps", "lr_search_steps", int),
+    ("--weight-decay", "weight_decay", float),
     ("--grad-clip", "grad_clip", float), ("--ema-decay", "ema_decay", float),
     ("--val-every", "val_every", int),
     ("--patience", "patience", int),
@@ -238,7 +279,9 @@ def add_protocol_args(ap, base=DEFAULT_PROTOCOL):
         g.add_argument(f"--steps-{s.name.lower()}", type=int, default=s.steps,
                        help=f"шаги этапа {s.name} ({s.curriculum})")
     for flag, name, typ in _CLI:
-        g.add_argument(flag, type=typ, default=getattr(base, name))
+        g.add_argument(flag, type=typ, default=getattr(base, name), help=_CLI_HELP.get(name))
+    g.add_argument("--lr-grid", type=float, nargs="+", default=list(base.lr_grid),
+                   metavar="LR", help="сетка подбора скорости обучения (--lr-search)")
     for name in SEED_NAMES:
         g.add_argument(f"--seed-{name}", type=int, default=getattr(base.seeds, name),
                        help=f"отдельный сид «{name}» (по умолчанию = --seed)")
@@ -249,7 +292,7 @@ def protocol_from_args(args, base=DEFAULT_PROTOCOL):
     stages = tuple(replace(s, steps=getattr(args, f"steps_{s.name.lower()}")) for s in base.stages)
     kw = {name: getattr(args, flag.lstrip("-").replace("-", "_")) for flag, name, _ in _CLI}
     seeds = Seeds(**{n: getattr(args, f"seed_{n}") for n in SEED_NAMES})
-    return replace(base, stages=stages, seeds=seeds, **kw)
+    return replace(base, stages=stages, seeds=seeds, lr_grid=tuple(args.lr_grid), **kw)
 
 
 def _write_journal(path, journal):
@@ -272,7 +315,7 @@ def write_config(path, cfg_dict):
 
 def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerator="auto",
                  tag=None, callbacks=(), enable_progress_bar=True, model_config=None,
-                 data_config=None, launch=None):
+                 data_config=None, launch=None, tuning=None):
     """Обучить архитектуру по протоколу. Единственная функция запуска обучения.
 
     Этап, который в протоколе идёт не первым, стартует с лучшего чекпойнта предыдущего
@@ -283,6 +326,11 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     После этапа холодного старта считается отчёт о поле по всем сохранённым чекпойнтам
     этапа и строятся графики. Если задан порог ворот, следующий этап не начинается, когда
     у стартового чекпойнта отношение MSE выше порога.
+
+    При подборе скорости обучения сначала на каждом значении сетки протокола идёт прогон
+    с полным первым этапом и укороченным последним в подкаталоге ``lr_search`` каталога
+    прогона, затем полный прогон с выбранным значением. Запись о подборе, своём или
+    взятом из журнала основного прогона, пишется в журнал и в каждый чекпойнт.
 
     Полностью разрешённый конфиг пишется в config.json в каталоге прогона, рядом с каждым
     чекпойнтом и внутрь него.
@@ -303,12 +351,15 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
         launch: какие этапы запустить, с какого чекпойнта стартует первый из них, порог
             ворот, пробный запуск и сохранение кандидатов; None значит все этапы одной
             командой.
+        tuning: подбор скорости обучения, её источник и этап сравнения; None значит
+            скорость обучения из протокола без записи о подборе.
 
     Returns:
         Журнал прогона; он же лежит в protocol.json в каталоге прогона.
 
     Raises:
-        ProtocolError: неверный выбор этапов или этап не сохранил ни одного чекпойнта.
+        ProtocolError: неверный выбор этапов; этап не сохранил ни одного чекпойнта;
+            подбор скорости обучения невозможен или его источник не подходит.
         InitCheckpointError: чекпойнт инициализации не подходит этому запуску.
         GateError: поле стартового чекпойнта не прошло порог, следующий этап не начат.
     """
@@ -319,14 +370,17 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
 
     from mayak import stage_report as SR
     from mayak import stages as ST
+    from mayak import tuning as TU
     from mayak.config import (DataConfig, RunConfig, check_pipeline_compat, model_config_for)
     from mayak.data.datamodule import MayakData, validation_set
     from mayak.data.store import get_store
     from mayak.leakage import SELECTION_KEY, run_checklist
     from mayak.lit import (ARCHS, CandidateCheckpoint, LitForecaster, SelectionProvenance,
-                           StageProvenance, param_group_summary, parameter_counts)
+                           StageProvenance, TuningProvenance, param_group_summary,
+                           parameter_counts)
 
     launch = ST.Launch.coerce(launch)
+    tuning = TU.Tuning.coerce(tuning)
     protocol = protocol_for(arch, protocol or DEFAULT_PROTOCOL)
     strict_fp32()
     plan = ST.plan_stages(protocol, launch)
@@ -334,6 +388,23 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     last_index = len(protocol.stages) - 1
     keep_candidates = ST.candidate_stages(protocol, launch)
     model_cfg = check_pipeline_compat(model_config_for(arch, model_config))
+
+    tag = tag or arch
+    run_dir = os.path.join(out_root, tag)
+    journal_path = os.path.join(run_dir, JOURNAL)
+
+    def train_candidate(p, sub_tag):
+        j = run_protocol(arch, manifest, p, out_root=out_root, accelerator=accelerator,
+                         tag=sub_tag, callbacks=callbacks,
+                         enable_progress_bar=enable_progress_bar, model_config=model_config,
+                         data_config=data_config, launch=TU.SEARCH_LAUNCH)
+        return j, os.path.abspath(os.path.join(out_root, sub_tag, JOURNAL))
+
+    TU.check_run_dir(journal_path, tuning)
+    protocol, tune = TU.resolve(arch, protocol, tuning, launch, model_cfg, tag,
+                                train_candidate)
+    for line in TU.format_tuning(tune):
+        log.info("%s: %s", arch, line)
     if data_config is None:
         data_cfg = DataConfig()
     elif isinstance(data_config, DataConfig):
@@ -348,10 +419,6 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     seeds = protocol.resolved_seeds()
     cfg_dict = run_cfg.to_dict()
     device = SR.report_device(accelerator)
-
-    tag = tag or arch
-    run_dir = os.path.join(out_root, tag)
-    journal_path = os.path.join(run_dir, JOURNAL)
     store = get_store(manifest, cache_root=data_cfg.cache_root)
 
     prev = None
@@ -361,7 +428,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
         prev = ST.inspect_init_checkpoint(launch.init_from, arch=arch, protocol=protocol,
                                           model_config=model_cfg, data_config=data_cfg,
                                           stage=prev_stage, store=store,
-                                          val_digest=prev_val.fingerprint())
+                                          val_digest=prev_val.fingerprint(), tuning=tune)
         if prev_stage.curriculum == ST.FIELD_CURRICULUM:
             entry, report_file = SR.find_report_entry(prev["run_dir"], prev_stage.name,
                                                       prev["digest"], prev_val.fingerprint())
@@ -381,7 +448,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     base = dict(arch=arch, model_class=f"{ARCHS[arch].__module__}.{ARCHS[arch].__qualname__}",
                 protocol=protocol.to_dict(),
                 manifest=os.path.abspath(manifest), seeds=seeds, config_file=CONFIG_FILE,
-                augment=data_cfg.augment.summary(), data_key=store.key)
+                augment=data_cfg.augment.summary(), data_key=store.key, tuning=tune)
     journal = ST.start_journal(journal_path, base, protocol, first, prev, run_dir)
     log.info("%s: сиды %s", arch, seeds)
     log.info("%s: аугментации %s", arch, journal["augment"])
@@ -434,6 +501,8 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
         ckpt = ModelCheckpoint(dirpath=stage_dir, monitor=protocol.monitor, mode="min",
                                save_top_k=1, filename="best")
         stage_callbacks = [ckpt, SelectionProvenance(), StageProvenance(record)]
+        if tune is not None:
+            stage_callbacks.append(TuningProvenance(tune))
         cands = None
         if stage.name in keep_candidates:
             cands = CandidateCheckpoint(dirpath=os.path.join(stage_dir, ST.CANDIDATE_DIR),
@@ -498,7 +567,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
 
 
 def run_experiment(cfg, out_root="runs", tag=None, accelerator="auto", callbacks=(),
-                   enable_progress_bar=True, launch=None):
+                   enable_progress_bar=True, launch=None, tuning=None):
     """Прогон по полной конфигурации: точка входа слоя композиции конфигов.
 
     Args:
@@ -509,6 +578,7 @@ def run_experiment(cfg, out_root="runs", tag=None, accelerator="auto", callbacks
         callbacks: дополнительные колбэки обучения.
         enable_progress_bar: показывать ли индикатор хода обучения.
         launch: какие этапы запустить и с какого чекпойнта; None значит все этапы.
+        tuning: подбор скорости обучения и этап сравнения; None значит без подбора.
 
     Returns:
         Журнал прогона.
@@ -519,7 +589,7 @@ def run_experiment(cfg, out_root="runs", tag=None, accelerator="auto", callbacks
     return run_protocol(cfg.arch, cfg.data.manifest, cfg.train, out_root=out_root, tag=tag,
                         accelerator=accelerator, callbacks=callbacks,
                         enable_progress_bar=enable_progress_bar, model_config=cfg.model,
-                        data_config=cfg.data, launch=launch)
+                        data_config=cfg.data, launch=launch, tuning=tuning)
 
 
 def read_journal(run_dir):
@@ -527,7 +597,7 @@ def read_journal(run_dir):
         return json.load(f)
 
 
-__all__ = ["ARCH_NAMES", "CONFIG_FILE", "DEFAULT_PROTOCOL", "Protocol", "ProtocolError",
-           "SEED_NAMES", "Seeds", "Stage", "add_protocol_args", "protocol_for",
-           "protocol_from_args", "read_journal", "run_experiment", "run_protocol",
-           "strict_fp32"]
+__all__ = ["ARCH_NAMES", "CONFIG_FILE", "DEFAULT_PROTOCOL", "JOURNAL", "LR_FIELDS", "Protocol",
+           "ProtocolError", "SEED_FIELDS", "SEED_NAMES", "Seeds", "Stage", "add_protocol_args",
+           "protocol_diff", "protocol_for", "protocol_from_args", "read_journal",
+           "run_experiment", "run_protocol", "strict_fp32"]

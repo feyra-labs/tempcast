@@ -483,25 +483,52 @@ def test_damped_coefficients_recover_known_decay():
     assert (BL.damped_coefficients(np.zeros(H), Sxy) == 0).all()
 
 
-def _fake_ckpt(path, arch="mayak", protocol=DEFAULT_PROTOCOL):
+def _tuning(lr=DEFAULT_PROTOCOL.lr, grid=DEFAULT_PROTOCOL.lr_grid, phase=1):
+    search = dict(grid=list(grid), stage_steps={"A": 10, "B": 5}, monitor="val/loss",
+                  results=[], selected_lr=lr)
+    return dict(phase=phase, lr_search=search, inherited_from=None)
+
+
+def _fake_ckpt(path, arch="mayak", protocol=DEFAULT_PROTOCOL, tuning=None):
+    from mayak.tuning import TUNING_KEY
     hp = {"arch": arch}
     if protocol is not None:
         hp["protocol"] = protocol.to_dict()
-    torch.save({"hyper_parameters": hp, "state_dict": {}}, path)
+    ck = {"hyper_parameters": hp, "state_dict": {}}
+    if tuning is not None:
+        ck[TUNING_KEY] = tuning
+    torch.save(ck, path)
     return str(path)
 
 
 def test_check_comparable_rejects_mismatch_and_pre_protocol_checkpoints(tmp_path):
-    from mayak.lit import SEED_FIELDS, check_comparable
-    ref = _fake_ckpt(tmp_path / "m.ckpt")
+    from mayak.lit import check_comparable
+    from mayak.protocol import SEED_FIELDS
+    ref = _fake_ckpt(tmp_path / "m.ckpt", tuning=_tuning())
     other = _fake_ckpt(tmp_path / "g.ckpt", "gru",
-                       Protocol(batch_size=DEFAULT_PROTOCOL.batch_size * 2))
+                       Protocol(batch_size=DEFAULT_PROTOCOL.batch_size * 2), _tuning())
     with pytest.raises(ProtocolError, match="batch_size"):
         check_comparable(ref, [other])
     old = _fake_ckpt(tmp_path / "old.ckpt", "dlinear", None)
     with pytest.raises(ProtocolError, match="нет протокола обучения"):
         check_comparable(ref, [old])
-    seed1 = _fake_ckpt(tmp_path / "s1.ckpt", "mayak", Protocol(seed=1))
+    seed1 = _fake_ckpt(tmp_path / "s1.ckpt", "mayak", Protocol(seed=1), _tuning())
     with pytest.raises(ProtocolError, match="seed"):
         check_comparable(ref, [seed1])
     check_comparable(ref, [seed1], ignore=SEED_FIELDS)
+    own_lr = _fake_ckpt(tmp_path / "lr.ckpt", "lru", Protocol(lr=1e-3), _tuning(lr=1e-3))
+    check_comparable(ref, [own_lr])
+    bare = _fake_ckpt(tmp_path / "bare.ckpt", "dlinear")
+    with pytest.raises(ProtocolError, match="нет записи о подборе"):
+        check_comparable(ref, [bare])
+    with pytest.raises(ProtocolError, match="нет записи о подборе"):
+        check_comparable(bare, [own_lr])
+    grid = _fake_ckpt(tmp_path / "grid.ckpt", "patchtst", tuning=_tuning(grid=(1e-3, 3e-3)))
+    with pytest.raises(ProtocolError, match="grid"):
+        check_comparable(ref, [grid])
+    not_chosen = _fake_ckpt(tmp_path / "nc.ckpt", "gru", Protocol(lr=1e-3), _tuning())
+    with pytest.raises(ProtocolError, match="не равна выбранной"):
+        check_comparable(ref, [not_chosen])
+    extra = _fake_ckpt(tmp_path / "extra.ckpt", tuning=_tuning(phase=2))
+    with pytest.raises(ProtocolError, match="этапа 2"):
+        check_comparable(ref, [extra])

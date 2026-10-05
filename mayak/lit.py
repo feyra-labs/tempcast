@@ -1,7 +1,8 @@
 """LightningModule - один на все архитектуры.
 
 Оптимизатор, расписание, EMA весов, функция потерь, правило весового затухания и
-логирование валидации берутся из протокола обучения и одинаковы для любой архитектуры.
+логирование валидации берутся из протокола обучения и одинаковы для любой архитектуры;
+скорость обучения каждая архитектура получает подбором по общей сетке протокола.
 Архитектура отвечает только за прямой проход, свои регуляризаторы (не зависят от цели)
 и объявленные отличия от правила весового затухания.
 
@@ -11,8 +12,9 @@ pinball) без регуляризаторов: одно и то же число
 на каком участке от холодного старта до полной истории модель лучше или хуже.
 
 Чекпойнт самодостаточен: в гиперпараметрах лежат архитектура, её конфиг, протокол
-и конфиг данных, а под ключом ``RUN_KEY`` - полностью разрешённый конфиг прогона,
-сиды, хеш коммита и версии библиотек. ``load_model`` восстанавливает архитектуру
+и конфиг данных, под ключом ``RUN_KEY`` - полностью разрешённый конфиг прогона,
+сиды, хеш коммита и версии библиотек, а под ключом ``TUNING_KEY`` - запись о подборе
+скорости обучения, если прогон шёл с ней. ``load_model`` восстанавливает архитектуру
 из чекпойнта, а не из значений по умолчанию.
 """
 import copy
@@ -28,8 +30,11 @@ from mayak.data.holdout import HISTORY_BINS
 from mayak.leakage import SELECTION_KEY, selection_record
 from mayak.loss import forecast_loss, forecast_terms, masked_mean
 from mayak.model import MAYAK
-from mayak.protocol import ARCH_NAMES, DEFAULT_PROTOCOL, Protocol, ProtocolError
+from mayak.protocol import (ARCH_NAMES, DEFAULT_PROTOCOL, LR_FIELDS, Protocol, ProtocolError,
+                            protocol_diff)
 from mayak.stages import STAGE_KEY
+from mayak.tuning import (EXTRA_ARCH, PHASE_EXTRA, TUNING_KEY, describe_phase,
+                          equal_terms_problems, search_terms)
 
 LEADS = [1, 3, 6, 12, 24, 48, 72, 120, 168]
 RUN_KEY = "mayak_run"
@@ -237,6 +242,20 @@ class StageProvenance(Callback):
         checkpoint[STAGE_KEY] = dict(self.record, step=int(trainer.global_step))
 
 
+class TuningProvenance(Callback):
+    """Кладёт в каждый сохраняемый чекпойнт запись о подборе скорости обучения прогона.
+
+    Args:
+        record: запись о подборе.
+    """
+
+    def __init__(self, record):
+        self.record = dict(record)
+
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        checkpoint[TUNING_KEY] = self.record
+
+
 class CandidateCheckpoint(ModelCheckpoint):
     """Сохранение чекпойнта после каждой валидации этапа.
 
@@ -409,14 +428,14 @@ def load_model(path, map_location="cpu"):
     return LitForecaster.load_from_checkpoint(path, map_location=map_location).model
 
 
-def checkpoint_protocol(path):
-    """Архитектура и протокол обучения чекпойнта.
+def checkpoint_terms(path):
+    """Архитектура, протокол обучения и запись о подборе чекпойнта.
 
     Args:
         path: путь к чекпойнту.
 
     Returns:
-        Пара: имя архитектуры и протокол.
+        Тройка: имя архитектуры, протокол и запись о подборе или None.
 
     Raises:
         ProtocolError: в чекпойнте нет протокола.
@@ -425,21 +444,17 @@ def checkpoint_protocol(path):
     hp = ck.get("hyper_parameters") or {}
     if "protocol" not in hp:
         raise ProtocolError(f"{path}: в чекпойнте нет протокола обучения")
-    return hp["arch"], Protocol.from_dict(hp["protocol"])
-
-
-SEED_FIELDS = ("seed", "seeds")
-
-
-def _comparable(protocol, ignore):
-    return {k: v for k, v in protocol.to_dict().items() if k not in ignore}
+    return hp["arch"], Protocol.from_dict(hp["protocol"]), ck.get(TUNING_KEY)
 
 
 def check_comparable(reference, others, ignore=()):
-    """Проверка, что все чекпойнты сравнения обучены по тому же протоколу, что эталон.
+    """Проверка, что все чекпойнты сравнения обучены в одинаковых условиях.
 
-    Протокол один на все архитектуры, поэтому любая разница в его полях делает
-    сравнение недействительным.
+    Протоколы должны совпадать во всех полях, кроме скорости обучения и полей из
+    ``ignore``. Скорость обучения у каждой модели своя, поэтому у каждого чекпойнта,
+    включая эталон, должна быть запись о подборе этапа 1 сравнения с той же сеткой, тем
+    же числом шагов этапов и той же метрикой выбора, что у эталона, а скорость обучения
+    чекпойнта - выбранная этим подбором.
 
     Args:
         reference: путь к эталонному чекпойнту.
@@ -451,22 +466,48 @@ def check_comparable(reference, others, ignore=()):
         Словарь из пути чекпойнта в его архитектуру.
 
     Raises:
-        ProtocolError: протоколы различаются или у чекпойнта нет протокола.
+        ProtocolError: протоколы различаются, у чекпойнта нет протокола или записи о
+            подборе, или подбор шёл в других условиях.
     """
-    ref_arch, ref = checkpoint_protocol(reference)
-    ref_d = _comparable(ref, ignore)
-    archs, bad = {reference: ref_arch}, []
+    ignore = (*ignore, *LR_FIELDS)
+    ref_arch, ref, ref_tune = checkpoint_terms(reference)
+    archs = {reference: ref_arch}
+    bad = [f"{reference} ({ref_arch}): {p}" for p in equal_terms_problems(ref_tune, ref)]
+    ref_terms = search_terms(ref_tune)
     for path in others:
-        arch, p = checkpoint_protocol(path)
+        arch, p, tune = checkpoint_terms(path)
         archs[path] = arch
-        d = _comparable(p, ignore)
-        diff = sorted(k for k in set(ref_d) | set(d) if ref_d.get(k) != d.get(k))
+        diff = protocol_diff(ref, p, ignore)
         if diff:
             bad.append(f"{path} ({arch}): отличаются {diff}")
+        own = equal_terms_problems(tune, p)
+        bad += [f"{path} ({arch}): {x}" for x in own]
+        terms = search_terms(tune)
+        terms_diff = sorted(k for k in ref_terms if ref_terms[k] != terms[k])
+        if not own and ref_tune and terms_diff:
+            bad.append(f"{path} ({arch}): подбор скорости обучения шёл в других условиях, "
+                       f"отличаются {terms_diff}")
     if bad:
-        raise ProtocolError(f"модели сравнения обучены по разным протоколам (эталон — "
+        raise ProtocolError(f"модели сравнения обучены в разных условиях (эталон — "
                             f"{reference}, {ref_arch}):\n  " + "\n  ".join(bad))
     return archs
+
+
+def check_extra_tuning(path):
+    """Проверка, что чекпойнт - прогон дополнительной настройки МАЯК.
+
+    Args:
+        path: путь к чекпойнту.
+
+    Raises:
+        ProtocolError: архитектура не МАЯК или прогон не помечен как этап 2 сравнения.
+    """
+    arch, _protocol, tune = checkpoint_terms(path)
+    phase = (tune or {}).get("phase")
+    if arch != EXTRA_ARCH or phase != PHASE_EXTRA:
+        raise ProtocolError(f"{path} ({arch}): нужен прогон {describe_phase(PHASE_EXTRA)} "
+                            f"(scripts/train.py --extra-tuning), а это прогон "
+                            f"{describe_phase(phase)}")
 
 
 def load_run_record(path):

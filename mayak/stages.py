@@ -3,9 +3,9 @@
 Этапы протокола можно запускать по одному. Этап, который в протоколе идёт не первым,
 стартует с явно указанного чекпойнта предыдущего этапа. Перед стартом чекпойнт
 проверяется целиком, и все найденные отличия перечисляются в одном исключении: та же
-архитектура, тот же конфиг модели и данных, тот же протокол, тот же кэш данных, тот же
-набор валидации, чекпойнт выбран на валидационных станциях по правилам чек-листа
-антиутечек и не получен пробным запуском.
+архитектура, тот же конфиг модели и данных, тот же протокол, та же запись о подборе
+скорости обучения, тот же кэш данных, тот же набор валидации, чекпойнт выбран на
+валидационных станциях по правилам чек-листа антиутечек и не получен пробным запуском.
 
 Какие этапы запускать, с какого чекпойнта стартовать, порог ворот, пробный запуск и
 сохранение кандидатов в протокол не входят. Протокол один на все модели и сравнивается
@@ -14,7 +14,9 @@
 прогоне одной командой, и с теми же сидами даёт тот же чекпойнт.
 
 На этапе холодного старта после каждой валидации сохраняется кандидат. Решение, какой
-кандидат передать следующему этапу, принимает человек по отчёту и графикам. Ворота по
+кандидат передать следующему этапу, принимает человек по отчёту и графикам. При подборе
+скорости обучения этапы идут одной командой, и следующий этап стартует с лучшего по
+валидации чекпойнта, у всех моделей одинаково (``mayak.tuning``). Ворота по
 порогу отношения MSE только страхуют от явно плохого поля.
 """
 from __future__ import annotations
@@ -354,7 +356,7 @@ def _data_fields(d):
 
 
 def init_mismatches(ck, arch, protocol, model_config, data_config, stage, data_key,
-                    val_digest):
+                    val_digest, tuning=None):
     """Все причины, по которым чекпойнт не годится для старта следующего этапа.
 
     Args:
@@ -366,11 +368,13 @@ def init_mismatches(ck, arch, protocol, model_config, data_config, stage, data_k
         stage: этап, чекпойнт которого нужен.
         data_key: ключ кэша данных этого запуска.
         val_digest: отпечаток набора валидации этого этапа в этом запуске.
+        tuning: запись о подборе скорости обучения этого запуска или None.
 
     Returns:
         Список причин; пустой, если чекпойнт подходит.
     """
     from mayak.leakage import SELECTION_KEY
+    from mayak.tuning import TUNING_KEY
     hp = ck.get("hyper_parameters") or {}
     out = []
     got_arch = hp.get("arch")
@@ -398,6 +402,9 @@ def init_mismatches(ck, arch, protocol, model_config, data_config, stage, data_k
             out.append(f"протокол: протокол в чекпойнте не читается: {e}")
         else:
             out += config_diff("протокол", got, protocol)
+    if _normalized(ck.get(TUNING_KEY)) != _normalized(tuning):
+        out.append("запись о подборе скорости обучения в чекпойнте другая, чем у этого "
+                   "запуска: укажите те же --lr-from и --extra-tuning, что у предыдущего этапа")
     rec = ck.get(STAGE_KEY)
     if not rec:
         out.append("нет записи об этапе: чекпойнт сохранён до раздельного запуска этапов, "
@@ -471,7 +478,7 @@ def _is_best_in_journal(journal_path, stage_name, digest, step):
 
 
 def inspect_init_checkpoint(path, arch, protocol, model_config, data_config, stage, store,
-                            val_digest):
+                            val_digest, tuning=None):
     """Проверяет чекпойнт, с которого стартует этап, и возвращает запись о нём.
 
     Args:
@@ -483,6 +490,7 @@ def inspect_init_checkpoint(path, arch, protocol, model_config, data_config, sta
         stage: этап, чекпойнт которого нужен.
         store: набор станций этого запуска.
         val_digest: отпечаток набора валидации этого этапа в этом запуске.
+        tuning: запись о подборе скорости обучения этого запуска или None.
 
     Returns:
         Словарь: путь, отпечаток файла, этап, шаг, каталог и журнал прогона, в котором
@@ -501,7 +509,7 @@ def inspect_init_checkpoint(path, arch, protocol, model_config, data_config, sta
     problems = init_mismatches(ck, arch=arch, protocol=protocol.to_dict(),
                                model_config=model_config.to_dict(),
                                data_config=data_config.to_dict(), stage=stage,
-                               data_key=store.key, val_digest=val_digest)
+                               data_key=store.key, val_digest=val_digest, tuning=tuning)
     try:
         check_selection_record(ck.get(SELECTION_KEY), store, what="запись о выборе")
     except LeakageError as e:
@@ -629,7 +637,7 @@ def init_summary(prev, report_summary=None):
 
 
 JOURNAL_IDENTITY = ("arch", "model_class", "protocol", "manifest", "seeds", "config_file",
-                    "augment", "data_key")
+                    "augment", "data_key", "tuning")
 
 
 def start_journal(path, base, protocol, first, init, run_dir):

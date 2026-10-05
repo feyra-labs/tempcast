@@ -8,6 +8,9 @@ Example:
     python scripts/run.py -m ablation=none,no_compression   # абляции МАЯК
     python scripts/run.py -m train.seed=0,1,2               # три сида основной модели
     python scripts/run.py augment=none                      # без аугментаций, свой каталог
+    python scripts/run.py run.lr_search=true                # подбор lr, затем полный прогон
+    python scripts/run.py -m ablation=no_compression run.lr_from=runs/mayak-none-s0
+    python scripts/run.py run.extra_tuning=true train.lr=0.001  # доп. настройка МАЯК
 """
 import os
 
@@ -30,7 +33,21 @@ def aug_suffix(profile):
     return "" if profile == AugmentConfig().profile else f"-aug_{profile}"
 
 
+def tuned_suffix(extra):
+    """Часть имени прогона дополнительной настройки МАЯК.
+
+    Args:
+        extra: прогон дополнительной настройки.
+
+    Returns:
+        Суффикс ``-tuned`` для прогона дополнительной настройки, иначе пустая строка.
+    """
+    from mayak.tuning import EXTRA_SUFFIX
+    return EXTRA_SUFFIX if extra in (True, "true", "True") else ""
+
+
 OmegaConf.register_new_resolver("aug_suffix", aug_suffix, replace=True)
+OmegaConf.register_new_resolver("tuned_suffix", tuned_suffix, replace=True)
 
 
 def to_run_config(cfg):
@@ -67,6 +84,19 @@ def to_launch(cfg):
     return launch_from_config(OmegaConf.to_container(cfg.run, resolve=False))
 
 
+def to_tuning(cfg):
+    """Настройки подбора скорости обучения из секции run.
+
+    Args:
+        cfg: конфиг Hydra.
+
+    Returns:
+        Настройки подбора.
+    """
+    from mayak.tuning import tuning_from_config
+    return tuning_from_config(OmegaConf.to_container(cfg.run, resolve=False))
+
+
 @hydra.main(config_path="../conf", config_name="config", version_base="1.3")
 def main(cfg: DictConfig):
     import logging
@@ -74,14 +104,18 @@ def main(cfg: DictConfig):
     from hydra.core.hydra_config import HydraConfig
 
     from mayak.protocol import run_experiment
+    from mayak.tuning import format_tuning
 
     log = logging.getLogger(__name__)
     rc = to_run_config(cfg)
     launch = to_launch(cfg)
+    tuning = to_tuning(cfg)
     out_dir = HydraConfig.get().runtime.output_dir
     journal = run_experiment(rc, out_root=os.path.dirname(out_dir),
                              tag=os.path.basename(out_dir), accelerator=cfg.run.accelerator,
-                             launch=launch)
+                             launch=launch, tuning=tuning)
+    for line in format_tuning(journal.get("tuning")):
+        log.info("%s", line)
     for st in journal["stages"]:
         log.info("лучшая модель этапа %s: %s", st["name"], st["best_ckpt"])
         if st.get("report"):

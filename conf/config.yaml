@@ -14,8 +14,8 @@ defaults:
 run:
   out_root: runs
   # имя прогона: архитектура, вариант абляции, профиль аугментаций (кроме default),
-  # базовый сид
-  tag: ${model.arch}-${hydra:runtime.choices.ablation}${aug_suffix:${data.augment.profile}}-s${train.seed}
+  # суффикс -tuned у дополнительной настройки МАЯК, базовый сид
+  tag: ${model.arch}-${hydra:runtime.choices.ablation}${aug_suffix:${data.augment.profile}}${tuned_suffix:${run.extra_tuning}}-s${train.seed}
   accelerator: gpu
   # Раздельный запуск этапов; в протокол не входит и на сравнение моделей не влияет.
   # Этапы этого запуска подряд в порядке протокола, например [A] или [B]; null - все.
@@ -31,6 +31,16 @@ run:
   # Этапы, у которых чекпойнт сохраняется после каждой валидации; null - этап холодного
   # старта, [] - ни один.
   candidates: null
+  # Подбор скорости обучения, этап 1 сравнения: на каждом значении train.lr_grid полный
+  # этап A и этап B на train.lr_search_steps шагов, выбор по val/loss, затем полный
+  # прогон с выбранным значением. Идёт одной командой по всем этапам.
+  lr_search: false
+  # Каталог прогона основного МАЯК: из его журнала берутся выбранная скорость обучения и
+  # запись о подборе, подбор не повторяется. Для абляций и повторов с другими сидами.
+  lr_from: null
+  # Дополнительная настройка МАЯК, этап 2 сравнения: любые гиперпараметры по валидации,
+  # свой каталог, отдельная строка таблиц, в сравнение на равных не входит.
+  extra_tuning: false
 
 hydra:
   job:
@@ -56,6 +66,11 @@ hydra:
         python scripts/run.py augment=none          # профиль аугментаций
         python scripts/run.py run.stages=[A]        # только этап A, затем отчёт о поле
         python scripts/run.py run.stages=[B] run.init_from=<чекпойнт этапа A>
+        python scripts/run.py run.lr_search=true    # этап 1: подбор lr, затем полный прогон
+        python scripts/run.py -m model=gru,dlinear,lru,patchtst run.lr_search=true
+        python scripts/run.py -m ablation=no_compression,no_solar run.lr_from=runs/mayak-none-s0
+        python scripts/run.py train.seed=1 run.lr_from=runs/mayak-none-s0
+        python scripts/run.py run.extra_tuning=true train.lr=0.001   # этап 2: доп. настройка
 
       Hydra: python scripts/run.py --hydra-help
     template: |

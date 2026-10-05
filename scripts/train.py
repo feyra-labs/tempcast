@@ -9,6 +9,12 @@
 чекпойнт, кандидаты после каждой валидации, отчёт о поле и графики. Человек смотрит
 отчёт и графики и сам выбирает, с какого чекпойнта запускать этап B. Примеры команд
 выводит справка.
+
+Для сравнения моделей (этап 1) скорость обучения подбирается по сетке протокола
+одинаково для всех архитектур (--lr-search): этапы идут одной командой, чекпойнт этапа A
+выбирается по валидации. Абляции и повторы с другими сидами берут скорость обучения
+основного МАЯК (--lr-from). Дополнительная настройка МАЯК (этап 2, --extra-tuning) идёт
+в отдельный каталог и в сравнение на равных не входит.
 """
 import argparse
 import logging
@@ -22,6 +28,8 @@ from mayak.protocol import (ARCH_NAMES, ProtocolError, add_protocol_args, protoc
 from mayak.stages import (FIELD_CURRICULUM, GATE_EXIT_CODE, INIT_EXIT_CODE, LAUNCH_FIELDS,
                           GateError, InitCheckpointError, add_launch_args, launch_from_args,
                           plan_stages)
+from mayak.tuning import (EXTRA_ARCH, EXTRA_SUFFIX, add_tuning_args, check_search,
+                          format_tuning, inherit_search, tuning_from_args)
 
 # Флаги, которые описывают этот запуск, а не прогон: подсказка следующей команды
 # собирается без них.
@@ -39,6 +47,20 @@ report/*.png.
 Полный прогон одной командой (для бейзлайнов те же флаги, другое --arch):
     python scripts/train.py --arch mayak --accelerator gpu
 
+Этап 1 сравнения: подбор скорости обучения по сетке --lr-grid (на каждом значении полный
+этап A и этап B на --lr-search-steps шагов, выбор по val/loss), затем полный прогон с
+выбранным значением; прогоны сетки в <out-root>/<tag>/lr_search/. Одинаково для всех:
+    python scripts/train.py --arch mayak --lr-search --accelerator gpu
+    python scripts/train_neurobaselines.py --lr-search --accelerator gpu
+
+Повторы основного МАЯК с другими сидами - со скоростью обучения основного прогона:
+    python scripts/train.py --arch mayak --seed 1 --tag mayak-s1 --lr-from runs/mayak \\
+        --accelerator gpu
+
+Этап 2: дополнительная настройка МАЯК любыми гиперпараметрами по валидации; каталог с
+суффиксом -tuned, в таблицах отдельная строка (python -m mayak.evaluate --tuned-ckpt):
+    python scripts/train.py --arch mayak --extra-tuning --lr 1e-3 --accelerator gpu
+
 По этапам, с ручным решением между ними:
     python scripts/train.py --arch mayak --accelerator gpu --stages A
     python scripts/stage_report.py a --run runs/mayak          # по желанию: пересчёт отчёта
@@ -53,8 +75,9 @@ report/*.png.
 Внутренности поля МАЯК после этапа A:
     python scripts/diagnose_stage_a.py --ckpt runs/mayak/stageA/best.ckpt
 
-Абляции переобучением (прогон в runs/mayak-<флаги>):
-    python scripts/train.py --arch mayak --ablate no_compression --accelerator gpu
+Абляции переобучением (прогон в runs/mayak-<флаги>), скорость обучения основного МАЯК:
+    python scripts/train.py --arch mayak --ablate no_compression --lr-from runs/mayak \\
+        --accelerator gpu
 
 Бейзлайны, их источники и отличия от оригиналов: MODELS.md. Композиция конфигов,
 переопределения и групповые запуски: python scripts/run.py --help.
@@ -75,6 +98,7 @@ def make_parser():
                     help="флаги абляций МАЯК (переобучение без компонента)")
     add_protocol_args(ap)
     add_launch_args(ap)
+    add_tuning_args(ap)
     return ap
 
 
@@ -111,6 +135,8 @@ def print_next_steps(ap, args, journal, protocol):
     """
     from mayak.stage_report import format_field_report, read_report
     names = [s.name for s in protocol.stages]
+    for line in format_tuning(journal.get("tuning")):
+        print(line)
     for st in journal["stages"]:
         print(f"Лучшая модель этапа {st['name']}:", st["best_ckpt"])
         if st.get("probe_steps"):
@@ -160,25 +186,40 @@ def main(argv=None):
         launch = launch_from_args(args)
         protocol = protocol_from_args(args)
         plan_stages(protocol, launch)
+        tuning = tuning_from_args(args)
+        if tuning.lr_search:
+            check_search(protocol, launch)
+        if tuning.lr_from:
+            inherit_search(tuning.lr_from, args.arch, protocol)
     except (ValueError, ProtocolError) as e:
         ap.error(str(e))
+    if tuning.extra_tuning and args.arch != EXTRA_ARCH:
+        ap.error(f"--extra-tuning применим только к --arch {EXTRA_ARCH}")
     model_config, tag = None, args.arch
     if args.ablate:
         if args.arch != "mayak":
             ap.error("--ablate применим только к --arch mayak")
+        if tuning.lr_search and not tuning.extra_tuning:
+            ap.error("абляции берут скорость обучения основного МАЯК: вместо --lr-search "
+                     "укажите --lr-from <прогон МАЯК>")
         model_config = ModelConfig(ablations=Ablations(**{n: True for n in args.ablate}))
         tag = run_label(model_config)
+    if tuning.extra_tuning:
+        tag += EXTRA_SUFFIX
     tag = args.tag or tag
     try:
         journal = run_protocol(args.arch, args.manifest, protocol,
                                out_root=args.out_root, accelerator=args.accelerator, tag=tag,
-                               model_config=model_config, launch=launch)
+                               model_config=model_config, launch=launch, tuning=tuning)
     except InitCheckpointError as e:
         print(f"\n{e}", file=sys.stderr)
         sys.exit(INIT_EXIT_CODE)
     except GateError as e:
         print(f"\nВорота закрыты: {e}", file=sys.stderr)
         sys.exit(GATE_EXIT_CODE)
+    except ProtocolError as e:
+        print(f"\n{e}", file=sys.stderr)
+        sys.exit(1)
     print_next_steps(ap, args, journal, protocol)
 
 

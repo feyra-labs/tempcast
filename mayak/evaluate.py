@@ -19,6 +19,11 @@
 сезонам и доле валидных часов истории, внешний тест на наблюдениях реальной сети с его
 собственными разрезами и сопоставлением с внутренним тестом, проверки поля при холодном
 старте, суточные амплитуды и строки переобученных абляций.
+
+Модели сравниваются на равных: у каждого чекпойнта есть запись о подборе скорости
+обучения по одной и той же сетке с одним и тем же числом шагов. Прогон дополнительной
+настройки МАЯК проверку не проходит и попадает в таблицы только по явному аргументу,
+отдельной помеченной строкой рядом со строкой МАЯК.
 """
 import os
 from dataclasses import dataclass
@@ -48,6 +53,11 @@ HISTORY_LEADS = (24, 72, 168)
 BREAKDOWN_LEAD = 24
 
 MAIN_MODEL = "МАЯК"
+TUNED_MODEL = "МАЯК (доп. настройка)†"
+TUNED_NOTE = (
+    "† МАЯК (доп. настройка) - этап 2 сравнения: гиперпараметры МАЯК дополнительно\n"
+    "  настроены по валидации сверх общего бюджета подбора. Сравнение с бейзлайнами не\n"
+    "  на равных; на равных - строка «МАЯК».")
 TRAIN_DISTANCE_DIM = "расстояние до обучающей точки"
 CLIMATOLOGY, DAMPED, SEASONAL = "Климатология", "Damped persistence", "Seasonal-naive 24ч"
 HISTORY_FREE = (CLIMATOLOGY,)
@@ -951,6 +961,8 @@ def print_evaluation(res, bootstrap=BOOTSTRAP):
     main = res["main"]
     ci = any("ci" in s for s in res["overall"].values())
     print(BENCHMARK_NOTE)
+    if TUNED_MODEL in res["leads"]:
+        print(TUNED_NOTE)
     for name, rows in res["leads"].items():
         print(f"\n=== {tag}{name} (полная история) ===")
         print_rows({str(h): s for h, s in rows.items()}, label="лид, ч", ci=ci)
@@ -1330,22 +1342,29 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     import argparse
     from mayak.config import run_label
-    from mayak.lit import SEED_FIELDS, check_comparable, load_model, load_run_record
-    from mayak.protocol import ProtocolError
+    from mayak.lit import check_comparable, check_extra_tuning, load_model, load_run_record
+    from mayak.protocol import SEED_FIELDS, ProtocolError
     ap = argparse.ArgumentParser(description="единый стенд оценки МАЯК")
     ap.add_argument("--ckpt", required=True, nargs="+",
-                    help="чекпойнты МАЯК; несколько = прогоны с разными сидами")
+                    help="чекпойнты МАЯК; несколько = прогоны с разными сидами (повторы "
+                         "берут скорость обучения первого: scripts/train.py --lr-from)")
     ap.add_argument("--manifest", default="data/manifest.csv")
     for arch, name in NEURAL_BASELINES.items():
         ap.add_argument(f"--{arch}-ckpt", default=None,
                         help=f"чекпойнт бейзлайна «{name}» "
                              f"(scripts/train.py --arch {arch})")
     ap.add_argument("--allow-protocol-mismatch", action="store_true",
-                    help="не падать, если модели обучены по разным протоколам "
-                         "(только для диагностики: такие таблицы несопоставимы)")
+                    help="не падать, если модели обучены в разных условиях: по разным "
+                         "протоколам или без одинакового подбора скорости обучения (только "
+                         "для диагностики: такие таблицы несопоставимы)")
     ap.add_argument("--ablation-ckpt", nargs="*", default=[],
-                    help="чекпойнты переобученных абляций МАЯК (тот же сид и протокол); "
-                         "имя строки таблицы берётся из конфига в чекпойнте")
+                    help="чекпойнты переобученных абляций МАЯК (тот же сид и протокол, "
+                         "скорость обучения основного МАЯК: --lr-from); имя строки таблицы "
+                         "берётся из конфига в чекпойнте")
+    ap.add_argument("--tuned-ckpt", default=None,
+                    help=f"чекпойнт дополнительной настройки МАЯК (этап 2 сравнения, "
+                         f"scripts/train.py --extra-tuning): отдельная строка «{TUNED_MODEL}», "
+                         f"в сравнение на равных не входит")
     ap.add_argument("--eval-seed", type=int, default=None,
                     help="сид оценки (бутстрап, примеры); по умолчанию - seeds.eval "
                          "из первого чекпойнта, иначе 0")
@@ -1384,6 +1403,9 @@ def main():
     baseline_ckpts = {a: getattr(args, f"{a}_ckpt") for a in NEURAL_BASELINES
                       if getattr(args, f"{a}_ckpt")}
     all_ckpts = [*args.ckpt, *baseline_ckpts.values(), *args.ablation_ckpt]
+    if args.tuned_ckpt:
+        check_extra_tuning(args.tuned_ckpt)
+        all_ckpts.append(args.tuned_ckpt)
     try:
         check_comparable(args.ckpt[0], [*baseline_ckpts.values(), *args.ablation_ckpt])
         check_comparable(args.ckpt[0], args.ckpt[1:], ignore=SEED_FIELDS)
@@ -1414,7 +1436,8 @@ def main():
     for arch, c in baseline_ckpts.items():
         named_extra[NEURAL_BASELINES[arch]] = load_model(c)
 
-    named_all = {MAIN_MODEL: mayak, **named_extra}
+    tuned = {TUNED_MODEL: load_model(args.tuned_ckpt)} if args.tuned_ckpt else {}
+    named_all = {MAIN_MODEL: mayak, **tuned, **named_extra}
     n_params = print_parameter_counts(named_all)
     shift = None
     if args.conformal:
@@ -1423,6 +1446,8 @@ def main():
     boot = dict(n_boot=args.bootstrap, seed=eval_seed, level=args.ci_level)
     ci = args.bootstrap > 0
     record = run_record(ckpt=args.ckpt, baselines=baseline_ckpts, ablations=args.ablation_ckpt,
+                        tuned=args.tuned_ckpt,
+                        unequal={TUNED_MODEL: TUNED_NOTE} if args.tuned_ckpt else {},
                         conformal=args.conformal, manifest=args.manifest,
                         external_manifest=args.external_manifest, eval_seed=eval_seed,
                         bootstrap=boot, history_grid=list(grid))

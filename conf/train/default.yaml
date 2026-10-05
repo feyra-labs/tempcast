@@ -6,7 +6,12 @@ batch_size: 256
 windows_per_epoch: 200000
 num_workers: 8
 seed: 0
+# Скорость обучения прогона без подбора; при подборе (run.lr_search) её заменяет
+# значение сетки lr_grid с наименьшим val/loss, при run.lr_from - значение основного МАЯК.
 lr: 0.003
+# Подбор: на каждом значении сетки полный этап A и этап B на lr_search_steps шагов.
+lr_grid: [0.0003, 0.001, 0.003]
+lr_search_steps: 20000
 weight_decay: 0.01
 betas: [0.9, 0.95]
 lr_schedule: cosine
