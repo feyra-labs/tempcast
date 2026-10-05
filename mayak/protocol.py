@@ -324,7 +324,9 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     запущенный отдельно, повторяет тот же этап прогона одной командой.
 
     После этапа холодного старта считается отчёт о поле по всем сохранённым чекпойнтам
-    этапа и строятся графики. Если задан порог ворот, следующий этап не начинается, когда
+    этапа, с разрывом обобщения по окнам обучающих станций в валидационном окне, и
+    строятся графики. Сводка отчёта о стартовом чекпойнте пишется в запись следующего этапа
+    о том, откуда он стартовал. Если задан порог ворот, следующий этап не начинается, когда
     у стартового чекпойнта отношение MSE выше порога.
 
     При подборе скорости обучения сначала на каждом значении сетки протокола идёт прогон
@@ -372,7 +374,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     from mayak import stages as ST
     from mayak import tuning as TU
     from mayak.config import (DataConfig, RunConfig, check_pipeline_compat, model_config_for)
-    from mayak.data.datamodule import MayakData, validation_set
+    from mayak.data.datamodule import MayakData, train_stations_set, validation_set
     from mayak.data.store import get_store
     from mayak.leakage import SELECTION_KEY, run_checklist
     from mayak.lit import (ARCHS, CandidateCheckpoint, LitForecaster, SelectionProvenance,
@@ -436,9 +438,12 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
                 # Отчёта для этого файла нет: чекпойнт перенесён или изменён. Для решения
                 # ворот он считается заново на том же наборе валидации.
                 items = SR.report_items(SR.describe_checkpoint(prev["ckpt"]), [])
+                prev_gap = train_stations_set(store, manifest, data_cfg, prev_stage.curriculum)
+                run_checklist(store, datasets=[prev_gap])
                 report, _ = SR.build_field_report(items, prev_val, arch=arch,
-                                                  stage=prev_stage.name, device=device,
-                                                  seed=seeds["eval"], n_examples=0)
+                                                  stage=prev_stage.name, train_dataset=prev_gap,
+                                                  device=device, seed=seeds["eval"],
+                                                  n_examples=0)
                 entry, report_file = report["candidates"][0], None
             prev.update(report=entry, report_file=report_file)
         log.info("%s: этап %s стартует с %s (этап %s, шаг %s, отпечаток %s)", arch,
@@ -549,9 +554,11 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
                      probe_steps=probe)
         report_entry = report_path = None
         if stage.curriculum == ST.FIELD_CURRICULUM:
+            gap_ds = train_stations_set(dm.store, manifest, data_cfg, stage.curriculum)
+            run_checklist(dm.store, datasets=[gap_ds])
             report, report_path, plots = SR.write_stage_report(
-                stage_dir, stage.name, arch, best, candidates, dm.val_ds, device=device,
-                seed=seeds["eval"], threshold=launch.require_gate,
+                stage_dir, stage.name, arch, best, candidates, dm.val_ds, train_dataset=gap_ds,
+                device=device, seed=seeds["eval"], threshold=launch.require_gate,
                 metrics_csv=entry["metrics_csv"])
             report_entry = next(e for e in report["candidates"] if e.get("is_best"))
             entry.update(report=report_path, report_best=SR.summary(report_entry), plots=plots)

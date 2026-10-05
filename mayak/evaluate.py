@@ -38,7 +38,7 @@ from mayak.data.holdout import (HISTORY_GRID, NOMINAL_HISTORY, EvalSet, check_hi
                                 history_label, history_strata)
 from mayak.loss import NORM_SCALE_CLAMP
 from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, breakdown, by_lead, coverage,
-                           metric_table, seed_spread, wmean)
+                           metric_table, seed_spread)
 from mayak.results import evaluation_tables, run_record, transfer_tables, write_tables
 from mayak.zones import normalize_zone
 
@@ -1066,60 +1066,19 @@ def coldstart_L0_check(model, ds):
                 picp90=p_before, diff_clim=diff_clim)
 
 
-def stage_a_field_check(model, clims, manifest="data/manifest.csv",
-                        station_split="unseen_val", time_key="val"):
-    """Критерий этапа A: поле без истории против климатологии станций.
-
-    Args:
-        model: модель МАЯК.
-        clims: климатологии станций.
-        manifest: путь к манифесту.
-        station_split: роль станций проверки.
-        time_key: временное окно проверки.
-
-    Returns:
-        Словарь: ошибка поля, ошибка климатологии, их отношение и средний сдвиг.
-    """
-    ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest,
-                 time_key=time_key, L=0)
-    D = gather(model, ds)
-    y, mu, muc, w = D["y"], D["mu"], D["mu_clim"], D["y_mask"]
-    mse_field = float(wmean((mu - y) ** 2, w))
-    mse_clim = float(wmean((muc - y) ** 2, w))
-    ratio = mse_field / max(mse_clim, 1e-9)
-    bias = float(np.abs(mu - muc).mean())
-    print(f"\n[Проверка этапа A] поле на {station_split} (L=0, окон: {len(ds)}):")
-    print(f"  MSE поля         = {mse_field:7.3f}")
-    print(f"  MSE климатологии = {mse_clim:7.3f}   ← эталон")
-    print(f"  отношение        = {ratio:7.3f}   ← цель ≤ 1.05")
-    print(f"  |поле − климат|  = {bias:7.3f} °C ← цель → 0")
-    if ratio <= 1.05:
-        print("  ИТОГ: OK — поле генерализует")
-    else:
-        print(
-            "  ИТОГ: НЕ ПРОЙДЕНО — поле недоучено/переобучено на train; "
-            "этап B на таком поле смысла мало")
-    return dict(mse_field=mse_field, mse_clim=mse_clim, ratio=ratio, bias=bias)
-
-
 @torch.no_grad()
-def pure_field_check(model, clims, manifest="data/manifest.csv",
-                     station_split="unseen_val", time_key="val"):
-    """Критерий этапа A для чистого поля: без паспорта и без поправки голов.
+def pure_field_check(model, ds):
+    """Чистое поле МАЯК при нулевой истории: без паспорта и без поправки голов.
 
     Args:
         model: модель МАЯК.
-        clims: климатологии станций.
-        manifest: путь к манифесту.
-        station_split: роль станций проверки.
-        time_key: временное окно проверки.
+        ds: окна с нулевой историей.
 
     Returns:
-        Словарь того же вида, что у критерия этапа A.
+        Словарь: отношение MSE чистого поля к MSE климатологии станции и средний модуль
+        разности поля и климатологии, °C.
     """
     from mayak.astro import astro_features
-    ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest,
-                 time_key=time_key, L=0)
     model.eval()
     e2 = ec = bias = 0.0
     n = 0
@@ -1134,14 +1093,24 @@ def pure_field_check(model, clims, manifest="data/manifest.csv",
         ec += float((((muc - y) ** 2) * w).sum())
         bias += float((mu_c - muc).abs().sum())
         n += y.numel()
-    print(f"ЧИСТОЕ поле на {station_split}: ratio={e2 / max(ec, 1e-9):.3f}, "
-          f"|поле−клим|={bias / n:.3f}°C  (окон: {len(ds)})")
+    ratio, bias = e2 / max(ec, 1e-9), bias / max(n, 1)
+    print(f"ЧИСТОЕ поле на {'/'.join(ds.station_splits)}: ratio={ratio:.3f}, "
+          f"|поле−клим|={bias:.3f}°C  (окон: {len(ds)})")
+    return dict(ratio=ratio, bias=bias)
 
 
 @torch.no_grad()
-def l0_decompose(model, clims, manifest="data/manifest.csv", station_split="train",
-                 time_key="val"):
-    ds = EvalSet(clims, station_splits=(station_split,), manifest=manifest, time_key=time_key, L=0)
+def l0_decompose(model, ds):
+    """Разложение выхода МАЯК при нулевой истории.
+
+    Args:
+        model: модель МАЯК.
+        ds: окна с нулевой историей.
+
+    Returns:
+        Словарь: разброс паспорта по окнам, средние модули поправки голов, вклада мод
+        погоды и группы P и средняя масса свидетельств.
+    """
     model.eval()
     Z = []
     sr = oo = op = ee = 0.0
@@ -1155,11 +1124,15 @@ def l0_decompose(model, clims, manifest="data/manifest.csv", station_split="trai
         ee += float(out["e"].abs().sum())
         n += out["mu"].numel()
     Z = torch.cat(Z, 0)
-    print(f"[{station_split}] std(z) по станциям = {float(Z.std(0).mean()):.3f}  "
+    res = dict(z_std=float(Z.std(0).mean()), correction=sr / n, o=oo / n, o_p=op / n,
+               e=ee / Z.numel() * Z.shape[1])
+    print(f"[{'/'.join(ds.station_splits)}] std(z) по станциям = {res['z_std']:.3f}  "
           f"(≈0 → прайор глобальный; >0 → прайор зависит от loc = меморизатор)")
-    print(f"        |σ₀·r| = {sr / n:.3f}°C  (≈0 → r заглушён; >0 → r ещё активен и фитит)")
-    print(f"        |o| = {oo / n:.3f}   |o_P| = {op / n:.3f}   "
-          f"e = {ee / Z.numel() * Z.shape[1]:.3f}  (ждём ≈0 при L=0)")
+    print(f"        |σ₀·r| = {res['correction']:.3f}°C  "
+          f"(≈0 → r заглушён; >0 → r ещё активен и фитит)")
+    print(f"        |o| = {res['o']:.3f}   |o_P| = {res['o_p']:.3f}   "
+          f"e = {res['e']:.3f}  (ждём ≈0 при L=0)")
+    return res
 
 
 def evaluate_external(named, external_manifest, store, grid=HISTORY_GRID, r_damped=None,

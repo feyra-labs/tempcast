@@ -12,7 +12,14 @@
 * покрытие 90- и 80-процентного интервалов, средняя ширина 90-процентного интервала,
   средняя абсолютная ошибка и CRPS;
 * скилл, покрытие и ошибка по лидам;
-* станции с худшим отношением.
+* станции с худшим отношением;
+* разрыв обобщения поля: отношение MSE медианы на валидационных станциях к MSE медианы на
+  обучающих станциях в том же валидационном окне при той же нулевой истории, с интервалом
+  бутстрапа по станциям.
+
+Вместе с числами отчёт записывает ограничители запоминания координат из конфига модели
+(``loc_freq_max`` и ``field_weight_decay``), если они у архитектуры есть. Автоматического
+порога у разрыва нет.
 
 Числа считаются по сырым выходам моделей и нужны только медиана и квантили, поэтому
 отчёт одинаков для всех архитектур. Графики строятся по тем же числам: кривые обучения
@@ -47,6 +54,7 @@ N_EXAMPLES = 6
 COVERAGE_BAND = (0.86, 0.94)
 FIELD_GATE_REFERENCE = 1.05
 PLOT_FILES = ("curves.png", "candidates.png", "leads.png", "examples.png")
+LIMIT_FIELDS = ("loc_freq_max", "field_weight_decay")
 
 
 def report_device(accelerator):
@@ -196,6 +204,97 @@ def field_metrics(pred, aux, seed=0, n_boot=N_BOOT, leads=REPORT_LEADS, n_worst=
                          by_lead=by_lead, worst_stations=worst, **ev.counts()))
 
 
+def _evaluation(pred, aux):
+    from mayak.metrics import Evaluation
+    return Evaluation(y=np.asarray(aux["y"], np.float64), mu=np.asarray(pred["mu"], np.float64),
+                      q=np.asarray(pred["q"], np.float64),
+                      mu_clim=np.asarray(aux["mu_clim"], np.float64),
+                      w=np.asarray(aux["y_mask"], np.float64), station=aux["station"])
+
+
+def memorization_gap(val_pred, val_aux, train_pred, train_aux, seed=0, n_boot=N_BOOT):
+    """Разрыв обобщения поля для одной модели.
+
+    Отношение пуловой MSE медианы на окнах валидационных станций к пуловой MSE медианы на
+    окнах обучающих станций. Интервал - блочный бутстрап по станциям: станции каждой роли
+    перевыбираются независимо, в каждой выборке берётся отношение пуловых MSE.
+
+    Args:
+        val_pred: медиана и квантили модели на окнах валидационных станций.
+        val_aux: данные тех же окон.
+        train_pred: медиана и квантили модели на окнах обучающих станций или None, если
+            таких окон нет.
+        train_aux: данные окон обучающих станций или None.
+        seed: сид бутстрапа.
+        n_boot: число выборок бутстрапа.
+
+    Returns:
+        Словарь: отношение gap_ratio, его интервал gap_ratio_ci, MSE медианы на обучающих
+        станциях gap_mse_train и число обучающих станций с валидными парами
+        gap_stations_train; нечисла записаны как None.
+    """
+    from mayak.metrics import EPS, quantile_ci
+    nan = float("nan")
+    ev_val = _evaluation(val_pred, val_aux)
+    ev_train = None if train_pred is None else _evaluation(train_pred, train_aux)
+    mse_val = float(ev_val.pooled()["RMSE"]) ** 2
+    mse_train = nan if ev_train is None else float(ev_train.pooled()["RMSE"]) ** 2
+    ratio = mse_val / mse_train if mse_train > EPS else nan
+    ci = [nan, nan]
+    if ev_train is not None:
+        boot_val = ev_val.bootstrap_samples(n_boot=n_boot, seed=seed)
+        # Обучающие станции перевыбираются своим потоком, независимо от валидационных.
+        boot_train = ev_train.bootstrap_samples(n_boot=n_boot, seed=seed + 1)
+        if boot_val is not None and boot_train is not None:
+            m_val, m_train = boot_val[0]["RMSE"] ** 2, boot_train[0]["RMSE"] ** 2
+            ok = m_train > EPS
+            with np.errstate(invalid="ignore", divide="ignore"):
+                r = np.where(ok, m_val / np.where(ok, m_train, 1.0), np.nan)
+            ci = list(quantile_ci({"r": r}, level=CI_LEVEL)["r"])
+    n_train = 0 if ev_train is None else ev_train.counts()["n_stations"]
+    return jsonable(dict(gap_ratio=ratio, gap_ratio_ci=ci, gap_mse_train=mse_train,
+                         gap_stations_train=n_train))
+
+
+def memorization_limits(model):
+    """Ограничители запоминания координат из конфига модели.
+
+    Args:
+        model: модель.
+
+    Returns:
+        Словарь значений полей ``LIMIT_FIELDS`` или None, если в конфиге модели их нет.
+    """
+    cfg = getattr(model, "cfg", None)
+    if cfg is None or not all(hasattr(cfg, k) for k in LIMIT_FIELDS):
+        return None
+    return {k: float(getattr(cfg, k)) for k in LIMIT_FIELDS}
+
+
+def _set_record(dataset):
+    return dict(time_key=dataset.time_key, station_role=list(dataset.station_splits),
+                windows=len(dataset), stations=len({sid for sid, _t in dataset.items}),
+                fingerprint=dataset.fingerprint(), history=dataset.history_spec())
+
+
+def check_gap_set(dataset, train_dataset):
+    """Проверяет, что набор обучающих станций сопоставим с набором валидации.
+
+    Args:
+        dataset: набор валидации этапа.
+        train_dataset: набор окон обучающих станций.
+
+    Raises:
+        ValueError: временное окно или правило длины истории различаются.
+    """
+    a, b = _set_record(dataset), _set_record(train_dataset)
+    diff = [k for k in ("time_key", "history") if a[k] != b[k]]
+    if diff:
+        raise ValueError(f"разрыв обобщения: набор обучающих станций отличается от набора "
+                         f"валидации полями {diff}: {[a[k] for k in diff]} против "
+                         f"{[b[k] for k in diff]}")
+
+
 def skill_at(entry, lead):
     """Скилл записи отчёта на лиде.
 
@@ -237,9 +336,12 @@ def pick_examples(preds, aux, n=N_EXAMPLES, seed=0):
                 preds={k: dict(mu=v["mu"][idx], q=v["q"][idx]) for k, v in preds.items()})
 
 
-def build_field_report(items, dataset, arch, stage, device="cpu", seed=0, threshold=None,
-                       n_boot=N_BOOT, n_examples=N_EXAMPLES):
+def build_field_report(items, dataset, arch, stage, train_dataset, device="cpu", seed=0,
+                       threshold=None, n_boot=N_BOOT, n_examples=N_EXAMPLES):
     """Отчёт о поле для нескольких чекпойнтов этапа на одном наборе окон.
+
+    Разрыв обобщения каждого чекпойнта считается по набору валидации и набору окон
+    обучающих станций в том же временном окне.
 
     Args:
         items: записи о чекпойнтах: имя, путь, отпечаток, шаг, метрика выбора и пометка
@@ -247,6 +349,7 @@ def build_field_report(items, dataset, arch, stage, device="cpu", seed=0, thresh
         dataset: набор валидации этапа.
         arch: архитектура.
         stage: имя этапа.
+        train_dataset: набор окон обучающих станций по правилу набора валидации.
         device: устройство.
         seed: сид бутстрапа и выбора примеров.
         threshold: порог ворот или None.
@@ -255,26 +358,31 @@ def build_field_report(items, dataset, arch, stage, device="cpu", seed=0, thresh
 
     Returns:
         Пара: отчёт, пригодный для записи в JSON, и массивы примеров для графиков.
+
+    Raises:
+        ValueError: набор обучающих станций не сопоставим с набором валидации.
     """
     from mayak.lit import load_model
     from mayak.stages import gate_verdict
+    check_gap_set(dataset, train_dataset)
     models = {e["name"]: load_model(e["ckpt"]) for e in items}
     preds, aux = collect_outputs(models, dataset, device=device)
+    train_preds, train_aux = ((None, None) if len(train_dataset) == 0
+                              else collect_outputs(models, train_dataset, device=device))
     entries = []
     for e in items:
         entry = dict(e, **field_metrics(preds[e["name"]], aux, seed=seed, n_boot=n_boot))
+        entry.update(memorization_gap(preds[e["name"]], aux,
+                                      None if train_preds is None else train_preds[e["name"]],
+                                      train_aux, seed=seed, n_boot=n_boot))
         entry["gate"] = None if threshold is None else gate_verdict(entry, threshold)
         entries.append(jsonable(entry))
     best = next((e["name"] for e in entries if e.get("is_best")), None)
+    limits = memorization_limits(models[best if best is not None else items[-1]["name"]])
     report = dict(arch=arch, stage=stage,
                   created_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                  val_set=dict(time_key=dataset.time_key,
-                               station_role=list(dataset.station_splits),
-                               windows=len(dataset),
-                               stations=len({sid for sid, _t in dataset.items}),
-                               fingerprint=dataset.fingerprint(),
-                               history=dataset.history_spec()),
-                  reference_gate=FIELD_GATE_REFERENCE, gate=threshold,
+                  val_set=_set_record(dataset), train_set=_set_record(train_dataset),
+                  limits=limits, reference_gate=FIELD_GATE_REFERENCE, gate=threshold,
                   leads=list(REPORT_LEADS), candidates=entries, best=best)
     return jsonable(report), pick_examples(preds, aux, n_examples, seed)
 
@@ -346,7 +454,7 @@ def summary(entry):
     if entry is None:
         return None
     out = {k: entry.get(k) for k in ("step", "mse_ratio", "mse_ratio_ci", "mse_ratio_macro",
-                                     "picp90", "width90")}
+                                     "picp90", "width90", "gap_ratio", "gap_ratio_ci")}
     for h in SUMMARY_LEADS:
         out[f"skill_{h}h"] = skill_at(entry, h)
     out["gate"] = entry.get("gate")
@@ -379,15 +487,19 @@ def format_field_report(report):
     head = (f"{'шаг':>8} {'val/loss':>9} {'MSE/клим':>9} {'интервал 90%':>17} "
             f"{'по станц.':>9} {'PICP90':>7} {'шир.90':>7}"
             + "".join(f" {'Skill ' + str(h) + 'ч':>11}" for h in SUMMARY_LEADS)
+            + f" {'вал/обуч':>9} {'интервал 90%':>17}"
             + ("  ворота" if gate is not None else ""))
     lines.append(head)
     for e in ents:
         ci = e.get("mse_ratio_ci") or [None, None]
+        gci = e.get("gap_ratio_ci") or [None, None]
         row = (f"{e['step']:>8} {_num(e.get('val_loss'), 4):>9} {_num(e.get('mse_ratio')):>9} "
                f"{'[' + _num(ci[0]) + ', ' + _num(ci[1]) + ']':>17} "
                f"{_num(e.get('mse_ratio_macro')):>9} {_pct(e.get('picp90')):>7} "
                f"{_num(e.get('width90'), 2):>7}"
-               + "".join(f" {_num(skill_at(e, h)):>11}" for h in SUMMARY_LEADS))
+               + "".join(f" {_num(skill_at(e, h)):>11}" for h in SUMMARY_LEADS)
+               + f" {_num(e.get('gap_ratio')):>9}"
+               + f" {'[' + _num(gci[0]) + ', ' + _num(gci[1]) + ']':>17}")
         if gate is not None:
             row += "  " + ("пройдены" if (e.get("gate") or {}).get("passed") else "закрыты")
         if e.get("is_best"):
@@ -398,6 +510,14 @@ def format_field_report(report):
         worst = ", ".join(f"{w['station']} {_num(w['mse_ratio'])}"
                           for w in best["worst_stations"])
         lines.append(f"Худшие станции у лучшего по val/loss: {worst}")
+    ts = report.get("train_set") or {}
+    lines.append(f"Разрыв обобщения вал/обуч: MSE медианы на валидационных станциях к MSE на "
+                 f"{ts.get('stations')} обучающих станциях ({ts.get('windows')} окон) в том же "
+                 f"окне {vs.get('time_key')}, L=0; автоматического порога нет.")
+    limits = report.get("limits")
+    lines.append("Ограничители запоминания координат: "
+                 + (", ".join(f"{k} {v:g}" for k, v in limits.items()) if limits
+                    else "в конфиге модели нет"))
     lines.append(f"Ориентир спецификации для поля: отношение не выше "
                  f"{report.get('reference_gate')}; цель покрытия 90%-интервала "
                  f"{COVERAGE_BAND[0]:.0%}–{COVERAGE_BAND[1]:.0%}.")
@@ -586,8 +706,9 @@ def plot_field_report(report, examples=None, metrics_csv=None, out_dir="."):
     return paths
 
 
-def write_stage_report(stage_dir, stage, arch, best, candidates, dataset, device="cpu", seed=0,
-                       threshold=None, metrics_csv=None, n_examples=N_EXAMPLES):
+def write_stage_report(stage_dir, stage, arch, best, candidates, dataset, train_dataset,
+                       device="cpu", seed=0, threshold=None, metrics_csv=None,
+                       n_examples=N_EXAMPLES):
     """Считает отчёт о поле для чекпойнтов этапа, пишет его и строит графики.
 
     Сбой графиков не отменяет отчёт: он пишется в журнал и в поле plots_error.
@@ -599,6 +720,7 @@ def write_stage_report(stage_dir, stage, arch, best, candidates, dataset, device
         best: запись о лучшем чекпойнте.
         candidates: записи о кандидатах.
         dataset: набор валидации этапа.
+        train_dataset: набор окон обучающих станций по правилу набора валидации.
         device: устройство.
         seed: сид бутстрапа и примеров.
         threshold: порог ворот или None.
@@ -610,7 +732,8 @@ def write_stage_report(stage_dir, stage, arch, best, candidates, dataset, device
     """
     items = report_items(best, candidates)
     report, examples = build_field_report(items, dataset, arch=arch, stage=stage,
-                                          device=device, seed=seed, threshold=threshold,
+                                          train_dataset=train_dataset, device=device,
+                                          seed=seed, threshold=threshold,
                                           n_examples=n_examples)
     path = os.path.join(stage_dir, REPORT_FILE)
     plots = []
@@ -662,6 +785,7 @@ def stage_runs(run_dirs, stage="B"):
                          val_set=entry.get("val_set"), init_ckpt=init.get("ckpt"),
                          init_step=init.get("step"), init_is_best=init.get("is_best"),
                          init_ratio=rep.get("mse_ratio"), init_picp90=rep.get("picp90"),
+                         init_gap=rep.get("gap_ratio"),
                          best_score=entry.get("best_score"), best_step=entry.get("best_step"),
                          steps_done=entry.get("steps_done"), probe_steps=entry.get("probe_steps"),
                          selection=entry.get("selection") or {}, steps=steps, values=values))
@@ -689,7 +813,7 @@ def format_stage_runs(rows, warnings=()):
         Список строк.
     """
     at = rows[0]["common_step"] if rows else None
-    lines = [f"{'запуск':<32} {'старт: шаг':>10} {'MSE/клим':>9} {'PICP90':>7} "
+    lines = [f"{'запуск':<32} {'старт: шаг':>10} {'MSE/клим':>9} {'вал/обуч':>9} {'PICP90':>7} "
              f"{'лучший val/loss':>15} {'на шаге':>8} {'шагов':>13} "
              f"{('val/loss на ' + str(at)) if at is not None else '':>16}"]
     for r in rows:
@@ -697,7 +821,8 @@ def format_stage_runs(rows, warnings=()):
         probe = " (проба)" if r["probe_steps"] else ""
         lines.append(f"{os.path.basename(os.path.normpath(r['run'])):<32} "
                      f"{str(r['init_step']) + mark:>10} {_num(r['init_ratio']):>9} "
-                     f"{_pct(r['init_picp90']):>7} {_num(r['best_score'], 4):>15} "
+                     f"{_num(r['init_gap']):>9} {_pct(r['init_picp90']):>7} "
+                     f"{_num(r['best_score'], 4):>15} "
                      f"{str(r['best_step']):>8} {str(r['steps_done']) + probe:>13} "
                      f"{_num(r['loss_at_common'], 4):>16}")
     lines.append("* старт с лучшего по val/loss чекпойнта предыдущего этапа")
@@ -747,9 +872,10 @@ def plot_stage_runs(rows, out_path):
     return out_path
 
 
-__all__ = ["FIELD_GATE_REFERENCE", "PLOT_FILES", "REPORT_DIR", "REPORT_FILE", "SUMMARY_LEADS",
-           "build_field_report", "collect_outputs", "describe_checkpoint", "field_metrics",
-           "find_report_entry", "format_field_report", "format_stage_runs", "pick_examples",
+__all__ = ["FIELD_GATE_REFERENCE", "LIMIT_FIELDS", "PLOT_FILES", "REPORT_DIR", "REPORT_FILE",
+           "SUMMARY_LEADS", "build_field_report", "check_gap_set", "collect_outputs",
+           "describe_checkpoint", "field_metrics", "find_report_entry", "format_field_report",
+           "format_stage_runs", "memorization_gap", "memorization_limits", "pick_examples",
            "plot_field_report", "plot_stage_runs", "read_report", "report_device",
            "report_items", "skill_at", "stage_runs", "summary", "write_report",
            "write_stage_report"]

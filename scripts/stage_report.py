@@ -4,6 +4,8 @@
 и заново строит графики: например, с другим числом примеров, с порогом ворот или после
 того, как отчёт внутри обучения не построился. Отчёт считается на том же наборе
 валидации, по которому выбирался чекпойнт; набор и кэш данных сверяются с журналом.
+Разрыв обобщения считается по окнам обучающих станций, построенным по правилу набора
+валидации.
 
 Команда b сравнивает запуски этапа B, начатые с разных чекпойнтов этапа A, обычно
 пробные: кривые валидации на одних осях, значение на общем для всех шаге, pinball по
@@ -34,7 +36,7 @@ def _stage_entry(journal, name):
 
 def cmd_a(args):
     from mayak.config import RunConfig
-    from mayak.data.datamodule import validation_set
+    from mayak.data.datamodule import train_stations_set, validation_set
     from mayak.data.store import get_store
     from mayak.leakage import run_checklist
     from mayak.protocol import CONFIG_FILE, Protocol, read_journal
@@ -64,12 +66,13 @@ def cmd_a(args):
     missing = [p for p in [entry["best_ckpt"], *paths] if not os.path.isfile(p)]
     if missing:
         sys.exit(f"нет файлов чекпойнтов: {missing}")
-    run_checklist(store, datasets=[ds], checkpoints=[entry["best_ckpt"], *paths])
+    gap_ds = train_stations_set(store, manifest, data_cfg, stage.curriculum)
+    run_checklist(store, datasets=[ds, gap_ds], checkpoints=[entry["best_ckpt"], *paths])
     report, path, plots = write_stage_report(
         os.path.dirname(entry["best_ckpt"]), stage.name, journal["arch"],
         describe_checkpoint(entry["best_ckpt"]), [describe_checkpoint(p) for p in paths], ds,
-        device=args.device, seed=journal["seeds"]["eval"], threshold=args.gate,
-        metrics_csv=entry.get("metrics_csv"), n_examples=args.examples)
+        train_dataset=gap_ds, device=args.device, seed=journal["seeds"]["eval"],
+        threshold=args.gate, metrics_csv=entry.get("metrics_csv"), n_examples=args.examples)
     print("\n".join(format_field_report(report)))
     print(f"Отчёт: {path}")
     for p in plots:

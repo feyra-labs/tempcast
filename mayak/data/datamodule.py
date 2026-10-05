@@ -7,7 +7,8 @@
 Валидация берёт окна валидационных станций в валидационном окне, с каждой станции
 одинаковое число. Длина истории каждого окна выбирается из того же распределения, что
 при обучении этапа, генератором с фиксированным сидом, поэтому набор один и тот же для
-всех архитектур и всех повторов.
+всех архитектур и всех повторов. По тому же правилу строится набор окон обучающих станций
+в валидационном окне: по нему отчёт этапа холодного старта считает разрыв обобщения поля.
 """
 import pytorch_lightning as L
 import torch
@@ -16,7 +17,7 @@ from torch.utils.data import DataLoader
 from mayak.config import DataConfig
 from mayak.data.dataset import WindowDataset, seed_worker
 from mayak.data.holdout import EvalSet
-from mayak.data.splits import ROLE_VAL
+from mayak.data.splits import ROLE_TRAIN, ROLE_VAL
 from mayak.data.store import get_store
 
 
@@ -36,8 +37,31 @@ def validation_set(store, manifest, data_cfg, curriculum):
     Returns:
         Набор окон валидации.
     """
+    return _stage_set(store, manifest, data_cfg, curriculum, ROLE_VAL)
+
+
+def train_stations_set(store, manifest, data_cfg, curriculum):
+    """Набор окон обучающих станций по правилу набора валидации этапа.
+
+    Временное окно, шаг между началами горизонта, норма окон на станцию, правило годности
+    цели и длины истории - как у набора валидации этапа; станции - обучающие. Окна этого
+    временного окна в обучении не участвуют.
+
+    Args:
+        store: набор станций.
+        manifest: путь к манифесту с ролями станций.
+        data_cfg: конфиг данных.
+        curriculum: имя куррикулума этапа.
+
+    Returns:
+        Набор окон обучающих станций в валидационном окне.
+    """
+    return _stage_set(store, manifest, data_cfg, curriculum, ROLE_TRAIN)
+
+
+def _stage_set(store, manifest, data_cfg, curriculum, role):
     c = data_cfg
-    return EvalSet(store.clims(), station_splits=(ROLE_VAL,), manifest=manifest, time_key="val",
+    return EvalSet(store.clims(), station_splits=(role,), manifest=manifest, time_key="val",
                    every_hours=c.val_every_hours, max_windows=None,
                    windows_per_station=c.val_windows_per_station, target_mask=c.target_mask,
                    curriculum=curriculum, history_seed=c.val_seed)
