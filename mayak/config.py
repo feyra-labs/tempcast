@@ -166,9 +166,10 @@ class Ablations:
             одной группой, постоянные времени и периоды при инициализации идут
             равномерно в логарифме. Квазипостоянная группа остаётся отдельной с обеими
             модами, своими периодами и пределами, поэтому групповых энергий две.
-        no_offset_aug: без аугментации постоянного смещения температуры. Это свойство
-            потока данных, но флаг живёт здесь, чтобы абляция задавалась в одном
-            месте; полная конфигурация прогона переносит его в аугментации данных.
+        no_offset_aug: без аугментации смещения станции: ни постоянной, ни суточной
+            части. Это свойство потока данных, но флаг живёт здесь, чтобы абляция
+            задавалась в одном месте; полная конфигурация прогона переносит его в
+            аугментации данных.
     """
     no_compression: bool = False
     no_passport: bool = False
@@ -780,11 +781,9 @@ def _pair(v, name, cast=float):
 
 
 AUGMENT_PROB_FIELDS = {
-    "coords": "coords_prob", "scale": "scale_prob", "drift": "drift_prob",
-    "offset": "offset_prob", "noise": "noise_prob", "spike": "spike_prob",
-    "stuck": "stuck_prob", "units": "units_prob", "rh_dewpoint": "rh_dewpoint_prob",
-    "dropout": "dropout_prob", "gap": "gap_prob", "outage": "outage_prob",
-    "drop_pressure": "drop_pressure_prob", "drop_humidity": "drop_humidity_prob",
+    "offset": "offset_prob", "noise": "noise_prob", "rh_dewpoint": "rh_dewpoint_prob",
+    "stuck": "stuck_prob", "dropout": "dropout_prob", "gap": "gap_prob",
+    "drop_channel": "drop_channel_prob",
 }
 
 
@@ -792,137 +791,106 @@ AUGMENT_PROB_FIELDS = {
 class AugmentConfig:
     """Аугментации обучающих окон, имитирующие реальный прибор.
 
-    Значения по умолчанию - профиль ``aggressive``: профиль обучения для переноса на
-    реальные наблюдения. Именованные профили хранят только отличия от умолчаний и
-    собираются методом ``from_profile``. Каждая аугментация включается со своей
-    вероятностью и берёт параметры из своего диапазона. Тройки значений - по каналам
-    температуры, давления и влажности; пары - нижняя и верхняя граница диапазона.
+    Значения по умолчанию - профиль ``default``. Именованные профили хранят только
+    отличия от умолчаний и собираются методом ``from_profile``. Каждая аугментация
+    включается со своей вероятностью и берёт параметры из своего диапазона. Тройки
+    значений - по каналам температуры, давления и влажности; пары - нижняя и верхняя
+    граница диапазона.
 
-    Смещение, масштаб и дрейф - свойства самого датчика, поэтому искажают и историю, и
-    цель. Шум искажает только историю. Запись температуры и влажности целыми числами -
-    не аугментация: она применяется к каждому окну после всех аугментаций. Если окно
-    искажается свойствами прибора или влажностью из точки росы, записанным значениям
-    перед искажением возвращается непрерывность: к ним прибавляется равномерный шум в
-    пределах полушага записи. Без искажений запись возвращает то же значение.
+    Цель меняет только смещение станции: оно прибавляется к температуре истории и цели
+    одинаково по солнечному часу. Шум, влажность из точки росы и залипание искажают
+    только историю, пропуски меняют только её маску. Запись температуры и влажности
+    целыми числами - не аугментация: она применяется к каждому окну после всех
+    аугментаций. Если окно искажается смещением, шумом или влажностью из точки росы,
+    записанным значениям перед искажением возвращается непрерывность: к ним
+    прибавляется равномерный шум в пределах полушага записи. Без искажений запись
+    возвращает то же значение.
 
     Attributes:
         profile: имя профиля, от которого отсчитываются отличия.
-        scale_prob: вероятность ошибки масштаба.
-        scale_max: наибольшее отклонение множителя канала от единицы; фактическое
-            отклонение случайно, от нуля до этого значения, в любую сторону.
-        drift_prob: вероятность дрейфа.
-        drift_rate_max: наибольшая скорость дрейфа по каналам: °C, гПа и % в сутки;
-            фактическая скорость случайна, от нуля до этого значения, в любую сторону.
-            Смещение растёт с этой скоростью от калибровки прибора через всю историю. На
-            горизонте цели оно растёт дальше при истории не короче
-            ``DRIFT_GROWTH_MIN_HISTORY`` из ``mayak.data.augment`` и держится на уровне
-            последнего часа истории при более короткой.
-        drift_age_max: наибольший возраст калибровки прибора к первому часу истории, ч;
-            фактический возраст - целое число часов, равномерно от нуля до этого
-            значения. Начало окна с калибровкой датчика не связано, поэтому смещение в
-            первом часе истории не нулевое и от длины истории не зависит.
-        drift_rw_frac: доля нарастания дрейфа на истории случайным блужданием,
-            остальное - линейно; на горизонте нарастание всегда линейное.
-        offset_prob: вероятность постоянного смещения температуры.
-        offset_min: нижняя граница величины смещения. Величина выбирается равномерно в
-            логарифме между границами, а при нулевой нижней границе - равномерно.
-        offset_max: верхняя граница величины смещения; ноль выключает аугментацию.
+        offset_prob: вероятность смещения станции.
+        offset_min: нижняя граница величины постоянной части смещения, °C. Величина
+            выбирается равномерно в логарифме между границами, а при нулевой нижней
+            границе - равномерно; знак случаен.
+        offset_max: верхняя граница величины постоянной части смещения, °C; ноль
+            выключает постоянную часть.
+        offset_diurnal_frac: доля смещений с суточной составляющей.
+        offset_diurnal_max: наибольшая амплитуда суточной составляющей, °C; амплитуда
+            равномерна от нуля до неё, знак случаен; ноль выключает суточную
+            составляющую.
+        offset_peak_hours: пределы часа максимума суточной составляющей по среднему
+            солнечному времени, ч; час равномерен между ними.
         noise_prob: вероятность шума.
         noise_sd: разброс гауссова шума по каналам: °C, гПа, %.
         rh_dewpoint_prob: вероятность того, что влажность восстановлена из целых
             температуры и точки росы и прыгает на несколько процентов, как в
             наблюдениях реальной сети.
-        spike_prob: вероятность одиночных выбросов в истории.
-        spike_max_count: наибольшее число выбросов, не меньше одного.
-        spike_min: наименьшая величина выброса по каналам.
-        spike_max: наибольшая величина выброса по каналам.
         stuck_prob: вероятность залипания канала.
         stuck_hours: пределы длительности залипания, ч.
-        units_prob: вероятность того, что вместо станционного давления пишется давление,
-            приведённое к уровню моря. Температура всегда в градусах Цельсия: это
-            обязанность владельца прибора.
-        units_hours: пределы длительности такого участка, ч.
         dropout_prob: вероятность одиночных пропусков.
         dropout_max_rate: наибольшая доля пропущенных часов; фактическая доля
             случайна, от нуля до неё.
         gap_prob: вероятность блочных пропусков.
         gap_max_count: наибольшее число блочных пропусков.
         gap_max_len: наибольшая длина блочного пропуска, ч.
-        outage_prob: вероятность выпадения канала в середине истории.
-        outage_hours: пределы длительности выпадения, ч.
-        drop_humidity_prob: вероятность того, что влажности нет на всей истории.
-        drop_pressure_prob: вероятность того, что давления нет на всей истории.
-        coords_prob: вероятность дрожания метаданных точки.
-        coord_jitter_deg: наибольший сдвиг широты и долготы, градусы; сдвиг равномерный
-            в обе стороны.
-        elev_jitter_m: разброс нормального дрожания высоты, м.
+        drop_channel_prob: вероятность того, что канала нет на всей истории.
+        drop_channel_weights: доли вариантов отсутствия канала: без давления, без
+            влажности, без обоих; нормируются к сумме 1.
     """
-    profile: str = "aggressive"
-    scale_prob: float = 0.3
-    scale_max: tuple = (0.02, 0.001, 0.05)
-    drift_prob: float = 0.3
-    drift_rate_max: tuple = (0.05, 0.05, 0.2)
-    drift_age_max: int = 336
-    drift_rw_frac: float = 0.5
-    offset_prob: float = 0.8
+    profile: str = "default"
+    offset_prob: float = 0.4
     offset_min: float = 0.1
-    offset_max: float = 3.0
+    offset_max: float = 2.0
+    offset_diurnal_frac: float = 0.5
+    offset_diurnal_max: float = 1.5
+    offset_peak_hours: tuple = (13.0, 16.0)
     noise_prob: float = 1.0
     noise_sd: tuple = (0.2, 0.3, 2.0)
     rh_dewpoint_prob: float = 0.1
-    spike_prob: float = 0.2
-    spike_max_count: int = 3
-    spike_min: tuple = (12.0, 15.0, 40.0)
-    spike_max: tuple = (30.0, 40.0, 80.0)
     stuck_prob: float = 0.15
-    stuck_hours: tuple = (12, 96)
-    units_prob: float = 0.05
-    units_hours: tuple = (24, 96)
+    stuck_hours: tuple = (6, 48)
     dropout_prob: float = 0.3
     dropout_max_rate: float = 0.2
     gap_prob: float = 0.5
     gap_max_count: int = 3
     gap_max_len: int = 96
-    outage_prob: float = 0.2
-    outage_hours: tuple = (24, 240)
-    drop_humidity_prob: float = 0.15
-    drop_pressure_prob: float = 0.15
-    coords_prob: float = 1.0
-    coord_jitter_deg: float = 0.4
-    elev_jitter_m: float = 50.0
+    drop_channel_prob: float = 0.28
+    drop_channel_weights: tuple = (0.46, 0.46, 0.08)
 
     def __post_init__(self):
         s = object.__setattr__
         if self.profile not in AUGMENT_PROFILES:
             raise ConfigError(f"неизвестный профиль аугментаций {self.profile!r}; "
                               f"есть {tuple(AUGMENT_PROFILES)}")
-        for name in ("scale_max", "drift_rate_max", "noise_sd", "spike_min", "spike_max"):
-            v = _floats(getattr(self, name))
-            if len(v) != 3 or min(v) < 0:
-                raise ConfigError(f"{name} - по одному неотрицательному значению на канал "
-                                  f"T, P, RH: {v}")
-            s(self, name, v)
-        if any(a > b for a, b in zip(self.spike_min, self.spike_max)):
-            raise ConfigError(f"spike_min {self.spike_min} > spike_max {self.spike_max}")
-        for name in ("stuck_hours", "units_hours", "outage_hours"):
-            v = _pair(getattr(self, name), name, int)
-            if v[0] < 1:
-                raise ConfigError(f"{name}: длительность ≥ 1 ч")
-            s(self, name, v)
-        for name in (*AUGMENT_PROB_FIELDS.values(), "drift_rw_frac", "dropout_max_rate"):
+        v = _floats(self.noise_sd)
+        if len(v) != 3 or min(v) < 0:
+            raise ConfigError(f"noise_sd - по одному неотрицательному значению на канал "
+                              f"T, P, RH: {v}")
+        s(self, "noise_sd", v)
+        v = _floats(self.drop_channel_weights)
+        if len(v) != 3 or min(v) < 0 or sum(v) <= 0:
+            raise ConfigError(f"drop_channel_weights - три неотрицательные доли вариантов "
+                              f"без P, без RH, без обоих с положительной суммой: {v}")
+        s(self, "drop_channel_weights", v)
+        v = _pair(self.stuck_hours, "stuck_hours", int)
+        if v[0] < 1:
+            raise ConfigError("stuck_hours: длительность ≥ 1 ч")
+        s(self, "stuck_hours", v)
+        v = _pair(self.offset_peak_hours, "offset_peak_hours")
+        if v[0] < 0.0 or v[1] > 24.0:
+            raise ConfigError(f"offset_peak_hours = {v}: часы суток в [0, 24]")
+        s(self, "offset_peak_hours", v)
+        for name in (*AUGMENT_PROB_FIELDS.values(), "offset_diurnal_frac", "dropout_max_rate"):
             v = float(getattr(self, name))
             if not 0.0 <= v <= 1.0:
                 raise ConfigError(f"{name} = {v} вне [0, 1]")
             s(self, name, v)
-        for name in ("spike_max_count", "gap_max_count", "gap_max_len"):
+        for name in ("gap_max_count", "gap_max_len"):
             v = int(getattr(self, name))
             if v < 1:
                 raise ConfigError(f"{name} ≥ 1")
             s(self, name, v)
-        if int(self.drift_age_max) < 0:
-            raise ConfigError(f"drift_age_max = {self.drift_age_max}: возраст калибровки ≥ 0 ч")
-        s(self, "drift_age_max", int(self.drift_age_max))
-        for name in ("offset_min", "offset_max", "coord_jitter_deg", "elev_jitter_m"):
+        for name in ("offset_min", "offset_max", "offset_diurnal_max"):
             v = float(getattr(self, name))
             if v < 0:
                 raise ConfigError(f"{name} ≥ 0")
@@ -933,7 +901,7 @@ class AugmentConfig:
             raise ConfigError(f"offset_min {self.offset_min} > offset_max {self.offset_max}")
 
     @classmethod
-    def from_profile(cls, name="aggressive", **overrides):
+    def from_profile(cls, name="default", **overrides):
         """Конфиг из именованного профиля с явными переопределениями.
 
         Args:
@@ -959,7 +927,7 @@ class AugmentConfig:
 
         Args:
             d: словарь полей; ключ ``profile`` выбирает профиль, без него -
-                ``aggressive``. None - профиль по умолчанию.
+                ``default``. None - профиль по умолчанию.
 
         Returns:
             Конфиг аугментаций.
@@ -968,7 +936,7 @@ class AugmentConfig:
             ConfigError: неизвестный ключ.
         """
         d = _strict_kwargs(cls, d, "data.augment")
-        return cls.from_profile(d.pop("profile", "aggressive"), **d)
+        return cls.from_profile(d.pop("profile", "default"), **d)
 
     def deviations(self):
         """Поля, которые отличаются от объявленного профиля.
@@ -989,30 +957,7 @@ class AugmentConfig:
 
 
 AUGMENT_PROFILES = {
-    "aggressive": {},
-    "soft": dict(
-        scale_prob=0.15, scale_max=(0.01, 0.0005, 0.03),
-        drift_prob=0.15, drift_rate_max=(0.025, 0.035, 0.1),
-        offset_max=1.5,
-        noise_sd=(0.15, 0.2, 1.5),
-        rh_dewpoint_prob=0.05,
-        spike_prob=0.05, spike_max_count=1,
-        stuck_prob=0.05, stuck_hours=(6, 48),
-        units_prob=0.01,
-        dropout_prob=0.2, dropout_max_rate=0.1,
-        gap_prob=0.3, gap_max_count=2, gap_max_len=48,
-        outage_prob=0.1, outage_hours=(24, 120),
-        drop_humidity_prob=0.1, drop_pressure_prob=0.1,
-        coord_jitter_deg=0.2, elev_jitter_m=20.0),
-    "base": dict(
-        scale_prob=0.0, drift_prob=0.0,
-        offset_prob=1.0, offset_min=0.0, offset_max=0.7,
-        noise_prob=1.0, noise_sd=(0.2, 0.5, 2.0), rh_dewpoint_prob=0.0,
-        spike_prob=0.0, stuck_prob=0.0, units_prob=0.0,
-        dropout_prob=0.0, gap_prob=0.3, gap_max_count=1, gap_max_len=24,
-        outage_prob=0.0,
-        drop_humidity_prob=0.1, drop_pressure_prob=0.1,
-        coords_prob=1.0, coord_jitter_deg=0.4, elev_jitter_m=0.0),
+    "default": {},
     "none": {f: 0.0 for f in AUGMENT_PROB_FIELDS.values()},
 }
 
@@ -1124,16 +1069,18 @@ class RunConfig:
     def resolved(self):
         """Конфигурация, где эффекты абляций перенесены между секциями.
 
-        Абляция без смещения температуры выключает аугментацию смещения в данных.
-        Повторный вызов ничего не меняет.
+        Абляция без смещения станции выключает в данных обе части аугментации смещения:
+        постоянную и суточную. Повторный вызов ничего не меняет.
 
         Returns:
             Новая полная конфигурация.
         """
         abl = getattr(self.model, "ablations", None)
         data = self.data
-        if abl is not None and abl.no_offset_aug and data.augment.offset_max != 0.0:
-            data = replace(data, augment=replace(data.augment, offset_min=0.0, offset_max=0.0))
+        aug = data.augment
+        if abl is not None and abl.no_offset_aug and (aug.offset_max or aug.offset_diurnal_max):
+            data = replace(data, augment=replace(aug, offset_min=0.0, offset_max=0.0,
+                                                 offset_diurnal_max=0.0))
         return replace(self, data=data)
 
     def to_dict(self):

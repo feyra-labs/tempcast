@@ -7,6 +7,7 @@ Example:
     python scripts/run.py train=debug run.accelerator=cpu   # отладка на CPU
     python scripts/run.py -m ablation=none,no_compression   # абляции МАЯК
     python scripts/run.py -m train.seed=0,1,2               # три сида основной модели
+    python scripts/run.py augment=none                      # без аугментаций, свой каталог
 """
 import os
 
@@ -14,6 +15,22 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 RUN_SECTIONS = ("model", "data", "train")
+
+
+def aug_suffix(profile):
+    """Часть имени прогона с профилем аугментаций.
+
+    Args:
+        profile: имя профиля аугментаций.
+
+    Returns:
+        Пустая строка для профиля по умолчанию, иначе ``-aug_<профиль>``.
+    """
+    from mayak.config import AugmentConfig
+    return "" if profile == AugmentConfig().profile else f"-aug_{profile}"
+
+
+OmegaConf.register_new_resolver("aug_suffix", aug_suffix, replace=True)
 
 
 def to_run_config(cfg):

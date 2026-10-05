@@ -1,18 +1,11 @@
 # @package data.augment
-# Профиль аугментаций «none»: без аугментаций - диагностика; значения параметров те же, что у aggressive.
-# Отличия от значений по умолчанию (= aggressive).
+# Профиль аугментаций «none»: без аугментаций; значения параметров те же, что у default.
+# Отличия от значений по умолчанию (= default).
 profile: none
-coords_prob: 0.0
-scale_prob: 0.0
-drift_prob: 0.0
 offset_prob: 0.0
 noise_prob: 0.0
-spike_prob: 0.0
-stuck_prob: 0.0
-units_prob: 0.0
 rh_dewpoint_prob: 0.0
+stuck_prob: 0.0
 dropout_prob: 0.0
 gap_prob: 0.0
-outage_prob: 0.0
-drop_pressure_prob: 0.0
-drop_humidity_prob: 0.0
+drop_channel_prob: 0.0

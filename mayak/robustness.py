@@ -147,7 +147,7 @@ class RobustnessSet(Dataset):
         w = AugWindow(x=np.array(raw["x"], np.float32), m=np.array(raw["m"], np.float32),
                       y=_np(item["y"]).astype(np.float32, copy=True),
                       y_mask=_np(item["y_mask"]).astype(np.float32, copy=True),
-                      L=L, hour=_np(item["hour_hist"]),
+                      L=L, hour=_np(item["hour_hist"]), hour_fut=_np(item["hour_fut"]),
                       lat=float(s["lat"]), lon=float(s["lon"]), elev=float(s["elev"]),
                       qc_elev=float(raw["qc_elev"]))
         if self.name in DITHER_SCENARIOS:

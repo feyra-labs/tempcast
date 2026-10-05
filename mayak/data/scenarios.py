@@ -12,10 +12,13 @@ from collections.abc import Callable
 import numpy as np
 
 from mayak.config import SCENARIO_INPUT, SCENARIO_INSTRUMENT, SCENARIO_RULES, ScenarioRule
-from mayak.constants import L_MAX
-from mayak.data.augment import P, RH, AugWindow, apply_one, drift_offset, drift_target
+from mayak.constants import H, L_MAX
+from mayak.data.augment import AugWindow
 
+T, P, RH = 0, 1, 2
 DROP_CHANNEL_LABELS = ("все каналы", "без P", "без RH", "без P и RH")
+# Наименьшая длина истории, при которой дрейф на горизонте растёт дальше, ч.
+DRIFT_GROWTH_MIN_HISTORY = 168
 
 
 def _dropout(w: AugWindow, level, rng, p):
@@ -32,38 +35,92 @@ def _gap(w, level, rng, p):
 
 
 def _offset(w, level, rng, p):
-    """Постоянное смещение температуры: история и цель, та же функция, что в обучении."""
-    apply_one(w, "offset", dict(b=float(level)))
+    """Постоянное смещение температуры: история и цель, смещение станции из обучения."""
+    w.add_station_offset(float(level))
 
 
 def _offset_input(w, level, rng, p):
     """То же смещение, но цель не трогается: незамеченное смещение прибора."""
-    apply_one(w, "offset", dict(b=float(level), target=False))
+    w.add_station_offset(float(level), target=False)
 
 
-def _drift_params(level, target):
-    return dict(rate=[float(level), 0.0, 0.0], walk=False, seed=0, age=0, target=target)
+def _drift_after(hours, rate_per_day):
+    """Смещение прибора через заданное число часов после калибровки."""
+    return float(rate_per_day) * hours / 24.0
+
+
+def _drift_history(L, rate_per_day):
+    """Смещение прибора на часах истории; прибор откалиброван в её первом часе.
+
+    Смещение нарастает линейно от нуля в первом часе до набранного к последнему.
+
+    Args:
+        L: длина истории, ч.
+        rate_per_day: скорость дрейфа, °C в сутки.
+
+    Returns:
+        Массив float32 длины L.
+    """
+    L = int(L)
+    end = _drift_after(max(L - 1, 0), rate_per_day)
+    if L <= 1 or end == 0.0:
+        return np.full(max(L, 0), end, np.float32)
+    out = end * np.arange(L, dtype=np.float64) / (L - 1)
+    out[0], out[-1] = 0.0, end
+    return out.astype(np.float32)
+
+
+def _drift_target(L, rate_per_day, n=H):
+    """Смещение прибора на часах горизонта; прибор откалиброван в первом часе истории.
+
+    При истории не короче ``DRIFT_GROWTH_MIN_HISTORY`` смещение продолжает расти с той же
+    скоростью без скачка: на первом часе горизонта оно на час дрейфа больше, чем в
+    последнем часе истории. При более короткой истории оно держится на уровне последнего
+    часа истории. Без истории цель не смещается.
+
+    Args:
+        L: длина истории, ч.
+        rate_per_day: скорость дрейфа, °C в сутки.
+        n: число часов горизонта.
+
+    Returns:
+        Массив float32 длины n.
+    """
+    if int(L) <= 0 or rate_per_day == 0:
+        return np.zeros(n, np.float32)
+    last = _drift_after(int(L) - 1, rate_per_day)
+    if int(L) < DRIFT_GROWTH_MIN_HISTORY:
+        return np.full(n, last, np.float32)
+    k = np.arange(1, n + 1, dtype=np.float64)
+    return (last + _drift_after(k, rate_per_day)).astype(np.float32)
+
+
+def _add_drift(w, level, target):
+    w.x[w.h0:, T] += _drift_history(w.L, level) * (w.m[w.h0:, T] > 0)
+    if target:
+        w.y[:] = w.y + _drift_target(w.L, level, w.y.shape[0]) * (w.y_mask > 0)
 
 
 def _drift(w, level, rng, p):
-    """Дрейф температуры со скоростью ``level`` в сутки той же функцией, что в обучении.
+    """Дрейф температуры со скоростью ``level`` в сутки: история и цель.
 
-    Прибор откалиброван в первом часе истории: смещение на истории нарастает от нуля до
-    текущего. На горизонте цель смещается по тому же правилу, что в обучении: при
-    длинной истории дальше с той же скоростью, при короткой - на уровне последнего часа
-    истории.
+    Прибор откалиброван в первом часе истории: смещение на истории нарастает линейно от
+    нуля до текущего. На горизонте при длинной истории оно растёт дальше с той же
+    скоростью, при короткой - держится на уровне последнего часа истории.
     """
-    apply_one(w, "drift", _drift_params(level, True))
+    _add_drift(w, float(level), True)
 
 
 def _drift_input(w, level, rng, p):
     """Тот же дрейф, но цель не трогается: незамеченный дрейф прибора."""
-    apply_one(w, "drift", _drift_params(level, False))
+    _add_drift(w, float(level), False)
 
 
 def _scale(w, level, rng, p):
-    """Ошибка масштаба температуры той же функцией, что в обучении: история и цель."""
-    apply_one(w, "scale", dict(k=[1.0 + float(level), 1.0, 1.0]))
+    """Ошибка масштаба температуры: история и цель умножаются на ``1 + level``."""
+    k = np.float32(1.0 + float(level))
+    w.x[:, T] = np.where(w.m[:, T] > 0, w.x[:, T] * k, w.x[:, T])
+    w.y[:] = np.where(w.y_mask > 0, w.y * k, w.y)
 
 
 def _noise(w, level, rng, p):
@@ -279,7 +336,8 @@ def instrument_reference(name, level, w: AugWindow, mu_clim, rng, params=None):
         return ref
     probe = AugWindow(x=np.zeros_like(w.x), m=np.zeros_like(w.m), y=ref,
                       y_mask=np.ones(ref.shape, np.float32), L=w.L, hour=w.hour,
-                      lat=w.lat, lon=w.lon, elev=w.elev, qc_elev=w.qc_elev)
+                      hour_fut=w.hour_fut, lat=w.lat, lon=w.lon, elev=w.elev,
+                      qc_elev=w.qc_elev)
     apply_scenario(probe, name, level, rng, params)
     return probe.y
 
@@ -301,6 +359,6 @@ def level_label(name, level):
     return f"{level:g}"
 
 
-__all__ = ["DITHER_SCENARIOS", "DROP_CHANNEL_LABELS", "SCENARIOS", "ScenarioDef",
-           "apply_scenario", "dither_rng", "drift_offset", "drift_target", "instrument_reference",
-           "level_label", "scenario_rng", "variants_of"]
+__all__ = ["DITHER_SCENARIOS", "DRIFT_GROWTH_MIN_HISTORY", "DROP_CHANNEL_LABELS", "SCENARIOS",
+           "ScenarioDef", "apply_scenario", "dither_rng", "instrument_reference", "level_label",
+           "scenario_rng", "variants_of"]

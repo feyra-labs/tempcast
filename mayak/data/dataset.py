@@ -398,8 +398,8 @@ class WindowDataset(Dataset):
         scale = norm_scale(s["clim"], doy_f, hour_f)
 
         w = augment_window(AugWindow(x=x_hist, m=mask_hist, y=y, y_mask=y_mask, L=L,
-                                     hour=hour_h, lat=s["lat"], lon=s["lon"],
-                                     elev=s["elev"], qc_elev=s["qc_elev"]),
+                                     hour=hour_h, hour_fut=hour_f, lat=s["lat"],
+                                     lon=s["lon"], elev=s["elev"], qc_elev=s["qc_elev"]),
                            self.augment, self.rng_aug)
         record_window(w)
         if info is not None:

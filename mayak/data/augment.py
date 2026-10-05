@@ -1,22 +1,17 @@
-"""Аугментации, имитирующие реальный прибор.
-
-Обучение идёт на реанализе - интерполированном поле без пропусков, квантования,
-дрейфа, залипаний, ошибок единиц и нерегулярной отчётности. Здесь всё это
-появляется искусственно, чтобы перенос на наблюдения реальной сети состоялся.
+"""Аугментации обучающих окон, имитирующие реальный прибор.
 
 Контракт:
 * Вход и выход - ``AugWindow``: история (L_MAX, 3), выровненная по правому краю
-  (валидная часть - последние ``L`` часов), её маска, цель (H,) и её маска,
-  метаданные станции.
-* Искажения значений действуют только на валидные точки; после всех
-  аугментаций окно записывается так, как его пишет прибор (``record_window``), затем
-  вызывающий код восстанавливает инвариант ``enforce_invariant`` и прогоняет QC окна.
-* Цель трогают все свойства прибора - смещение, масштаб, дрейф - и только они. Маска
-  цели не меняется никогда. Дрейф задан скоростью и возрастом калибровки: прибор
-  откалиброван за случайное число часов до первого часа истории, начало окна с
-  калибровкой не связано. Смещение растёт с этой скоростью через всю историю; на
-  горизонте оно растёт дальше только при истории не короче
-  ``DRIFT_GROWTH_MIN_HISTORY``, иначе держится на уровне последнего часа истории.
+  (валидная часть - последние ``L`` часов), её маска, цель (H,) и её маска, часы UTC
+  истории и горизонта, метаданные станции.
+* Окно без истории не меняется.
+* Искажения значений действуют только на валидные точки; после всех аугментаций окно
+  записывается так, как его пишет прибор (``record_window``), затем вызывающий код
+  восстанавливает инвариант ``enforce_invariant`` и прогоняет QC окна.
+* Цель меняет только смещение станции, маска цели не меняется никогда. Смещение -
+  постоянная часть плюс, в части окон, суточная составляющая с периодом 24 ч по
+  среднему солнечному времени точки (``station_offset``). На истории и цели оно
+  одинаково в один и тот же солнечный час.
 * Каждая аугментация берёт случайные числа из своего подпотока, выведенного из
   одного числа основного генератора аугментаций. Отсюда два свойства: окно
   потребляет из ``rng`` ровно одно число, а включение, выключение или смена
@@ -26,23 +21,19 @@
 Порядок применения - физическая цепочка: истинное значение, датчик, запись, передача
 и архив.
 
-1. ``coords``   - ошибка метаданных станции;
-2. ``scale``, ``drift``, ``offset``, ``noise`` - свойства датчика; затем влажность
-   ограничивается диапазоном от 0 до 100 процентов (датчик насыщается);
-3. ``rh_dewpoint`` - влажность восстановлена из целых температуры и точки росы;
-4. ``spike``, ``stuck``, ``units`` - грубые ошибки записи;
-5. ``dropout``, ``gap``, ``outage``, ``drop_pressure``, ``drop_humidity`` -
-   доступность: только маска.
+1. ``offset``, ``noise`` - свойства датчика; затем влажность ограничивается диапазоном
+   от 0 до 100 процентов (датчик насыщается);
+2. ``rh_dewpoint`` - влажность восстановлена из целых температуры и точки росы;
+3. ``stuck`` - залипание канала;
+4. ``dropout``, ``gap``, ``drop_channel`` - доступность: только маска.
 
 История и цель приходят уже записанными прибором. Перед искажениями датчика и перед
 влажностью из точки росы им возвращается непрерывность: к каждому значению прибавляется
-равномерный шум в пределах полушага записи (``dither_window``). Так малое смещение или
-слабый шум меняют запись в той доле часов, в какой меняли бы у настоящего датчика.
-После всех аугментаций окно снова записывается целыми градусами и процентами, давление -
-десятыми; значения, которых искажения не коснулись, возвращаются к прежней записи.
+равномерный шум в пределах полушага записи (``dither_window``). После всех аугментаций
+окно снова записывается целыми градусами и процентами, давление - десятыми; значения,
+которых искажения не коснулись, возвращаются к прежней записи.
 
-Датчик отчитывается раз в час; регулярный шаг отчётов в несколько часов вне области
-проекта. Температура приходит в градусах Цельсия.
+Датчик отчитывается раз в час. Температура приходит в градусах Цельсия.
 """
 from __future__ import annotations
 
@@ -55,41 +46,56 @@ from mayak.astro import dewpoint_from_rh, rh_from_dewpoint
 from mayak.config import AUGMENT_PROB_FIELDS, AugmentConfig
 from mayak.constants import H, L_MAX
 from mayak.data.masking import enforce_invariant
-from mayak.data.qc import QC_CODES, P_SEA_LEVEL, QCCode, qc_window, station_pressure_expected
+from mayak.data.qc import QC_CODES, QCCode, qc_window, station_pressure_expected
 from mayak.data.recording import RECORD_SCALE, record_channel, record_values, round_half_even
 
 T, P, RH = 0, 1, 2
-DRIFT_GROWTH_MIN_HISTORY = 168
 
-AUG_ORDER = ("coords", "scale", "drift", "offset", "noise", "rh_dewpoint", "spike", "stuck",
-             "units", "dropout", "gap", "outage", "drop_pressure", "drop_humidity")
+AUG_ORDER = ("offset", "noise", "rh_dewpoint", "stuck", "dropout", "gap", "drop_channel")
 
-_STREAM_ID = {"coords": 1, "scale": 2, "drift": 3, "offset": 4, "noise": 5, "spike": 6,
-              "stuck": 7, "units": 8, "dropout": 10, "gap": 11, "outage": 13,
-              "drop_pressure": 14, "drop_humidity": 15, "rh_dewpoint": 16}
+_STREAM_ID = {"offset": 4, "noise": 5, "stuck": 7, "dropout": 10, "gap": 11,
+              "rh_dewpoint": 16, "drop_channel": 18}
 assert set(AUG_ORDER) == set(_STREAM_ID) == set(AUGMENT_PROB_FIELDS)
 
 AUG_KIND = {
-    "coords": "metadata",
-    "scale": "instrument", "drift": "instrument", "offset": "instrument",
-    "noise": "instrument", "rh_dewpoint": "record",
-    "spike": "gross", "stuck": "gross", "units": "gross",
-    "dropout": "availability", "gap": "availability",
-    "outage": "availability", "drop_pressure": "availability", "drop_humidity": "availability",
+    "offset": "instrument", "noise": "instrument", "rh_dewpoint": "record",
+    "stuck": "gross",
+    "dropout": "availability", "gap": "availability", "drop_channel": "availability",
 }
 
 EXPECTED_QC = {
-    "coords": set(), "scale": set(), "drift": set(), "offset": set(), "noise": set(),
-    "rh_dewpoint": set(),
-    "spike": {QCCode.SPIKE, QCCode.RANGE, QCCode.JUMP},
+    "offset": set(), "noise": set(), "rh_dewpoint": set(),
     "stuck": {QCCode.STUCK},
-    "units": {QCCode.UNITS},
-    "dropout": {QCCode.MISSING}, "gap": {QCCode.MISSING},
-    "outage": {QCCode.MISSING}, "drop_pressure": {QCCode.MISSING},
-    "drop_humidity": {QCCode.MISSING},
+    "dropout": {QCCode.MISSING}, "gap": {QCCode.MISSING}, "drop_channel": {QCCode.MISSING},
 }
-SIDE_QC = {name: set() for name in EXPECTED_QC}
-SIDE_QC["units"] = {QCCode.RANGE, QCCode.JUMP, QCCode.SPIKE}
+
+# Варианты ``drop_channel``: каналы, которых нет на всей истории.
+DROP_CHANNEL_VARIANTS = ((P,), (RH,), (P, RH))
+
+
+def station_offset(hour, lon, b, amp=0.0, peak=0.0):
+    """Смещение станции в заданные часы.
+
+    Постоянная часть плюс суточная составляющая: косинус с периодом 24 ч и максимумом
+    в час ``peak`` среднего солнечного времени точки. Солнечный час - час UTC плюс
+    долгота, делённая на 15. При отрицательной амплитуде в час ``peak`` минимум.
+
+    Args:
+        hour: час UTC каждого часа.
+        lon: долгота точки, градусы.
+        b: постоянная часть, °C.
+        amp: амплитуда суточной составляющей, °C.
+        peak: час максимума суточной составляющей по солнечному времени, ч.
+
+    Returns:
+        Массив float32 той же формы, что hour.
+    """
+    hour = np.asarray(hour, np.float64)
+    out = np.full(hour.shape, float(b))
+    if amp:
+        solar = hour + float(lon) / 15.0
+        out += float(amp) * np.cos(2.0 * np.pi * (solar - float(peak)) / 24.0)
+    return out.astype(np.float32)
 
 
 @dataclass
@@ -101,6 +107,7 @@ class AugWindow:
     y_mask: np.ndarray             # (H,) float32, маска цели - только читается
     L: int                         # фактическая длина истории
     hour: np.ndarray               # (L_MAX,) час UTC каждого часа истории
+    hour_fut: np.ndarray           # (H,) час UTC каждого часа горизонта
     lat: float
     lon: float
     elev: float
@@ -115,10 +122,32 @@ class AugWindow:
     def valid_rows(self, ch):
         return self.h0 + np.flatnonzero(self.m[self.h0:, ch] > 0)
 
+    def add_station_offset(self, b, amp=0.0, peak=0.0, target=True):
+        """Прибавить смещение станции к температуре истории и цели.
+
+        Смещение в каждом часе считает ``station_offset`` по часу UTC и долготе окна.
+        Трогаются только валидные значения.
+
+        Args:
+            b: постоянная часть, °C.
+            amp: амплитуда суточной составляющей, °C.
+            peak: час максимума суточной составляющей по солнечному времени, ч.
+            target: смещать ли и цель.
+
+        Returns:
+            То же окно.
+        """
+        d = station_offset(self.hour, self.lon, b, amp, peak)
+        self.x[:, T] += d * (self.m[:, T] > 0)
+        if target:
+            dy = station_offset(self.hour_fut, self.lon, b, amp, peak)
+            self.y[:] = self.y + dy * (self.y_mask > 0)
+        return self
+
 
 _DITHER_STREAM = 17
-DITHER_BEFORE = frozenset({"scale", "drift", "offset", "noise", "rh_dewpoint"})
-ON_TARGET = frozenset({"scale", "drift", "offset"})
+DITHER_BEFORE = frozenset({"offset", "noise", "rh_dewpoint"})
+ON_TARGET = frozenset({"offset"})
 DITHER_FRAC = 0.98
 
 
@@ -174,10 +203,6 @@ def _add_target(w, uy):
     w.y[:] = np.where(w.y_mask > 0, w.y + uy, w.y).astype(np.float32)
 
 
-def _sym(r, a):
-    return float(r.uniform(-a, a)) if a > 0 else 0.0
-
-
 def _signed_mag(r, lo, hi):
     """|v| log-равномерно в [lo, hi] (равномерно в [0, hi] при lo = 0), знак случаен."""
     if hi <= 0:
@@ -193,41 +218,17 @@ def _rand_channel(r, w, need=1):
     return int(ch[r.integers(len(ch))]) if ch else None
 
 
-def _s_coords(r, c, w):
-    return dict(dlat=_sym(r, c.coord_jitter_deg), dlon=_sym(r, c.coord_jitter_deg),
-                delev=float(r.normal(0.0, c.elev_jitter_m)) if c.elev_jitter_m > 0 else 0.0)
-
-
-def _s_scale(r, c, w):
-    return dict(k=[1.0 + _sym(r, a) for a in c.scale_max])
-
-
-def _s_drift(r, c, w):
-    return dict(rate=[_sym(r, a) for a in c.drift_rate_max],
-                walk=bool(r.random() < c.drift_rw_frac), seed=int(r.integers(2 ** 31)),
-                age=int(r.integers(0, c.drift_age_max + 1)))
-
-
 def _s_offset(r, c, w):
-    if w.L == 0 or c.offset_max <= 0:
+    b = _signed_mag(r, c.offset_min, c.offset_max)
+    amp = _signed_mag(r, 0.0, c.offset_diurnal_max) if r.random() < c.offset_diurnal_frac \
+        else 0.0
+    if b == 0.0 and amp == 0.0:
         return None
-    return dict(b=_signed_mag(r, c.offset_min, c.offset_max))
+    return dict(b=b, amp=amp, peak=float(r.uniform(*c.offset_peak_hours)))
 
 
 def _s_noise(r, c, w):
     return dict(sd=list(c.noise_sd), seed=int(r.integers(2 ** 31)))
-
-
-def _s_spike(r, c, w):
-    out = []
-    for _ in range(int(r.integers(1, c.spike_max_count + 1))):
-        ch = _rand_channel(r, w)
-        if ch is None:
-            break
-        rows = w.valid_rows(ch)
-        out.append(dict(ch=ch, i=int(rows[r.integers(len(rows))]),
-                        d=_signed_mag(r, c.spike_min[ch], c.spike_max[ch])))
-    return dict(spikes=out) if out else None
 
 
 def _s_stuck(r, c, w):
@@ -237,14 +238,6 @@ def _s_stuck(r, c, w):
     n = int(r.integers(c.stuck_hours[0], c.stuck_hours[1] + 1))
     rows = w.valid_rows(ch)
     return dict(ch=ch, i=int(rows[r.integers(len(rows))]), n=n)
-
-
-def _s_units(r, c, w):
-    if len(w.valid_rows(P)) == 0:
-        return None
-    n = min(w.L, int(r.integers(c.units_hours[0], c.units_hours[1] + 1)))
-    i = int(w.h0 + r.integers(0, w.L - n + 1))
-    return dict(i=i, n=n)
 
 
 def _s_dropout(r, c, w):
@@ -259,16 +252,9 @@ def _s_gap(r, c, w):
     return dict(gaps=gaps)
 
 
-def _s_outage(r, c, w):
-    n = int(r.integers(c.outage_hours[0], c.outage_hours[1] + 1))
-    if w.L < n + 2:
-        return None
-    ch = int(r.integers(3))
-    return dict(ch=ch, i=int(w.h0 + r.integers(1, w.L - n)), n=n)
-
-
-def _s_drop(r, c, w):
-    return {}
+def _s_drop_channel(r, c, w):
+    p = np.asarray(c.drop_channel_weights, np.float64)
+    return dict(ch=list(DROP_CHANNEL_VARIANTS[int(r.choice(len(p), p=p / p.sum()))]))
 
 
 def _s_rh_dewpoint(r, c, w):
@@ -276,135 +262,8 @@ def _s_rh_dewpoint(r, c, w):
     return {} if both.any() else None
 
 
-def _a_coords(w, p):
-    w.lat = float(np.clip(w.lat + p["dlat"], -90.0, 90.0))
-    w.lon = float((w.lon + p["dlon"] + 180.0) % 360.0 - 180.0)
-    w.elev = float(w.elev + p["delev"])
-    if w.qc_elev is not None:
-        w.qc_elev = float(w.qc_elev + p["delev"])
-
-
-def _on_target(p):
-    """Трогает ли свойство прибора цель.
-
-    Выключается только у вариантов робастности, где искажён один вход.
-    """
-    return bool(p.get("target", True))
-
-
-def _a_scale(w, p):
-    k = np.asarray(p["k"], np.float32)
-    w.x[:] = np.where(w.m > 0, w.x * k, w.x)
-    if _on_target(p):
-        w.y[:] = np.where(w.y_mask > 0, w.y * k[T], w.y)
-
-
-def _drift_after(hours, rate_per_day):
-    """Смещение прибора через заданное число часов после калибровки."""
-    return float(rate_per_day) * hours / 24.0
-
-
-def drift_offset(L, rate_per_day, age=0):
-    """Смещение прибора в последнем часе истории при дрейфе с постоянной скоростью.
-
-    Прибор откалиброван за ``age`` часов до первого часа фактической истории и к её
-    последнему часу уходит на скорость, умноженную на время от калибровки. Одна функция
-    для аугментации и сценария робастности.
-
-    Args:
-        L: длина истории, ч.
-        rate_per_day: скорость дрейфа в единицах канала за сутки.
-        age: возраст калибровки прибора к первому часу истории, ч.
-
-    Returns:
-        Смещение в последнем часе истории; при истории не длиннее часа - смещение в её
-        первом часе.
-    """
-    return _drift_after(int(age) + max(int(L) - 1, 0), rate_per_day)
-
-
-def drift_target(L, rate_per_day, age=0, n=H):
-    """Смещение прибора на часах горизонта цели при дрейфе с постоянной скоростью.
-
-    Отсчёт времени тот же, что в истории, - от калибровки прибора. При истории не короче
-    ``DRIFT_GROWTH_MIN_HISTORY`` смещение на горизонте продолжает расти с той же скоростью
-    без скачка: на первом часе горизонта оно на час дрейфа больше, чем в последнем часе
-    истории. При более короткой истории оно держится на уровне последнего часа истории:
-    смещение, видимое в истории, переносится в цель, а рост, который по короткой истории
-    не оценить, не добавляется. Без истории смещение прибора не видно, и цель не
-    смещается.
-
-    Args:
-        L: длина истории, ч.
-        rate_per_day: скорость дрейфа в единицах канала за сутки.
-        age: возраст калибровки прибора к первому часу истории, ч.
-        n: число часов горизонта.
-
-    Returns:
-        Массив float32 длины n.
-    """
-    if int(L) <= 0 or rate_per_day == 0:
-        return np.zeros(n, np.float32)
-    last = drift_offset(L, rate_per_day, age)
-    if int(L) < DRIFT_GROWTH_MIN_HISTORY:
-        return np.full(n, last, np.float32)
-    k = np.arange(1, n + 1, dtype=np.float64)
-    return (last + _drift_after(k, rate_per_day)).astype(np.float32)
-
-
-def drift_profile(L, start, end, walk, seed):
-    """Смещение прибора на часах истории.
-
-    В первом часе истории смещение равно start, к последнему нарастает до end.
-    Нарастание линейное либо случайным блужданием, которое закреплено на обоих концах.
-    Размах блуждания в середине истории в среднем около половины смещения, набранного за
-    историю.
-
-    Args:
-        L: длина истории, ч.
-        start: смещение прибора в первом часе истории.
-        end: смещение прибора в последнем часе истории.
-        walk: нарастание случайным блужданием, иначе линейное.
-        seed: сид блуждания.
-
-    Returns:
-        Массив float32 длины L; при истории в один час - смещение end.
-    """
-    if L <= 1 or start == end:
-        return np.full(max(L, 0), end, np.float32)
-    k = np.arange(L, dtype=np.float64)
-    out = float(start) + (float(end) - float(start)) * k / (L - 1)
-    if walk:
-        steps = np.random.default_rng(seed).standard_normal(L - 1)
-        path = np.concatenate([[0.0], np.cumsum(steps)])
-        bridge = path - path[-1] * k / (L - 1)
-        out = out + abs(float(end) - float(start)) / np.sqrt(L - 1) * bridge
-    out[0] = float(start)
-    out[-1] = float(end)
-    return out.astype(np.float32)
-
-
-def _a_drift(w, p):
-    """Дрейф каналов с заданными скоростями; цель - температура - смещается тоже.
-
-    Прибор откалиброван за ``age`` часов до первого часа истории. На истории смещение
-    нарастает от смещения первого часа до смещения последнего - линейно или блужданием;
-    на горизонте оно растёт дальше или держится по правилу ``drift_target``.
-    """
-    age = int(p["age"])
-    for ch, rate in enumerate(p["rate"]):
-        d = drift_profile(w.L, _drift_after(age, rate), drift_offset(w.L, rate, age),
-                          p["walk"], p["seed"] + ch)
-        w.x[w.h0:, ch] += d * (w.m[w.h0:, ch] > 0)
-    if _on_target(p):
-        w.y[:] = w.y + drift_target(w.L, p["rate"][T], age, w.y.shape[0]) * (w.y_mask > 0)
-
-
 def _a_offset(w, p):
-    b = np.float32(p["b"])
-    w.x[:, T] += b * (w.m[:, T] > 0)
-    if _on_target(p):
-        w.y[:] = w.y + b * (w.y_mask > 0)
+    w.add_station_offset(p["b"], p["amp"], p["peak"])
 
 
 def _a_noise(w, p):
@@ -413,40 +272,12 @@ def _a_noise(w, p):
     w.x[:] = w.x + e * (w.m > 0)
 
 
-def _a_spike(w, p):
-    for s in p["spikes"]:
-        w.x[s["i"], s["ch"]] += np.float32(s["d"])
-
-
 def _a_stuck(w, p):
     ch, i = p["ch"], p["i"]
     j = min(L_MAX, i + p["n"])
     v = w.x[i, ch]
     seg = w.m[i:j, ch] > 0
     w.x[i:j, ch] = np.where(seg, v, w.x[i:j, ch])
-
-
-def sea_level_ratio(elev):
-    """Во сколько раз давление, приведённое к уровню моря, больше станционного.
-
-    Считается по стандартной атмосфере.
-
-    Args:
-        elev: высота станции, м; отрицательная и отсутствующая считаются нулём.
-
-    Returns:
-        Множитель.
-    """
-    return P_SEA_LEVEL / station_pressure_expected(max(0.0, float(elev or 0.0)))
-
-
-def _a_units(w, p):
-    """Давление, приведённое к уровню моря, вместо станционного на участке истории."""
-    i, j = p["i"], p["i"] + p["n"]
-    seg = w.m[i:j, P] > 0
-    v = w.x[i:j, P]
-    conv = v * np.float32(sea_level_ratio(w.qc_elev if w.qc_elev is not None else w.elev))
-    w.x[i:j, P] = np.where(seg, conv, v)
 
 
 def rh_via_dewpoint(t, rh):
@@ -501,29 +332,16 @@ def _a_gap(w, p):
         w.m[gp["i"]:min(L_MAX, gp["i"] + gp["n"])] = 0.0
 
 
-def _a_outage(w, p):
-    w.m[p["i"]:p["i"] + p["n"], p["ch"]] = 0.0
+def _a_drop_channel(w, p):
+    w.m[:, list(p["ch"])] = 0.0
 
 
-def _a_drop_pressure(w, p):
-    w.m[:, P] = 0.0
-
-
-def _a_drop_humidity(w, p):
-    w.m[:, RH] = 0.0
-
-
-_SAMPLE = {"coords": _s_coords, "scale": _s_scale, "drift": _s_drift, "offset": _s_offset,
-           "noise": _s_noise, "spike": _s_spike, "stuck": _s_stuck, "units": _s_units,
-           "rh_dewpoint": _s_rh_dewpoint, "dropout": _s_dropout, "gap": _s_gap,
-           "outage": _s_outage, "drop_pressure": _s_drop,
-           "drop_humidity": _s_drop}
-_APPLY = {"coords": _a_coords, "scale": _a_scale, "drift": _a_drift, "offset": _a_offset,
-          "noise": _a_noise, "spike": _a_spike, "stuck": _a_stuck, "units": _a_units,
-          "rh_dewpoint": _a_rh_dewpoint, "dropout": _a_dropout, "gap": _a_gap,
-          "outage": _a_outage, "drop_pressure": _a_drop_pressure,
-          "drop_humidity": _a_drop_humidity}
-_NEEDS_HISTORY = frozenset(AUG_ORDER) - {"coords"}
+_SAMPLE = {"offset": _s_offset, "noise": _s_noise, "rh_dewpoint": _s_rh_dewpoint,
+           "stuck": _s_stuck, "dropout": _s_dropout, "gap": _s_gap,
+           "drop_channel": _s_drop_channel}
+_APPLY = {"offset": _a_offset, "noise": _a_noise, "rh_dewpoint": _a_rh_dewpoint,
+          "stuck": _a_stuck, "dropout": _a_dropout, "gap": _a_gap,
+          "drop_channel": _a_drop_channel}
 
 
 def apply_one(w, name, params):
@@ -547,9 +365,9 @@ def apply_one(w, name, params):
 def augment_window(w: AugWindow, cfg: AugmentConfig, rng) -> AugWindow:
     """Все аугментации профиля к окну. Из генератора берётся ровно одно число.
 
-    Перед первым искажением датчика записанным значениям истории возвращается
-    непрерывность, цели - перед первым свойством прибора, которое её трогает. Окно после
-    этой функции нужно записать прибором.
+    Окно без истории не меняется. Перед первым искажением датчика записанным значениям
+    истории возвращается непрерывность, цели - перед смещением станции. Окно после этой
+    функции нужно записать прибором.
 
     Args:
         w: окно; меняется на месте.
@@ -559,12 +377,14 @@ def augment_window(w: AugWindow, cfg: AugmentConfig, rng) -> AugWindow:
     Returns:
         То же окно.
     """
-    streams = aug_streams(rng.integers(2 ** 63))
+    key = rng.integers(2 ** 63)
+    if w.L == 0:
+        return w
+    streams = aug_streams(key)
     noise, target_done = None, False
     for name in AUG_ORDER:
         r = streams[name]
-        fire = r.random() < getattr(cfg, AUGMENT_PROB_FIELDS[name])
-        if not fire or (w.L == 0 and name in _NEEDS_HISTORY):
+        if not r.random() < getattr(cfg, AUGMENT_PROB_FIELDS[name]):
             continue
         params = _SAMPLE[name](r, cfg, w)
         if params is None:
@@ -633,38 +453,30 @@ def make_window(x, hour, L=L_MAX, lat=45.0, lon=10.0, elev=200.0, y=None):
         y: цель на горизонте; None - постоянные 10 °C.
 
     Returns:
-        Окно с полной маской цели.
+        Окно с полной маской цели; горизонт начинается через час после последней строки
+        истории.
     """
     m = np.zeros((L_MAX, 3), np.float32)
     m[L_MAX - L:] = 1.0
     xx = np.where(m > 0, x, 0.0).astype(np.float32)
     y = np.full(H, 10.0, np.float32) if y is None else np.asarray(y, np.float32).copy()
-    return AugWindow(x=xx, m=m, y=y, y_mask=np.ones(H, np.float32), L=L,
-                     hour=np.asarray(hour, np.float32), lat=lat, lon=lon, elev=elev,
-                     qc_elev=elev)
+    hour = np.asarray(hour, np.float32)
+    hour_fut = ((hour[-1] + 1 + np.arange(H)) % 24).astype(np.float32)
+    return AugWindow(x=xx, m=m, y=y, y_mask=np.ones(H, np.float32), L=L, hour=hour,
+                     hour_fut=hour_fut, lat=lat, lon=lon, elev=elev, qc_elev=elev)
 
 
-_H0 = L_MAX - 24 * 28
 REFERENCE_CASES = (
-    ("spike_T", "spike", dict(spikes=[dict(ch=T, i=400, d=20.0)]), 200.0, T, (400, 401)),
-    ("spike_P", "spike", dict(spikes=[dict(ch=P, i=410, d=-25.0)]), 200.0, P, (410, 411)),
     ("stuck_T_96h", "stuck", dict(ch=T, i=300, n=96), 200.0, T, (372, 396)),
     ("stuck_RH_48h", "stuck", dict(ch=RH, i=200, n=48), 200.0, RH, (223, 248)),
-    ("units_P_slp", "units", dict(i=250, n=72), 1500.0, P, (256, 322)),
     ("dropout", "dropout", dict(rate=0.2, seed=3), 200.0, None, None),
     ("gap_3d", "gap", dict(gaps=[dict(i=100, n=72)]), 200.0, None, (100, 172)),
-    ("outage_RH", "outage", dict(ch=RH, i=150, n=120), 200.0, RH, (150, 270)),
-    ("drop_pressure", "drop_pressure", {}, 200.0, P, (0, L_MAX)),
-    ("drop_humidity", "drop_humidity", {}, 200.0, RH, (0, L_MAX)),
-    ("scale", "scale", dict(k=[1.03, 1.0005, 1.05]), 200.0, None, None),
-    ("drift_linear", "drift", dict(rate=[0.07, 0.05, 0.2], walk=False, seed=0, age=168),
-     200.0, None, None),
-    ("drift_walk", "drift", dict(rate=[0.07, 0.05, 0.2], walk=True, seed=1, age=336), 200.0,
-     None, None),
-    ("offset", "offset", dict(b=3.0), 200.0, None, None),
+    ("drop_pressure", "drop_channel", dict(ch=[P]), 200.0, P, (0, L_MAX)),
+    ("drop_humidity", "drop_channel", dict(ch=[RH]), 200.0, RH, (0, L_MAX)),
+    ("drop_both", "drop_channel", dict(ch=[P, RH]), 200.0, [P, RH], (0, L_MAX)),
+    ("offset", "offset", dict(b=2.0, amp=1.5, peak=14.0), 200.0, None, None),
     ("noise", "noise", dict(sd=[0.2, 0.3, 2.0], seed=5), 200.0, None, None),
     ("rh_dewpoint", "rh_dewpoint", {}, 200.0, None, None),
-    ("coords", "coords", dict(dlat=0.3, dlon=-0.3, delev=40.0), 200.0, None, None),
 )
 
 
@@ -729,13 +541,13 @@ def qc_effect(name, before, after, ch=None, rows=None):
         Словарь. ``hit`` - появился ли на затронутых часах хотя бы один ожидаемый код;
         для аугментаций, которые QC не должен видеть, - None. ``hit_frac`` - доля
         затронутых часов с ожидаемым кодом. ``side_frac`` - доля часов, валидных до
-        аугментации, с новым кодом вне ожидаемых, допустимых побочных и кода пропуска.
+        аугментации, с новым кодом вне ожидаемых и кода пропуска.
         ``new`` - число часов с каждым новым кодом.
     """
     cb, ca = window_codes(before), window_codes(after)
     new = ca & ~cb
     exp = _bits(EXPECTED_QC[name])
-    allowed = exp | _bits(SIDE_QC[name]) | np.uint8(QCCode.MISSING)
+    allowed = exp | np.uint8(QCCode.MISSING)
     r = slice(None) if rows is None else slice(*rows)
     c = slice(None) if ch is None else ch
     reg = new[r, c]
@@ -749,8 +561,7 @@ def qc_effect(name, before, after, ch=None, rows=None):
                      if ((new & q) > 0).any()})
 
 
-__all__ = ["AUG_KIND", "AUG_ORDER", "AugWindow", "EXPECTED_QC", "REFERENCE_CASES", "SIDE_QC",
-           "DITHER_BEFORE", "DRIFT_GROWTH_MIN_HISTORY", "apply_one", "aug_streams",
-           "augment_window", "clean_history", "dither_window", "drift_offset", "drift_profile",
-           "drift_target", "make_window", "qc_effect", "record_window", "reference_windows",
-           "rh_via_dewpoint", "sea_level_ratio", "window_codes"]
+__all__ = ["AUG_KIND", "AUG_ORDER", "AugWindow", "DITHER_BEFORE", "DROP_CHANNEL_VARIANTS",
+           "EXPECTED_QC", "REFERENCE_CASES", "apply_one", "aug_streams", "augment_window",
+           "clean_history", "dither_window", "make_window", "qc_effect", "record_window",
+           "reference_windows", "rh_via_dewpoint", "station_offset", "window_codes"]

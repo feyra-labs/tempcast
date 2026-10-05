@@ -7,14 +7,15 @@ defaults:
   - model: mayak
   - ablation: none
   - data: default
-  - augment: aggressive
+  - augment: default
   - train: default
   - _self_
 
 run:
   out_root: runs
-  # имя прогона: архитектура, вариант абляции, базовый сид
-  tag: ${model.arch}-${hydra:runtime.choices.ablation}-s${train.seed}
+  # имя прогона: архитектура, вариант абляции, профиль аугментаций (кроме default),
+  # базовый сид
+  tag: ${model.arch}-${hydra:runtime.choices.ablation}${aug_suffix:${data.augment.profile}}-s${train.seed}
   accelerator: gpu
   # Раздельный запуск этапов; в протокол не входит и на сравнение моделей не влияет.
   # Этапы этого запуска подряд в порядке протокола, например [A] или [B]; null - все.
@@ -52,7 +53,7 @@ hydra:
         python scripts/run.py model.encoder_width=64 train.seed=1
         python scripts/run.py -m ablation=none,no_compression train.seed=0
         python scripts/run.py -m train.seed=0,1,2
-        python scripts/run.py augment=soft          # профиль аугментаций
+        python scripts/run.py augment=none          # профиль аугментаций
         python scripts/run.py run.stages=[A]        # только этап A, затем отчёт о поле
         python scripts/run.py run.stages=[B] run.init_from=<чекпойнт этапа A>
 
