@@ -134,12 +134,13 @@ class ModeGroup:
 
 
 PERSISTENT_GROUP = "P"
+PERSISTENT_PERIODS = (0.0, 24.0)
 DEFAULT_MODE_GROUPS = (
     ModeGroup("R", (3, 6, 12, 24, 48, 96, 168, 240), (0.0,)),
     ModeGroup("D", (12, 24, 48, 96, 168, 240), (24.0,)),
     ModeGroup("S", (12, 24, 72, 168), (12.0,)),
     ModeGroup("W", (24, 48, 72, 120, 168, 240), (60, 84, 108, 132, 156, 192)),
-    ModeGroup(PERSISTENT_GROUP, (2000.0,), (0.0,), (720.0, 8760.0)),
+    ModeGroup(PERSISTENT_GROUP, (2000.0, 2000.0), PERSISTENT_PERIODS, (720.0, 8760.0)),
 )
 
 ENCODER_CHANNELS = ("aT", "aTc", "adef", "dP3", "dP24", "rh", "sin_d", "cos_d", "czp",
@@ -163,8 +164,8 @@ class Ablations:
             Гармонический базис климат-поля не трогается: это часть якоря.
         no_mode_groups: групповой структуры нет: все моды, кроме квазипостоянной группы,
             одной группой, постоянные времени и периоды при инициализации идут
-            равномерно в логарифме. Квазипостоянная группа остаётся отдельной со своими
-            пределами, поэтому групповых энергий две.
+            равномерно в логарифме. Квазипостоянная группа остаётся отдельной с обеими
+            модами, своими периодами и пределами, поэтому групповых энергий две.
         no_offset_aug: без аугментации постоянного смещения температуры. Это свойство
             потока данных, но флаг живёт здесь, чтобы абляция задавалась в одном
             месте; полная конфигурация прогона переносит его в аугментации данных.
@@ -201,9 +202,10 @@ class ModelConfig:
         max_history: наибольшая длина истории, ч, кратно суткам.
         quantiles: уровни квантилей по возрастанию, среди них медиана.
         mode_groups: группы затухающих мод. Группа с именем ``P`` - квазипостоянная:
-            её мода не колеблется и затухает медленнее всех, через неё идёт устойчивое
-            смещение станции в градусах. В среднюю массу свидетельств голов она не
-            входит.
+            её моды затухают медленнее всех, через них идёт устойчивое смещение станции
+            в градусах - константа плюс суточная составляющая. Периоды мод группы - только
+            0 и 24 ч, их частоты не подстраиваются ни считыванием, ни паспортом. В
+            среднюю массу свидетельств голов группа не входит.
         tau_bounds: общие пределы постоянных времени мод, ч; группа может задать свои.
         passport_dim: размер паспорта станции.
         passport_hidden: ширина скрытого слоя кодировщика паспорта.
@@ -218,6 +220,8 @@ class ModelConfig:
         field_hidden: ширина скрытых слоёв климат-поля.
         heads_hidden: ширина скрытых слоёв голов.
         heads_z_proj: размер проекции паспорта на вход голов.
+        field_weight_decay: весовое затухание матриц весов климат-поля вместо
+            базового затухания протокола.
         ablations: флаги абляций.
     """
     arch: str = "mayak"
@@ -239,6 +243,7 @@ class ModelConfig:
     field_hidden: int = 128
     heads_hidden: int = 48
     heads_z_proj: int = 4
+    field_weight_decay: float = 0.5
     ablations: Ablations = Ablations()
 
     def __post_init__(self):
@@ -258,7 +263,7 @@ class ModelConfig:
                      "encoder_kernel", "encoder_norm_groups", "loc_freqs", "field_hidden",
                      "heads_hidden", "heads_z_proj", "loc_seed"):
             s(self, name, int(getattr(self, name)))
-        for name in ("loc_freq_scale", "loc_freq_max"):
+        for name in ("loc_freq_scale", "loc_freq_max", "field_weight_decay"):
             s(self, name, float(getattr(self, name)))
         self._validate()
 
@@ -285,10 +290,9 @@ class ModelConfig:
         if not names or len(set(names)) != len(names):
             raise ConfigError(f"имена групп мод пусты или повторяются: {names}")
         for g in self.mode_groups:
-            if g.name == PERSISTENT_GROUP and any(p > 0 for p in g.period):
-                raise ConfigError(f"группа мод {g.name!r} квазипостоянная: её моды не "
-                                  f"колеблются, периоды должны быть нулевыми, получено "
-                                  f"{g.period}")
+            if g.name == PERSISTENT_GROUP and not set(g.period) <= set(PERSISTENT_PERIODS):
+                raise ConfigError(f"группа мод {g.name!r} квазипостоянная: периоды её мод "
+                                  f"только из {PERSISTENT_PERIODS}, получено {g.period}")
         if names == [PERSISTENT_GROUP]:
             raise ConfigError(f"кроме квазипостоянной группы {PERSISTENT_GROUP!r} нужна хотя "
                               f"бы одна группа мод: по ней считается масса свидетельств голов")
@@ -303,6 +307,9 @@ class ModelConfig:
                      "field_hidden", "heads_hidden", "heads_z_proj"):
             if getattr(self, name) < 1:
                 raise ConfigError(f"{name} < 1")
+        if not (math.isfinite(self.field_weight_decay) and self.field_weight_decay >= 0.0):
+            raise ConfigError(f"field_weight_decay = {self.field_weight_decay}: нужно конечное "
+                              f"число не меньше нуля")
 
     @property
     def effective_mode_groups(self):
@@ -310,8 +317,8 @@ class ModelConfig:
 
         Абляция снимает структуру только с мод погоды: они сливаются в одну группу с
         однородной инициализацией в общих пределах модели. Квазипостоянная группа
-        остаётся отдельной группой после неё, со своими начальными постоянными времени и
-        пределами: она описывает смещение станции, а не погоду.
+        остаётся отдельной группой после неё, с обеими модами, их начальными постоянными
+        времени, периодами и пределами: она описывает смещение станции, а не погоду.
         """
         if not self.ablations.no_mode_groups:
             return self.mode_groups
@@ -338,6 +345,7 @@ class ModelConfig:
 
         Их вклад в медиану переводится в градусы постоянным масштабом, а не
         климатологическим разбросом точки: через них идёт устойчивое смещение станции.
+        Частоты этих мод фиксированы: их не подстраивают ни считывание, ни паспорт.
 
         Returns:
             Кортеж флагов по модам в порядке мод модели.
@@ -349,8 +357,8 @@ class ModelConfig:
     def evidence_modes(self):
         """Моды, по которым головы считают среднюю массу свидетельств.
 
-        Масса квазипостоянной моды за полную историю в разы больше массы остальных и
-        растёт почти линейно с длиной истории, поэтому в среднее она не входит: вес
+        Масса квазипостоянных мод за полную историю в разы больше массы остальных и
+        растёт почти линейно с длиной истории, поэтому в среднее они не входят: вес
         поправки и вход голов описывают свидетельства о погоде.
 
         Returns:
@@ -1585,6 +1593,7 @@ __all__ = ["ABLATION_NAMES", "AUGMENT_PROB_FIELDS", "AUGMENT_PROFILES", "Ablatio
            "DEFAULT_MODE_GROUPS",
            "DLinearConfig", "DataConfig", "ENCODER_CHANNELS", "GRUConfig", "LRUConfig",
            "LRU_SCANS", "MODEL_CONFIGS", "ModeGroup", "ModelConfig", "PERSISTENT_GROUP",
+           "PERSISTENT_PERIODS",
            "PatchTSTConfig",
            "DEFAULT_SCENARIOS", "ROBUSTNESS_QC", "RobustnessConfig", "RunConfig", "RuntimeConfig",
            "SCENARIO_INPUT", "SCENARIO_INSTRUMENT", "SCENARIO_RULES", "SOLAR_CHANNELS",

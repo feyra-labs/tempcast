@@ -1,9 +1,9 @@
 """LightningModule - один на все архитектуры.
 
-Оптимизатор, расписание, EMA весов, функция потерь и логирование валидации берутся
-из протокола обучения и одинаковы для любой архитектуры. Архитектура
-отвечает только за прямой проход, свои регуляризаторы (не зависят от цели) и группы
-весового затухания.
+Оптимизатор, расписание, EMA весов, функция потерь, правило весового затухания и
+логирование валидации берутся из протокола обучения и одинаковы для любой архитектуры.
+Архитектура отвечает только за прямой проход, свои регуляризаторы (не зависят от цели)
+и объявленные отличия от правила весового затухания.
 
 Критерий выбора чекпойнта ``val/loss`` - общая часть функции потерь (нормированный
 pinball) без регуляризаторов: одно и то же число для всех моделей. Рядом пишется тот же
@@ -19,6 +19,7 @@ import copy
 
 import pytorch_lightning as L
 import torch
+import torch.nn as nn
 from pytorch_lightning.callbacks import Callback, ModelCheckpoint
 
 from mayak.baselines import DLinear, GRUSeq2Seq, LRUForecaster, PatchTST
@@ -32,6 +33,8 @@ from mayak.stages import STAGE_KEY
 
 LEADS = [1, 3, 6, 12, 24, 48, 72, 120, 168]
 RUN_KEY = "mayak_run"
+
+DECAY_LAYERS = (nn.Linear, nn.Conv1d, nn.GRU)
 
 ARCHS = {"mayak": MAYAK, "gru": GRUSeq2Seq, "dlinear": DLinear, "lru": LRUForecaster,
          "patchtst": PatchTST}
@@ -70,21 +73,57 @@ def regularization(model, out):
     return fn(out) if fn is not None else out["q"].new_zeros(())
 
 
+def decayed_by_rule(model):
+    """Параметры, которые по общему правилу получают весовое затухание.
+
+    Args:
+        model: модель любой архитектуры.
+
+    Returns:
+        Множество имён параметров: веса слоёв ``Linear``, ``Conv1d`` и ``GRU``.
+    """
+    return {f"{mod_name}.{name}" if mod_name else name
+            for mod_name, mod in model.named_modules() if isinstance(mod, DECAY_LAYERS)
+            for name, _ in mod.named_parameters(recurse=False) if name.startswith("weight")}
+
+
 def optim_groups(model, weight_decay):
-    """Группы параметров архитектуры для оптимизатора.
+    """Группы параметров для оптимизатора по общему правилу весового затухания.
+
+    Базовое затухание протокола получают только веса слоёв ``Linear``, ``Conv1d`` и
+    ``GRU``. Все остальные параметры - смещения, нормы, скалярные, векторные и прочие
+    обучаемые тензоры - идут без затухания. Архитектура может объявить отличия методом
+    ``decay_exceptions(weight_decay)``: список групп с именем, затуханием и признаком
+    ``match(имя параметра, затухание по правилу)``. Параметр попадает в первую
+    подходящую группу отличий, иначе - в группу по правилу.
 
     Args:
         model: модель любой архитектуры.
         weight_decay: базовое весовое затухание протокола.
 
     Returns:
-        Список групп; если архитектура их не задаёт - одна группа с базовым затуханием.
+        Список групп с ключами name, params и weight_decay: группы отличий в порядке
+        объявления, затем ``decay`` и ``no_decay``. Каждый обучаемый параметр - ровно в
+        одной группе; группа может быть пустой.
     """
-    fn = getattr(model, "optim_groups", None)
-    if fn is not None:
-        return fn(weight_decay)
-    return [dict(name="all", params=[p for p in model.parameters() if p.requires_grad],
-                 weight_decay=weight_decay)]
+    rule = decayed_by_rule(model)
+    fn = getattr(model, "decay_exceptions", None)
+    special = list(fn(weight_decay)) if fn is not None else []
+    groups = [dict(name=s["name"], params=[], weight_decay=float(s["weight_decay"]))
+              for s in special]
+    decay = dict(name="decay", params=[], weight_decay=float(weight_decay))
+    no_decay = dict(name="no_decay", params=[], weight_decay=0.0)
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        by_rule = name in rule
+        for s, g in zip(special, groups):
+            if s["match"](name, by_rule):
+                g["params"].append(p)
+                break
+        else:
+            (decay if by_rule else no_decay)["params"].append(p)
+    return [*groups, decay, no_decay]
 
 
 def parameter_counts(model):
@@ -108,9 +147,21 @@ def parameter_counts(model):
 
 
 def param_group_summary(model, weight_decay):
+    """Сводка групп весового затухания для журнала прогона.
+
+    Args:
+        model: модель любой архитектуры.
+        weight_decay: базовое весовое затухание протокола.
+
+    Returns:
+        Список по группам: имя, затухание, число тензоров и параметров и имена
+        параметров группы.
+    """
+    names = {id(p): n for n, p in model.named_parameters()}
     return [dict(name=g["name"], n_tensors=len(g["params"]),
                  n_params=int(sum(p.numel() for p in g["params"])),
-                 weight_decay=float(g["weight_decay"]))
+                 weight_decay=float(g["weight_decay"]),
+                 params=[names[id(p)] for p in g["params"]])
             for g in optim_groups(model, weight_decay)]
 
 

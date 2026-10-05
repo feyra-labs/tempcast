@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 EVIDENCE_FLOOR = 1.0
+OMEGA_TUNE = 0.15
 
 
 def mode_bounds(tau_bounds, n_modes):
@@ -32,7 +33,9 @@ class LaplaceReadout(nn.Module):
     """Считывание затухающих мод по истории признаков энкодера.
 
     Каждая мода затухает со своей постоянной времени и вращается со своей частотой.
-    Формула моды - в описании модели.
+    Частота моды - начальная частота, умноженная на обучаемый множитель в пределах
+    exp(±OMEGA_TUNE). У мод с фиксированной частотой множителя нет: частота равна
+    начальной. Формула моды - в описании модели.
 
     Args:
         width: ширина признаков энкодера.
@@ -45,9 +48,15 @@ class LaplaceReadout(nn.Module):
             свидетельств плюс обучаемую силу сжатия, поэтому при малой массе аномалия
             стягивается к нулю. Ложь - абляция ``no_compression``: деление только на
             массу свидетельств с нижней границей.
+        fixed_freq: флаги мод с фиксированной частотой, по одному на моду; None - таких
+            мод нет.
+
+    Raises:
+        ValueError: флагов фиксированной частоты не по числу мод.
     """
 
-    def __init__(self, width, groups, tau_bounds=(3.0, 240.0), compression=True):
+    def __init__(self, width, groups, tau_bounds=(3.0, 240.0), compression=True,
+                 fixed_freq=None):
         super().__init__()
         self.compression = compression
         tau0 = torch.tensor([t for g in groups for t in g.tau0])
@@ -55,10 +64,14 @@ class LaplaceReadout(nn.Module):
         M = len(tau0)
         self.n_modes = M
         lo, hi = mode_bounds(tau_bounds, M)
-        # Пределы следуют из конфига, который лежит в чекпойнте, поэтому в состояние
-        # модуля они не пишутся.
+        fixed = [False] * M if fixed_freq is None else [bool(f) for f in fixed_freq]
+        if len(fixed) != M:
+            raise ValueError(f"флагов фиксированной частоты {len(fixed)}, а мод {M}")
+        # Пределы и флаги следуют из конфига, который лежит в чекпойнте, поэтому в
+        # состояние модуля они не пишутся.
         self.register_buffer("tau_lo", lo, persistent=False)
         self.register_buffer("tau_hi", hi, persistent=False)
+        self.register_buffer("fixed_freq", torch.tensor(fixed), persistent=False)
         self.raw_tau = nn.Parameter(torch.logit(((tau0 - lo) / (hi - lo)).clamp(1e-3, 1 - 1e-3)))
 
         w = 2 * math.pi
@@ -71,8 +84,15 @@ class LaplaceReadout(nn.Module):
         self.proj = nn.Linear(width, 2 * M)
 
     def constants(self):
+        """Постоянные времени, частоты и силы сжатия мод.
+
+        Returns:
+            Тройка тензоров формы (M,): постоянные времени, ч, частоты, рад/ч, - у мод с
+            фиксированной частотой начальные, - и силы сжатия.
+        """
         tau = self.tau_lo + (self.tau_hi - self.tau_lo) * torch.sigmoid(self.raw_tau)
-        omega = self.omega0 * torch.exp(0.15 * torch.tanh(self.p_w))
+        tuned = self.omega0 * torch.exp(OMEGA_TUNE * torch.tanh(self.p_w))
+        omega = torch.where(self.fixed_freq, self.omega0, tuned)
         kappa = 1.0 + F.softplus(self.p_k)
         return tau, omega, kappa
 

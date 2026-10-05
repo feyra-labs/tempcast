@@ -142,17 +142,26 @@ def test_empty_history_gives_zero_anomaly_and_field_median():
 
 
 def test_station_offset_in_degrees_does_not_depend_on_passport_or_hour():
-    """Смещение через квазипостоянную моду - одни и те же градусы на любом часе и паспорте.
+    """Смещение станции через моды группы P.
 
-    Мод погоды нет, свидетельств о погоде нет, поэтому поправка голов равна нулю.
-    Разность медианы и среднего поля, делённая на затухание моды по лиду, обязана быть
-    одним числом на всех лидах, в окнах с разным часом суток и с разными паспортами.
-    Затухание само зависит от паспорта: он подстраивает постоянную времени моды.
+    Постоянная мода P - одни и те же градусы на любом часе и паспорте. Мод погоды нет,
+    свидетельств о погоде нет, поэтому поправка голов равна нулю. Разность медианы и
+    среднего поля, делённая на затухание постоянной моды по лиду, обязана быть одним
+    числом на всех лидах, в окнах с разным часом суток и с разными паспортами. Затухание
+    само зависит от паспорта: он подстраивает постоянную времени моды.
+
+    Суточная мода P - частота ровно 2π/24 при любом паспорте и любом ``p_w``, хотя
+    частоты мод погоды подстраиваются и тем, и другим.
     """
     model = _shaken_model()
     cfg = model.cfg
     p = torch.tensor(cfg.persistent_modes)
-    assert p.sum() == 1, "тест рассчитан на одну квазипостоянную моду"
+    const = p & (model.readout.omega0 == 0)
+    daily = p & (model.readout.omega0 > 0)
+    assert const.sum() == 1 and daily.sum() == 1, "тест рассчитан на моды P с периодами 0 и 24"
+    with torch.no_grad():
+        model.readout.p_w.add_(2.0 * torch.randn(model.readout.p_w.shape,
+                                                 generator=torch.Generator().manual_seed(3)))
     B = 2
     lat, lon, elev = torch.full((B,), 48.0), torch.full((B,), 11.0), torch.full((B,), 500.0)
     h = torch.arange(1, H + 1, dtype=torch.float32)
@@ -160,8 +169,8 @@ def test_station_offset_in_degrees_does_not_depend_on_passport_or_hour():
     hoy = start + h[None]
     astro_f = astro_features(hoy / 24.0, hoy % 24.0, lat[:, None], lon[:, None])
     z = 1.5 * torch.randn(B, cfg.passport_dim, generator=torch.Generator().manual_seed(5))
-    a_re = torch.where(p, torch.tensor(0.7), torch.tensor(0.0)).expand(B, -1)
-    a_im = torch.where(p, torch.tensor(-0.3), torch.tensor(0.0)).expand(B, -1)
+    a_re = torch.where(const, torch.tensor(0.7), torch.tensor(0.0)).expand(B, -1)
+    a_im = torch.where(const, torch.tensor(-0.3), torch.tensor(0.0)).expand(B, -1)
     e = torch.where(p, torch.tensor(50.0), torch.tensor(0.0)).expand(B, -1)
     with torch.no_grad():
         loc = model.loc(lat, lon, elev)
@@ -169,16 +178,25 @@ def test_station_offset_in_degrees_does_not_depend_on_passport_or_hour():
         out = model.issue(loc, z, coefs, a_re, a_im, e, astro_f)
         mu_c, sigma_0, _ = model.field.evaluate(coefs, astro_f)
         tau, omega, _ = model.readout.constants()
-        tau_s, _ = model.propagator.site_constants(z, tau, omega)
+        tau_s, omg_s = model.propagator.site_constants(z, tau, omega)
     sigma_z = out["sigma_c"]
     assert (sigma_0.amax(-1) - sigma_0.amin(-1)).min() > 1e-3, "тест вырожден: σ без хода"
     assert (sigma_z[0] - sigma_z[1]).abs().max() > 1e-3, "тест вырожден: паспорт не влияет"
-    assert not torch.allclose(tau_s[0, p], tau_s[1, p]), "тест вырожден: τ моды одна"
+    assert not torch.allclose(tau_s[0, const], tau_s[1, const]), "тест вырожден: τ моды одна"
+
+    weather = (~p) & (model.readout.omega0 > 0)
+    assert not torch.allclose(omega[weather], model.readout.omega0[weather]), (
+        "тест вырожден: p_w не меняет частоты мод погоды")
+    assert not torch.allclose(omg_s[0, weather], omg_s[1, weather]), (
+        "тест вырожден: паспорт не меняет частоты мод погоды")
+    day = torch.tensor(2 * math.pi / 24.0)
+    torch.testing.assert_close(omega[daily], day.expand(1))
+    torch.testing.assert_close(omg_s[:, daily], day.expand(B, 1))
 
     assert torch.equal(out["r"], torch.zeros_like(out["r"]))
-    level = (out["mu"] - mu_c) / torch.exp(-h[None] / tau_s[:, p])
+    level = (out["mu"] - mu_c) / torch.exp(-h[None] / tau_s[:, const])
     w = model.propagator
-    expect = P_MODE_SCALE * float((w.w_re[p] * 0.7 - w.w_im[p] * 0.3).sum().detach())
+    expect = P_MODE_SCALE * float((w.w_re[const] * 0.7 - w.w_im[const] * 0.3).sum().detach())
     assert abs(expect) > 0.1, "тест вырожден: вклад моды почти нулевой"
     torch.testing.assert_close(level, torch.full_like(level, expect), rtol=1e-5, atol=1e-5)
 

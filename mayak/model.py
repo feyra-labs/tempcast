@@ -25,10 +25,11 @@ class MAYAK(nn.Module):
     Аномалия мод погоды и поправка измеряются в единицах климатологического разброса
     точки без паспорта - того же, что нормирует историю, - и переводятся в градусы
     умножением на него. Вклад квазипостоянных мод переводится в градусы постоянным
-    масштабом ``P_MODE_SCALE``: устойчивое смещение станции на выходе одно и то же на
-    всех часах суток и не зависит от паспорта. Паспорт задаёт ширину интервала через
-    разброс поля с паспортом и подстраивает постоянные времени мод. Формула - в описании
-    модели.
+    масштабом ``P_MODE_SCALE``: устойчивое смещение станции - константа плюс суточная
+    составляющая с фиксированным периодом 24 ч; масштаб перевода не зависит ни от часа
+    суток, ни от паспорта. Паспорт задаёт ширину интервала через разброс поля с
+    паспортом и подстраивает постоянные времени мод и частоты мод погоды. Формула - в
+    описании модели.
 
     Вся архитектура задаётся конфигом модели: размеры, группы мод, квантили, флаги
     абляций. Производные размерности - каналы энкодера, вход голов, число групп -
@@ -39,8 +40,6 @@ class MAYAK(nn.Module):
     Args:
         cfg: конфиг модели; None - значения по умолчанию.
     """
-    NO_WD_SUFFIX = ("raw_tau", "p_w", "p_k", "r_kappa")
-    FIELD_WEIGHT_DECAY = 0.5
 
     def __init__(self, cfg=None):
         super().__init__()
@@ -57,7 +56,8 @@ class MAYAK(nn.Module):
         self.encoder = SynopticEncoder(cfg.n_channels, cfg.encoder_width, cfg.encoder_dilations,
                                        cfg.encoder_kernel, cfg.encoder_norm_groups)
         self.readout = LaplaceReadout(cfg.encoder_width, cfg.effective_mode_groups,
-                                      cfg.mode_tau_bounds, compression=not abl.no_compression)
+                                      cfg.mode_tau_bounds, compression=not abl.no_compression,
+                                      fixed_freq=cfg.persistent_modes)
         self.propagator = ModalPropagator(cfg.n_modes, cfg.passport_dim, cfg.group_sizes,
                                           cfg.horizon, cfg.mode_tau_bounds,
                                           cfg.persistent_modes)
@@ -69,30 +69,21 @@ class MAYAK(nn.Module):
     def regularization(self, out):
         return mayak_regularizers(out)
 
-    def optim_groups(self, weight_decay):
-        """Группы параметров для оптимизатора протокола.
+    def decay_exceptions(self, weight_decay):
+        """Отличия от общего правила весового затухания.
 
-        Климат-поле получает своё весовое затухание, нормы и смещения - нулевое.
+        Веса слоёв климат-поля, которые по общему правилу получают затухание, получают
+        затухание поля из конфига вместо базового. Смещения поля, как и все остальные
+        параметры вне правила, остаются без затухания.
 
         Args:
             weight_decay: базовое весовое затухание протокола.
 
         Returns:
-            Список словарей с именем группы, параметрами и весовым затуханием.
+            Список из одной группы ``field``.
         """
-        no_decay, field, rest = [], [], []
-        for n, p in self.named_parameters():
-            if not p.requires_grad:
-                continue
-            if n.split(".")[-1] in self.NO_WD_SUFFIX:
-                no_decay.append(p)
-            elif n.startswith("field."):
-                field.append(p)
-            else:
-                rest.append(p)
-        return [dict(name="rest", params=rest, weight_decay=weight_decay),
-                dict(name="field", params=field, weight_decay=self.FIELD_WEIGHT_DECAY),
-                dict(name="no_decay", params=no_decay, weight_decay=0.0)]
+        return [dict(name="field", weight_decay=self.cfg.field_weight_decay,
+                     match=lambda name, by_rule: by_rule and name.startswith("field."))]
 
     def build_channels(self, x, mask, astro_h, mu_c, sigma_c, defc):
         """Входные каналы энкодера в порядке имён каналов конфига.
@@ -171,8 +162,9 @@ class MAYAK(nn.Module):
         Returns:
             Словарь: квантили (B, H, число квантилей), медиана, среднее поля ``mu_c``,
             разброс поля с паспортом ``sigma_c`` и без него ``sigma_0``, аномалия мод
-            погоды ``o``, вклад квазипостоянных мод ``o_p``, поправка, масштаб
-            интервала и энергии групп мод.
+            погоды ``o``, вклад квазипостоянных мод ``o_p`` - постоянная и суточная
+            составляющие смещения станции, - поправка, масштаб интервала и энергии групп
+            мод.
         """
         mu_c, sigma_0, _ = self.field.evaluate(coefs, astro_f)
         _, sigma_z, _ = self.field.evaluate(self.field.coefficients(loc, z), astro_f)

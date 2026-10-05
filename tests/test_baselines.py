@@ -146,18 +146,44 @@ def test_lru_input_normalization_keeps_state_variance(modulus):
     assert abs(var - 1.0) < 0.1, var
 
 
-def test_lru_optim_groups_exclude_recurrent_params_from_weight_decay():
-    m = _model("lru")
-    groups = m.optim_groups(0.01)
-    names = {n for n, _ in m.named_parameters()}
-    by_id = {id(p): n for n, p in m.named_parameters()}
-    rec = [by_id[id(p)] for p in groups[0]["params"]]
-    oth = [by_id[id(p)] for p in groups[1]["params"]]
-    assert groups[0]["name"] == "recurrent" and groups[0]["weight_decay"] == 0.0
-    assert groups[1]["weight_decay"] == 0.01
-    assert set(rec) | set(oth) == names and not set(rec) & set(oth)
-    assert {n.rsplit(".", 1)[-1] for n in rec} == {"nu_log", "theta_log", "gamma_log",
-                                                   "B_re", "B_im"}
+NO_DECAY_PARAMS = ("bias", "gaps", "log_sig", "W_pos", "prior_m", "prior_s", "w_re", "w_im",
+                   "raw_tau", "p_w", "p_k", "r_kappa", "nu_log", "theta_log", "gamma_log",
+                   "B_re", "B_im", "D")
+
+
+def test_weight_decay_only_on_layer_weights():
+    """Общее правило весового затухания у всех архитектур.
+
+    Затухание получают только веса слоёв Linear, Conv1d и GRU и отличия, объявленные
+    архитектурой: матрицы климат-поля МАЯК - с затуханием поля, матрицы C ядра LRU - с
+    базовым. Смещения, нормы, скалярные и векторные параметры - без затухания.
+    """
+    from mayak.lit import build_model, optim_groups
+    from mayak.protocol import ARCH_NAMES
+    wd = 0.01
+    for arch in ARCH_NAMES:
+        torch.manual_seed(0)
+        m = build_model(arch)
+        by_id = {id(p): n for n, p in m.named_parameters()}
+        groups = optim_groups(m, wd)
+        placed = [by_id[id(p)] for g in groups for p in g["params"]]
+        assert sorted(placed) == sorted(by_id.values()), f"{arch}: параметр не в одной группе"
+        decay = {by_id[id(p)]: g["weight_decay"] for g in groups for p in g["params"]
+                 if g["weight_decay"] > 0}
+        layers = {f"{mn}.{pn}" for mn, mod in m.named_modules()
+                  if isinstance(mod, (nn.Linear, nn.Conv1d, nn.GRU))
+                  for pn, _ in mod.named_parameters(recurse=False) if pn.startswith("weight")}
+        if arch == "lru":
+            layers |= {n for n in by_id.values() if n.rsplit(".", 1)[-1] in ("C_re", "C_im")}
+        assert set(decay) == layers, (arch, sorted(set(decay) ^ layers))
+        assert all(dict(m.named_parameters())[n].dim() >= 2 for n in decay), arch
+        assert not [n for n in decay if n.rsplit(".", 1)[-1] in NO_DECAY_PARAMS
+                    or n.rsplit(".", 1)[-1].startswith("bias")], arch
+        for n, v in decay.items():
+            field = arch == "mayak" and n.startswith("field.")
+            assert v == (m.cfg.field_weight_decay if field else wd), (arch, n, v)
+        if arch == "mayak":
+            assert any(n.startswith("field.") for n in decay)
 
 
 def test_patchtst_patching():

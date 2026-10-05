@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from mayak.baselines.neural import N_RECURRENT_INPUT, LeadHead, recurrent_inputs
 from mayak.config import LRUConfig
 
-RECURRENT_PARAMS = ("nu_log", "theta_log", "gamma_log", "B_re", "B_im")
+OUTPUT_MATRICES = ("C_re", "C_im")
 
 
 def lambda_polar(nu_log, theta_log):
@@ -243,8 +243,10 @@ class LRUBlock(nn.Module):
 class LRUForecaster(nn.Module):
     """Стек линейных рекуррентных блоков над историей и общая по лидам голова.
 
-    Параметры рекуррентности (затухание, фаза, масштаб и проекция входа) обучаются без
-    весового затухания, остальные - с базовым затуханием протокола.
+    Весовое затухание - по общему правилу проекта, с одним отличием: выходные матрицы
+    рекуррентного ядра ``C_re`` и ``C_im`` получают базовое затухание протокола.
+    Затухание, фаза, масштаб и проекция входа ядра (``nu_log``, ``theta_log``,
+    ``gamma_log``, ``B_re``, ``B_im``) и вектор ``D`` обучаются без него.
 
     Args:
         cfg: конфиг LRU, словарь с теми же полями или None для значений по умолчанию.
@@ -292,19 +294,15 @@ class LRUForecaster(nn.Module):
     def forward(self, batch, scan=None):
         return self.head(self.encode(batch, scan)[:, -1], batch)
 
-    def optim_groups(self, weight_decay):
-        """Группы весового затухания: рекуррентные параметры без затухания, остальные с ним.
+    def decay_exceptions(self, weight_decay):
+        """Отличия от общего правила весового затухания.
 
         Args:
             weight_decay: базовое весовое затухание протокола.
 
         Returns:
-            Список групп.
+            Список из одной группы ``lru_output``: выходные матрицы рекуррентных ядер с
+            базовым затуханием.
         """
-        rec, other = [], []
-        for name, p in self.named_parameters():
-            if not p.requires_grad:
-                continue
-            (rec if name.rsplit(".", 1)[-1] in RECURRENT_PARAMS else other).append(p)
-        return [dict(name="recurrent", params=rec, weight_decay=0.0),
-                dict(name="other", params=other, weight_decay=weight_decay)]
+        return [dict(name="lru_output", weight_decay=weight_decay,
+                     match=lambda name, by_rule: name.rsplit(".", 1)[-1] in OUTPUT_MATRICES)]
