@@ -1,7 +1,9 @@
 r"""Хост устройства на Python: построчный протокол на stdin, ответы JSON на stdout.
 
 Модель берётся либо из каталога экспорта графов ONNX, либо из чекпойнта PyTorch: тогда
-те же графы исполняются в PyTorch.
+те же графы исполняются в PyTorch. Для каталога экспорта нужны только numpy и
+onnxruntime; чекпойнт открывается только при установленных зависимостях обучения
+(дополнительная группа ``train``).
 
 Запуск:
     python -m mayak.runtime.run_inference --model runtime/model \
@@ -25,7 +27,7 @@ def build_parser():
     ap = argparse.ArgumentParser(description="хост устройства МАЯК на Python")
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--model", help="каталог экспорта графов ONNX с манифестом")
-    src.add_argument("--ckpt", help="чекпойнт PyTorch")
+    src.add_argument("--ckpt", help="чекпойнт PyTorch; нужны зависимости обучения (extra train)")
     ap.add_argument("--lat", type=float, required=True)
     ap.add_argument("--lon", type=float, required=True)
     ap.add_argument("--elev", type=float, required=True,
@@ -58,13 +60,13 @@ def open_runtime(args):
         Устройство на графах экспорта или на графах PyTorch из чекпойнта.
     """
     if args.model:
-        from mayak.runtime.graphs import runtime_from_export
+        from mayak.runtime.backend import runtime_from_export
         return runtime_from_export(args.model, args.lat, args.lon, args.elev,
                                    threads=args.threads, conformal=not args.no_conformal,
                                    aci=args.aci)
+    from mayak.export import TorchBackend
     from mayak.lit import load_model
     from mayak.runtime.device import Device
-    from mayak.runtime.graphs import TorchBackend
     aci = None
     if args.aci:
         from mayak.calibration import load_config

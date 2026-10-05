@@ -6,8 +6,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: uv sync --group dev
-      - run: uv run pytest -q
+      - run: uv sync --extra train --group dev
+      - run: uv run --no-sync pytest -q
 
   lint:
     runs-on: ubuntu-latest

@@ -10,6 +10,8 @@ from mayak.constants import H, HISTORY_BINS, QUANTILES
 
 Q = np.array(QUANTILES, np.float32)
 NQ = len(QUANTILES)
+# Квантили стандартного нормального распределения на уровнях QUANTILES.
+ZQ = np.array([NormalDist().inv_cdf(q) for q in QUANTILES], np.float32)
 I_LO90, I_LO80, I_MED, I_HI80, I_HI90 = 0, 1, 3, 5, 6
 EPS = 1e-9
 NO_HOUR = int(np.iinfo(np.int64).min)
@@ -1398,8 +1400,9 @@ def metric_table(y, mu, q, mu_clim, w, leads=(1, 3, 6, 12, 24, 48, 72, 120, 168)
 
 __all__ = ["ACIParams", "AdaptiveCalibration", "CENTRAL_INTERVALS", "Evaluation", "FINE_LEADS",
            "HISTORY_BINS", "LEAD_BINS", "METRICS", "NO_HOUR", "NQ", "Q", "SHARPNESS_POINTS",
-           "SHARPNESS_RANGE", "aci_effective_level", "aci_run", "aci_score", "aci_score_bounds",
-           "apply_adaptive", "apply_conformal", "breakdown", "by_lead", "by_lead_bin",
+           "SHARPNESS_RANGE", "ZQ", "aci_effective_level", "aci_run", "aci_score",
+           "aci_score_bounds", "apply_adaptive", "apply_conformal", "breakdown", "by_lead",
+           "by_lead_bin",
            "calibrate_forecast", "check_conformal_shape", "check_history_bins",
            "check_median_free", "conformal_table", "coverage", "fit_conformal_shift",
            "history_bin_index", "history_bin_of", "inside", "interval_indices",

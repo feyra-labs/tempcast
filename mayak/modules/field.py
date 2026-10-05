@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mayak.constants import inv_softplus
+from mayak.modules import inv_softplus
 
 N_YEAR_BASIS = 7
 N_DAY_BASIS = 5

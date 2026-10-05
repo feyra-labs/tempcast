@@ -28,8 +28,8 @@ def main():
                          "conf/runtime/default.yaml)")
     args = ap.parse_args()
 
+    from mayak.export import export_graphs
     from mayak.lit import load_model
-    from mayak.runtime.graphs import export_graphs
     from mayak.runtime.site import load_runtime_config
     aci = None
     if args.aci:

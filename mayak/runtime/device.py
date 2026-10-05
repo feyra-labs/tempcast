@@ -55,7 +55,7 @@ from mayak.data.qc import PHYS, CausalQC
 from mayak.data.recording import RECORD_SCALE
 from mayak.data.window import issue_calendar, place_history
 from mayak.leakage import load_conformal
-from mayak.metrics import (LEAD_BINS, ACIParams, AdaptiveCalibration, apply_adaptive,
+from mayak.metrics import (LEAD_BINS, ZQ, ACIParams, AdaptiveCalibration, apply_adaptive,
                            apply_conformal, check_conformal_shape)
 from mayak.runtime.site import (SITE_MOVED, SITE_REFINED, as_site, describe_gap,
                                 load_runtime_config, site_change)
@@ -330,7 +330,6 @@ class Device:
         self.lat, self.lon, self.elev = float(lat), float(lon), float(elev)
         clim_mu, clim_sig = backend.run("climatology", self._site_inputs())
         self.clim_mu, self.clim_sig = check_climatology(clim_mu, clim_sig)
-        from mayak.baselines.statistical import ZQ
         self.zq = np.asarray(ZQ, np.float32)
         self.conformal = self._conformal(conformal)
         self.aci = ACIParams() if aci is True else aci

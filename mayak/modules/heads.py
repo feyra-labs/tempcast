@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mayak.constants import inv_softplus
+from mayak.modules import inv_softplus
 
 R_MAX = 0.6
 R_KAPPA_FLOOR = 1.0

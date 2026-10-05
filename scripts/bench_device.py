@@ -7,7 +7,8 @@ r"""Замеры рантайма на устройстве - один восп�
 * стоимость часа (контроль качества и запись в окно) и стоимость выпуска (один проход
   графа прогноза с калибровкой): медиана, p95, p99 на длинном прогоне - для графов на
   PyTorch (эталон) и для Python с ONNX Runtime на графах экспорта;
-* пиковая резидентная память процесса (каждая реализация - в отдельном процессе);
+* пиковая резидентная память процесса (каждая реализация - в отдельном процессе;
+  процесс ONNX Runtime поднимает устройство из каталога экспорта и не загружает torch);
 * размер графов экспорта, размер состояния и рабочей памяти устройства - точным числом
   байт;
 * расхождение выходов ONNX Runtime с эталоном на тех же входах;
@@ -107,18 +108,26 @@ def start_hour():
 def worker(args):
     """Отдельный процесс: одна реализация на Python, замер задержек и пиковой памяти.
 
+    Эталон исполняет графы в PyTorch на модели. Реализация на ONNX Runtime поднимает
+    устройство из каталога экспорта без конформной таблицы, как эталон, и torch не
+    загружает.
+
     Args:
         args: аргументы командной строки замера.
     """
-    import torch
-    torch.set_num_threads(1)
-    model = load_model(args.ckpt, args.seed)
     series = np.fromfile(args.series, "<f4").reshape(-1, 3)
-    t0 = time.perf_counter()
-    from mayak.runtime.device import Device
-    from mayak.runtime.graphs import OnnxBackend, TorchBackend
-    backend = TorchBackend(model) if args.backend == "torch" else OnnxBackend(args.model_dir)
-    rt = Device(backend, model.cfg, args.lat, args.lon, args.elev)
+    if args.backend == "torch":
+        import torch
+        torch.set_num_threads(1)
+        model = load_model(args.ckpt, args.seed)
+        t0 = time.perf_counter()
+        from mayak.export import TorchBackend
+        from mayak.runtime.device import Device
+        rt = Device(TorchBackend(model), model.cfg, args.lat, args.lon, args.elev)
+    else:
+        t0 = time.perf_counter()
+        from mayak.runtime.backend import runtime_from_export
+        rt = runtime_from_export(args.model_dir, args.lat, args.lon, args.elev, conformal=False)
     startup_ms = (time.perf_counter() - t0) * 1e3
     start = args.start_unix_hour
     t_step, t_fc, dump = [], [], []
@@ -171,8 +180,9 @@ def eval_divergence(model_dir, model, n_issues, hours, seed, lat, lon, elev):
     """
     import torch
 
+    from mayak.export import eval_inputs, eval_set, feed, synthetic_series
+    from mayak.runtime.backend import OnnxBackend
     from mayak.runtime.device import Device
-    from mayak.runtime.graphs import OnnxBackend, eval_inputs, eval_set, feed, synthetic_series
     H = model.cfg.horizon
     rng = np.random.default_rng(seed)
     s = synthetic_series(hours + H, seed=seed)
@@ -282,7 +292,7 @@ def main():
 
     import torch
     torch.set_num_threads(1)
-    from mayak.runtime.graphs import export_graphs, synthetic_series
+    from mayak.export import export_graphs, synthetic_series
     os.makedirs(args.out_dir, exist_ok=True)
     model = load_model(args.ckpt, args.seed)
     args.model_dir = os.path.join(args.out_dir, "model")

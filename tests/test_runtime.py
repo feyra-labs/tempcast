@@ -8,23 +8,33 @@
 * смена точки: уточнение сохраняет окно и калибровку, перенос - холодный старт;
 * простой заполняется пустыми часами, простой не короче окна - холодный старт;
 * нечисловой выход графа прогноза - откат к климатологии точки;
-* манифест согласован с конфигом, QC, форматом состояния и порогами смены точки.
+* манифест согласован с конфигом, QC, форматом состояния и порогами смены точки;
+* точка входа устройства на каталоге экспорта не загружает torch и другие зависимости
+  обучения.
 """
+import json
 import os
+import subprocess
+import sys
 
 import numpy as np
 import pytest
 import torch
 
 from mayak.config import ABLATION_NAMES, Ablations, ModelConfig
+from mayak.export import (TorchBackend, eval_inputs, eval_set, export_graphs, feed,
+                          synthetic_series)
 from mayak.metrics import ACIParams
+from mayak.runtime.backend import GRAPH_IO, GRAPH_NAMES, runtime_from_export
 from mayak.runtime.device import (FORECAST_INPUTS, STATE_HEADER, Device, mask_bytes,
                                   state_nbytes)
-from mayak.runtime.graphs import (GRAPH_IO, GRAPH_NAMES, TorchBackend, eval_inputs, eval_set,
-                                  export_graphs, feed, runtime_from_export, synthetic_series)
 from mayak.runtime.host import Host
 
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LAT, LON, ELEV = 52.37, 4.9, 0.0
+# Модули, которых нет на устройстве: группа train и PyYAML, который приходит с hydra.
+TRAIN_ONLY = ("torch", "pytorch_lightning", "pandas", "matplotlib", "scipy", "sklearn", "pyarrow",
+              "rasterio", "onnx", "hydra", "yaml")
 ATOL_ONNX = 2e-4
 SEED, PERTURB = 1414, 0.05
 ACI = ACIParams(target=0.10, gamma=0.05, max_factor=4.0)
@@ -209,12 +219,11 @@ def test_fallback_on_non_finite_output(model):
 
 
 def test_manifest_contract(model, tmp_path):
-    from mayak.baselines.statistical import ZQ
     from mayak.config import RuntimeConfig
     from mayak.constants import HISTORY_BINS
     from mayak.data.qc import PHYS
-    from mayak.metrics import LEAD_BINS, conformal_table
-    from mayak.runtime.graphs import GRAPH_FORMAT
+    from mayak.metrics import LEAD_BINS, ZQ, conformal_table
+    from mayak.runtime.backend import GRAPH_FORMAT
     out = tmp_path / "m"
     man = export_graphs(model, str(out), conformal=SHIFT, aci=ACI)
     assert sorted(os.listdir(out)) == ["climatology.onnx", "conformal.f32", "forecast.onnx",
@@ -244,3 +253,21 @@ def test_manifest_contract(model, tmp_path):
     np.testing.assert_allclose(dev.conformal, SHIFT, rtol=0, atol=1e-7)
     assert dev.aci == ACI
     assert not model.training
+
+
+def test_device_entry_point_without_torch(model, tmp_path):
+    out = str(tmp_path / "m")
+    export_graphs(model, out)
+    sec = 1_000_000 * 3600
+    args = ["--model", out, "--lat", str(LAT), "--lon", str(LON), "--elev", str(ELEV),
+            "--state-dir", str(tmp_path / "state")]
+    code = ("import json, sys\n"
+            "from mayak.runtime.run_inference import main\n"
+            f"rc = main({args!r})\n"
+            f"print(json.dumps([rc, [m for m in {TRAIN_ONLY!r} if m in sys.modules]]))\n")
+    r = subprocess.run([sys.executable, "-c", code], input=f"obs {sec} 8 1003 71\nforecast\n",
+                       capture_output=True, text=True, encoding="utf-8", cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    *replies, (rc, loaded) = [json.loads(line) for line in r.stdout.splitlines()]
+    assert rc == 0 and loaded == [], f"устройство загрузило {loaded}"
+    assert replies[0]["ok"] and not replies[1]["fallback"], r.stdout

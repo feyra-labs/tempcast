@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import logging
 import math
+import sys
 from dataclasses import dataclass
 
 import numpy as np
-import torch
 
 log = logging.getLogger(__name__)
 
@@ -27,7 +27,9 @@ DEFAULT_TARGET_MASK = TargetMaskConfig()
 
 
 def enforce_invariant(x, mask):
-    if torch.is_tensor(x):
+    # Тензор может прийти, только если torch уже загружен; сам модуль torch не тянет.
+    torch = sys.modules.get("torch")
+    if torch is not None and torch.is_tensor(x):
         m = (mask > 0).to(x.dtype)
         return torch.where(m > 0, x, torch.zeros_like(x)), m
     m = (np.asarray(mask) > 0).astype(np.float32)

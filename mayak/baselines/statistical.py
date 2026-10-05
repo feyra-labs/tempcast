@@ -5,14 +5,12 @@
 функцию потерь, поэтому второго эталона разброса не возникает.
 """
 import numpy as np
-from scipy.stats import norm
 
-from mayak.constants import H, QUANTILES
+from mayak.constants import H
 from mayak.data.splits import time_layout
 from mayak.data.store import get_store
+from mayak.metrics import ZQ
 from mayak.timeaxis import window_calendar
-
-ZQ = norm.ppf(np.array(QUANTILES)).astype(np.float32)
 
 RECENT_HOURS = 24
 RECENT_MIN_VALID = 6
