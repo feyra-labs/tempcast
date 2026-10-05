@@ -1,9 +1,11 @@
 """Таблицы результатов в JSON: по файлу на таблицу, с записью о прогоне.
 
 Каталог результатов хранит то, из чего автор заполняет таблицы описания проекта. Каждый
-файл содержит запись о прогоне (формат, время, коммит, версии библиотек, чекпойнты и сид
-оценки) и саму таблицу. Файлы пишутся строгим JSON: пропуски и бесконечности становятся
-null. Таблицы берутся из уже посчитанного результата оценки, ничего не пересчитывается.
+файл содержит запись о прогоне (формат, время, коммит, версии библиотек, чекпойнты, сид
+оценки, роли станций оценённых наборов) и саму таблицу. Таблицы одного набора окон
+пишутся в его каталог; запись о прогоне в них несёт роли станций, временное окно и число
+окон этого набора. Файлы пишутся строгим JSON: пропуски и бесконечности становятся null.
+Таблицы берутся из уже посчитанного результата оценки, ничего не пересчитывается.
 """
 import os
 
@@ -25,6 +27,20 @@ def run_record(**info):
     return dict(schema=SCHEMA, **provenance(), **info)
 
 
+def set_record(record, dataset):
+    """Запись о прогоне для таблиц одного набора окон.
+
+    Args:
+        record: общая запись о прогоне.
+        dataset: набор окон, по которому посчитаны таблицы.
+
+    Returns:
+        Копия записи с ролями станций, временным окном и числом окон набора.
+    """
+    return dict(record, station_roles=list(dataset.station_splits),
+                time_key=dataset.time_key, n_windows=len(dataset))
+
+
 def reliability_table(ev):
     """Надёжность одной модели по сырым выходам.
 
@@ -39,6 +55,19 @@ def reliability_table(ev):
                 reliability=ev.reliability(), sharpness=ev.sharpness_coverage())
 
 
+def lead_tables(res):
+    """Метрики по лидам и по всему горизонту из результата оценки набора.
+
+    Args:
+        res: результат оценки набора: основная модель, сводки по лидам и по всему
+            горизонту.
+
+    Returns:
+        Словарь из одной таблицы metrics.
+    """
+    return {"metrics": dict(main=res["main"], leads=res["leads"], overall=res["overall"])}
+
+
 def evaluation_tables(res):
     """Таблицы одного набора окон из результата оценки.
 
@@ -51,7 +80,7 @@ def evaluation_tables(res):
     """
     bench = res["bench"]
     tables = {
-        "metrics": dict(main=res["main"], leads=res["leads"], overall=res["overall"]),
+        **lead_tables(res),
         "history": dict(grid=list(bench.grid), models=res["history"]),
         "breakdowns": res["breakdowns"],
         "reliability": dict(model=res["main"], **reliability_table(res["reliability"]),
@@ -89,5 +118,5 @@ def write_tables(tables, out_dir, record):
             for name, table in tables.items()]
 
 
-__all__ = ["SCHEMA", "evaluation_tables", "reliability_table", "run_record", "transfer_tables",
-           "write_tables"]
+__all__ = ["SCHEMA", "evaluation_tables", "lead_tables", "reliability_table", "run_record",
+           "set_record", "transfer_tables", "write_tables"]

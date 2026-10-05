@@ -2,6 +2,13 @@
 
 Стенд собирает окна оценки, прогоняет по ним все модели и печатает таблицы.
 
+Основной внутренний набор - станции unseen_test в их тестовом окне. По нему считаются
+метрики по лидам, разрез по длине истории, сезоны и зоны, надёжность, раздел после
+калибровки с офлайн-прогоном адаптивной калибровки и сопоставление с внешним тестом.
+Обучающие станции в их тестовом окне - отдельный набор со своим каталогом результатов;
+по нему считаются только метрики по лидам. Разрез по ролям станций собирается из двух
+наборов: строка train - из набора обучающих станций, строка unseen_test - из основного.
+
 Сравнение моделей идёт только по их сырым выходам. Основные таблицы, разрезы,
 надёжность, острота против покрытия, графики и сохранённые предсказания не зависят от
 того, задана ли конформная таблица. Таблица МАЯК даёт отдельный раздел «МАЯК после
@@ -15,10 +22,10 @@
 нужна, поэтому она считается один раз и одинакова на всей сетке.
 
 Кроме того, стенд считает таблицы в двух видах агрегирования (пуловом и макро) с
-интервалами блочного бутстрапа по станциям, разрезы по ролям станций, зонам Кёппена,
-сезонам и доле валидных часов истории, внешний тест на наблюдениях реальной сети с его
-собственными разрезами и сопоставлением с внутренним тестом, проверки поля при холодном
-старте, суточные амплитуды и строки переобученных абляций.
+интервалами блочного бутстрапа по станциям, разрезы по зонам Кёппена, сезонам и доле
+валидных часов истории, внешний тест на наблюдениях реальной сети с его собственными
+разрезами и сопоставлением с внутренним тестом, проверки поля при холодном старте,
+суточные амплитуды и строки переобученных абляций.
 
 Модели сравниваются на равных: у каждого чекпойнта есть запись о подборе скорости
 обучения по одной и той же сетке с одним и тем же числом шагов. Прогон дополнительной
@@ -36,10 +43,12 @@ from mayak import baselines as BL
 from mayak.constants import H, QUANTILES
 from mayak.data.holdout import (HISTORY_GRID, NOMINAL_HISTORY, EvalSet, check_history_grid,
                                 history_label, history_strata)
+from mayak.data.splits import ROLE_EXTERNAL, ROLE_TEST, ROLE_TRAIN
 from mayak.loss import NORM_SCALE_CLAMP
 from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, breakdown, by_lead, coverage,
                            metric_table, seed_spread)
-from mayak.results import evaluation_tables, run_record, transfer_tables, write_tables
+from mayak.results import (evaluation_tables, lead_tables, run_record, set_record,
+                           transfer_tables, write_tables)
 from mayak.zones import normalize_zone
 
 Q = np.array(QUANTILES, np.float32)
@@ -59,6 +68,8 @@ TUNED_NOTE = (
     "  настроены по валидации сверх общего бюджета подбора. Сравнение с бейзлайнами не\n"
     "  на равных; на равных - строка «МАЯК».")
 TRAIN_DISTANCE_DIM = "расстояние до обучающей точки"
+ROLE_DIM = "роль станции"
+TRAIN_STATIONS_DIR = "train_stations"
 CLIMATOLOGY, DAMPED, SEASONAL = "Климатология", "Damped persistence", "Seasonal-naive 24ч"
 HISTORY_FREE = (CLIMATOLOGY,)
 
@@ -335,7 +346,10 @@ def print_rows(rows, label="разрез", metrics=("Skill", "MAE", "RMSE", "CRP
 
 def all_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS, min_stations=MIN_STATIONS,
                    ci=False, history=None, **kw):
-    """Разрезы одной модели по метаданным окон.
+    """Разрезы одной модели по метаданным окон одного набора.
+
+    Разреза по ролям станций здесь нет: набор состоит из станций одной роли, разрез по
+    ролям собирает role_breakdown из отдельных наборов.
 
     Args:
         ev: оценка модели.
@@ -355,13 +369,35 @@ def all_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS, min_stations=M
     hvalid = np.array([bin_label(float(v), HIST_VALID_BINS) for v in meta["hist_valid"]], object)
     kwargs = dict(leads=leads, min_windows=min_windows, min_stations=min_stations, ci=ci, **kw)
     return {
-        "роль станции": breakdown(ev, meta["role"], **kwargs),
         "зона Кёппена": breakdown(ev, meta["zone"], **kwargs),
         "сезон": breakdown(ev, meta["season"], **kwargs),
         "длина истории": (history if history is not None
                           else breakdown(ev, hist, order=hist_order, **kwargs)),
         "валидность истории": breakdown(ev, hvalid, **kwargs),
     }
+
+
+def role_breakdown(parts, lead=BREAKDOWN_LEAD, min_windows=MIN_WINDOWS,
+                   min_stations=MIN_STATIONS, ci=False, **kw):
+    """Разрез основной модели по ролям станций, собранный из отдельных наборов.
+
+    Args:
+        parts: пары из оценки основной модели на наборе и метаданных окон этого набора,
+            в порядке строк разреза.
+        lead: лид, ч.
+        min_windows: страта с меньшим числом окон не показывается.
+        min_stations: страта с меньшим числом станций не показывается.
+        ci: считать интервалы бутстрапа по станциям.
+        **kw: параметры бутстрапа.
+
+    Returns:
+        Словарь из роли станций в её сводку на лиде.
+    """
+    rows = {}
+    for ev, meta in parts:
+        rows.update(breakdown(ev, meta["role"], leads=[lead], min_windows=min_windows,
+                              min_stations=min_stations, ci=ci, **kw))
+    return rows
 
 
 def external_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS,
@@ -599,8 +635,7 @@ def plot_pit(ev, out_dir="runs/plots"):
 @torch.no_grad()
 def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
                            out_dir="runs/plots", time_key="test",
-                           station_splits=("train", "unseen_test"),
-                           seed=0, L=None):
+                           station_splits=(ROLE_TEST,), seed=0, L=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -865,6 +900,9 @@ def evaluate_set(named, base, grid=HISTORY_GRID, r_damped=None, shift=None, ci=T
                  bootstrap=BOOTSTRAP, device="cpu", external=False, main=MAIN_MODEL):
     """Все числа стенда на одном наборе окон.
 
+    Внутренний тест подаётся сюда набором станций unseen_test; обучающие станции
+    оцениваются отдельно, только по лидам.
+
     Сравнительная часть считается по сырым выходам всех моделей и от конформной таблицы
     не зависит. Таблица влияет только на раздел основной модели после калибровки и
     применяется к каждому окну по его фактической длине истории. В этом разделе же
@@ -930,6 +968,33 @@ def evaluate_set(named, base, grid=HISTORY_GRID, r_damped=None, shift=None, ci=T
     return res
 
 
+def evaluate_leads(named, base, r_damped=None, ci=True, bootstrap=BOOTSTRAP, device="cpu",
+                   main=MAIN_MODEL):
+    """Метрики по лидам всех моделей и эталонов на одном наборе окон при полной истории.
+
+    Args:
+        named: словарь из имени модели в модель; основная модель обязательна.
+        base: набор окон.
+        r_damped: коэффициенты затухающей персистентности; None значит без неё.
+        ci: считать интервалы бутстрапа по станциям.
+        bootstrap: параметры бутстрапа.
+        device: устройство.
+        main: имя основной модели.
+
+    Returns:
+        Словарь: имя основной модели, сводки по лидам и по всему горизонту для всех
+        моделей, оценка основной модели и метаданные окон.
+    """
+    preds, aux = collect_predictions(named, base.with_history(NOMINAL_HISTORY), device=device)
+    preds = add_statistical_baselines(preds, aux, r_damped=r_damped)
+    evs = evaluations(preds, aux)
+    kw = bootstrap if ci else {}
+    return dict(main=main,
+                leads={n: by_lead(ev, leads=TABLE_LEADS, ci=ci, **kw) for n, ev in evs.items()},
+                overall={n: ev.summary(ci=ci, **kw) for n, ev in evs.items()},
+                main_eval=evs[main], meta=aux["meta"])
+
+
 def print_history_table(history, lead, metric="Skill"):
     """Печатает метрику всех моделей по длинам истории на одном лиде.
 
@@ -948,6 +1013,21 @@ def print_history_table(history, lead, metric="Skill"):
             print(f"{name:>24} {title:>7} " + " ".join(f"{c:>22}" for c in cells))
 
 
+def print_leads(res, tag=""):
+    """Печатает метрики всех моделей по лидам и по всему горизонту.
+
+    Args:
+        res: результат оценки набора со сводками по лидам и по всему горизонту.
+        tag: метка набора в заголовках.
+    """
+    ci = any("ci" in s for s in res["overall"].values())
+    for name, rows in res["leads"].items():
+        print(f"\n=== {tag}{name} (полная история) ===")
+        print_rows({str(h): s for h, s in rows.items()}, label="лид, ч", ci=ci)
+    print(f"\n=== {tag}Общие метрики по всему горизонту (полная история) ===")
+    print_rows(res["overall"], label="модель", ci=ci)
+
+
 def print_evaluation(res, bootstrap=BOOTSTRAP):
     """Печатает все таблицы стенда на одном наборе окон.
 
@@ -959,15 +1039,10 @@ def print_evaluation(res, bootstrap=BOOTSTRAP):
                                    print_coverage_report, print_sharpness)
     tag = "[внешний] " if res["external"] else ""
     main = res["main"]
-    ci = any("ci" in s for s in res["overall"].values())
     print(BENCHMARK_NOTE)
     if TUNED_MODEL in res["leads"]:
         print(TUNED_NOTE)
-    for name, rows in res["leads"].items():
-        print(f"\n=== {tag}{name} (полная история) ===")
-        print_rows({str(h): s for h, s in rows.items()}, label="лид, ч", ci=ci)
-    print(f"\n=== {tag}Общие метрики по всему горизонту (полная история) ===")
-    print_rows(res["overall"], label="модель", ci=ci)
+    print_leads(res, tag)
     for h in HISTORY_LEADS:
         print(f"\n=== {tag}Длина истории: скилл всех моделей, лид {h} ч ===")
         print_history_table(res["history"], h)
@@ -1155,14 +1230,14 @@ def evaluate_external(named, external_manifest, store, grid=HISTORY_GRID, r_damp
         bootstrap: параметры бутстрапа.
         checkpoints: чекпойнты всех моделей, для чек-листа.
         conformal: путь к конформной таблице, для чек-листа.
-        internal: предсказания и данные окон внутренней оценки при полной истории, для
-            сопоставления внутреннего и внешнего теста; None значит без сопоставления.
+        internal: предсказания и данные окон основного внутреннего набора (станции
+            unseen_test) при полной истории, для сопоставления внутреннего и внешнего
+            теста; None значит без сопоставления.
         transfer_level: уровень зон в сопоставлении.
 
     Returns:
         Тройка: результат оценки внешнего набора, набор окон и таблицы сопоставления.
     """
-    from mayak.data.splits import ROLE_EXTERNAL, ROLE_TEST
     from mayak.data.store import get_store
     from mayak.external import nearest_train_km, print_transfer, transfer_table
     from mayak.leakage import check_external, run_checklist
@@ -1184,22 +1259,18 @@ def evaluate_external(named, external_manifest, store, grid=HISTORY_GRID, r_damp
     if internal is not None:
         p_int, a_int = internal
         preds, aux = res["bench"].preds, res["bench"].aux
+        tag = "/".join(sorted(set(np.asarray(a_int["meta"]["role"]).astype(str).tolist())))
         for name in (MAIN_MODEL, CLIMATOLOGY):
             if name not in p_int or name not in preds:
                 continue
             ev_i = evaluation_for(p_int[name], a_int)
             ev_e = evaluation_for(preds[name], aux)
-            for tag, roles in (("все станции внутреннего теста", None),
-                               ("только невиденные (unseen_test)", (ROLE_TEST,))):
-                sel = (np.ones(len(ev_i.y), bool) if roles is None
-                       else np.isin(a_int["meta"]["role"], roles))
-                tbl = transfer_table(ev_i.restrict(windows=sel), a_int["meta"]["zone"],
-                                     ev_e, aux["meta"]["zone"], level=transfer_level,
-                                     n_boot=kw.get("n_boot", 0), seed=kw.get("seed", 0),
-                                     ci_level=kw.get("level", 0.90))
-                transfer[(name, tag)] = tbl
-                print_transfer(tbl, title=f"\n=== Перенос: {name}, внешний против внутреннего "
-                                          f"({tag}); Δ = внешний − внутренний ===")
+            tbl = transfer_table(ev_i, a_int["meta"]["zone"], ev_e, aux["meta"]["zone"],
+                                 level=transfer_level, n_boot=kw.get("n_boot", 0),
+                                 seed=kw.get("seed", 0), ci_level=kw.get("level", 0.90))
+            transfer[(name, tag)] = tbl
+            print_transfer(tbl, title=f"\n=== Перенос: {name}, внешний против внутреннего "
+                                      f"({tag}); Δ = внешний − внутренний ===")
     return res, ds, transfer
 
 
@@ -1359,18 +1430,20 @@ def main():
     ap.add_argument("--transfer-zones", choices=("group", "full"), default="group",
                     help="уровень зон для сопоставления внутреннего и внешнего теста")
     ap.add_argument("--save-preds", default=None, metavar="DIR",
-                    help="сохранить сырые предсказания: DIR/internal.npz (все модели при "
-                         "полной истории) и DIR/internal_history.npz (МАЯК на всей сетке "
-                         "длин истории), с --conformal ещё DIR/internal_hourly.npz (МАЯК с "
+                    help="сохранить сырые предсказания основного внутреннего набора "
+                         "(станции unseen_test): DIR/internal.npz (все модели при полной "
+                         "истории) и DIR/internal_history.npz (МАЯК на всей сетке длин "
+                         "истории), с --conformal ещё DIR/internal_hourly.npz (МАЯК с "
                          "ежечасным выпуском), для внешнего теста - DIR/external*.npz; их "
                          "читает python -m mayak.calibration")
     ap.add_argument("--results-dir", default=None, metavar="DIR",
                     help="записать каждую таблицу в свой JSON с записью о прогоне: "
-                         "DIR/internal/*.json, DIR/external/*.json, DIR/params.json")
+                         "DIR/internal/*.json (станции unseen_test), "
+                         f"DIR/{TRAIN_STATIONS_DIR}/metrics.json (обучающие станции в "
+                         "тестовом окне), DIR/external/*.json, DIR/params.json")
     args = ap.parse_args()
     grid = parse_grid(args.history_grid)
 
-    from mayak.data.splits import ROLE_TRAIN
     from mayak.data.store import get_store
     from mayak.leakage import run_checklist
     baseline_ckpts = {a: getattr(args, f"{a}_ckpt") for a in NEURAL_BASELINES
@@ -1389,8 +1462,11 @@ def main():
 
     store = get_store(args.manifest)
     clims = store.clims()
-    base = EvalSet(clims, manifest=args.manifest, time_key="test")
-    run_checklist(store, datasets=[base], conformal=args.conformal, checkpoints=all_ckpts)
+    base = EvalSet(clims, station_splits=(ROLE_TEST,), manifest=args.manifest, time_key="test")
+    train_set = EvalSet(clims, station_splits=(ROLE_TRAIN,), manifest=args.manifest,
+                        time_key="test")
+    run_checklist(store, datasets=[base, train_set], conformal=args.conformal,
+                  checkpoints=all_ckpts)
     rec = load_run_record(args.ckpt[0])
     eval_seed = args.eval_seed
     if eval_seed is None:
@@ -1418,18 +1494,31 @@ def main():
         shift, _rec = load_conformal(args.conformal)
     boot = dict(n_boot=args.bootstrap, seed=eval_seed, level=args.ci_level)
     ci = args.bootstrap > 0
+    set_roles = {"internal": list(base.station_splits),
+                 TRAIN_STATIONS_DIR: list(train_set.station_splits)}
+    if args.external_manifest:
+        set_roles["external"] = [ROLE_EXTERNAL]
     record = run_record(ckpt=args.ckpt, baselines=baseline_ckpts, ablations=args.ablation_ckpt,
                         tuned=args.tuned_ckpt,
                         unequal={TUNED_MODEL: TUNED_NOTE} if args.tuned_ckpt else {},
                         conformal=args.conformal, manifest=args.manifest,
                         external_manifest=args.external_manifest, eval_seed=eval_seed,
-                        bootstrap=boot, history_grid=list(grid))
+                        bootstrap=boot, history_grid=list(grid), sets=set_roles)
     written = []
 
-    print(f"\n=== Таблицы метрик: окон {len(base)}, сетка длин истории {list(grid)} ===")
+    print(f"\n=== Таблицы метрик: станции {'/'.join(base.station_splits)}, окон {len(base)}, "
+          f"сетка длин истории {list(grid)} ===")
     res = evaluate_set(named_all, base, grid=grid, r_damped=r, shift=shift, ci=ci,
                        bootstrap=boot)
+    res_train = evaluate_leads(named_all, train_set, r_damped=r, ci=ci, bootstrap=boot)
+    roles = role_breakdown([(res_train["main_eval"], res_train["meta"]),
+                            (res["reliability"], res["bench"].aux["meta"])])
+    res["breakdowns"] = {ROLE_DIM: roles, **res["breakdowns"]}
     print_evaluation(res, boot)
+    print(f"\n########## Обучающие станции в тестовом окне: станции "
+          f"{'/'.join(train_set.station_splits)}, окон {len(train_set)}, только метрики по "
+          f"лидам ##########")
+    print_leads(res_train, "[обучающие] ")
     preds, aux = res["bench"].preds, res["bench"].aux
     info = dict(ckpt=args.ckpt, conformal=args.conformal, manifest=args.manifest,
                 eval_seed=eval_seed, n_params=n_params)
@@ -1460,25 +1549,23 @@ def main():
     print("\n=== Холодный старт L=0 ===")
     tables["coldstart"] = coldstart_L0_check(mayak, base.with_history(0))
     if args.results_dir:
-        written += write_tables(tables, os.path.join(args.results_dir, "internal"), record)
+        written += write_tables(tables, os.path.join(args.results_dir, "internal"),
+                                set_record(record, base))
+        written += write_tables(lead_tables(res_train),
+                                os.path.join(args.results_dir, TRAIN_STATIONS_DIR),
+                                set_record(record, train_set))
         written += write_tables(dict(params=n_params), args.results_dir, record)
 
     print("\n=== Графики прогноз vs факт (примеры МАЯК, сырые выходы) ===")
     plot_forecast_examples(mayak, clims, manifest=args.manifest,
                            n=args.n_examples, out_dir=args.out_dir, seed=eval_seed)
-    plot_forecast_examples(mayak, clims, manifest=args.manifest, n=args.n_examples,
-                           out_dir=args.out_dir + "/unseen",
-                           station_splits=("unseen_test",), seed=eval_seed)
     plot_forecast_examples(mayak, clims, manifest=args.manifest, n=args.n_examples, L=0,
                            out_dir=args.out_dir, seed=eval_seed)
-    plot_forecast_examples(mayak, clims, manifest=args.manifest, n=args.n_examples, L=0,
-                           station_splits=("unseen_test",),
-                           out_dir=args.out_dir + "/unseen", seed=eval_seed)
     print("\n=== Суточные амплитуды ===")
     plot_amplitude_scatter(mayak, clims, manifest=args.manifest, out_dir=args.out_dir)
 
     if args.external_manifest:
-        res_e, _ds, _tr = evaluate_external(
+        res_e, ds_e, tr_e = evaluate_external(
             named_all, args.external_manifest, store, grid=grid, r_damped=r, shift=shift,
             ci=ci, bootstrap=boot, checkpoints=all_ckpts, conformal=args.conformal,
             internal=(preds, aux), transfer_level=args.transfer_zones)
@@ -1489,8 +1576,9 @@ def main():
                                 info=dict(info, manifest=args.external_manifest)):
                 print("Предсказания:", p)
         if args.results_dir:
-            ext = dict(evaluation_tables(res_e), transfer=transfer_tables(_tr))
-            written += write_tables(ext, os.path.join(args.results_dir, "external"), record)
+            ext = dict(evaluation_tables(res_e), transfer=transfer_tables(tr_e))
+            written += write_tables(ext, os.path.join(args.results_dir, "external"),
+                                    set_record(record, ds_e))
 
     if written:
         print("\n=== Таблицы результатов (JSON) ===")

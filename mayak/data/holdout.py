@@ -5,6 +5,9 @@
 куррикулума этапа. Подвыборка стратифицирована: с каждой станции берётся одинаковое
 число окон, разнесённых по всему временному окну. История проходит тот же причинный QC,
 что на приборе; аугментаций нет.
+
+Основной внутренний тест - станции unseen_test в их тестовом окне; обучающие станции в
+тестовом окне - отдельный набор.
 """
 import copy
 import hashlib
@@ -21,7 +24,7 @@ from mayak.data.dataset import (HISTORY_MIX, block_starts, footprint, history_le
                                 station_qc_elev)
 from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats, enforce_invariant
 from mayak.data.qc import qc_window
-from mayak.data.splits import time_layout
+from mayak.data.splits import ROLE_TEST, time_layout
 from mayak.data.store import read_manifest
 from mayak.data.window import issue_calendar
 from mayak.timeaxis import window_month
@@ -173,9 +176,13 @@ class EvalSet(Dataset):
     заданы), одна длина для всех окон (L) или своя длина у каждого окна по распределению
     куррикулума (curriculum и history_seed).
 
+    Набор по умолчанию - основной внутренний тест: станции unseen_test в тестовом окне.
+    Обучающие станции в тестовом окне задаются отдельным набором с ролью train.
+
     Args:
         clims: словарь станций набора.
-        station_splits: роли станций, окна которых входят в набор.
+        station_splits: роли станций, окна которых входят в набор; по умолчанию только
+            unseen_test.
         manifest: путь к манифесту с ролями станций.
         time_key: временное окно, в котором лежат цели.
         every_hours: шаг между кандидатами в начала горизонта, ч.
@@ -197,7 +204,7 @@ class EvalSet(Dataset):
         ValueError: заданы одновременно одна длина и куррикулум.
     """
 
-    def __init__(self, clims, station_splits=("train", "unseen_test"),
+    def __init__(self, clims, station_splits=(ROLE_TEST,),
                  manifest="data/manifest.csv", time_key="test",
                  every_hours=72, L=None, max_windows=6000, windows_per_station=None,
                  target_mask=DEFAULT_TARGET_MASK, curriculum=None, history_seed=0,

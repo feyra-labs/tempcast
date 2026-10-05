@@ -452,7 +452,8 @@ def save_results(rows, out_dir, cfg: RobustnessConfig, meta=None, violations=(),
         rows: строки сценариев.
         out_dir: каталог результатов.
         cfg: настройки робастности.
-        meta: сведения о прогоне: чекпойнты, режим QC, сид бутстрапа, наборы окон.
+        meta: сведения о прогоне: чекпойнты, режим QC, сид бутстрапа, наборы окон с ролями
+            станций.
         violations: строки, нарушившие проверку.
         cold_start: строки холодного старта.
 
@@ -781,7 +782,8 @@ def main(argv=None):
                 input_floor="холодный старт той же модели, если он хуже климатологии",
                 instrument_reference="климатология, искажённая тем же прибором, что цель",
                 qc=cfg.qc, boot_seed=boot_seed,
-                sets={n: dict(n_windows=len(d), n_stations=len({s for s, _t in d.items}))
+                sets={n: dict(station_roles=list(d.station_splits), n_windows=len(d),
+                              n_stations=len({s for s, _t in d.items}))
                       for n, d in sets.items()})
     for p in save_results(rows, args.out_dir, cfg, meta=meta, violations=bad, cold_start=cold):
         print("  ", p)

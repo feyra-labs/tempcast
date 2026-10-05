@@ -7,11 +7,12 @@ r"""Калибровка интервалов обученной модели.
 таблица, если она есть, даёт отдельный раздел: та же модель после калибровки рядом с
 сырой, покрытие по тем же разрезам и офлайн-прогон адаптивной калибровки устройства.
 
-Покрытие центральных интервалов разбирается по лидам, бинам лидов, ролям станций,
-полным зонам Кёппена, длине истории и доле валидных часов истории. Для внешнего теста
-разрезы свои. У каждой страты: покрытие, доли промахов ниже и выше интервала, ширина,
-интервал блочного бутстрапа по станциям и два вердикта. «Мимо номинала» значит, что
-покрытие дальше допуска от номинала и интервал бутстрапа номинал не содержит.
+Покрытие центральных интервалов разбирается по лидам, бинам лидов, полным зонам Кёппена,
+длине истории и доле валидных часов истории. Набор окон состоит из станций одной роли,
+поэтому разреза по ролям нет. Для внешнего теста разрезы свои. У каждой страты:
+покрытие, доли промахов ниже и выше интервала, ширина, интервал блочного бутстрапа по
+станциям и два вердикта. «Мимо номинала» значит, что покрытие дальше допуска от номинала
+и интервал бутстрапа номинал не содержит.
 «Отличается от набора» значит то же самое относительно покрытия всего набора: общее для
 всех страт отклонение исправляет маргинальная поправка, отличие страты от набора нет.
 
@@ -175,8 +176,7 @@ def coverage_strata(meta, external=False):
     from mayak.external import TRAIN_DISTANCE_ORDER
     hist, hist_order = history_strata(meta)
     hvalid = np.array([bin_label(float(v), HIST_VALID_BINS) for v in meta["hist_valid"]], object)
-    keys = {"роль станции": meta.get("role"), "зона Кёппена": meta.get("zone"),
-            HISTORY_DIM: hist, "валидность истории": hvalid,
+    keys = {"зона Кёппена": meta.get("zone"), HISTORY_DIM: hist, "валидность истории": hvalid,
             TRAIN_DISTANCE_DIM: meta.get("train_distance"),
             "Δ высоты станция−ЦМР": meta.get("elev_gap"),
             "канал давления": meta.get("has_pressure")}
@@ -590,9 +590,9 @@ def aci_hourly_replay(pred, aux, params, shift=None, lead_bins=LEAD_BINS):
         lead_bins: бины лидов.
 
     Returns:
-        Словарь: ритм прогона, сводки без подстройки и с подстройкой по всему потоку,
-        бинам лидов и ролям, покрытие по станциям, число обратных связей и итоговые
-        множители по бинам лидов, число упоров в границы.
+        Словарь: ритм прогона, сводки без подстройки и с подстройкой по всему потоку и
+        бинам лидов, покрытие по станциям, число обратных связей и итоговые множители по
+        бинам лидов, число упоров в границы.
 
     Raises:
         KeyError: в метаданных нет момента начала горизонта.
@@ -658,8 +658,6 @@ def aci_hourly_replay(pred, aux, params, shift=None, lead_bins=LEAD_BINS):
                     width_base=float(width0[sel].mean()), width_aci=float(width1[sel].mean()))
 
     by_bin = {f"{a}-{b}": summ(lb == k) for k, (a, b) in enumerate(lead_bins)}
-    role = np.asarray(meta.get("role", np.full(n, "—"))).astype(str)[win]
-    by_role = {r: summ(role == r) for r in sorted(set(role.tolist()))}
     sw = st[win]
     per_st = {s_: (1 - miss0[sw == s_].mean(), 1 - miss1[sw == s_].mean())
               for s_ in sorted(set(sw.tolist()))}
@@ -669,7 +667,7 @@ def aci_hourly_replay(pred, aux, params, shift=None, lead_bins=LEAD_BINS):
     return dict(
         rhythm="ежечасный выпуск", nominal=nominal, gamma=params.gamma,
         max_factor=params.max_factor, stations_n=int(len(theta_end)), issues=int(hours),
-        overall=summ(np.ones(len(win), bool)), by_lead_bin=by_bin, by_role=by_role,
+        overall=summ(np.ones(len(win), bool)), by_lead_bin=by_bin,
         stations=dict(n=len(per_st), mad_base=float(dev0.mean()) if len(dev0) else float("nan"),
                       mad_aci=float(dev1.mean()) if len(dev1) else float("nan"),
                       per_station={k: dict(base=float(a), aci=float(b))
@@ -700,8 +698,6 @@ def print_aci_replay(r, tol=0.04):
     line("весь поток", r["overall"])
     for k, s in r["by_lead_bin"].items():
         line(f"лиды {k}", s)
-    for k, s in r["by_role"].items():
-        line(str(k), s)
     s = r["stations"]
     within = lambda key: np.mean([abs(v[key] - r["nominal"]) <= tol
                                   for v in s["per_station"].values()]) if s["n"] else float("nan")
