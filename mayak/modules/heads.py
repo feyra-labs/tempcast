@@ -46,6 +46,10 @@ class Heads(nn.Module):
     модам погоды. Масса квазипостоянных мод на полной истории в разы больше и растёт
     почти линейно с длиной истории, в среднем она заслонила бы остальные моды.
 
+    Без поправки (абляция ``no_correction``) выходного канала поправки и порога её веса
+    нет, поправка тождественно равна нулю; масштаб интервала и зазоры квантилей
+    считаются так же.
+
     Args:
         dz: размер паспорта станции.
         n_groups: число групп мод.
@@ -55,17 +59,20 @@ class Heads(nn.Module):
         z_proj: размер проекции паспорта на вход голов.
         evidence_modes: флаги мод, входящих в среднюю массу свидетельств, по одному на
             моду; None - все моды.
+        correction: есть ли поправка к аномалии; ложь - абляция ``no_correction``.
 
     Attributes:
-        r_kappa: сырой параметр порога веса поправки. Сам порог не меньше одного часа
-            свидетельств, чтобы вес не превращался в ступеньку при исчезающе малой массе.
-            При инициализации порог около 3.4 ч, как у сжатия мод: поправка набирает
-            силу с той же скоростью, что и аномалия.
+        r_kappa: сырой параметр порога веса поправки, только при включённой поправке.
+            Сам порог не меньше одного часа свидетельств, чтобы вес не превращался в
+            ступеньку при исчезающе малой массе. При инициализации порог около 3.4 ч,
+            как у сжатия мод: поправка набирает силу с той же скоростью, что и аномалия.
     """
 
     def __init__(self, dz, n_groups, n_sun, quantiles, hidden=48, z_proj=4,
-                 evidence_modes=None):
+                 evidence_modes=None, correction=True):
         super().__init__()
+        self.correction = bool(correction)
+        n_r = int(self.correction)
         if evidence_modes is None:
             self.register_buffer("evidence_w", None)
         else:
@@ -80,14 +87,15 @@ class Heads(nn.Module):
         self.in_dim = 1 + n_groups + 1 + n_sun + 1 + z_proj + 1 + 1
         self.zproj = nn.Linear(dz, z_proj)
         self.fc1 = nn.Linear(self.in_dim, hidden)
-        self.fc2 = nn.Linear(hidden, 2 + self.n_lo + self.n_hi)
-        self.r_kappa = nn.Parameter(torch.tensor(R_KAPPA_RAW_INIT))
+        self.fc2 = nn.Linear(hidden, n_r + 1 + self.n_lo + self.n_hi)
+        if self.correction:
+            self.r_kappa = nn.Parameter(torch.tensor(R_KAPPA_RAW_INIT))
         gaps = torch.tensor(lower + upper)
         with torch.no_grad():
             self.fc2.weight.zero_()
             self.fc2.bias.zero_()
-            self.fc2.bias[1] = 0.9
-            self.fc2.bias[2:] = inv_softplus(gaps)
+            self.fc2.bias[n_r] = 0.9
+            self.fc2.bias[n_r + 1:] = inv_softplus(gaps)
 
     def evidence_mass(self, e):
         """Средняя масса свидетельств по модам погоды.
@@ -130,9 +138,9 @@ class Heads(nn.Module):
             e: масса свидетельств по модам, форма (B, M).
 
         Returns:
-            Тройка: поправка к аномалии мод погоды (B, H), масштаб интервала (B, H) и
-            смещения квантилей от медианы (B, H, число квантилей) с нулём на месте
-            медианы.
+            Тройка: поправка к аномалии мод погоды (B, H) - нулевая без поправки, -
+            масштаб интервала (B, H) и смещения квантилей от медианы
+            (B, H, число квантилей) с нулём на месте медианы.
         """
         Bsz, Hn = o.shape
         zp = self.zproj(z)[:, None, :].expand(Bsz, Hn, self.z_proj)
@@ -144,9 +152,13 @@ class Heads(nn.Module):
                        log_sigma[..., None], zp, hn, le], dim=-1)
         out = self.fc2(F.gelu(self.fc1(x)))
 
-        r = R_MAX * torch.tanh(out[..., 0]) * self.evidence_gate(e)[:, None]
-        ratio = 0.08 + torch.sigmoid(out[..., 1] + 1.5)
-        gaps = F.softplus(out[..., 2:])
+        n_r = int(self.correction)
+        if self.correction:
+            r = R_MAX * torch.tanh(out[..., 0]) * self.evidence_gate(e)[:, None]
+        else:
+            r = torch.zeros_like(o)
+        ratio = 0.08 + torch.sigmoid(out[..., n_r] + 1.5)
+        gaps = F.softplus(out[..., n_r + 1:])
 
         lo = torch.flip(torch.cumsum(gaps[..., :self.n_lo], dim=-1), dims=(-1,))
         hi = torch.cumsum(gaps[..., self.n_lo:], dim=-1)

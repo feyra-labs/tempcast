@@ -162,20 +162,28 @@ class Ablations:
             тоже нулевой.
         no_solar: солнечные признаки убраны из входа энкодера и из входа голов.
             Гармонический базис климат-поля не трогается: это часть якоря.
-        no_mode_groups: групповой структуры нет: все моды, кроме квазипостоянной группы,
-            одной группой, постоянные времени и периоды при инициализации идут
-            равномерно в логарифме. Квазипостоянная группа остаётся отдельной с обеими
-            модами, своими периодами и пределами, поэтому групповых энергий две.
+        no_mode_groups: групповой структуры нет: все моды погоды одной группой,
+            постоянные времени и периоды при инициализации идут равномерно в
+            логарифме. Квазипостоянная группа, если она есть, остаётся отдельной с
+            обеими модами, своими периодами и пределами, поэтому групповых энергий две.
         no_offset_aug: без аугментации смещения станции: ни постоянной, ни суточной
             части. Это свойство потока данных, но флаг живёт здесь, чтобы абляция
             задавалась в одном месте; полная конфигурация прогона переносит его в
             аугментации данных.
+        no_correction: поправка голов к аномалии мод погоды тождественно равна нулю.
+            Головы по-прежнему дают масштаб интервала и смещения квантилей.
+        no_persistent: квазипостоянной группы нет: смещение станции идёт через моды
+            погоды, в медиане нет слагаемого с постоянным масштабом квазипостоянных мод,
+            масса свидетельств голов считается по всем модам. Сочетается с
+            ``no_mode_groups``.
     """
     no_compression: bool = False
     no_passport: bool = False
     no_solar: bool = False
     no_mode_groups: bool = False
     no_offset_aug: bool = False
+    no_correction: bool = False
+    no_persistent: bool = False
 
     def __post_init__(self):
         for f in fields(self):
@@ -206,7 +214,8 @@ class ModelConfig:
             её моды затухают медленнее всех, через них идёт устойчивое смещение станции
             в градусах - константа плюс суточная составляющая. Периоды мод группы - только
             0 и 24 ч, их частоты не подстраиваются ни считыванием, ни паспортом. В
-            среднюю массу свидетельств голов группа не входит.
+            среднюю массу свидетельств голов группа не входит. Абляция
+            ``no_persistent`` убирает группу из модели.
         tau_bounds: общие пределы постоянных времени мод, ч; группа может задать свои.
         passport_dim: размер паспорта станции.
         passport_hidden: ширина скрытого слоя кодировщика паспорта.
@@ -297,6 +306,9 @@ class ModelConfig:
         if names == [PERSISTENT_GROUP]:
             raise ConfigError(f"кроме квазипостоянной группы {PERSISTENT_GROUP!r} нужна хотя "
                               f"бы одна группа мод: по ней считается масса свидетельств голов")
+        if self.ablations.no_persistent and PERSISTENT_GROUP not in names:
+            raise ConfigError(f"абляция no_persistent: в mode_groups нет квазипостоянной "
+                              f"группы {PERSISTENT_GROUP!r}, убирать нечего")
         if not self.encoder_dilations or min(self.encoder_dilations) < 1:
             raise ConfigError("дилатации энкодера должны быть ≥ 1")
         if self.encoder_kernel < 2:
@@ -314,17 +326,22 @@ class ModelConfig:
 
     @property
     def effective_mode_groups(self):
-        """Группы мод с учётом абляции ``no_mode_groups``.
+        """Группы мод с учётом абляций ``no_persistent`` и ``no_mode_groups``.
 
-        Абляция снимает структуру только с мод погоды: они сливаются в одну группу с
-        однородной инициализацией в общих пределах модели. Квазипостоянная группа
-        остаётся отдельной группой после неё, с обеими модами, их начальными постоянными
-        времени, периодами и пределами: она описывает смещение станции, а не погоду.
+        ``no_persistent`` убирает квазипостоянную группу, число мод модели уменьшается
+        на её размер. ``no_mode_groups`` снимает структуру только с мод погоды: они
+        сливаются в одну группу с однородной инициализацией в общих пределах модели.
+        Квазипостоянная группа, если она осталась, идёт отдельной группой после неё, с
+        обеими модами, их начальными постоянными времени, периодами и пределами: она
+        описывает смещение станции, а не погоду.
         """
+        groups = self.mode_groups
+        if self.ablations.no_persistent:
+            groups = tuple(g for g in groups if g.name != PERSISTENT_GROUP)
         if not self.ablations.no_mode_groups:
-            return self.mode_groups
-        kept = tuple(g for g in self.mode_groups if g.name == PERSISTENT_GROUP)
-        m = self.n_modes - sum(g.size for g in kept)
+            return groups
+        kept = tuple(g for g in groups if g.name == PERSISTENT_GROUP)
+        m = sum(g.size for g in groups) - sum(g.size for g in kept)
         lo, hi = self.tau_bounds
         p_lo, p_hi = UNSTRUCTURED_PERIODS
         geom = lambda a, b: tuple(a * (b / a) ** (i / max(m - 1, 1)) for i in range(m))
@@ -349,7 +366,8 @@ class ModelConfig:
         Частоты этих мод фиксированы: их не подстраивают ни считывание, ни паспорт.
 
         Returns:
-            Кортеж флагов по модам в порядке мод модели.
+            Кортеж флагов по модам в порядке мод модели; при абляции ``no_persistent``
+            все флаги ложны.
         """
         return tuple(g.name == PERSISTENT_GROUP for g in self.effective_mode_groups
                      for _ in range(g.size))
@@ -363,13 +381,15 @@ class ModelConfig:
         поправки и вход голов описывают свидетельства о погоде.
 
         Returns:
-            Кортеж флагов по модам в порядке мод модели.
+            Кортеж флагов по модам в порядке мод модели; при абляции ``no_persistent``
+            в среднее входят все моды.
         """
         return tuple(not f for f in self.persistent_modes)
 
     @property
     def n_modes(self):
-        return sum(g.size for g in self.mode_groups)
+        """Число мод модели с учётом абляций."""
+        return sum(g.size for g in self.effective_mode_groups)
 
     @property
     def group_sizes(self):

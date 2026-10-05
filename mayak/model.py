@@ -31,6 +31,10 @@ class MAYAK(nn.Module):
     паспортом и подстраивает постоянные времени мод и частоты мод погоды. Формула - в
     описании модели.
 
+    Без квазипостоянной группы (абляция ``no_persistent``) слагаемого с
+    ``P_MODE_SCALE`` в медиане нет, смещение станции может идти только через моды
+    погоды. Без поправки голов (абляция ``no_correction``) поправка равна нулю.
+
     Вся архитектура задаётся конфигом модели: размеры, группы мод, квантили, флаги
     абляций. Производные размерности - каналы энкодера, вход голов, число групп -
     вычисляются из конфига. Флаги абляций меняют только методы этой модели, поэтому
@@ -62,8 +66,10 @@ class MAYAK(nn.Module):
                                           cfg.horizon, cfg.mode_tau_bounds,
                                           cfg.persistent_modes)
         self.heads = Heads(cfg.passport_dim, cfg.n_groups, cfg.n_solar_head, cfg.quantiles,
-                           cfg.heads_hidden, cfg.heads_z_proj, cfg.evidence_modes)
+                           cfg.heads_hidden, cfg.heads_z_proj, cfg.evidence_modes,
+                           correction=not abl.no_correction)
         assert self.heads.in_dim == cfg.heads_in_dim
+        self.has_persistent = any(cfg.persistent_modes)
         self._ch_index = {n: i for i, n in enumerate(cfg.channel_names)}
 
     def regularization(self, out):
@@ -163,15 +169,16 @@ class MAYAK(nn.Module):
             Словарь: квантили (B, H, число квантилей), медиана, среднее поля ``mu_c``,
             разброс поля с паспортом ``sigma_c`` и без него ``sigma_0``, аномалия мод
             погоды ``o``, вклад квазипостоянных мод ``o_p`` - постоянная и суточная
-            составляющие смещения станции, - поправка, масштаб интервала и энергии групп
-            мод.
+            составляющие смещения станции, нулевой без квазипостоянной группы, -
+            поправка, масштаб интервала и энергии групп мод.
         """
         mu_c, sigma_0, _ = self.field.evaluate(coefs, astro_f)
         _, sigma_z, _ = self.field.evaluate(self.field.coefficients(loc, z), astro_f)
         tau, omega, _ = self.readout.constants()
         o, o_p, Eg = self.propagator(a_re, a_im, z, tau, omega)
         r, ratio, off = self.heads(o, Eg, self.solar_future(astro_f), torch.log(sigma_z), z, e)
-        mu = mu_c + P_MODE_SCALE * o_p + sigma_0 * (o + r)
+        mu = mu_c + P_MODE_SCALE * o_p if self.has_persistent else mu_c
+        mu = mu + sigma_0 * (o + r)
         q = mu[..., None] + (sigma_z * ratio)[..., None] * off
         return dict(q=q, mu=mu, mu_c=mu_c, sigma_c=sigma_z, sigma_0=sigma_0, o=o, o_p=o_p,
                     r=r, ratio=ratio, Eg=Eg)

@@ -37,3 +37,5 @@ ablations:
   no_solar: false
   no_mode_groups: false
   no_offset_aug: false
+  no_correction: false
+  no_persistent: false
