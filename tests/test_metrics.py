@@ -245,11 +245,11 @@ def test_reliability_respects_target_mask():
 
 def _reference_conformal(q, shift, history):
     """Поправка по лидам и бину длины истории, порядок квантилей от медианы наружу, циклом."""
-    from mayak.metrics import history_bin_index
+    from mayak.metrics import history_bin_of
     q = np.array(q, np.float32, copy=True)
     hist = np.broadcast_to(np.asarray(history), q.shape[:-2])
     for idx in np.ndindex(*q.shape[:-2]):
-        hb = history_bin_index(int(hist[idx]))
+        hb = int(history_bin_of(int(hist[idx])))
         for h in range(q.shape[-2]):
             q[idx + (h,)] += shift[lead_bin_index(h + 1), hb]
     for i in range(I_MED - 1, -1, -1):

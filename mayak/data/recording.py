@@ -54,21 +54,4 @@ def record_values(x):
     return (round_half_even(x * s) / s).astype(np.float32)
 
 
-def is_recorded(x, mask=None):
-    """Лежат ли значения на сетке записи прибора.
-
-    Args:
-        x: значения, форма (..., 3).
-        mask: где значение есть, форма (..., 3); None - везде.
-
-    Returns:
-        True, если каждое имеющееся значение совпадает со своей записью.
-    """
-    x = np.asarray(x, np.float32)
-    ok = np.ones(x.shape, bool) if mask is None else np.asarray(mask) > 0
-    ok &= np.isfinite(x)
-    return bool(np.array_equal(record_values(x)[ok], x[ok]))
-
-
-__all__ = ["RECORD_SCALE", "is_recorded", "record_channel", "record_values",
-           "round_half_even"]
+__all__ = ["RECORD_SCALE", "record_channel", "record_values", "round_half_even"]

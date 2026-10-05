@@ -309,49 +309,6 @@ def _window_count(flag, half, after=None):
     return c[np.minimum(n, i + after + 1)] - c[np.maximum(0, i - half)]
 
 
-def mad_ok(x, valid, half=MAD_HALF, thresh=MAD_THRESH, min_valid=MAD_MIN_VALID, chunk=1 << 16,
-           floor=0.0, causal=False):
-    """Какие точки не выбросы относительно скользящей медианы.
-
-    Args:
-        x: значения, форма (N,).
-        valid: валидность точек, форма (N,).
-        half: полуширина окна, ч.
-        thresh: порог в единицах разброса.
-        min_valid: наименьшее число точек в окне.
-        chunk: сколько окон обрабатывать за раз.
-        floor: нижняя граница разброса.
-        causal: причинный режим окна.
-
-    Returns:
-        Булев массив (N,): True там, где точка не выброс.
-    """
-    x = np.asarray(x, np.float64)
-    before, after = window_span(half, causal)
-    med, mad, cnt = rolling_median_mad(x, valid, before, chunk, after=after)
-    bad = np.abs(x - med) > thresh * np.maximum(MAD_TO_SD * mad, floor)
-    return ~((cnt >= min_valid) & bad)
-
-
-def _mad_ok_reference(x, valid, half=MAD_HALF, thresh=MAD_THRESH, min_valid=MAD_MIN_VALID,
-                      floor=0.0, causal=False):
-    """Медленный эталон проверки выброса для тестов."""
-    x = np.asarray(x, np.float64)
-    before, after = window_span(half, causal)
-    n = len(x)
-    ok = np.ones(n, dtype=bool)
-    for i in range(n):
-        lo, hi = max(0, i - before), min(n, i + after + 1)
-        seg = x[lo:hi][valid[lo:hi] > 0]
-        if len(seg) < min_valid:
-            continue
-        med = np.median(seg)
-        mad = np.median(np.abs(seg - med)) + 1e-6
-        if abs(x[i] - med) > thresh * max(MAD_TO_SD * mad, floor):
-            ok[i] = False
-    return ok
-
-
 def increments(x, ok, max_gap):
     """Приращения между соседними валидными отчётами.
 
@@ -488,25 +445,6 @@ def run_lengths(x, ok, max_gap, causal=False, below=None, at_least=None):
 
 def _long(span, count, hours, min_count):
     return (span >= hours) & (count >= min_count)
-
-
-def stuck_flags(x, ok, min_hours, max_gap=6, min_count=4, below=None, causal=False):
-    """Одно и то же значение дольше min_hours часов.
-
-    Args:
-        x: значения, форма (N,).
-        ok: валидность отчётов, форма (N,).
-        min_hours: допустимый срок одного значения, ч.
-        max_gap: наибольший пропуск внутри серии, ч.
-        min_count: наименьшее число отчётов в серии.
-        below: если задано, в серии участвуют только значения меньше него.
-        causal: причинный режим.
-
-    Returns:
-        Булев массив (N,).
-    """
-    span, count = run_lengths(x, ok, max_gap, causal, below=below)
-    return _long(span, count, min_hours, min_count)
 
 
 def saturation_flags(rh, ok, sat, min_hours, max_gap=6, min_count=4, causal=False):
@@ -769,11 +707,6 @@ def qc_station(T, P, RH, valid, *, Td=None, flag=None, elev=None, cfg=DEFAULT_QC
     mask = (codes == 0).astype(np.uint8)
     x, _ = enforce_invariant(x, mask)
     return x, mask, codes
-
-
-def run_qc(T, P, RH, valid):
-    x, mask, _ = qc_station(T, P, RH, valid)
-    return x, mask.astype(np.float32)
 
 
 def qc_window(x, mask, elev=None, cfg=DEFAULT_QC, past=None):

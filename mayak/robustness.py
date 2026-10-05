@@ -746,8 +746,7 @@ def main(argv=None):
     base = base_eval_set(clims, args.manifest, cfg)
     run_checklist(store, datasets=[base], checkpoints=all_ckpts)
     rec = load_run_record(args.ckpt)
-    boot_seed = args.eval_seed if args.eval_seed is not None else (
-        int(rec["seeds"]["eval"]) if rec else 0)
+    boot_seed = args.eval_seed if args.eval_seed is not None else int(rec["seeds"]["eval"])
 
     named = {MAIN_MODEL: load_model(args.ckpt)}
     for arch, c in baseline_ckpts.items():

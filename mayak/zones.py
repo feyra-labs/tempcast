@@ -1,8 +1,6 @@
 """Явные словари разрезов оценки: зоны Кёппена и сезоны."""
 from __future__ import annotations
 
-import numpy as np
-
 ZONES_VERSION = "1"
 
 KOPPEN_ZONES = (
@@ -20,7 +18,6 @@ KG_TIF_CODE = {i + 1: z for i, z in enumerate(KOPPEN_ZONES)}
 
 SEASONS = ("winter", "spring", "summer", "autumn")
 SEASON_RU = {"winter": "зима", "spring": "весна", "summer": "лето", "autumn": "осень"}
-SEASON_ID = {s: i for i, s in enumerate(SEASONS)}
 N_SEASONS = len(SEASONS)
 
 
@@ -35,18 +32,6 @@ def normalize_zone(zone) -> str:
     """
     z = str(zone).strip()
     return z if z in KOPPEN_ID else UNKNOWN_ZONE
-
-
-def koppen_id(zone) -> int:
-    """Стабильный номер полной зоны Кёппена.
-
-    Args:
-        zone: зона Кёппена как в манифесте.
-
-    Returns:
-        Номер от нуля до числа зон в таблице, у неизвестной зоны - последний.
-    """
-    return KOPPEN_ID[normalize_zone(zone)]
 
 
 def koppen_group(zone) -> str:
@@ -89,32 +74,6 @@ def season_of(month, lat) -> str:
     return SEASONS[i]
 
 
-def season_id(month, lat) -> int:
-    return SEASON_ID[season_of(month, lat)]
-
-
-def seasons_of(months, lat) -> np.ndarray:
-    """Местные сезоны для массива месяцев одной станции.
-
-    Args:
-        months: месяцы UTC от 1 до 12, массив.
-        lat: широта станции, градусы.
-
-    Returns:
-        Массив имён сезонов той же формы.
-
-    Raises:
-        ValueError: хотя бы один месяц вне диапазона от 1 до 12.
-    """
-    m = np.asarray(months, dtype=np.int64)
-    if m.size and (m.min() < 1 or m.max() > 12):
-        raise ValueError("месяц вне [1, 12]")
-    i = (m % 12) // 3
-    if float(lat) < 0.0:
-        i = (i + 2) % 4
-    return np.asarray(SEASONS, dtype=object)[i]
-
-
 __all__ = ["KG_TIF_CODE", "KOPPEN_ID", "KOPPEN_ZONES", "N_KOPPEN", "N_SEASONS", "SEASONS",
-           "SEASON_ID", "SEASON_RU", "UNKNOWN_ZONE", "ZONES_VERSION", "koppen_group",
-           "koppen_id", "normalize_zone", "season_id", "season_of", "seasons_of"]
+           "SEASON_RU", "UNKNOWN_ZONE", "ZONES_VERSION", "koppen_group", "normalize_zone",
+           "season_of"]

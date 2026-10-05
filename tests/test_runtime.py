@@ -238,7 +238,7 @@ def test_manifest_contract(model, tmp_path):
     assert {c: tuple(v) for c, v in man["phys"].items()} == {c: PHYS[c] for c in ("T", "P", "RH")}
     np.testing.assert_array_equal(np.float32(man["zq"]), ZQ)
     assert ModelConfig.from_dict(man["model_config"]) == cfg
-    assert man["format"] == GRAPH_FORMAT == 7
+    assert man["format"] == GRAPH_FORMAT == 1
     assert set(man["calibration"]) == {"conformal", "aci", "lead_bins", "history_bins"}
     assert all(set(g) == {"file", "inputs", "outputs", "shapes_in", "shapes_out"}
                for g in man["graphs"].values())

@@ -31,7 +31,7 @@ from mayak.data.qc import (DEFAULT_QC, QC_CODE_DOC, STATION_CHECKS, code_fractio
 from mayak.data.recording import record_values
 from mayak.data.splits import (EXTERNAL_MIN_TRAIN_YEARS, ROLE_EXTERNAL, TIME_LAYOUT, full_years,
                                layout_fingerprint, time_layout)
-from mayak.timeaxis import legacy_t0, window_calendar
+from mayak.timeaxis import window_calendar
 
 log = logging.getLogger(__name__)
 
@@ -52,9 +52,6 @@ CACHE_CODE = {
     "mayak.timeaxis": None,
 }
 
-CACHE_CODE_IGNORED = ("mayak.codehash", "check_sources", "read_manifest", "source_path",
-                      "key_payload", "cache_key", "default_cache_root", "previous_build",
-                      "rebuild_reasons", "log")
 KEY_PARTS = {"sources": "источники", "qc_config": "конфиг QC",
              "clim_params": "параметры климатологии", "layout": "раскладка сплитов",
              "code": "код правил"}
@@ -94,12 +91,7 @@ def read_source(path):
         for opt in ("flag", "Td"):
             if opt in d:
                 out[opt] = d[opt]
-        if "t0_utc_h" in d:
-            out["t0"] = int(d["t0_utc_h"])
-        else:
-            log.warning("%s: старый формат (t0_doy/t0_hour) — пересоберите источник; "
-                        "год условный, календарь приближённый", path)
-            out["t0"] = legacy_t0(float(d["t0_doy"]), float(d["t0_hour"]))
+        out["t0"] = int(d["t0_utc_h"])
     return out
 
 

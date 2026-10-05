@@ -387,14 +387,14 @@ def test_checkpoint_selection_check(store, manifest, dm, tmp_path):
 def test_trainer_checkpoint_carries_selection_record(dm, store, tmp_path):
     import pytorch_lightning as L
     from pytorch_lightning.callbacks import ModelCheckpoint
-    from mayak.lit import LitBaseline, SelectionProvenance
+    from mayak.lit import LitForecaster, SelectionProvenance
     torch.manual_seed(0)
     ck = ModelCheckpoint(dirpath=str(tmp_path), monitor="val/loss", mode="min", filename="best")
     trainer = L.Trainer(max_steps=2, accelerator="cpu", devices=1, logger=False,
                         val_check_interval=1, check_val_every_n_epoch=None,
                         limit_val_batches=1, enable_progress_bar=False,
                         enable_model_summary=False, callbacks=[ck, SelectionProvenance()])
-    trainer.fit(LitBaseline(model_name="dlinear", total_steps=2), datamodule=dm)
+    trainer.fit(LitForecaster(arch="dlinear", total_steps=2), datamodule=dm)
     rec = torch.load(ck.best_model_path, map_location="cpu", weights_only=False)[SELECTION_KEY]
     assert rec["station_role"] == ROLE_VAL and rec["time_key"] == "val"
     assert rec["monitor"] == "val/loss" and rec["stations"] == ["v0", "v1"]

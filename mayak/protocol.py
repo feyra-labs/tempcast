@@ -157,8 +157,6 @@ class Protocol:
     def from_dict(cls, d):
         """Протокол из словаря.
 
-        Пустой список ``deviations`` из журналов прежних прогонов пропускается.
-
         Args:
             d: словарь с полями протокола.
 
@@ -166,21 +164,9 @@ class Protocol:
             Протокол.
 
         Raises:
-            ProtocolError: в словаре есть непустой список отклонений архитектуры; такой
-                протокол не общий, и сравнивать по нему нельзя. Или в словаре есть поля
-                прежней валидации: число батчей валидации или длина истории валидации
-                этапа; чекпойнт такого прогона выбран по другому набору.
+            TypeError: в словаре есть поле, которого нет у протокола или этапа.
         """
-        d = dict(d)
-        if d.pop("deviations", None):
-            raise ProtocolError("протокол с отклонениями для отдельной архитектуры не "
-                                "поддерживается: протокол один на все модели")
-        stages = [s if isinstance(s, Stage) else dict(s) for s in d.get("stages", ())]
-        if "val_batches" in d or any(isinstance(s, dict) and "val_L" in s for s in stages):
-            raise ProtocolError("протокол прежней валидации (val_batches, val_L у этапов): "
-                                "чекпойнт выбран на части набора с одной длиной истории; "
-                                "переобучите модель")
-        return cls(**d)
+        return cls(**dict(d))
 
     def resolved_seeds(self):
         return self.seeds.resolve(self.seed)

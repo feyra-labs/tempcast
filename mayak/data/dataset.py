@@ -58,25 +58,6 @@ def sample_history_len(rng, curriculum):
     return int(lo) if lo == hi else int(rng.integers(lo, hi + 1))
 
 
-def history_probability(curriculum, lo, hi):
-    """Вероятность того, что длина истории окна лежит в заданных границах.
-
-    Args:
-        curriculum: имя куррикулума.
-        lo: наименьшая длина, ч, включительно.
-        hi: наибольшая длина, ч, включительно.
-
-    Returns:
-        Вероятность от нуля до единицы.
-    """
-    total, prev = 0.0, 0.0
-    for upper, a, b in HISTORY_MIX[curriculum]:
-        overlap = max(0, min(hi, b) - max(lo, a) + 1)
-        total += (upper - prev) * overlap / (b - a + 1)
-        prev = upper
-    return total
-
-
 def make_streams(base_seed, worker_id=0, salt=0, aug_seed=None):
     """Два независимых генератора: поток окон и аугментации.
 

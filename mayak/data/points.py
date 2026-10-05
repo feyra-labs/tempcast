@@ -81,19 +81,6 @@ class ZoneGrid:
         inside = (row >= 0) & (row < n_lat) & (col >= 0) & (col < n_lon)
         return np.clip(row, 0, n_lat - 1), np.clip(col, 0, n_lon - 1), inside
 
-    def code_at(self, lat, lon):
-        """Код зоны в точках, ноль вне сетки.
-
-        Args:
-            lat: широты, градусы.
-            lon: долготы, градусы.
-
-        Returns:
-            Массив кодов той же формы, что и входы.
-        """
-        row, col, inside = self.cell_of(lat, lon)
-        return np.where(inside, self.codes[row, col], 0)
-
     @classmethod
     def from_raster(cls, path, step=DEFAULT_GRID_STEP):
         """Сетка зон, снятая с растра Кёппена в центрах ячеек заданного шага.

@@ -279,19 +279,6 @@ def history_bin_of(history, history_bins=HISTORY_BINS):
     return np.minimum(np.searchsorted(his, h, side="left"), len(his) - 1).astype(np.int64)
 
 
-def history_bin_index(L, history_bins=HISTORY_BINS):
-    """Номер бина длины истории для одной длины.
-
-    Args:
-        L: длина истории, ч.
-        history_bins: бины длины истории.
-
-    Returns:
-        Номер бина.
-    """
-    return int(history_bin_of(int(L), history_bins))
-
-
 def order_around_median(q):
     """Восстанавливает порядок квантилей, не трогая медиану.
 
@@ -339,16 +326,10 @@ def check_conformal_shape(shift, lead_bins=LEAD_BINS, history_bins=HISTORY_BINS)
         квантилей).
 
     Raises:
-        ValueError: таблица старого формата без бинов длины истории, другой формы или с
-            ненулевой поправкой медианы.
+        ValueError: таблица другой формы или с ненулевой поправкой медианы.
     """
     shift = np.asarray(shift, np.float32)
     want = (len(lead_bins), len(history_bins), NQ)
-    if shift.ndim == 2:
-        raise ValueError(f"таблица поправок старого формата {shift.shape}: бины лидов × "
-                         f"квантили, без бинов длины истории. Теперь таблица - бины лидов × "
-                         f"бины длины истории × квантили {want}; подгоните таблицу заново: "
-                         f"python scripts/calibrate.py")
     if shift.shape != want:
         raise ValueError(f"таблица поправок формы {shift.shape}, нужно {want}: бины лидов × "
                          f"бины длины истории × квантили")
@@ -619,36 +600,6 @@ class ACIParams:
         return self.update(theta, miss), miss
 
 
-def aci_run(scores, params, theta0=0.0):
-    """Прогон адаптивной калибровки по одному потоку оценок в порядке времени.
-
-    NaN в оценках - обратной связи нет, факт невалиден, параметр не меняется.
-
-    Args:
-        scores: нормированные выходы факта за интервал по порядку времени.
-        params: параметры адаптивной калибровки.
-        theta0: начальный параметр.
-
-    Returns:
-        Словарь: параметр до каждого наблюдения, с которым и выпущен интервал; промахи,
-        NaN там, где связи нет; итоговый параметр и число упоров в границы.
-    """
-    scores = np.asarray(scores, np.float64).ravel()
-    theta = params.clip(theta0)
-    before = np.empty(len(scores), np.float64)
-    miss = np.full(len(scores), np.nan)
-    clipped = 0
-    lo, hi = params.theta_min, params.theta_max
-    for k, s in enumerate(scores.tolist()):
-        before[k] = theta
-        if s != s:
-            continue
-        theta, m = params.step(theta, s)
-        miss[k] = m
-        clipped += theta in (lo, hi)
-    return dict(theta=before, miss=miss, theta_end=theta, clipped=int(clipped))
-
-
 class AdaptiveCalibration:
     """Адаптивная калибровка прибора по бинам лидов.
 
@@ -797,11 +748,6 @@ class AdaptiveCalibration:
             self.updates[b] += 1
             self.misses[b] += int(miss)
             self.clipped += self.theta[b] in (self.params.theta_min, self.params.theta_max)
-
-    def coverage(self):
-        """Фактическое покрытие по обратной связи в каждом бине; NaN без обратной связи."""
-        return tuple(1.0 - m / u if u else float("nan")
-                     for u, m in zip(self.updates, self.misses))
 
 
 def aci_effective_level(theta, target=0.10):
@@ -1334,48 +1280,6 @@ def seed_spread(summaries, key="pooled"):
     return {m: spread([s[key][m] for s in summaries]) for m in METRICS}
 
 
-def skill(y, mu, mu_clim, w):
-    """Скилл относительно климатологии на выбранных парах; знаменатель - те же пары.
-
-    Args:
-        y: факт.
-        mu: точечный прогноз.
-        mu_clim: прогноз климатологии.
-        w: веса пар.
-
-    Returns:
-        Единица минус отношение квадратичной ошибки прогноза к ошибке климатологии.
-    """
-    y = np.asarray(y, np.float64)
-    sums, den = _sums_of(y, mu, mu_clim, w)
-    return float(1.0 - sums["se"] / max(sums["se_clim"], EPS))
-
-
-def _sums_of(y, mu, mu_clim, w):
-    w = (np.asarray(w, np.float64) > 0).astype(np.float64)
-    se = (np.asarray(mu, np.float64) - y) ** 2
-    se_c = (np.asarray(mu_clim, np.float64) - y) ** 2
-    return dict(se=float((se * w).sum()), se_clim=float((se_c * w).sum())), float(w.sum())
-
-
-def skill_per_lead(y, mu, mu_clim, w):
-    """Скилл отдельно на каждом лиде: и числитель, и знаменатель - по этому лиду.
-
-    Args:
-        y: факт, форма (N, H).
-        mu: точечный прогноз, форма (N, H).
-        mu_clim: прогноз климатологии, форма (N, H).
-        w: веса пар, форма (N, H).
-
-    Returns:
-        Массив длины H.
-    """
-    mse = wmean((np.asarray(mu) - np.asarray(y)) ** 2, w, axis=0)
-    mse_c = wmean((np.asarray(mu_clim) - np.asarray(y)) ** 2, w, axis=0)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        return 1.0 - mse / np.maximum(mse_c, EPS)
-
-
 def coverage(y, q, w, lo=I_LO90, hi=I_HI90):
     return float(wmean(inside(y, q[..., lo], q[..., hi]), w))
 
@@ -1400,12 +1304,12 @@ def metric_table(y, mu, q, mu_clim, w, leads=(1, 3, 6, 12, 24, 48, 72, 120, 168)
 
 __all__ = ["ACIParams", "AdaptiveCalibration", "CENTRAL_INTERVALS", "Evaluation", "FINE_LEADS",
            "HISTORY_BINS", "LEAD_BINS", "METRICS", "NO_HOUR", "NQ", "Q", "SHARPNESS_POINTS",
-           "SHARPNESS_RANGE", "ZQ", "aci_effective_level", "aci_run", "aci_score",
+           "SHARPNESS_RANGE", "ZQ", "aci_effective_level", "aci_score",
            "aci_score_bounds", "apply_adaptive", "apply_conformal", "breakdown", "by_lead",
            "by_lead_bin",
            "calibrate_forecast", "check_conformal_shape", "check_history_bins",
            "check_median_free", "conformal_table", "coverage", "fit_conformal_shift",
-           "history_bin_index", "history_bin_of", "inside", "interval_indices",
+           "history_bin_of", "inside", "interval_indices",
            "lead_bin_index", "lead_bin_of", "lead_mask", "metric_table", "order_around_median",
            "ordered_labels", "pair_terms", "pinball_crps", "seed_spread", "sharpness_scales",
-           "skill", "skill_per_lead", "spread", "width_at_coverage", "winkler", "wmean"]
+           "spread", "width_at_coverage", "winkler", "wmean"]

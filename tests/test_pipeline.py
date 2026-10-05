@@ -14,10 +14,10 @@ import pytest
 import mayak
 from mayak.constants import H, L_MAX
 from mayak.data import store as S
-from mayak.data.qc import QCCode, _mad_ok_reference, mad_ok, qc_station
+from mayak.data.qc import DEFAULT_QC, MAD_TO_SD, QCCode, _spike_flags, qc_station
 from mayak.data.recording import record_values
-from mayak.timeaxis import (future_calendar, to_hourly_grid,
-                            to_utc_hour, utc_to_doy_hour, window_calendar)
+from mayak.data.window import issue_calendar
+from mayak.timeaxis import to_hourly_grid, to_utc_hour, window_calendar
 
 REPO = Path(__file__).resolve().parents[1]
 N_HOURS = 12_000
@@ -73,19 +73,48 @@ def _fresh_process_memo():
     S._STORES.clear()
 
 
+def _spike_reference(x, valid, half, thresh, min_valid, floor, causal):
+    """Медленный эталон проверки выброса одного канала: медиана и MAD окна циклом по часам.
+
+    Returns:
+        Булев массив (N,): True там, где точка не выброс.
+    """
+    x = np.asarray(x, np.float64)
+    before, after = (2 * half, 0) if causal else (half, half)
+    n = len(x)
+    ok = np.ones(n, dtype=bool)
+    for i in range(n):
+        lo, hi = max(0, i - before), min(n, i + after + 1)
+        seg = x[lo:hi][valid[lo:hi] > 0]
+        if len(seg) < min_valid:
+            continue
+        med = np.median(seg)
+        mad = np.median(np.abs(seg - med)) + 1e-6
+        if abs(x[i] - med) > thresh * max(MAD_TO_SD * mad, floor):
+            ok[i] = False
+    return ok
+
+
 @pytest.mark.parametrize("dtype", [np.float32, np.float64])
-def test_mad_vectorized_matches_reference(dtype):
+def test_spike_flags_match_reference(dtype):
+    """Выбросы рабочего QC совпадают с эталоном по каждому каналу в обоих режимах окна."""
+    cfg = DEFAULT_QC
     rng = np.random.default_rng(0)
-    for trial in range(150):
+    for trial in range(60):
         n = int(rng.integers(1, 300))
-        x = (rng.standard_normal(n) * rng.uniform(0.1, 5)).astype(dtype)
+        x = (rng.standard_normal((n, 3)) * rng.uniform(0.1, 5, 3)).astype(dtype)
         if trial % 3 == 0:
             x = np.round(x).astype(dtype)
-        x[rng.random(n) < 0.03] += dtype(40)
-        v = (rng.random(n) < rng.uniform(0.2, 1.0)).astype(np.uint8)
-        x[(v == 0) & (rng.random(n) < 0.3)] = np.nan
-        got = mad_ok(x, v, chunk=int(rng.integers(1, 50)))
-        assert np.array_equal(got, _mad_ok_reference(x, v)), f"trial {trial}"
+        x[rng.random((n, 3)) < 0.03] += dtype(40)
+        base = rng.random((n, 3)) < rng.uniform(0.2, 1.0)
+        x[~base & (rng.random((n, 3)) < 0.3)] = np.nan
+        for causal in (False, True):
+            got = _spike_flags(x, base, cfg, causal)
+            for j in range(3):
+                ok = _spike_reference(x[:, j], base[:, j], cfg.spike_half, cfg.spike_thresh,
+                                      cfg.spike_min_valid, cfg.scale_floor[j], causal)
+                assert np.array_equal(got[:, j], base[:, j] & ~ok), \
+                    f"trial {trial}, causal={causal}, канал {j}"
 
 
 def test_qc_per_channel_mask_and_codes():
@@ -145,11 +174,12 @@ def test_calendar_matches_independent_reference():
     (datetime(2021, 3, 1, 12, tzinfo=timezone(timedelta(hours=3))), 59 + 9 / 24, 9.0),
 ])
 def test_calendar_fixed_points(ts, doy, hour):
-    assert utc_to_doy_hour(ts) == pytest.approx((doy, hour))
+    d, h = window_calendar(0, to_utc_hour(ts))
+    assert (float(d), float(h)) == pytest.approx((doy, hour))
 
 
 def test_all_calendar_paths_agree(manifest):
-    """Сетка сборщика, кэш, датасет и рантайм дают один и тот же календарь."""
+    """Сетка сборщика, датасет и устройство дают один и тот же календарь."""
     from mayak.data.dataset import WindowDataset
     times = pd.date_range("2020-02-27 22:00", periods=100, freq="h", tz="UTC")
     t0, _ = to_hourly_grid(times, {"T": np.zeros(100)})
@@ -165,13 +195,10 @@ def test_all_calendar_paths_agree(manifest):
     got_h = np.concatenate([np.asarray(item["hour_hist"]), np.asarray(item["hour_fut"])])
     assert np.allclose(got_d, ref_d, atol=1e-4) and np.array_equal(got_h, ref_h)
 
-    last_obs = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(hours=s["t0"] + t - 1)
-    rt_d, rt_h = utc_to_doy_hour(last_obs)
-    assert (rt_d, rt_h) == pytest.approx((float(item["doy_hist"][-1]),
-                                          float(item["hour_hist"][-1])))
-    fd, fh = future_calendar(last_obs, H)
-    assert np.allclose(fd, np.asarray(item["doy_fut"]), atol=1e-4)
-    assert np.array_equal(fh, np.asarray(item["hour_fut"]))
+    last = s["t0"] + t - 1
+    device = issue_calendar(0, last + 1, L_MAX, H)
+    for k, v in zip(("doy_hist", "hour_hist", "doy_fut", "hour_fut"), device):
+        np.testing.assert_array_equal(np.asarray(item[k]), v, err_msg=k)
 
 
 def test_hourly_grid_marks_gaps_without_interpolation():

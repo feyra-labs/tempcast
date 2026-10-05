@@ -66,14 +66,6 @@ class DSBlock(nn.Module):
         h = self.dw(F.pad(x, (self.pad, 0)))
         return x + F.gelu(self.norm(self.pw(h)))
 
-    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        if prefix + "gn.weight" in state_dict:
-            raise RuntimeError(
-                f"{prefix}gn: веса обучены с нормализацией по всей оси времени окна. "
-                f"Эта нормализация не причинна и несовместима с потактовым шагом - "
-                f"модель нужно переобучить.")
-        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
-
 
 class SynopticEncoder(nn.Module):
     """Причинный TCN из depthwise-separable блоков.

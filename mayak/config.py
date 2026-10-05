@@ -367,10 +367,6 @@ class ModelConfig:
         return tuple(g.size for g in self.effective_mode_groups)
 
     @property
-    def group_names(self):
-        return tuple(g.name for g in self.effective_mode_groups)
-
-    @property
     def n_groups(self):
         return len(self.effective_mode_groups)
 
@@ -411,10 +407,6 @@ class ModelConfig:
         плюс один.
         """
         return (self.encoder_kernel - 1) * sum(self.encoder_dilations) + 1
-
-    @property
-    def history_days(self):
-        return self.max_history // 24
 
     @property
     def device_window(self):
@@ -965,24 +957,10 @@ class AugmentConfig:
             Конфиг аугментаций.
 
         Raises:
-            ConfigError: неизвестный ключ или ключ прежнего дрейфа.
+            ConfigError: неизвестный ключ.
         """
-        if d is not None and "drift_max" in d:
-            raise ConfigError("data.augment.drift_max больше не поддерживается: дрейф задаётся "
-                              "скоростью в сутки (drift_rate_max), а не смещением в момент "
-                              "выпуска. Конфиг с этим ключом принадлежит прогону, обученному с "
-                              "прежним дрейфом; переобучите модель")
         d = _strict_kwargs(cls, d, "data.augment")
         return cls.from_profile(d.pop("profile", "aggressive"), **d)
-
-    @classmethod
-    def only(cls, name, profile="aggressive"):
-        if name not in AUGMENT_PROB_FIELDS:
-            raise ConfigError(f"нет аугментации {name!r}; есть {tuple(AUGMENT_PROB_FIELDS)}")
-        base = cls.from_profile(profile)
-        probs = {f: 0.0 for f in AUGMENT_PROB_FIELDS.values()}
-        probs[AUGMENT_PROB_FIELDS[name]] = 1.0
-        return replace(base, **probs)
 
     def deviations(self):
         """Поля, которые отличаются от объявленного профиля.
@@ -1105,13 +1083,8 @@ class DataConfig:
             Конфиг данных.
 
         Raises:
-            ConfigError: неизвестный ключ или ключ прежнего набора валидации.
+            ConfigError: неизвестный ключ.
         """
-        if d is not None and "val_max_windows" in d:
-            raise ConfigError("data.val_max_windows больше не поддерживается: размер набора "
-                              "валидации задаётся числом окон на станцию "
-                              "(val_windows_per_station). Конфиг с этим ключом принадлежит "
-                              "прогону, выбранному по прежней валидации; переобучите модель")
         return cls(**_strict_kwargs(cls, d, "data"))
 
 

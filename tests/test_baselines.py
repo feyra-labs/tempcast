@@ -7,8 +7,8 @@ import torch
 import torch.nn as nn
 
 from mayak import baselines as BL
-from mayak.baselines.lru import (LRULayer, LRUForecaster, lru_recurrent, lru_scan_associative,
-                                 lru_scan_chunked)
+from mayak.baselines.lru import (LRULayer, LRUForecaster, lambda_polar, lru_recurrent,
+                                 lru_scan_associative, lru_scan_chunked)
 from mayak.baselines.patchtst import make_patches, masked_instance_stats
 from mayak.config import ConfigError, DLinearConfig, LRUConfig, PatchTSTConfig
 from mayak.constants import H, L_MAX, NQ
@@ -108,7 +108,7 @@ def test_lru_full_forecast_identical_for_all_scans():
         == "recurrent"
 
 
-def test_lru_eigenvalues_inside_unit_disk_for_any_parameters():
+def test_lru_modulus_inside_unit_disk_for_any_parameters():
     """Экспоненциальная параметризация держит модуль собственного числа строго меньше единицы.
 
     Это верно при любых сырых параметрах, пока модуль различим в float64. В float32 он
@@ -119,7 +119,8 @@ def test_lru_eigenvalues_inside_unit_disk_for_any_parameters():
     with torch.no_grad():
         lay.nu_log.copy_(torch.linspace(-30, 5, 64, dtype=torch.float64))
         lay.theta_log.copy_(torch.linspace(-10, 5, 64))
-    mod, _ = lay.eigenvalues()
+    nu, _ = lambda_polar(lay.nu_log, lay.theta_log)
+    mod = torch.exp(-nu)
     assert (mod < 1).all() and (mod >= 0).all()
 
 
@@ -275,11 +276,11 @@ def test_new_baselines_monotone_and_finite_on_extreme_inputs(arch, case):
 @pytest.mark.parametrize("arch", NEW_ARCHS)
 @pytest.mark.parametrize("L", [0, 24, L_MAX])
 def test_new_baselines_train_with_finite_gradients(arch, L):
-    from mayak.loss import pinball_loss
+    from mayak.loss import forecast_loss
     torch.manual_seed(0)
     m = BL.NEURAL[arch]().train()
     b = _batch(B=4, L=L)
-    loss = pinball_loss(m(b), b)
+    loss = forecast_loss(m(b), b)
     loss.backward()
     assert torch.isfinite(loss)
     grads = [p.grad for p in m.parameters() if p.grad is not None]

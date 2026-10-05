@@ -66,18 +66,6 @@ class MAYAK(nn.Module):
         assert self.heads.in_dim == cfg.heads_in_dim
         self._ch_index = {n: i for i, n in enumerate(cfg.channel_names)}
 
-    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        key = prefix + "encoder.stem.weight"
-        n_ch = self.encoder.stem.weight.shape[1]
-        if key in state_dict and state_dict[key].shape[1] != n_ch:
-            raise RuntimeError(
-                f"{key}: в чекпойнте энкодер на {state_dict[key].shape[1]} входных каналов, у "
-                f"модели {n_ch}. Веса обучены, когда смещение станции хранилось в единицах "
-                f"климатологического разброса и переводилось в градусы разбросом поля с "
-                f"паспортом, а канала аномалии в градусах у энкодера не было; модель нужно "
-                f"переобучить.")
-        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
-
     def regularization(self, out):
         return mayak_regularizers(out)
 
@@ -105,19 +93,6 @@ class MAYAK(nn.Module):
         return [dict(name="rest", params=rest, weight_decay=weight_decay),
                 dict(name="field", params=field, weight_decay=self.FIELD_WEIGHT_DECAY),
                 dict(name="no_decay", params=no_decay, weight_decay=0.0)]
-
-    @staticmethod
-    def lag_valid(v, k):
-        """Маска часов, у которых валидны и сам час, и час на k раньше.
-
-        Args:
-            v: маска наличия, форма (..., L).
-            k: лаг в часах.
-
-        Returns:
-            Маска той же формы.
-        """
-        return lag_valid(v, k)
 
     def build_channels(self, x, mask, astro_h, mu_c, sigma_c, defc):
         """Входные каналы энкодера в порядке имён каналов конфига.
@@ -160,9 +135,6 @@ class MAYAK(nn.Module):
             Тензор канала, форма (B, ...).
         """
         return ch[:, self._ch_index[name]]
-
-    def channel_indices(self, names):
-        return [self._ch_index[n] for n in names if n in self._ch_index]
 
     def solar_future(self, astro_f):
         """Солнечные ковариаты голов на часах горизонта.
@@ -260,7 +232,7 @@ class MAYAK(nn.Module):
         ch, aT, vt = self.build_channels(x, mask, astro_h, mu0, sg0, df0)
 
         summ, day_mask = self.daily_summaries(aT, self.channel(ch, "dP24"), vt,
-                                              self.lag_valid(mask[..., 1], DAY_LAG))
+                                              lag_valid(mask[..., 1], DAY_LAG))
         z, kl = self.passport(loc, summ, day_mask, sample=self.training)
 
         feats = self.encoder(ch)

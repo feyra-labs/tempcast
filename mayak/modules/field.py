@@ -81,15 +81,6 @@ class ClimateField(nn.Module):
         c = self.head_scale(F.gelu(h))
         return c_mu, c[:, :N_SIG], c[:, N_SIG:]
 
-    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        if prefix + "head.weight" in state_dict:
-            raise RuntimeError(
-                f"{prefix}head: в чекпойнте климат-поле прежнего устройства, где паспорт "
-                f"модулировал и коэффициенты среднего. Прогноз от такого поля отсчитывался "
-                f"от другого среднего, чем нормировка истории, и смещение станции "
-                f"учитывалось дважды: через паспорт и через моды; модель нужно переобучить.")
-        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
-
     def evaluate(self, coefs, astro):
         """Поле в наборе моментов.
 

@@ -40,7 +40,7 @@ class Climatology:
         Args:
             beta: коэффициенты среднего.
             sigma: разброс остатка станции, °C.
-            scale_beta: коэффициенты масштаба остатка; None у старого кэша.
+            scale_beta: коэффициенты масштаба остатка.
             n_year: число годовых гармоник среднего.
             n_day: число суточных гармоник среднего.
             scale_n_year: число годовых гармоник масштаба.
@@ -52,7 +52,7 @@ class Climatology:
         c = cls(n_year, n_day, scale_n_year, scale_n_day)
         c.beta = np.asarray(beta, np.float64)
         c.sigma = float(sigma)
-        c.scale_beta = None if scale_beta is None else np.asarray(scale_beta, np.float64)
+        c.scale_beta = np.asarray(scale_beta, np.float64)
         return c
 
     def __init__(self, n_year=3, n_day=3, scale_n_year=2, scale_n_day=2):
@@ -92,13 +92,7 @@ class Climatology:
 
         Returns:
             Масштаб, °C.
-
-        Raises:
-            RuntimeError: у климатологии нет коэффициентов масштаба, кэш устарел.
         """
-        if self.scale_beta is None:
-            raise RuntimeError("у климатологии нет масштаба остатка — пересоберите кэш "
-                               "(python scripts/build_cache.py)")
         A = _design(np.asarray(doy, float), np.asarray(hour, float),
                     self.scale_n_year, self.scale_n_day)
         return np.maximum(A @ self.scale_beta, SCALE_FLOOR_FRAC * self.sigma)

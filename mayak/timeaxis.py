@@ -1,11 +1,10 @@
 """Единая календарная конвенция проекта."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import numpy as np
 
-LEGACY_YEAR = 2001
 _EPOCH_H = np.datetime64("1970-01-01T00", "h")
 
 
@@ -121,32 +120,6 @@ def window_calendar(t0_utc_h: int, idx):
     ts = from_utc_hour(int(t0_utc_h) + np.asarray(idx, dtype=np.int64))
     doy, hour = doy_hour(ts)
     return doy.astype(np.float32), hour.astype(np.float32)
-
-
-def utc_to_doy_hour(dt: datetime):
-    """День года и час UTC одного момента как обычные числа.
-
-    Args:
-        dt: момент UTC.
-
-    Returns:
-        Пара float: день года с дробной частью и час UTC.
-    """
-    d, h = doy_hour(dt)
-    return float(d), float(h)
-
-
-def future_calendar(last_obs_time: datetime, horizon: int):
-    ts = [last_obs_time + timedelta(hours=h) for h in range(1, horizon + 1)]
-    d, h = doy_hour(np.array([_as_datetime64_s(x) for x in ts]))
-    return d.astype(np.float32), h.astype(np.float32)
-
-
-def legacy_t0(t0_doy: float, t0_hour: float) -> int:
-    day = int(np.floor(float(t0_doy)))
-    hour = int(round(float(t0_hour)))
-    base = datetime(LEGACY_YEAR, 1, 1) + timedelta(days=day, hours=hour)
-    return int(to_utc_hour(base))
 
 
 def to_hourly_grid(times, columns: dict):

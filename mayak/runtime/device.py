@@ -12,12 +12,11 @@
 
 Персистентное состояние - только сырое окно и заголовок. В заголовке абсолютный час
 последнего шага, число часов окна после холодного старта, множители адаптивной
-калибровки по бинам лидов и координаты точки, для которой состояние записано. Состояние
-прежней версии с одним множителем читается: множитель переносится во все бины. В окне
-для каждого часа записанные прибором значения до отбраковки, маска наличия и маска
-годности после причинного контроля качества. Температура и влажность занимают по байту
-со знаком, давление - два байта в десятых гектопаскаля, маски упакованы по битам. При
-загрузке кольцо контроля качества заполняется последними часами окна.
+калибровки по бинам лидов и координаты точки, для которой состояние записано. В окне для
+каждого часа записанные прибором значения до отбраковки, маска наличия и маска годности
+после причинного контроля качества. Температура и влажность занимают по байту со знаком,
+давление - два байта в десятых гектопаскаля, маски упакованы по битам. При загрузке
+кольцо контроля качества заполняется последними часами окна.
 
 Холодный старт - это окно из пустых часов. Простой заполняется пустыми часами, простой
 не короче окна опустошает окно. Множители калибровки при этом сохраняются: они
@@ -64,16 +63,12 @@ from mayak.timeaxis import hour_of_year
 log = logging.getLogger(__name__)
 
 STATE_MAGIC = b"MYK"
-STATE_VERSION = 5
+STATE_VERSION = 1
 N_LEAD_BINS = len(LEAD_BINS)
 STATE_HEADER = np.dtype([("magic", "S3"), ("version", "u1"), ("filled", "<u2"),
                          ("reserved", "<u2"), ("last_hour", "<i8"),
                          ("aci_theta", "<f4", (N_LEAD_BINS,)),
                          ("lat", "<f4"), ("lon", "<f4"), ("elev", "<f4")])
-STATE_HEADER_V4 = np.dtype([("magic", "S3"), ("version", "u1"), ("filled", "<u2"),
-                            ("reserved", "<u2"), ("last_hour", "<i8"), ("aci_theta", "<f4"),
-                            ("lat", "<f4"), ("lon", "<f4"), ("elev", "<f4")])
-STATE_HEADERS = {4: STATE_HEADER_V4, STATE_VERSION: STATE_HEADER}
 NO_HOUR = int(np.iinfo(np.int64).min)
 
 RAW_CHANNELS = ("T", "P", "RH")
@@ -120,9 +115,6 @@ def parse_state(raw, window):
     Returns:
         Разобранное состояние.
 
-    Состояние версии 4 хранит один множитель калибровки: он переносится во все бины
-    лидов.
-
     Raises:
         ValueError: байты не состояние этого формата, не подходят длине окна или
             повреждены.
@@ -131,24 +123,21 @@ def parse_state(raw, window):
     if len(raw) < len(STATE_MAGIC) + 1 or raw[:len(STATE_MAGIC)] != STATE_MAGIC:
         raise ValueError("не состояние МАЯК: нет заголовка")
     version = raw[len(STATE_MAGIC)]
-    if version not in STATE_HEADERS:
-        raise ValueError(f"версия состояния {version}, рантайм читает "
-                         f"{sorted(STATE_HEADERS)}; прежние версии не хранят сырое окно "
-                         f"целиком, нужен холодный старт")
-    header = STATE_HEADERS[version]
-    want = window_nbytes(window, version)
+    if version != STATE_VERSION:
+        raise ValueError(f"версия состояния {version}, рантайм читает {STATE_VERSION}")
+    want = window_nbytes(window)
     if len(raw) != want:
         raise ValueError(f"состояние {len(raw)} Б не соответствует конфигу модели "
                          f"(ожидалось {want} Б)")
-    hdr = np.frombuffer(raw, header, count=1)[0]
-    theta = tuple(float(v) for v in np.broadcast_to(hdr["aci_theta"], (N_LEAD_BINS,)))
+    hdr = np.frombuffer(raw, STATE_HEADER, count=1)[0]
+    theta = tuple(float(v) for v in hdr["aci_theta"])
     filled, last = int(hdr["filled"]), int(hdr["last_hour"])
     if not np.all(np.isfinite(theta)):
         raise ValueError(f"повреждённый множитель калибровки в состоянии: {list(theta)}")
     if filled > window or (last == NO_HOUR and filled):
         raise ValueError(f"повреждённый заголовок состояния: filled={filled}, окно {window}, "
                          f"последний час {last}")
-    x, present, valid = decode_window(raw[header.itemsize:], window)
+    x, present, valid = decode_window(raw[STATE_HEADER.itemsize:], window)
     if np.any(valid > present):
         raise ValueError("повреждённое окно: годный час без значения")
     ok = valid > 0
@@ -217,18 +206,17 @@ def mask_bytes(n_hours):
     return (3 * n_hours + 7) // 8
 
 
-def window_nbytes(window, version=STATE_VERSION):
+def window_nbytes(window):
     """Размер сериализованного состояния для длины окна.
 
     Args:
         window: длина окна, часы.
-        version: версия формата состояния.
 
     Returns:
         Число байт.
     """
     W = int(window)
-    return (STATE_HEADERS[version].itemsize + W * sum(d.itemsize for d in STORE_DTYPES)
+    return (STATE_HEADER.itemsize + W * sum(d.itemsize for d in STORE_DTYPES)
             + 2 * mask_bytes(W))
 
 
@@ -371,11 +359,6 @@ class Device:
     def aci_misses(self):
         """Число промахов по бинам лидов с последнего сброса калибровки."""
         return tuple(self.cal.misses)
-
-    @property
-    def aci_coverage(self):
-        """Фактическое покрытие по обратной связи в каждом бине лидов с последнего сброса."""
-        return self.cal.coverage()
 
     @property
     def history_length(self):
@@ -588,7 +571,7 @@ class Device:
             Таблица float32 по бинам лидов и длины истории или None.
 
         Raises:
-            ValueError: таблица старого формата, другой формы или сдвигает медиану.
+            ValueError: таблица другой формы или сдвигает медиану.
         """
         if conformal is None:
             return None
@@ -625,8 +608,7 @@ class Device:
         Если состояние записано для другой точки, сдвиг в пределах порогов рантайма -
         уточнение: окно сохраняется, прогноз по нему строится для новой точки. Больше
         порога - перенос: окно пустое, множители калибровки нулевые, момент последнего
-        шага сохраняется. Состояние версии 4 читается, его множитель идёт во все бины
-        лидов.
+        шага сохраняется.
 
         Raises:
             ValueError: байты не состояние этого формата, не подходят конфигу модели или
@@ -659,6 +641,6 @@ class Device:
 
 
 __all__ = ["CLIMATOLOGY_INPUTS", "FORECAST_INPUTS", "HOURS_OF_YEAR", "NO_HOUR", "N_LEAD_BINS",
-           "RAW_CHANNELS", "STATE_HEADER", "STATE_HEADERS", "STATE_HEADER_V4", "STATE_VERSION",
+           "RAW_CHANNELS", "STATE_HEADER", "STATE_VERSION",
            "Device", "StateSnapshot", "check_climatology", "decode_window", "encode_window",
            "mask_bytes", "parse_state", "state_nbytes", "to_store", "window_nbytes"]

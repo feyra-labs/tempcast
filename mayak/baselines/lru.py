@@ -186,11 +186,6 @@ class LRULayer(nn.Module):
         self.C_im = nn.Parameter(torch.randn(d_model, d_state) / math.sqrt(d_state))
         self.D = nn.Parameter(torch.randn(d_model))
 
-    def eigenvalues(self):
-        """Модули и фазы собственных чисел, для проверок и журнала."""
-        nu, theta = lambda_polar(self.nu_log, self.theta_log)
-        return torch.exp(-nu), theta
-
     def states(self, x, scan=None):
         """Комплексные состояния рекуррентности.
 

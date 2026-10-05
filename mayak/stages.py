@@ -395,7 +395,7 @@ def init_mismatches(ck, arch, protocol, model_config, data_config, stage, data_k
         try:
             got = Protocol.from_dict(hp["protocol"]).to_dict()
         except (ProtocolError, TypeError, ValueError) as e:
-            out.append(f"протокол: в чекпойнте протокол, который больше не читается: {e}")
+            out.append(f"протокол: протокол в чекпойнте не читается: {e}")
         else:
             out += config_diff("протокол", got, protocol)
     rec = ck.get(STAGE_KEY)

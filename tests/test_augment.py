@@ -13,13 +13,28 @@ from mayak.data.augment import (AUG_ORDER, EXPECTED_QC, apply_one, augment_windo
                                 clean_history, make_window, qc_effect, reference_windows)
 from mayak.data.masking import enforce_invariant
 from mayak.data import qc as Q
-from mayak.data.recording import is_recorded, record_values
+from mayak.data.recording import record_values
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL
 
 VALUE_AUGS = ("scale", "drift", "offset", "noise", "rh_dewpoint", "spike", "stuck", "units")
 INSTRUMENT_ON_TARGET = ("scale", "drift", "offset")
 MASK_AUGS = ("dropout", "gap", "outage", "drop_pressure", "drop_humidity")
 ALL_ON = {f: 1.0 for f in AUGMENT_PROB_FIELDS.values()}
+
+
+def _only(name, profile="aggressive"):
+    """Профиль, в котором срабатывает только одна аугментация, всегда."""
+    probs = {f: 0.0 for f in AUGMENT_PROB_FIELDS.values()}
+    probs[AUGMENT_PROB_FIELDS[name]] = 1.0
+    return AugmentConfig.from_profile(profile, **probs)
+
+
+def _on_record_grid(x, mask=None):
+    """Каждое имеющееся значение лежит на сетке записи прибора."""
+    x = np.asarray(x, np.float32)
+    ok = np.ones(x.shape, bool) if mask is None else np.asarray(mask) > 0
+    ok &= np.isfinite(x)
+    return bool(np.array_equal(record_values(x)[ok], x[ok]))
 
 
 def _window(seed=0, L=L_MAX, elev=200.0, holes=0.0):
@@ -56,7 +71,7 @@ def test_invariant_holds_after_all_augmentations(L, holes):
 
 @pytest.mark.parametrize("name", VALUE_AUGS)
 def test_value_distortions_touch_only_valid_points(name):
-    cfg = AugmentConfig.only(name)
+    cfg = _only(name)
     for seed in range(8):
         w0 = _window(seed, holes=0.3)
         w = augment_window(_copy(w0), cfg, np.random.default_rng(seed))
@@ -66,7 +81,7 @@ def test_value_distortions_touch_only_valid_points(name):
 
 @pytest.mark.parametrize("name", MASK_AUGS)
 def test_availability_only_removes_validity(name):
-    cfg = AugmentConfig.only(name)
+    cfg = _only(name)
     for seed in range(8):
         w0 = _window(seed, holes=0.1)
         w = augment_window(_copy(w0), cfg, np.random.default_rng(seed))
@@ -76,7 +91,7 @@ def test_availability_only_removes_validity(name):
 
 @pytest.mark.parametrize("name", [n for n in AUG_ORDER if n not in INSTRUMENT_ON_TARGET])
 def test_target_untouched_except_instrument_properties(name):
-    cfg = AugmentConfig.only(name)
+    cfg = _only(name)
     for seed in range(6):
         w0 = _window(seed, holes=0.2)
         w = augment_window(_copy(w0), cfg, np.random.default_rng(seed))
@@ -84,7 +99,7 @@ def test_target_untouched_except_instrument_properties(name):
 
 
 def test_offset_shifts_history_and_target_consistently():
-    cfg = AugmentConfig.only("offset")
+    cfg = _only("offset")
     for seed in range(10):
         w0 = _window(seed, holes=0.2)
         w = augment_window(_copy(w0), cfg, np.random.default_rng(seed))
@@ -104,7 +119,7 @@ def test_offset_shifts_history_and_target_consistently():
 
 
 def test_offset_needs_history_and_obeys_ablation():
-    w = augment_window(_window(0, L=0), AugmentConfig.only("offset"), np.random.default_rng(0))
+    w = augment_window(_window(0, L=0), _only("offset"), np.random.default_rng(0))
     assert "offset" not in w.applied, "без истории смещение не выучить - цель не трогаем"
     rc = RunConfig(model={"arch": "mayak", "ablations": {"no_offset_aug": True}}).resolved()
     cfg = dataclasses.replace(rc.data.augment, **ALL_ON)
@@ -218,7 +233,7 @@ def test_drift_counts_from_calibration_and_grows_on_horizon_only_with_long_histo
 
 @pytest.mark.parametrize("name", INSTRUMENT_ON_TARGET)
 def test_instrument_properties_never_change_target_mask(name):
-    cfg = AugmentConfig.only(name)
+    cfg = _only(name)
     for seed in range(20):
         w0 = _window(seed, L=(0, 5, 200, L_MAX)[seed % 4], holes=0.3)
         w = augment_window(_copy(w0), cfg, np.random.default_rng(seed))
@@ -250,10 +265,10 @@ def test_units_and_outage_semantics():
     assert np.allclose(ratio, A.sea_level_ratio(1500.0)) and ratio[0] > 1.15
     assert np.array_equal(w.x[:, [0, 2]], w0.x[:, [0, 2]])
     for seed in range(50):
-        w = augment_window(_window(seed), AugmentConfig.only("units"),
+        w = augment_window(_window(seed), _only("units"),
                            np.random.default_rng(seed))
         assert np.array_equal(w.x[:, 0], _window(seed).x[:, 0])
-    cfg = AugmentConfig.only("outage")
+    cfg = _only("outage")
     for seed in range(10):
         w = augment_window(_window(seed), cfg, np.random.default_rng(seed))
         p = w.applied["outage"]
@@ -263,7 +278,7 @@ def test_units_and_outage_semantics():
 
 
 def test_metadata_jitter_bounds():
-    cfg = AugmentConfig.only("coords")
+    cfg = _only("coords")
     d_elev = []
     for seed in range(200):
         w0 = _window(seed % 3)
@@ -320,7 +335,7 @@ def _detectable(name, params, w):
 
 @pytest.mark.parametrize("name", AUG_ORDER)
 def test_sampled_augmentation_produces_expected_codes(name):
-    cfg = AugmentConfig.only(name, "aggressive")
+    cfg = _only(name, "aggressive")
     hits, sides, n = [], [], 40
     for seed in range(n):
         elev = (200.0, 1500.0)[seed % 2]
@@ -402,7 +417,7 @@ def test_dataset_aggressive_keeps_contract(manifest):
         assert np.all(np.abs(got - y)[ym0 > 0] <= 1.0 + 1e-4), \
             "цель - запись прибора после его свойств: не дальше полушага шума и полушага записи"
         assert np.array_equal(got[ym0 == 0], y0[ym0 == 0])
-        assert is_recorded(it["x_hist"].numpy(), it["mask_hist"].numpy())
+        assert _on_record_grid(it["x_hist"].numpy(), it["mask_hist"].numpy())
         assert np.array_equal(it["y"].numpy(), np.round(it["y"].numpy()))
         for k, shape in (("x_hist", (L_MAX, 3)), ("mask_hist", (L_MAX, 3)), ("y", (H,))):
             assert tuple(it[k].shape) == shape
@@ -413,9 +428,9 @@ def test_dataset_window_qc_masks_augmented_artifacts(manifest):
     from mayak.data.dataset import WindowDataset
     for name in ("spike", "stuck", "units"):
         on = WindowDataset(manifest, windows_per_epoch=4, seed=0,
-                           augment=AugmentConfig.only(name), window_qc=True)
+                           augment=_only(name), window_qc=True)
         off = WindowDataset(manifest, windows_per_epoch=4, seed=0,
-                            augment=AugmentConfig.only(name), window_qc=False)
+                            augment=_only(name), window_qc=False)
         masked = 0
         for i in range(12):
             s = on.st[i % len(on.st)]
@@ -429,7 +444,7 @@ def test_dataset_window_qc_masks_augmented_artifacts(manifest):
 def _recorded_window(seed=0, holes=0.1):
     w = _window(seed, holes=holes)
     w.y[:] = np.where(w.y_mask > 0, np.round(w.y), 0.0)
-    assert is_recorded(w.x, w.m)
+    assert _on_record_grid(w.x, w.m)
     return w
 
 
@@ -466,7 +481,7 @@ def test_small_offset_shifts_the_record_like_a_real_sensor():
 
 
 def test_weak_noise_survives_recording():
-    cfg = AugmentConfig.only("noise")
+    cfg = _only("noise")
     changed = []
     for seed in range(10):
         w0 = _recorded_window(seed)
@@ -481,9 +496,9 @@ def test_weak_noise_survives_recording():
 def test_no_dither_without_sensor_distortion(name):
     for seed in range(5):
         w0 = _recorded_window(seed)
-        w = augment_window(_copy(w0), AugmentConfig.only(name), np.random.default_rng(seed))
+        w = augment_window(_copy(w0), _only(name), np.random.default_rng(seed))
         assert np.array_equal(w.y, w0.y)
         same = (w.m > 0) & (w0.m > 0)
         if name in MASK_AUGS or name == "coords":
             assert np.array_equal(w.x[same], w0.x[same]), name
-        assert is_recorded(record_values(w.x), w.m)
+        assert _on_record_grid(record_values(w.x), w.m)

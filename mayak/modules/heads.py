@@ -152,11 +152,3 @@ class Heads(nn.Module):
         hi = torch.cumsum(gaps[..., self.n_lo:], dim=-1)
         off = torch.cat([-lo, torch.zeros_like(r)[..., None], hi], dim=-1)
         return r, ratio, off
-
-    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        if prefix + "fc2.weight" in state_dict and prefix + "r_kappa" not in state_dict:
-            raise RuntimeError(
-                f"{prefix}r_kappa: в чекпойнте нет порога веса поправки. Веса обучены с "
-                f"поправкой, которая не зависит от массы свидетельств и сдвигает медиану "
-                f"холодного старта от климат-поля; модель нужно переобучить.")
-        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)

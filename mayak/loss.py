@@ -39,11 +39,6 @@ def pinball_terms(q, y, y_mask, scale):
     return per_pair, m
 
 
-def pinball(q, y, y_mask, scale):
-    per_pair, m = pinball_terms(q, y, y_mask, scale)
-    return masked_mean(per_pair, m)
-
-
 def loss_scale(batch):
     """Нормировка функции потерь: масштаб из батча, обрезанный общими пределами.
 
@@ -113,20 +108,3 @@ def mayak_regularizers(out):
     dead = (out["Eg"].sum(-1) < 0.05).float()
     anchor = ((out["ratio"] - 1.0) ** 2 * dead).mean()
     return 1e-3 * kl + 1e-4 * energy + 1e-2 * anchor
-
-
-def mayak_loss(out, batch):
-    return forecast_loss(out, batch) + mayak_regularizers(out)
-
-
-def pinball_loss(out, batch):
-    """Функция потерь нейробейзлайнов: регуляризаторов нет, только общая часть.
-
-    Args:
-        out: выход модели с квантилями под ключом q.
-        batch: батч с целью, её маской и нормировочным масштабом.
-
-    Returns:
-        Скаляр функции потерь.
-    """
-    return forecast_loss(out, batch)

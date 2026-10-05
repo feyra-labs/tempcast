@@ -343,29 +343,10 @@ def run_record(run_config):
                 provenance=provenance())
 
 
-# Обратная совместимость.
-LitMayak = LitForecaster
-
-
-def LitBaseline(model_name="gru", **kw):
-    """Модуль обучения бейзлайна под старым именем.
-
-    Args:
-        model_name: имя архитектуры.
-        **kw: остальные аргументы модуля обучения.
-
-    Returns:
-        Модуль обучения этой архитектуры.
-    """
-    return LitForecaster(arch=model_name, **kw)
-
-
 def load_model(path, map_location="cpu"):
     """Модель из чекпойнта любой архитектуры.
 
-    Архитектура и её конфиг берутся из гиперпараметров чекпойнта. У старых чекпойнтов
-    конфига архитектуры нет - тогда берутся значения по умолчанию, совпадающие с
-    прежними константами.
+    Архитектура и её конфиг берутся из гиперпараметров чекпойнта.
 
     Args:
         path: путь к чекпойнту.
@@ -380,10 +361,6 @@ def load_model(path, map_location="cpu"):
 def checkpoint_protocol(path):
     """Архитектура и протокол обучения чекпойнта.
 
-    Чекпойнт без протокола в гиперпараметрах обучен до того, как функция потерь стала
-    нормироваться климатологическим масштабом из данных, а протокол обучения стал общим
-    для всех архитектур. Сравнивать с таким чекпойнтом нельзя.
-
     Args:
         path: путь к чекпойнту.
 
@@ -396,11 +373,8 @@ def checkpoint_protocol(path):
     ck = torch.load(path, map_location="cpu", weights_only=False)
     hp = ck.get("hyper_parameters") or {}
     if "protocol" not in hp:
-        raise ProtocolError(f"{path}: в чекпойнте нет протокола обучения — он обучен до "
-                            f"единого протокола и нормировки функции потерь "
-                            f"климатологическим масштабом; сравнение с ним "
-                            f"недействительно, переобучите модель")
-    return hp.get("arch", "mayak"), Protocol.from_dict(hp["protocol"])
+        raise ProtocolError(f"{path}: в чекпойнте нет протокола обучения")
+    return hp["arch"], Protocol.from_dict(hp["protocol"])
 
 
 SEED_FIELDS = ("seed", "seeds")
@@ -451,8 +425,12 @@ def load_run_record(path):
         path: путь к чекпойнту.
 
     Returns:
-        Запись о прогоне; None у старых чекпойнтов без неё.
+        Запись о прогоне: разрешённый конфиг, сиды, коммит и версии библиотек.
+
+    Raises:
+        ValueError: в чекпойнте нет записи о прогоне.
     """
-    import torch
     ck = torch.load(path, map_location="cpu", weights_only=False)
-    return ck.get(RUN_KEY)
+    if RUN_KEY not in ck:
+        raise ValueError(f"{path}: в чекпойнте нет записи о прогоне")
+    return ck[RUN_KEY]

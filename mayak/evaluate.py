@@ -33,7 +33,7 @@ from mayak.data.holdout import (HISTORY_GRID, NOMINAL_HISTORY, EvalSet, check_hi
                                 history_label, history_strata)
 from mayak.loss import NORM_SCALE_CLAMP
 from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, breakdown, by_lead, coverage,
-                           metric_table, seed_spread, skill, wmean)
+                           metric_table, seed_spread, wmean)
 from mayak.results import evaluation_tables, run_record, transfer_tables, write_tables
 from mayak.zones import normalize_zone
 
@@ -323,19 +323,6 @@ def print_rows(rows, label="разрез", metrics=("Skill", "MAE", "RMSE", "CRP
             print(line)
 
 
-def show(tbl):
-    print(f"{'лид,ч':>6} {'MAE':>6} {'RMSE':>6} {'Skill':>7} {'CRPS':>6} "
-          f"{'PICP80':>7} {'PICP90':>7} {'Wink90':>7}")
-    for h, m in tbl.items():
-        print(f"{h:>6} {m['MAE']:>6.2f} {m['RMSE']:>6.2f} {m['Skill']:>+7.1%} "
-              f"{m['CRPS']:>6.2f} {m['PICP80']:>7.1%} {m['PICP90']:>7.1%} {m['Winkler90']:>7.2f}")
-
-
-def print_lead_table(ev, leads=TABLE_LEADS, ci=False, **kw):
-    rows = {str(h): s for h, s in by_lead(ev, leads=leads, ci=ci, **kw).items()}
-    print_rows(rows, label="лид, ч", ci=ci)
-
-
 def all_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS, min_stations=MIN_STATIONS,
                    ci=False, history=None, **kw):
     """Разрезы одной модели по метаданным окон.
@@ -458,10 +445,6 @@ def print_seed_spread(evs_by_seed, lead=24):
             continue
         print(f"{m:>10} {s['mean']:>10.3f} {s['min']:>10.3f} {s['max']:>10.3f} {s['std']:>10.3f}")
     return dict(lead=int(lead), n_seeds=len(evs_by_seed), metrics=spread)
-
-
-def koppen_per_window(ds):
-    return np.array([normalize_zone(ds.clims[sid]["koppen"]) for sid, _t in ds.items])
 
 
 def zone_breakdown(preds, aux, koppen=None, leads=(24, 72), model="МАЯК",
@@ -1167,18 +1150,6 @@ def l0_decompose(model, clims, manifest="data/manifest.csv", station_split="trai
           f"e = {ee / Z.numel() * Z.shape[1]:.3f}  (ждём ≈0 при L=0)")
 
 
-def compare_ablation(model_full, model_ablated, clims, manifest="data/manifest.csv", lead=24):
-    ds = EvalSet(clims, manifest=manifest, time_key="test", every_hours=120)
-    out = {}
-    for tag, mdl in [("full", model_full), ("ablated", model_ablated)]:
-        D = gather(mdl, ds)
-        j = lead - 1
-        out[tag] = skill(D["y"][:, j], D["mu"][:, j], D["mu_clim"][:, j], D["y_mask"][:, j])
-    print(f"Skill-{lead}ч: full {out['full']:+.1%}  vs  ablated {out['ablated']:+.1%}  "
-          f"(падение {out['full'] - out['ablated']:+.1%})")
-    return out
-
-
 def evaluate_external(named, external_manifest, store, grid=HISTORY_GRID, r_damped=None,
                       shift=None, ci=True, bootstrap=BOOTSTRAP, checkpoints=(), conformal=None,
                       internal=None, transfer_level="group"):
@@ -1428,7 +1399,7 @@ def main():
     rec = load_run_record(args.ckpt[0])
     eval_seed = args.eval_seed
     if eval_seed is None:
-        eval_seed = int(rec["seeds"]["eval"]) if rec else 0
+        eval_seed = int(rec["seeds"]["eval"])
     print(f"Сид оценки: {eval_seed}")
 
     r = BL.fit_damped_persistence({k: s for k, s in clims.items() if s["role"] == ROLE_TRAIN},

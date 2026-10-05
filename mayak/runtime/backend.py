@@ -18,7 +18,7 @@ import numpy as np
 
 from mayak.runtime.device import CLIMATOLOGY_INPUTS, FORECAST_INPUTS, Device
 
-GRAPH_FORMAT = 7
+GRAPH_FORMAT = 1
 GRAPH_NAMES = ("forecast", "climatology")
 GRAPH_IO = {
     "forecast": (FORECAST_INPUTS, ("q",)),

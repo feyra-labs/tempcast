@@ -13,7 +13,7 @@ from mayak.data import store as S
 from mayak.data.climatology import ABS_TO_SD, SCALE_FLOOR_FRAC, Climatology
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL, time_layout
 from mayak.leakage import SELECTION_KEY
-from mayak.loss import NORM_SCALE_CLAMP, forecast_loss, pinball
+from mayak.loss import NORM_SCALE_CLAMP, forecast_loss, masked_mean, pinball_terms
 from mayak.protocol import (ARCH_NAMES, DEFAULT_PROTOCOL, Protocol, ProtocolError, Stage,
                             protocol_for, run_protocol)
 from mayak.timeaxis import window_calendar
@@ -289,7 +289,8 @@ def test_norm_scale_clamped_by_shared_constants():
     c = forecast_loss({"q": q}, dict(batch, norm_scale=torch.full((3, H), hi * 10)))
     d = forecast_loss({"q": q}, dict(batch, norm_scale=torch.full((3, H), hi)))
     assert torch.equal(a, b) and torch.equal(c, d)
-    assert torch.equal(b, pinball(q, batch["y"], batch["y_mask"], torch.full((3, H), lo)))
+    ref = masked_mean(*pinball_terms(q, batch["y"], batch["y_mask"], torch.full((3, H), lo)))
+    assert torch.equal(b, ref)
 
 
 @pytest.mark.parametrize("arch", ARCH_NAMES)

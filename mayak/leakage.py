@@ -163,7 +163,6 @@ def check_climatology(store, deep=False):
                 s["mask"][lo:hi, 0], min_valid=CLIM_PARAMS["min_valid"])
             got = s["clim"]
             same = (np.allclose(ref.beta, got.beta, rtol=1e-6, atol=1e-6)
-                    and got.scale_beta is not None
                     and np.allclose(ref.scale_beta, got.scale_beta, rtol=1e-6, atol=1e-6))
             if not same:
                 _fail(f"климатология {sid}: коэффициенты среднего или масштаба не "
@@ -363,7 +362,7 @@ def load_conformal(path):
 
     Raises:
         LeakageError: рядом с таблицей нет записи о подгонке.
-        ValueError: таблица старого формата, другой формы или сдвигает медиану.
+        ValueError: таблица другой формы или сдвигает медиану.
     """
     from mayak.metrics import check_conformal_shape
     meta = conformal_meta_path(path)
