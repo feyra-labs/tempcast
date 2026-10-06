@@ -33,7 +33,7 @@ loc_seed: 7
 field_hidden: 128
 heads_hidden: 48
 heads_z_proj: 4
-field_weight_decay: 0.5     # весовое затухание матриц климат-поля вместо базового
+field_weight_decay: 0.5     # затухание матриц климат-поля вместо базового, кроме FiLM
 ablations:
   no_compression: false
   no_passport: false

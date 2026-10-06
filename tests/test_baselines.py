@@ -155,8 +155,9 @@ def test_weight_decay_only_on_layer_weights():
     """Общее правило весового затухания у всех архитектур.
 
     Затухание получают только веса слоёв Linear, Conv1d и GRU и отличия, объявленные
-    архитектурой: матрицы климат-поля МАЯК - с затуханием поля, матрицы C ядра LRU - с
-    базовым. Смещения, нормы, скалярные и векторные параметры - без затухания.
+    архитектурой: матрицы климат-поля МАЯК, кроме FiLM, - с затуханием поля, матрицы C
+    ядра LRU - с базовым. Смещения, нормы, скалярные и векторные параметры - без
+    затухания.
     """
     from mayak.lit import build_model, optim_groups
     from mayak.protocol import ARCH_NAMES
@@ -180,10 +181,13 @@ def test_weight_decay_only_on_layer_weights():
         assert not [n for n in decay if n.rsplit(".", 1)[-1] in NO_DECAY_PARAMS
                     or n.rsplit(".", 1)[-1].startswith("bias")], arch
         for n, v in decay.items():
-            field = arch == "mayak" and n.startswith("field.")
+            field = (arch == "mayak" and n.startswith("field.")
+                     and not n.startswith("field.film."))
             assert v == (m.cfg.field_weight_decay if field else wd), (arch, n, v)
         if arch == "mayak":
-            assert any(n.startswith("field.") for n in decay)
+            assert any(n.startswith("field.") and not n.startswith("field.film.")
+                       for n in decay)
+            assert decay["field.film.weight"] == wd
 
 
 def test_patchtst_patching():
