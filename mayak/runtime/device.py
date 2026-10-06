@@ -23,11 +23,14 @@
 относятся к прибору, а не к истории.
 
 Калибровка интервалов: квантили модели, затем конформная таблица, затем адаптивный
-множитель своего бина лидов. Строка конформной таблицы выбирается по длине истории
-выпуска. Множители подстраиваются онлайн, если рантайм создан с параметрами адаптивной
-калибровки: каждый валидный час температуры сверяется с кольцом по часам-мишеням, где
-для каждого бина лидов лежит последний выпуск, чей лид до этого часа попадает в бин.
-Кольцо живёт только в памяти.
+множитель своего бина лидов. Строка конформной таблицы выбирается по числу часов с
+валидной температурой во входе модели, а не по длине истории выпуска: после простоя
+короче окна история остаётся длинной, а данных в ней мало, и интервал должен быть
+шире. Подгонка таблицы и оценка выбирают строку той же функцией. Множители
+подстраиваются онлайн, если рантайм создан с параметрами адаптивной калибровки: каждый
+валидный час температуры сверяется с кольцом по часам-мишеням, где для каждого бина
+лидов лежит последний выпуск, чей лид до этого часа попадает в бин. Кольцо живёт только
+в памяти.
 
 Смена точки. Состояние помнит координаты и высоту, для которых оно записано. При загрузке
 они сравниваются с текущими. Сдвиг в пределах порогов рантайма - уточнение метаданных:
@@ -52,7 +55,7 @@ import numpy as np
 
 from mayak.data.qc import PHYS, CausalQC
 from mayak.data.recording import RECORD_SCALE
-from mayak.data.window import issue_calendar, place_history
+from mayak.data.window import issue_calendar, place_history, valid_history_hours
 from mayak.leakage import load_conformal
 from mayak.metrics import (LEAD_BINS, ZQ, ACIParams, AdaptiveCalibration, apply_adaptive,
                            apply_conformal, check_conformal_shape)
@@ -365,6 +368,16 @@ class Device:
         """Длина истории выпуска: часы после холодного старта, не больше истории модели."""
         return min(int(self.filled), int(self.history))
 
+    @property
+    def valid_hours(self):
+        """Часы с валидной температурой во входе модели; по ним выбирается строка таблицы.
+
+        До первого шага окно пустое, и часов ноль.
+        """
+        if self.last_hour is None:
+            return 0
+        return valid_history_hours(self.model_inputs()["mask_hist"][0])
+
     def reset(self, last_hour=None):
         """Холодный старт: окно состоит из пустых часов. Множители калибровки сохраняются.
 
@@ -501,13 +514,20 @@ class Device:
             ValueError: момент выпуска не определён.
             FloatingPointError: выход графа прогноза не конечен.
         """
-        (q,) = self.b.run("forecast", self.model_inputs(now_hour))
+        return self._run_forecast(self.model_inputs(now_hour))
+
+    def _run_forecast(self, inputs):
+        """Проход графа прогноза по готовым входам; квантили формы (H, число квантилей)."""
+        (q,) = self.b.run("forecast", inputs)
         if not np.all(np.isfinite(q)):
             raise FloatingPointError("выход графа прогноза не конечен")
         return q[0]
 
     def forecast(self, now_hour=None):
         """Выпуск на часы после момента выпуска.
+
+        Строка конформной таблицы выбирается по числу часов с валидной температурой в тех
+        же входах, по которым считает граф прогноза.
 
         Args:
             now_hour: текущий абсолютный час UTC по часам устройства; нужен только до
@@ -516,9 +536,10 @@ class Device:
         Returns:
             Пара: квантили float32 формы (H, число квантилей) и медиана формы (H,).
         """
-        q = self.raw_forecast(now_hour)
+        inputs = self.model_inputs(now_hour)
+        q = self._run_forecast(inputs)
         if self.conformal is not None:
-            q = apply_conformal(q, self.conformal, self.history_length)
+            q = apply_conformal(q, self.conformal, valid_history_hours(inputs["mask_hist"][0]))
         self.cal.record(self.issue_hour(now_hour), q)
         return apply_adaptive(q, self.theta)
 

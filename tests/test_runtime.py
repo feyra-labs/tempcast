@@ -1,8 +1,9 @@
 """Тесты: устройство и экспорт.
 
 * ряд, поданный устройству час за часом через ONNX-бэкенд, даёт те же входы и квантили,
-  что проход модели на окне оценки с тем же моментом выпуска - на модели по умолчанию и
-  на каждой абляции;
+  что проход модели на окне оценки с тем же моментом выпуска, и до конформной таблицы, и
+  после неё (строка по числу валидных часов температуры) - на модели по умолчанию и на
+  каждой абляции;
 * круговая сериализация состояния: перезапуск продолжает непрерывный прогон, битое
   состояние отвергается;
 * смена точки: уточнение сохраняет окно и калибровку, перенос - холодный старт;
@@ -22,9 +23,10 @@ import pytest
 import torch
 
 from mayak.config import ABLATION_NAMES, Ablations, ModelConfig
+from mayak.data.window import valid_history_hours
 from mayak.export import (TorchBackend, eval_inputs, eval_set, export_graphs, feed,
                           synthetic_series)
-from mayak.metrics import ACIParams
+from mayak.metrics import ACIParams, apply_conformal
 from mayak.runtime.backend import GRAPH_IO, GRAPH_NAMES, runtime_from_export
 from mayak.runtime.device import (FORECAST_INPUTS, STATE_HEADER, Device, mask_bytes,
                                   state_nbytes)
@@ -69,8 +71,9 @@ def test_device_equals_eval_window(ablation, tmp_path):
     cfg = ModelConfig(ablations=Ablations(**{ablation: True})) if ablation else None
     m = _model(cfg)
     out = str(tmp_path / "m")
-    man = export_graphs(m, out)
-    assert sorted(os.listdir(out)) == ["climatology.onnx", "forecast.onnx", "manifest.json"]
+    man = export_graphs(m, out, conformal=SHIFT)
+    assert sorted(os.listdir(out)) == ["climatology.onnx", "conformal.f32", "forecast.onnx",
+                                       "manifest.json"]
     for name in GRAPH_NAMES:
         assert set(man["graphs"][name]["inputs"]) <= set(GRAPH_IO[name][0])
         assert man["export_check_max_rel"][name] <= 1e-4
@@ -92,6 +95,9 @@ def test_device_equals_eval_window(ablation, tmp_path):
             q_ref = m({k: torch.from_numpy(v) for k, v in ref.items()})["q"][0].numpy()
         err = float(np.abs(dev.raw_forecast(now) - q_ref).max())
         assert err <= ATOL_ONNX, f"{ablation}, час {end}: устройство и оценка, {err:.2e}"
+        q_cal = apply_conformal(q_ref, SHIFT, valid_history_hours(ref["mask_hist"][0]))
+        err = float(np.abs(dev.forecast(now)[0] - q_cal).max())
+        assert err <= ATOL_ONNX, f"{ablation}, час {end}: после таблицы, {err:.2e}"
 
 
 def test_state_roundtrip(model):

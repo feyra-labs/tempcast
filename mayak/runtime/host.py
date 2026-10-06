@@ -270,7 +270,7 @@ class Host:
     def status(self):
         """Команда сводки рантайма."""
         rt = self.rt
-        return {"filled": int(rt.filled), "history_hours": int(rt.history_length),
+        return {"filled": int(rt.filled), "valid_hours": int(rt.valid_hours),
                 "theta": [_f32(v) for v in rt.theta],
                 "conformal": rt.conformal is not None,
                 "aci_lead_bins": [list(b) for b in rt.cal.lead_bins],

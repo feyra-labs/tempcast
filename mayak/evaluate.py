@@ -44,6 +44,7 @@ from mayak.constants import H, QUANTILES
 from mayak.data.holdout import (HISTORY_GRID, NOMINAL_HISTORY, EvalSet, check_history_grid,
                                 history_label, history_strata)
 from mayak.data.splits import ROLE_EXTERNAL, ROLE_TEST, ROLE_TRAIN
+from mayak.data.window import valid_history_hours
 from mayak.loss import NORM_SCALE_CLAMP
 from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, breakdown, by_lead, coverage,
                            metric_table, seed_spread)
@@ -120,8 +121,10 @@ def gather_all(named, dataset, device="cpu", batch_size=128):
     Returns:
         Пара: словарь из имени модели в её медиану формы (N, H) и квантили формы
         (N, H, 7), и словарь с целью, маской цели, климатологией на горизонте, недавней
-        аномалией, нормировочным масштабом на часах горизонта и историей окон. Если набор
-        окон даёт отдельный эталон скилла, он лежит в том же словаре под ключом mu_ref.
+        аномалией, нормировочным масштабом на часах горизонта, историей окон и числом
+        часов с валидной температурой во входе модели (history_valid, по нему
+        выбирается строка конформной таблицы). Если набор окон даёт отдельный эталон
+        скилла, он лежит в том же словаре под ключом mu_ref.
     """
     for m in named.values():
         m.eval().to(device)
@@ -142,6 +145,7 @@ def gather_all(named, dataset, device="cpu", batch_size=128):
             outs[name]["q"].append(o["q"].cpu().numpy())
     cat = lambda parts: np.concatenate(parts, 0)
     aux = {k: cat(v) for k, v in acc.items()}
+    aux["history_valid"] = valid_history_hours(aux["mask_hist"])
     preds = {name: {k: cat(v) for k, v in d.items()} for name, d in outs.items()}
     return preds, aux
 
@@ -193,10 +197,13 @@ def collect_predictions(named, ds, device="cpu"):
 
     Returns:
         Пара: словарь из имени модели в её медиану и квантили, и данные окон вместе с
-        метаданными для разрезов.
+        метаданными для разрезов. В метаданных, кроме меток набора, число часов с
+        валидной температурой во входе модели (history_valid): по нему выбирается
+        строка конформной таблицы.
     """
     preds, aux = gather_all(named, ds, device=device)
-    aux["meta"] = ds.window_meta()
+    # Новый словарь: набор может кэшировать свои метаданные между вызовами.
+    aux["meta"] = dict(ds.window_meta(), history_valid=aux["history_valid"])
     return preds, aux
 
 
@@ -840,8 +847,8 @@ def history_evaluations(bench, shift=None):
 
     Args:
         bench: результат прогона по сетке.
-        shift: конформная таблица; None значит сырые выходы. Применяется по
-            фактической длине истории каждого окна при этой длине сетки.
+        shift: конформная таблица; None значит сырые выходы. Строка выбирается по
+            числу валидных часов температуры каждого окна при этой длине сетки.
 
     Yields:
         Пары из метки длины истории и оценки.
@@ -851,7 +858,7 @@ def history_evaluations(bench, shift=None):
         p = bench.main_history[L]
         ev = Evaluation(y=aux["y"], mu=p["mu"], q=p["q"], mu_clim=aux["mu_clim"],
                         w=aux["y_mask"], station=p["meta"]["station"])
-        yield history_label(L), ev.with_conformal(shift, p["meta"]["history"])
+        yield history_label(L), ev.with_conformal(shift, p["meta"]["history_valid"])
 
 
 def history_predictions(bench):
@@ -905,8 +912,9 @@ def evaluate_set(named, base, grid=HISTORY_GRID, r_damped=None, shift=None, ci=T
     оцениваются отдельно, только по лидам.
 
     Сравнительная часть считается по сырым выходам всех моделей и от конформной таблицы
-    не зависит. Таблица влияет только на раздел основной модели после калибровки и
-    применяется к каждому окну по его фактической длине истории. В этом разделе же
+    не зависит. Таблица влияет только на раздел основной модели после калибровки; строка
+    таблицы у каждого окна - по числу часов с валидной температурой во входе модели, как
+    на устройстве. Разрезы по длине истории остаются по запрошенной длине. В этом разделе же
     офлайн-прогон адаптивной калибровки: основная модель выпускает прогноз каждый час
     на непрерывном периоде части станций набора, как прибор.
 
@@ -956,7 +964,7 @@ def evaluate_set(named, base, grid=HISTORY_GRID, r_damped=None, shift=None, ci=T
         coverage=dict(report=report, gate=conditional_gate(report, cfg)),
         calibrated=None, hourly=None, config=cfg)
     if shift is not None:
-        ev_cal = evs[main].with_conformal(shift, meta["history"])
+        ev_cal = evs[main].with_conformal(shift, meta["history_valid"])
         rep = coverage_report(ev_cal, meta, cfg, external=external,
                               history=history_evaluations(bench, shift))
         hourly = collect_predictions({main: named[main]},

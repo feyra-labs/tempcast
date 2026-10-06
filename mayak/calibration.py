@@ -17,8 +17,10 @@ r"""Калибровка интервалов обученной модели.
 всех страт отклонение исправляет маргинальная поправка, отличие страты от набора нет.
 
 Разрез по длине истории строится по сетке длин, если предсказания сохранены для всей
-сетки. Тогда каждая длина из сетки становится своей стратой. Конформная таблица
-применяется к каждому окну по его фактической длине истории.
+сетки. Тогда каждая длина из сетки становится своей стратой. Строка конформной таблицы
+у каждого окна выбирается по числу часов с валидной температурой во входе модели
+(history_valid), как на устройстве; разрезы по длине истории остаются по запрошенной
+длине.
 
 Офлайн-прогон адаптивной калибровки идёт с ритмом устройства: непрерывный период с
 выпуском каждый час на части станций набора. Для него стенд оценки сохраняет отдельные
@@ -59,8 +61,9 @@ KIND_NARROW, KIND_WIDE = "узкий интервал", "широкий инте
 KIND_BELOW, KIND_ABOVE = "факт ниже интервала", "факт выше интервала"
 ONE_SIDED = 2.0 / 3.0
 META_KEYS = ("station", "role", "zone", "season", "history", "history_label", "hist_valid",
-             "has_pressure", "elev_gap", "train_distance", "t")
-FORMAT_VERSION = 1
+             "history_valid", "has_pressure", "elev_gap", "train_distance", "t")
+FORMAT_VERSION = 2
+RESAVE_HINT = "пересохраните предсказания текущей версией: python -m mayak.evaluate --save-preds"
 
 
 def load_config(path=None):
@@ -126,12 +129,15 @@ def load_predictions(path):
         None и сведения о прогоне.
 
     Raises:
-        ValueError: файл другой версии формата.
+        ValueError: файл другой версии формата. В версии 1 нет числа валидных часов
+            температуры окон, по которому выбирается строка конформной таблицы.
     """
     with np.load(path, allow_pickle=False) as z:
         header = json.loads(str(z["header"]))
         if header.get("format") != FORMAT_VERSION:
-            raise ValueError(f"{path}: формат {header.get('format')}, читается {FORMAT_VERSION}")
+            raise ValueError(f"{path}: формат {header.get('format')}, читается {FORMAT_VERSION}: "
+                             f"строка конформной таблицы теперь выбирается по числу валидных "
+                             f"часов температуры окна (history_valid); {RESAVE_HINT}")
         preds = {n: dict(mu=z[f"pred{i}_mu"], q=z[f"pred{i}_q"])
                  for i, n in enumerate(header["names"])}
         meta = {}
@@ -143,19 +149,39 @@ def load_predictions(path):
     return preds, aux, shift, header.get("info", {})
 
 
+def table_hours(meta):
+    """Число валидных часов температуры окон, по которому выбирается строка таблицы.
+
+    Args:
+        meta: метаданные окон.
+
+    Returns:
+        Массив int64 формы (N,).
+
+    Raises:
+        KeyError: в метаданных нет числа валидных часов.
+    """
+    if "history_valid" not in meta:
+        raise KeyError(f"в метаданных окон нет 'history_valid' - числа валидных часов "
+                       f"температуры во входе модели; {RESAVE_HINT}")
+    return np.asarray(meta["history_valid"], np.int64)
+
+
 def evaluation_of(pred, aux, shift=None, theta=0.0):
     """Оценка модели по сохранённым предсказаниям, при желании после калибровки.
 
     Args:
         pred: медиана и квантили модели.
-        aux: факт, веса, эталон и метаданные окон; длина истории окон - в метаданных.
-        shift: конформная таблица; применяется по фактической длине истории окна.
+        aux: факт, веса, эталон и метаданные окон; с таблицей в метаданных нужно число
+            валидных часов температуры окон.
+        shift: конформная таблица; строка выбирается по числу валидных часов
+            температуры окна.
         theta: логарифм адаптивного множителя: число или по бинам лидов.
 
     Returns:
         Оценка.
     """
-    hist = aux["meta"].get("history") if shift is not None else None
+    hist = table_hours(aux["meta"]) if shift is not None else None
     return Evaluation(y=aux["y"], mu=pred["mu"], q=pred["q"], mu_clim=aux["mu_clim"],
                       w=aux["y_mask"],
                       station=aux["meta"]["station"]).with_calibration(shift, theta, hist)
@@ -584,7 +610,7 @@ def aci_hourly_replay(pred, aux, params, shift=None, lead_bins=LEAD_BINS):
     Args:
         pred: медиана и квантили модели до калибровки на ежечасных окнах.
         aux: факт, веса и метаданные тех же окон; нужны станция, момент начала горизонта
-            и, с таблицей, длина истории.
+            и, с таблицей, число валидных часов температуры.
         params: параметры адаптивной калибровки.
         shift: конформная таблица; None - прибор без таблицы.
         lead_bins: бины лидов.
@@ -604,7 +630,7 @@ def aci_hourly_replay(pred, aux, params, shift=None, lead_bins=LEAD_BINS):
                        "предсказания текущей версией mayak.evaluate --save-preds")
     q = np.asarray(pred["q"], np.float32)
     if shift is not None:
-        q = apply_conformal(q, shift, meta["history"], lead_bins)
+        q = apply_conformal(q, shift, table_hours(meta), lead_bins)
     y = np.asarray(aux["y"], np.float64)
     w = np.asarray(aux["y_mask"]) > 0
     n, horizon = y.shape

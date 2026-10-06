@@ -4,10 +4,12 @@
 году. Длина истории каждого окна берётся из того распределения, на котором обучен
 чекпойнт, генератором с фиксированным сидом, тем же, что у набора валидации.
 
-Таблица разбита по бинам лидов и бинам длины истории: у каждого бина длины истории свои
-поправки, подогнанные по окнам с такой фактической длиной истории. Так номинальное
-покрытие держится в каждом режиме прибора, в том числе при полной истории, в которой
-устройство проводит почти всё время. Бин, в котором окон меньше порога из конфига
+Таблица разбита по бинам лидов и бинам длины истории: у каждого бина свои поправки,
+подогнанные по окнам, у которых столько часов с валидной температурой во входе модели
+после причинного QC. По этому же числу строку выбирают устройство и оценка, поэтому
+после простоя или при редких наблюдениях интервал берётся из строки короткой истории.
+Так номинальное покрытие держится в каждом режиме прибора, в том числе при полной
+истории, в которой устройство проводит почти всё время. Бин, в котором окон меньше порога из конфига
 калибровки, получает маргинальную строку по всем окнам; это пишется в запись о подгонке.
 
 Поправка медианы равна нулю: таблица меняет только ширину интервалов, точечный прогноз
@@ -25,6 +27,7 @@ import numpy as np
 from mayak.data.masking import DEFAULT_TARGET_MASK
 from mayak.data.splits import ROLE_VAL
 from mayak.data.store import get_store
+from mayak.data.window import valid_history_hours
 from mayak.evaluate import EvalSet, gather
 from mayak.leakage import (CONFORMAL_TIME_KEY, SELECTION_KEY, LeakageError, conformal_record,
                            run_checklist, save_conformal)
@@ -97,14 +100,14 @@ def fit(model, ds, checkpoint=None, min_windows=None):
 
     Returns:
         Тройка: таблица поправок, запись о подгонке и прогон набора (факт, квантили,
-        веса, фактическая длина истории окон и остальное про окна).
+        веса, маски истории, число валидных часов температуры окон и остальное про окна).
     """
     from mayak.config import CalibrationConfig
     if min_windows is None:
         min_windows = CalibrationConfig().fit_min_windows
     D = gather(model, ds)
-    D["history"] = np.asarray(ds.window_meta()["history"], np.int64)
-    shift, history_fit = fit_conformal_shift(D["y"], D["q"], D["y_mask"], D["history"],
+    D["history_valid"] = valid_history_hours(D["mask_hist"])
+    shift, history_fit = fit_conformal_shift(D["y"], D["q"], D["y_mask"], D["history_valid"],
                                              LEAD_BINS, min_windows=min_windows)
     rec = conformal_record(ds, checkpoint=checkpoint, history_fit=history_fit)
     rec["min_windows"] = int(min_windows)
@@ -113,6 +116,9 @@ def fit(model, ds, checkpoint=None, min_windows=None):
 
 def report(D, meta, shift, cfg=None):
     """Покрытие калибровочного набора до и после таблицы по сезонам и длине истории.
+
+    Разрезы по длине истории - по запрошенной длине из метаданных набора, строка таблицы -
+    по числу валидных часов температуры окна из прогона.
 
     Args:
         D: прогон набора.
@@ -124,6 +130,7 @@ def report(D, meta, shift, cfg=None):
         Отчёт о покрытии.
     """
     from mayak.calibration import evaluation_of, fit_report
+    meta = dict(meta, history_valid=D["history_valid"])
     aux = dict(y=D["y"], y_mask=D["y_mask"], mu_clim=D["mu_clim"], meta=meta)
     pred = dict(mu=D["mu"], q=D["q"])
     return fit_report(evaluation_of(pred, aux), evaluation_of(pred, aux, shift), meta, cfg)
@@ -175,7 +182,7 @@ def main(argv=None):
           "медианы - нули:")
     print_table(shift, rec)
     before = coverage(D["y"], D["q"], D["y_mask"])
-    after = coverage(D["y"], apply_conformal(D["q"], shift, D["history"]), D["y_mask"])
+    after = coverage(D["y"], apply_conformal(D["q"], shift, D["history_valid"]), D["y_mask"])
     print(f"PICP-90 на калибровочном наборе (в выборке): до {before:.1%}, после {after:.1%}")
 
     rep = report(D, ds.window_meta(), shift, cfg)
