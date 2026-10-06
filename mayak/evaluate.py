@@ -1392,24 +1392,24 @@ def main():
     ap = argparse.ArgumentParser(description="единый стенд оценки МАЯК")
     ap.add_argument("--ckpt", required=True, nargs="+",
                     help="чекпойнты МАЯК; несколько = прогоны с разными сидами (повторы "
-                         "берут скорость обучения первого: scripts/train.py --lr-from)")
+                         "берут скорость обучения первого: scripts/run.py run.lr_from=...)")
     ap.add_argument("--manifest", default="data/manifest.csv")
     for arch, name in NEURAL_BASELINES.items():
         ap.add_argument(f"--{arch}-ckpt", default=None,
                         help=f"чекпойнт бейзлайна «{name}» "
-                             f"(scripts/train.py --arch {arch})")
+                             f"(scripts/run.py model={arch})")
     ap.add_argument("--allow-protocol-mismatch", action="store_true",
                     help="не падать, если модели обучены в разных условиях: по разным "
                          "протоколам или без одинакового подбора скорости обучения (только "
                          "для диагностики: такие таблицы несопоставимы)")
     ap.add_argument("--ablation-ckpt", nargs="*", default=[],
                     help="чекпойнты переобученных абляций МАЯК (тот же сид и протокол, "
-                         "скорость обучения основного МАЯК: --lr-from); имя строки таблицы "
+                         "скорость обучения основного МАЯК: run.lr_from); имя строки таблицы "
                          "берётся из конфига в чекпойнте")
     ap.add_argument("--tuned-ckpt", default=None,
                     help=f"чекпойнт дополнительной настройки МАЯК (этап 2 сравнения, "
-                         f"scripts/train.py --extra-tuning): отдельная строка «{TUNED_MODEL}», "
-                         f"в сравнение на равных не входит")
+                         f"scripts/run.py run.extra_tuning=true): отдельная строка "
+                         f"«{TUNED_MODEL}», в сравнение на равных не входит")
     ap.add_argument("--eval-seed", type=int, default=None,
                     help="сид оценки (бутстрап, примеры); по умолчанию - seeds.eval "
                          "из первого чекпойнта, иначе 0")

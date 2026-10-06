@@ -1,8 +1,9 @@
 # Корневой конфиг Hydra: python scripts/run.py [группа=вариант ...] [ключ=значение ...]
 #
-# Значения в группах model/, data/, train/ совпадают со значениями по умолчанию
-# конфигов модели, данных и протокола обучения в коде; совпадение проверяется тестом.
-# Здесь только композиция; источник истины - код.
+# Значения прогона берутся из групп model/, data/, train/ и переопределений командной
+# строки. Полностью разрешённый конфиг пишется в каталог прогона (config.json) и в каждый
+# чекпойнт. Значения по умолчанию датаклассов в коде - только запасные для программного
+# использования (вызов run_protocol из Python без конфига).
 defaults:
   - model: mayak
   - ablation: none
@@ -13,9 +14,10 @@ defaults:
 
 run:
   out_root: runs
-  # имя прогона: архитектура, вариант абляции, профиль аугментаций (кроме default),
-  # суффикс -tuned у дополнительной настройки МАЯК, базовый сид
-  tag: ${model.arch}-${hydra:runtime.choices.ablation}${aug_suffix:${data.augment.profile}}${tuned_suffix:${run.extra_tuning}}-s${train.seed}
+  # Тег прогона и имя его каталога: <arch>[-<абляция>][-aug_<профиль>][-tuned][-s<сид>].
+  # Не пишутся абляция none, профиль default, сид 0; -tuned - доп. настройка МАЯК.
+  # Примеры: mayak, mayak-no_solar, mayak-aug_none, mayak-s1, mayak-tuned, gru.
+  tag: ${run_tag:${model.arch},${hydra:runtime.choices.ablation},${data.augment.profile},${run.extra_tuning},${train.seed}}
   accelerator: gpu
   # Раздельный запуск этапов; в протокол не входит и на сравнение моделей не влияет.
   # Этапы этого запуска подряд в порядке протокола, например [A] или [B]; null - все.
@@ -47,8 +49,9 @@ hydra:
     chdir: false            # относительные пути к данным остаются относительными
   run:
     dir: ${run.out_root}/${run.tag}
+  # Групповой запуск пишет в те же каталоги, что и одиночный: <out_root>/<тег>.
   sweep:
-    dir: ${run.out_root}/sweeps/${now:%Y-%m-%d_%H-%M-%S}
+    dir: ${run.out_root}
     subdir: ${run.tag}
   help:
     app_name: mayak-run
@@ -57,20 +60,21 @@ hydra:
 
       Обучение по единому протоколу с композицией конфигов (Hydra).
     footer: |
+      Каталог прогона: run.out_root/<тег>, тег <arch>[-<абляция>][-aug_<профиль>][-tuned][-s<сид>].
+
       Примеры:
-        python scripts/run.py model=gru run.accelerator=cpu train=debug
-        python scripts/run.py -m model=gru,dlinear,lru,patchtst   # бейзлайны
-        python scripts/run.py model.encoder_width=64 train.seed=1
-        python scripts/run.py -m ablation=none,no_compression train.seed=0
-        python scripts/run.py -m train.seed=0,1,2
-        python scripts/run.py augment=none          # профиль аугментаций
-        python scripts/run.py run.stages=[A]        # только этап A, затем отчёт о поле
-        python scripts/run.py run.stages=[B] run.init_from=<чекпойнт этапа A>
+        python scripts/run.py train=debug run.accelerator=cpu      # отладка: runs/mayak
+        python scripts/run.py model=gru                            # runs/gru
+        python scripts/run.py -m model=gru,dlinear,lru,patchtst    # runs/gru, runs/dlinear, ...
         python scripts/run.py run.lr_search=true    # этап 1: подбор lr, затем полный прогон
         python scripts/run.py -m model=gru,dlinear,lru,patchtst run.lr_search=true
-        python scripts/run.py -m ablation=no_compression,no_solar run.lr_from=runs/mayak-none-s0
-        python scripts/run.py train.seed=1 run.lr_from=runs/mayak-none-s0
-        python scripts/run.py run.extra_tuning=true train.lr=0.001   # этап 2: доп. настройка
+        python scripts/run.py run.stages=[A]        # только этап A, затем отчёт о поле
+        python scripts/run.py run.stages=[B] run.init_from=runs/mayak/stageA/candidates/step006000.ckpt
+        python scripts/run.py -m ablation=no_compression,no_solar run.lr_from=runs/mayak
+        python scripts/run.py -m train.seed=1,2 run.lr_from=runs/mayak   # runs/mayak-s1, -s2
+        python scripts/run.py augment=none run.lr_from=runs/mayak        # runs/mayak-aug_none
+        python scripts/run.py run.extra_tuning=true train.lr=0.001 model.encoder_width=64
+                                                    # этап 2: доп. настройка, runs/mayak-tuned
 
       Hydra: python scripts/run.py --hydra-help
     template: |

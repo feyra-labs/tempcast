@@ -506,7 +506,7 @@ def check_extra_tuning(path):
     phase = (tune or {}).get("phase")
     if arch != EXTRA_ARCH or phase != PHASE_EXTRA:
         raise ProtocolError(f"{path} ({arch}): нужен прогон {describe_phase(PHASE_EXTRA)} "
-                            f"(scripts/train.py --extra-tuning), а это прогон "
+                            f"(scripts/run.py run.extra_tuning=true), а это прогон "
                             f"{describe_phase(phase)}")
 
 

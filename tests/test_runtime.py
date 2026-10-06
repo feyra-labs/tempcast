@@ -32,7 +32,7 @@ from mayak.runtime.host import Host
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LAT, LON, ELEV = 52.37, 4.9, 0.0
-# Модули, которых нет на устройстве: группа train и PyYAML, который приходит с hydra.
+# Модули, которых нет на устройстве: группа train, в том числе hydra и PyYAML.
 TRAIN_ONLY = ("torch", "pytorch_lightning", "pandas", "matplotlib", "scipy", "sklearn", "pyarrow",
               "rasterio", "onnx", "hydra", "yaml")
 ATOL_ONNX = 2e-4

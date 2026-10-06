@@ -404,8 +404,7 @@ def test_trainer_checkpoint_carries_selection_record(dm, store, tmp_path):
     run_checklist(store, checkpoints=[ck.best_model_path])
 
 
-TRAINING_CODE = ["scripts/train.py", "scripts/train_neurobaselines.py",
-                 "mayak/data/datamodule.py", "mayak/lit.py"]
+TRAINING_CODE = ["scripts/run.py", "mayak/data/datamodule.py", "mayak/lit.py"]
 
 
 @pytest.mark.parametrize("rel", TRAINING_CODE)

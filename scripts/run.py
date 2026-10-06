@@ -1,53 +1,70 @@
-"""Обучение через Hydra: композиция конфигов, переопределения, групповые запуски.
+r"""Обучение: единственный вход. Композиция конфигов Hydra, переопределения, групповые запуски.
+
+Значения прогона берутся из YAML в conf/ и переопределений командной строки, полностью
+разрешённый конфиг пишется в каталог прогона и в каждый чекпойнт. Каталог прогона -
+``<run.out_root>/<run.tag>``, у одиночного и группового запуска он один и тот же. Тег:
+``<arch>[-<абляция>][-aug_<профиль>][-tuned][-s<сид>]``, части со значением по умолчанию
+опускаются.
 
 Example:
-    python scripts/run.py                                   # МАЯК, протокол по умолчанию
-    python scripts/run.py model=gru                         # бейзлайн - другая группа model
-    python scripts/run.py -m model=gru,dlinear,lru,patchtst # все нейробейзлайны
-    python scripts/run.py train=debug run.accelerator=cpu   # отладка на CPU
-    python scripts/run.py -m ablation=none,no_compression   # абляции МАЯК
-    python scripts/run.py -m train.seed=0,1,2               # три сида основной модели
-    python scripts/run.py augment=none                      # без аугментаций, свой каталог
-    python scripts/run.py run.lr_search=true                # подбор lr, затем полный прогон
-    python scripts/run.py -m ablation=no_compression run.lr_from=runs/mayak-none-s0
-    python scripts/run.py run.extra_tuning=true train.lr=0.001  # доп. настройка МАЯК
+    python scripts/run.py train=debug run.accelerator=cpu      # отладка на CPU: runs/mayak
+    python scripts/run.py model=gru                            # бейзлайн: runs/gru
+    python scripts/run.py -m model=gru,dlinear,lru,patchtst    # все нейробейзлайны
+    python scripts/run.py run.lr_search=true                   # подбор lr, затем полный прогон
+    python scripts/run.py run.stages=[A]                       # только этап A, затем отчёт
+    python scripts/run.py run.stages=[B] \
+        run.init_from=runs/mayak/stageA/candidates/step006000.ckpt
+    python scripts/run.py -m ablation=no_compression,no_solar run.lr_from=runs/mayak
+    python scripts/run.py train.seed=1 run.lr_from=runs/mayak  # runs/mayak-s1
+    python scripts/run.py augment=none run.lr_from=runs/mayak  # runs/mayak-aug_none
+    python scripts/run.py run.extra_tuning=true train.lr=0.001 model.encoder_width=64
 """
+import logging
 import os
+import shlex
 
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
+log = logging.getLogger(__name__)
+
 RUN_SECTIONS = ("model", "data", "train")
+# Значения, которые в теге прогона не пишутся.
+BASE_ABLATION, BASE_AUGMENT, BASE_SEED = "none", "default", 0
 
 
-def aug_suffix(profile):
-    """Часть имени прогона с профилем аугментаций.
+def run_tag(arch, ablation, profile, extra, seed):
+    """Тег прогона, он же имя его каталога.
+
+    Схема ``<arch>[-<абляция>][-aug_<профиль>][-tuned][-s<сид>]``: абляция ``none``,
+    профиль аугментаций ``default``, прогон без дополнительной настройки и сид 0 в теге
+    не пишутся.
 
     Args:
+        arch: имя архитектуры.
+        ablation: вариант группы ablation.
         profile: имя профиля аугментаций.
+        extra: прогон дополнительной настройки МАЯК (этап 2 сравнения).
+        seed: базовый сид протокола.
 
     Returns:
-        Пустая строка для профиля по умолчанию, иначе ``-aug_<профиль>``.
-    """
-    from mayak.config import AugmentConfig
-    return "" if profile == AugmentConfig().profile else f"-aug_{profile}"
-
-
-def tuned_suffix(extra):
-    """Часть имени прогона дополнительной настройки МАЯК.
-
-    Args:
-        extra: прогон дополнительной настройки.
-
-    Returns:
-        Суффикс ``-tuned`` для прогона дополнительной настройки, иначе пустая строка.
+        Строка вида ``mayak``, ``mayak-no_solar``, ``mayak-aug_none``, ``mayak-s1``,
+        ``mayak-tuned``, ``gru``.
     """
     from mayak.tuning import EXTRA_SUFFIX
-    return EXTRA_SUFFIX if extra in (True, "true", "True") else ""
+    tag = str(arch)
+    if ablation is not None and str(ablation) != BASE_ABLATION:
+        tag += f"-{ablation}"
+    if str(profile) != BASE_AUGMENT:
+        tag += f"-aug_{profile}"
+    if str(extra).lower() == "true":
+        tag += EXTRA_SUFFIX
+    if int(seed) != BASE_SEED:
+        tag += f"-s{int(seed)}"
+    return tag
 
 
-OmegaConf.register_new_resolver("aug_suffix", aug_suffix, replace=True)
-OmegaConf.register_new_resolver("tuned_suffix", tuned_suffix, replace=True)
+OmegaConf.register_new_resolver("run_tag", run_tag, replace=True)
 
 
 def to_run_config(cfg):
@@ -97,30 +114,102 @@ def to_tuning(cfg):
     return tuning_from_config(OmegaConf.to_container(cfg.run, resolve=False))
 
 
+def next_command(overrides, stage, init_from):
+    """Команда запуска следующего этапа в том же каталоге прогона.
+
+    Переопределения настроек запуска (``run.stages``, ``run.init_from`` и остальные поля
+    ``Launch``) описывают только этот запуск и не переносятся. Остальные переносятся без
+    изменений, поэтому у следующего этапа те же конфиг, тег и запись о подборе.
+
+    Args:
+        overrides: переопределения командной строки этого запуска.
+        stage: имя следующего этапа.
+        init_from: чекпойнт, с которого он стартует.
+
+    Returns:
+        Строка команды для оболочки.
+    """
+    from mayak.stages import LAUNCH_FIELDS
+    launch_keys = {f"run.{k}" for k in LAUNCH_FIELDS}
+    kept = [o for o in overrides if o.lstrip("+~").split("=", 1)[0] not in launch_keys]
+    return shlex.join(["python", "scripts/run.py", *kept, f"run.stages=[{stage}]",
+                       f"run.init_from={init_from}"])
+
+
+def print_next_step(journal, stage_names, overrides):
+    """Печатает путь к отчёту и готовую команду следующего этапа.
+
+    Подсказка нужна, только если запуск остановился до итогового чекпойнта: чекпойнт для
+    следующего этапа выбирает человек по отчёту.
+
+    Args:
+        journal: журнал прогона.
+        stage_names: имена этапов протокола по порядку.
+        overrides: переопределения командной строки этого запуска.
+    """
+    from mayak.stages import CANDIDATE_DIR
+    last = journal["stages"][-1]
+    idx = stage_names.index(last["name"])
+    if journal["final_ckpt"] or idx + 1 >= len(stage_names):
+        return
+    nxt = stage_names[idx + 1]
+    cand_dir = os.path.join(os.path.dirname(last["best_ckpt"]), CANDIDATE_DIR)
+    print(f"\nЭтап {last['name']} готов.")
+    if last.get("report"):
+        print(f"Отчёт: {last['report']}")
+    print(f"Выберите чекпойнт для этапа {nxt}: лучший по val/loss (в команде ниже) или любой "
+          f"кандидат из {cand_dir}.")
+    print(f"Этап {nxt}:")
+    print("    " + next_command(overrides, nxt, last["best_ckpt"]))
+
+
+def exit_code(err):
+    """Код выхода процесса при ошибке протокола.
+
+    Args:
+        err: исключение протокола.
+
+    Returns:
+        Отдельный код для неподходящего чекпойнта инициализации и закрытых ворот, иначе 1.
+    """
+    from mayak.stages import GATE_EXIT_CODE, INIT_EXIT_CODE, GateError, InitCheckpointError
+    if isinstance(err, InitCheckpointError):
+        return INIT_EXIT_CODE
+    if isinstance(err, GateError):
+        return GATE_EXIT_CODE
+    return 1
+
+
 @hydra.main(config_path="../conf", config_name="config", version_base="1.3")
 def main(cfg: DictConfig):
-    import logging
+    import sys
 
     from hydra.core.hydra_config import HydraConfig
 
-    from mayak.protocol import run_experiment
+    from mayak.protocol import ProtocolError, run_experiment
     from mayak.tuning import format_tuning
 
-    log = logging.getLogger(__name__)
     rc = to_run_config(cfg)
     launch = to_launch(cfg)
     tuning = to_tuning(cfg)
-    out_dir = HydraConfig.get().runtime.output_dir
-    journal = run_experiment(rc, out_root=os.path.dirname(out_dir),
-                             tag=os.path.basename(out_dir), accelerator=cfg.run.accelerator,
-                             launch=launch, tuning=tuning)
+    hc = HydraConfig.get()
+    out_dir = hc.runtime.output_dir
+    try:
+        journal = run_experiment(rc, out_root=os.path.dirname(out_dir),
+                                 tag=os.path.basename(out_dir), accelerator=cfg.run.accelerator,
+                                 launch=launch, tuning=tuning)
+    except ProtocolError as e:
+        log.error("%s", e)
+        sys.exit(exit_code(e))
     for line in format_tuning(journal.get("tuning")):
         log.info("%s", line)
     for st in journal["stages"]:
         log.info("лучшая модель этапа %s: %s", st["name"], st["best_ckpt"])
         if st.get("report"):
             log.info("отчёт о поле этапа %s: %s", st["name"], st["report"])
-    log.info("итоговый чекпойнт: %s", journal["final_ckpt"])
+    if journal["final_ckpt"]:
+        log.info("итоговый чекпойнт: %s", journal["final_ckpt"])
+    print_next_step(journal, [s.name for s in rc.train.stages], list(hc.overrides.task))
     return journal["stages"][-1]["best_score"] if journal["stages"] else None
 
 

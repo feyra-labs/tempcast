@@ -245,56 +245,6 @@ def protocol_diff(a, b, ignore=()):
     return sorted(k for k in set(da) | set(db) if da.get(k) != db.get(k))
 
 
-_CLI_HELP = {
-    "lr": "скорость обучения прогона; при подборе её заменяет выбранное значение сетки",
-    "lr_search_steps": "шаги последнего этапа на каждом значении сетки при подборе",
-}
-
-# (флаг, поле протокола, тип)
-_CLI = [
-    ("--batch", "batch_size", int), ("--windows", "windows_per_epoch", int),
-    ("--workers", "num_workers", int), ("--seed", "seed", int),
-    ("--lr", "lr", float), ("--lr-search-steps", "lr_search_steps", int),
-    ("--weight-decay", "weight_decay", float),
-    ("--grad-clip", "grad_clip", float), ("--ema-decay", "ema_decay", float),
-    ("--val-every", "val_every", int),
-    ("--patience", "patience", int),
-]
-
-
-def add_protocol_args(ap, base=DEFAULT_PROTOCOL):
-    """Добавить флаги протокола в разбор командной строки.
-
-    Флаги одни и те же для всех архитектур и всех точек входа обучения.
-
-    Args:
-        ap: разборщик аргументов командной строки.
-        base: протокол, значения которого становятся значениями флагов по умолчанию.
-
-    Returns:
-        Тот же разборщик.
-    """
-    g = ap.add_argument_group("протокол обучения (одинаков для всех архитектур)")
-    for s in base.stages:
-        g.add_argument(f"--steps-{s.name.lower()}", type=int, default=s.steps,
-                       help=f"шаги этапа {s.name} ({s.curriculum})")
-    for flag, name, typ in _CLI:
-        g.add_argument(flag, type=typ, default=getattr(base, name), help=_CLI_HELP.get(name))
-    g.add_argument("--lr-grid", type=float, nargs="+", default=list(base.lr_grid),
-                   metavar="LR", help="сетка подбора скорости обучения (--lr-search)")
-    for name in SEED_NAMES:
-        g.add_argument(f"--seed-{name}", type=int, default=getattr(base.seeds, name),
-                       help=f"отдельный сид «{name}» (по умолчанию = --seed)")
-    return ap
-
-
-def protocol_from_args(args, base=DEFAULT_PROTOCOL):
-    stages = tuple(replace(s, steps=getattr(args, f"steps_{s.name.lower()}")) for s in base.stages)
-    kw = {name: getattr(args, flag.lstrip("-").replace("-", "_")) for flag, name, _ in _CLI}
-    seeds = Seeds(**{n: getattr(args, f"seed_{n}") for n in SEED_NAMES})
-    return replace(base, stages=stages, seeds=seeds, lr_grid=tuple(args.lr_grid), **kw)
-
-
 def _write_journal(path, journal):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
@@ -605,6 +555,5 @@ def read_journal(run_dir):
 
 
 __all__ = ["ARCH_NAMES", "CONFIG_FILE", "DEFAULT_PROTOCOL", "JOURNAL", "LR_FIELDS", "Protocol",
-           "ProtocolError", "SEED_FIELDS", "SEED_NAMES", "Seeds", "Stage", "add_protocol_args",
-           "protocol_diff", "protocol_for", "protocol_from_args", "read_journal",
-           "run_experiment", "run_protocol", "strict_fp32"]
+           "ProtocolError", "SEED_FIELDS", "SEED_NAMES", "Seeds", "Stage", "protocol_diff",
+           "protocol_for", "read_journal", "run_experiment", "run_protocol", "strict_fp32"]

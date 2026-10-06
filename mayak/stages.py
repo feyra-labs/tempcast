@@ -174,52 +174,6 @@ def launch_from_config(section):
     return Launch.coerce({k: section[k] for k in LAUNCH_FIELDS if k in section})
 
 
-def add_launch_args(ap):
-    """Флаги раздельного запуска этапов для командной строки.
-
-    Args:
-        ap: разборщик аргументов.
-
-    Returns:
-        Тот же разборщик.
-    """
-    g = ap.add_argument_group("этапы: раздельный запуск и ворота (в протокол не входят)")
-    g.add_argument("--stages", default=None, metavar="ЭТАПЫ",
-                   help="этапы через запятую подряд в порядке протокола, например A или B; "
-                        "по умолчанию все этапы одной командой")
-    g.add_argument("--init-from", default=None, metavar="ЧЕКПОЙНТ",
-                   help="чекпойнт предыдущего этапа, с которого стартует первый запускаемый "
-                        "этап; обязателен для --stages B")
-    g.add_argument("--require-gate", type=float, default=None, metavar="ПОРОГ",
-                   help="не начинать этап B, если отношение MSE поля к MSE климатологии на "
-                        "валидационных станциях при L=0 выше порога (спецификация: 1.05); "
-                        "по умолчанию отчёт только для сведения")
-    g.add_argument("--probe-steps", type=int, default=None, metavar="ШАГИ",
-                   help="пробный запуск последнего этапа: столько первых шагов при расписании "
-                        "полного этапа; итоговым чекпойнтом не считается")
-    g.add_argument("--candidates", nargs="*", default=None, metavar="ЭТАП",
-                   help="этапы, у которых чекпойнт сохраняется после каждой валидации; по "
-                        "умолчанию этап холодного старта; флаг без имён отключает")
-    return ap
-
-
-def launch_from_args(args):
-    """Настройки запуска из разобранных аргументов командной строки.
-
-    Args:
-        args: результат разбора с флагами раздельного запуска.
-
-    Returns:
-        Настройки запуска.
-
-    Raises:
-        ValueError: значение флага недопустимо.
-    """
-    return Launch(stages=args.stages, init_from=args.init_from,
-                  require_gate=args.require_gate, probe_steps=args.probe_steps,
-                  candidates=args.candidates)
-
-
 def plan_stages(protocol, launch):
     """Проверяет выбор этапов и возвращает запускаемые этапы с их номерами в протоколе.
 
@@ -249,8 +203,7 @@ def plan_stages(protocol, launch):
     first, last = idx[0], idx[-1]
     if first > 0 and not launch.init_from:
         raise ProtocolError(f"этап {names[first]} в протоколе не первый: укажите чекпойнт этапа "
-                            f"{names[first - 1]}, с которого он стартует (--init-from или "
-                            f"run.init_from)")
+                            f"{names[first - 1]}, с которого он стартует (run.init_from)")
     if first == 0 and launch.init_from:
         raise ProtocolError(f"этап {names[0]} первый в протоколе и стартует с нуля: чекпойнт "
                             f"инициализации ему не нужен")
@@ -404,7 +357,8 @@ def init_mismatches(ck, arch, protocol, model_config, data_config, stage, data_k
             out += config_diff("протокол", got, protocol)
     if _normalized(ck.get(TUNING_KEY)) != _normalized(tuning):
         out.append("запись о подборе скорости обучения в чекпойнте другая, чем у этого "
-                   "запуска: укажите те же --lr-from и --extra-tuning, что у предыдущего этапа")
+                   "запуска: укажите те же run.lr_from и run.extra_tuning, что у предыдущего "
+                   "этапа")
     rec = ck.get(STAGE_KEY)
     if not rec:
         out.append("нет записи об этапе: чекпойнт сохранён до раздельного запуска этапов, "
@@ -697,8 +651,7 @@ def warn_stale(stage_dir):
 
 __all__ = ["CANDIDATE_DIR", "FIELD_CURRICULUM", "GATE_EXIT_CODE", "GateError",
            "INIT_EXIT_CODE", "InitCheckpointError", "LAUNCH_FIELDS", "Launch", "STAGE_KEY",
-           "add_launch_args", "candidate_stages", "config_diff", "gate_message", "gate_verdict",
-           "init_mismatches", "init_summary", "inspect_init_checkpoint", "jsonable",
-           "launch_from_args", "launch_from_config", "lineage", "load_init_weights",
-           "parse_stage_list", "plan_stages", "stage_dir_name", "stage_record", "start_journal",
-           "warn_stale"]
+           "candidate_stages", "config_diff", "gate_message", "gate_verdict", "init_mismatches",
+           "init_summary", "inspect_init_checkpoint", "jsonable", "launch_from_config", "lineage",
+           "load_init_weights", "parse_stage_list", "plan_stages", "stage_dir_name",
+           "stage_record", "start_journal", "warn_stale"]

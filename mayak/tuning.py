@@ -122,49 +122,6 @@ def tuning_from_config(section):
     return Tuning.coerce({k: section[k] for k in TUNING_FIELDS if k in section})
 
 
-def add_tuning_args(ap, inherit=True):
-    """Флаги подбора скорости обучения для командной строки.
-
-    Args:
-        ap: разборщик аргументов.
-        inherit: добавить флаги наследования подбора и дополнительной настройки МАЯК.
-
-    Returns:
-        Тот же разборщик.
-    """
-    g = ap.add_argument_group("подбор скорости обучения (в протокол не входит)")
-    g.add_argument("--lr-search", action="store_true",
-                   help="этап 1 сравнения: пройти сетку --lr-grid (полный этап A, этап B на "
-                        "--lr-search-steps шагов), выбрать значение по val/loss, затем полный "
-                        "прогон с ним")
-    if inherit:
-        g.add_argument("--lr-from", default=None, metavar="ПРОГОН",
-                       help="каталог прогона основного МАЯК или его protocol.json: взять "
-                            "выбранную скорость обучения и запись о подборе, подбор не "
-                            "повторять (абляции, повторы с другими сидами)")
-        g.add_argument("--extra-tuning", action="store_true",
-                       help="этап 2 сравнения: дополнительная настройка МАЯК любыми "
-                            "гиперпараметрами по валидации; свой каталог (суффикс -tuned), "
-                            "отдельная строка таблиц, в сравнение на равных не входит")
-    return ap
-
-
-def tuning_from_args(args):
-    """Настройки подбора из разобранных аргументов командной строки.
-
-    Args:
-        args: результат разбора с флагами подбора.
-
-    Returns:
-        Настройки подбора.
-
-    Raises:
-        ValueError: флаги несовместимы.
-    """
-    return Tuning(lr_search=bool(args.lr_search), lr_from=getattr(args, "lr_from", None),
-                  extra_tuning=bool(getattr(args, "extra_tuning", False)))
-
-
 def search_protocol(protocol, lr):
     """Протокол прогона на одном значении сетки.
 
@@ -195,7 +152,7 @@ def check_search(protocol, launch):
     plan = plan_stages(protocol, launch)
     if len(plan) != len(protocol.stages) or launch.probe_steps is not None:
         raise ProtocolError("подбор скорости обучения идёт одной командой по всем этапам "
-                            "протокола: выбор этапов, --init-from и --probe-steps с ним не "
+                            "протокола: run.stages, run.init_from и run.probe_steps с ним не "
                             "сочетаются")
     last = protocol.stages[-1]
     if protocol.lr_search_steps > last.steps:
@@ -395,7 +352,7 @@ def resolve(arch, protocol, tuning, launch, model_config, tag, train):
     abl = getattr(model_config, "ablations", None)
     if tuning.lr_search and abl is not None and abl.active() and not tuning.extra_tuning:
         raise ProtocolError("абляции берут скорость обучения основного МАЯК: вместо подбора "
-                            "укажите его прогон (--lr-from, run.lr_from)")
+                            "укажите его прогон (run.lr_from)")
     search = inherited = None
     if tuning.lr_search:
         check_search(protocol, launch)
@@ -418,8 +375,8 @@ def equal_terms_problems(record, protocol):
         Список причин; пустой, если чекпойнт входит в сравнение.
     """
     if not record:
-        return ["нет записи о подборе скорости обучения: прогон запущен без --lr-search "
-                "и без --lr-from"]
+        return ["нет записи о подборе скорости обучения: прогон запущен без run.lr_search "
+                "и без run.lr_from"]
     if record.get("phase") != PHASE_EQUAL:
         return [f"прогон {describe_phase(record.get('phase'))} в сравнение на равных не "
                 f"входит: для него --tuned-ckpt"]
@@ -474,8 +431,7 @@ def format_tuning(record):
 
 
 __all__ = ["EXTRA_SUFFIX", "PHASE_EQUAL", "PHASE_EXTRA", "SEARCH_DIR", "SEARCH_LAUNCH",
-           "TUNING_FIELDS", "TUNING_KEY", "Tuning", "add_tuning_args", "check_run_dir",
-           "check_search", "describe_phase", "equal_terms_problems", "format_tuning",
-           "inherit_search", "lr_label", "read_source_journal", "resolve", "run_lr_search",
-           "search_protocol", "search_terms", "select_lr", "tuning_from_args",
-           "tuning_from_config", "tuning_record"]
+           "TUNING_FIELDS", "TUNING_KEY", "Tuning", "check_run_dir", "check_search",
+           "describe_phase", "equal_terms_problems", "format_tuning", "inherit_search",
+           "lr_label", "read_source_journal", "resolve", "run_lr_search", "search_protocol",
+           "search_terms", "select_lr", "tuning_from_config", "tuning_record"]
