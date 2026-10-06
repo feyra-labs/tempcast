@@ -6,9 +6,10 @@ run_protocol. Для любой архитектуры одинаковы:
 * этапы обучения и число шагов каждого: этап A только без истории, этап B - полный
   куррикулум длины истории;
 * размер батча, число окон в эпохе, число воркеров и сид, то есть поток окон;
-* оптимизатор AdamW (betas, базовое весовое затухание), косинусное расписание,
-  обрезка градиента, точность вычислений: fp32 без TF32, та же, в которой модель
-  оценивают, калибруют и экспортируют;
+* оптимизатор AdamW (betas, базовое весовое затухание), расписание скорости обучения
+  WSD (прогрев, плато, линейный спад до нуля в конце этапа), обрезка градиента, точность
+  вычислений: fp32 без TF32, та же, в которой модель оценивают, калибруют и
+  экспортируют;
 * сетка скоростей обучения ``lr_grid`` и число шагов последнего этапа при подборе
   ``lr_search_steps``. Скорость обучения ``lr`` каждая архитектура получает подбором по
   этой сетке (``mayak.tuning``), поэтому ``lr`` - единственное поле протокола, которое у
@@ -17,7 +18,8 @@ run_protocol. Для любой архитектуры одинаковы:
   pinball на всём наборе валидации: одинаковое число окон с каждой
   валидационной станции в валидационном окне, длина истории каждого окна - из того же
   распределения, что при обучении этапа, генератором с фиксированным сидом;
-* ранняя остановка, выбор лучшего чекпойнта и экспоненциальное усреднение весов.
+* выбор лучшего чекпойнта по метрике выбора среди валидаций и экспоненциальное
+  усреднение весов. Ранней остановки нет: каждый этап идёт ровно заданное число шагов.
 
 Сиды раздельные (``Seeds``): инициализация весов, поток окон, аугментации, подвыборка
 при оценке. Не заданный явно сид равен базовому ``seed``; разрешённые значения пишутся
@@ -50,7 +52,7 @@ log = logging.getLogger(__name__)
 
 ARCH_NAMES = ("mayak", "gru", "dlinear", "lru", "patchtst")
 CURRICULA = ("L0", "full")
-LR_SCHEDULES = ("cosine",)
+LR_SCHEDULES = ("wsd",)
 JOURNAL = "protocol.json"
 CONFIG_FILE = "config.json"
 SEED_FIELDS = ("seed", "seeds")
@@ -128,6 +130,14 @@ SEED_NAMES = tuple(f.name for f in fields(Seeds))
 
 @dataclass(frozen=True)
 class Protocol:
+    """Общий протокол обучения всех архитектур.
+
+    Расписание скорости обучения ``wsd`` (warmup - stable - decay) задаётся полями
+    ``warmup_steps`` и ``decay_frac`` и одной формулой для любого этапа, включая
+    укороченный последний этап при подборе (``lr_factor``). Поэтому короткий прогон
+    подбора совпадает с началом полного этапа до начала спада, а спад у всех моделей
+    приходится на одну и ту же долю этапа.
+    """
     stages: tuple = (Stage("A", "L0", 10_000), Stage("B", "full", 200_000))
     batch_size: int = 256
     windows_per_epoch: int = 200_000
@@ -138,12 +148,13 @@ class Protocol:
     lr_search_steps: int = 20_000
     weight_decay: float = 1e-2
     betas: tuple = (0.9, 0.95)
-    lr_schedule: str = "cosine"
+    lr_schedule: str = "wsd"
+    warmup_steps: int = 1000
+    decay_frac: float = 0.2
     grad_clip: float = 1.0
     ema_decay: float = 0.999
     monitor: str = "val/loss"
     val_every: int = 2000
-    patience: int = 5
     seeds: Seeds = Seeds()
 
     def __post_init__(self):
@@ -152,6 +163,8 @@ class Protocol:
         if not isinstance(self.seeds, Seeds):
             object.__setattr__(self, "seeds", Seeds(**dict(self.seeds or {})))
         object.__setattr__(self, "betas", tuple(float(b) for b in self.betas))
+        object.__setattr__(self, "warmup_steps", int(self.warmup_steps))
+        object.__setattr__(self, "decay_frac", float(self.decay_frac))
         grid = tuple(sorted(float(v) for v in self.lr_grid))
         object.__setattr__(self, "lr_grid", grid)
         if not grid or len(set(grid)) != len(grid):
@@ -166,6 +179,10 @@ class Protocol:
             raise ValueError("имена этапов повторяются")
         if self.lr_schedule not in LR_SCHEDULES:
             raise ValueError(f"неизвестное расписание {self.lr_schedule!r}")
+        if self.warmup_steps < 0:
+            raise ValueError(f"число шагов прогрева {self.warmup_steps} < 0")
+        if not 0.0 <= self.decay_frac <= 1.0:
+            raise ValueError(f"доля спада {self.decay_frac}: нужна от 0 до 1")
         if not str(self.monitor).startswith("val/"):
             raise ValueError(f"метрика выбора {self.monitor!r} не валидационная")
 
@@ -194,6 +211,27 @@ class Protocol:
     @property
     def total_steps(self):
         return sum(s.steps for s in self.stages)
+
+    def lr_factor(self, step, total_steps):
+        """Множитель скорости обучения расписания WSD на шаге этапа.
+
+        ``f(s) = min(1, (s + 1) / W) * min(1, (S - s) / D)``, где ``W = warmup_steps``,
+        ``S = total_steps``, ``D = max(1, round(decay_frac * S))``: линейный прогрев до
+        пика, плато и линейный спад до нуля к концу этапа. Множитель - произведение
+        прогрева и спада, поэтому он определён и для этапа короче ``W + D`` шагов.
+        Значение зависит только от номера шага и длины этапа, поэтому у этапов разной
+        длины с одним протоколом оно совпадает до начала спада более короткого.
+
+        Args:
+            step: номер шага оптимизатора внутри этапа, с нуля.
+            total_steps: число шагов этапа.
+
+        Returns:
+            Множитель от 0 до 1.
+        """
+        warmup = max(1, self.warmup_steps)
+        decay = max(1, round(self.decay_frac * total_steps))
+        return max(0.0, min(1.0, (step + 1) / warmup) * min(1.0, (total_steps - step) / decay))
 
 
 DEFAULT_PROTOCOL = Protocol()
@@ -269,7 +307,9 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
 
     Этап, который в протоколе идёт не первым, стартует с лучшего чекпойнта предыдущего
     этапа, если этапы идут одной командой, или с явно указанного чекпойнта, если этап
-    запущен отдельно. Номер этапа в протоколе задаёт его сид инициализации, поэтому этап,
+    запущен отдельно. Каждый этап идёт ровно ``steps`` шагов со своим расписанием WSD,
+    без ранней остановки; чекпойнт этапа - лучший по метрике выбора среди всех
+    валидаций. Номер этапа в протоколе задаёт его сид инициализации, поэтому этап,
     запущенный отдельно, повторяет тот же этап прогона одной командой.
 
     После этапа холодного старта считается отчёт о поле по всем сохранённым чекпойнтам
@@ -314,7 +354,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     """
     import pytorch_lightning as L
     import torch
-    from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+    from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
     from pytorch_lightning.loggers import CSVLogger
 
     from mayak import stage_report as SR
@@ -450,9 +490,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
             # окон на станцию, обрезка по батчам выбросила бы последние станции.
             limit_val_batches=1.0,
             logger=logger, log_every_n_steps=20,
-            callbacks=[*stage_callbacks, LearningRateMonitor("step"),
-                       EarlyStopping(monitor=protocol.monitor, patience=protocol.patience,
-                                     mode="min"), *callbacks],
+            callbacks=[*stage_callbacks, LearningRateMonitor("step"), *callbacks],
             enable_progress_bar=enable_progress_bar, enable_model_summary=False)
         trainer.fit(lit, datamodule=dm)
         if not ckpt.best_model_path:

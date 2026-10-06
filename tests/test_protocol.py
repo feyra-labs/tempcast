@@ -336,8 +336,12 @@ def test_optimizer_and_schedule_identical_across_architectures():
         n_opt = sum(p.numel() for g in opt.param_groups for p in g["params"])
         n_all = sum(p.numel() for p in lit.model.parameters() if p.requires_grad)
         assert n_opt == n_all, f"{arch}: не все параметры попали в оптимизатор"
-        seen.append((type(opt), {g["lr"] for g in opt.param_groups},
-                     {tuple(g["betas"]) for g in opt.param_groups}, type(sched), sched.T_max,
+        w, total = lit.protocol.warmup_steps, lit.hparams.total_steps
+        at = (0, w - 1, w, total // 2, total - 1, total)
+        factors = {tuple(f(s) for s in at) for f in sched.lr_lambdas}
+        assert len(factors) == 1, f"{arch}: у групп параметров разные расписания"
+        seen.append((type(opt), {g["initial_lr"] for g in opt.param_groups},
+                     {tuple(g["betas"]) for g in opt.param_groups}, type(sched), factors,
                      cfg["lr_scheduler"]["interval"], lit.protocol.ema_decay))
     assert all(s == seen[0] for s in seen[1:]), seen
 

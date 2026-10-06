@@ -18,6 +18,7 @@ pinball) без регуляризаторов: одно и то же число
 из чекпойнта, а не из значений по умолчанию.
 """
 import copy
+import functools
 
 import pytorch_lightning as L
 import torch
@@ -319,7 +320,7 @@ class LitForecaster(L.LightningModule):
         protocol: протокол или его словарь; словарь хранится в гиперпараметрах
             чекпойнта.
         stage: имя этапа протокола для журнала.
-        total_steps: длина косинусного расписания этого этапа.
+        total_steps: число шагов этого этапа; по нему расписание WSD ставит спад.
         model_config: конфиг архитектуры.
         data_config: конфиг данных, с которым шло обучение; пишется в чекпойнт.
     """
@@ -395,7 +396,10 @@ class LitForecaster(L.LightningModule):
         opt = torch.optim.AdamW([dict(params=g["params"], weight_decay=g["weight_decay"])
                                  for g in groups if g["params"]],
                                 lr=p.lr, betas=p.betas)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.hparams.total_steps)
+        # Множитель - функция номера шага этапа (Protocol.lr_factor). Лямбда-планировщик
+        # шагает после каждого шага оптимизатора, поэтому шаг s идёт со скоростью lr * f(s).
+        factor = functools.partial(p.lr_factor, total_steps=int(self.hparams.total_steps))
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, factor)
         return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
 
 
@@ -438,13 +442,20 @@ def checkpoint_terms(path):
         Тройка: имя архитектуры, протокол и запись о подборе или None.
 
     Raises:
-        ProtocolError: в чекпойнте нет протокола.
+        ProtocolError: в чекпойнте нет протокола или он не читается текущим протоколом,
+            например чекпойнт обучен до смены расписания.
     """
     ck = torch.load(path, map_location="cpu", weights_only=False)
     hp = ck.get("hyper_parameters") or {}
     if "protocol" not in hp:
         raise ProtocolError(f"{path}: в чекпойнте нет протокола обучения")
-    return hp["arch"], Protocol.from_dict(hp["protocol"]), ck.get(TUNING_KEY)
+    try:
+        protocol = Protocol.from_dict(hp["protocol"])
+    except (TypeError, ValueError) as e:
+        raise ProtocolError(f"{path}: протокол чекпойнта несовместим с текущим ({e}); "
+                            f"чекпойнт обучен по старому протоколу, обучите модель заново"
+                            ) from e
+    return hp["arch"], protocol, ck.get(TUNING_KEY)
 
 
 def check_comparable(reference, others, ignore=()):
