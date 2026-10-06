@@ -39,7 +39,7 @@ SEARCH_DIR = "lr_search"
 PHASE_EQUAL, PHASE_EXTRA = 1, 2
 EXTRA_SUFFIX = "-tuned"
 EXTRA_ARCH = "mayak"
-# Прогоны сетки: без кандидатов после каждой валидации, без ворот.
+# Прогоны сетки: без кандидатов после каждой валидации.
 SEARCH_LAUNCH = Launch(candidates=())
 
 
@@ -150,10 +150,9 @@ def check_search(protocol, launch):
             подборе не короче полного.
     """
     plan = plan_stages(protocol, launch)
-    if len(plan) != len(protocol.stages) or launch.probe_steps is not None:
+    if len(plan) != len(protocol.stages):
         raise ProtocolError("подбор скорости обучения идёт одной командой по всем этапам "
-                            "протокола: run.stages, run.init_from и run.probe_steps с ним не "
-                            "сочетаются")
+                            "протокола: run.stages и run.init_from с ним не сочетаются")
     last = protocol.stages[-1]
     if protocol.lr_search_steps > last.steps:
         raise ProtocolError(f"подбор скорости обучения: этап {last.name} на "
@@ -215,10 +214,10 @@ def run_lr_search(protocol, train, tag):
         journal, path = train(p, f"{tag}/{SEARCH_DIR}/{lr_label(lr)}")
         results.append(dict(lr=float(lr), journal=path, final_ckpt=journal["final_ckpt"],
                             val_loss={s["name"]: s["best_score"] for s in journal["stages"]}))
-    probe = search_protocol(protocol, protocol.lr_grid[0])
-    selected = select_lr(results, probe.stages[-1].name)
+    short = search_protocol(protocol, protocol.lr_grid[0])
+    selected = select_lr(results, short.stages[-1].name)
     return jsonable(dict(grid=list(protocol.lr_grid),
-                         stage_steps={s.name: s.steps for s in probe.stages},
+                         stage_steps={s.name: s.steps for s in short.stages},
                          monitor=protocol.monitor, results=results, selected_lr=selected))
 
 

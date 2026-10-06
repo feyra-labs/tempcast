@@ -5,19 +5,19 @@
 проверяется целиком, и все найденные отличия перечисляются в одном исключении: та же
 архитектура, тот же конфиг модели и данных, тот же протокол, та же запись о подборе
 скорости обучения, тот же кэш данных, тот же набор валидации, чекпойнт выбран на
-валидационных станциях по правилам чек-листа антиутечек и не получен пробным запуском.
+валидационных станциях по правилам чек-листа антиутечек.
 
-Какие этапы запускать, с какого чекпойнта стартовать, порог ворот, пробный запуск и
-сохранение кандидатов в протокол не входят. Протокол один на все модели и сравнивается
-между чекпойнтами, а эти настройки описывают только то, как человек проводит обучение по
-шагам. Поэтому этап B, запущенный отдельной командой, получает тот же протокол, что и в
-прогоне одной командой, и с теми же сидами даёт тот же чекпойнт.
+Какие этапы запускать, с какого чекпойнта стартовать и сохранение кандидатов в протокол
+не входят. Протокол один на все модели и сравнивается между чекпойнтами, а эти настройки
+описывают только то, как человек проводит обучение по шагам. Поэтому этап B, запущенный
+отдельной командой, получает тот же протокол, что и в прогоне одной командой, и с теми же
+сидами даёт тот же чекпойнт.
 
 На этапе холодного старта после каждой валидации сохраняется кандидат. Решение, какой
-кандидат передать следующему этапу, принимает человек по отчёту и графикам. При подборе
-скорости обучения этапы идут одной командой, и следующий этап стартует с лучшего по
-валидации чекпойнта, у всех моделей одинаково (``mayak.tuning``). Ворота по
-порогу отношения MSE только страхуют от явно плохого поля.
+кандидат передать следующему этапу, принимает человек по отчёту и графикам этапа; код
+только считает и печатает числа и ничего не решает за человека. При подборе скорости
+обучения этапы идут одной командой, и следующий этап стартует с лучшего по валидации
+чекпойнта, у всех моделей одинаково (``mayak.tuning``).
 """
 from __future__ import annotations
 
@@ -36,16 +36,11 @@ STAGE_KEY = "mayak_stage"
 FIELD_CURRICULUM = "L0"
 CANDIDATE_DIR = "candidates"
 MAX_LISTED_DIFFS = 25
-GATE_EXIT_CODE = 3
 INIT_EXIT_CODE = 2
 
 
 class InitCheckpointError(ProtocolError):
     """Чекпойнт, с которого должен стартовать этап, не подходит этому запуску."""
-
-
-class GateError(ProtocolError):
-    """Следующий этап не начат: поле предыдущего этапа не прошло порог."""
 
 
 def stage_dir_name(name):
@@ -92,20 +87,11 @@ class Launch:
             этапы протокола, как одной командой.
         init_from: чекпойнт предыдущего этапа, с которого стартует первый запускаемый
             этап. Обязателен, если этот этап в протоколе не первый.
-        require_gate: порог отношения MSE медианы к MSE эмпирической климатологии на
-            валидационных станциях при нулевой истории. Если отношение у чекпойнта,
-            с которого стартует этап после холодного старта, выше порога, этап не
-            начинается. None значит отчёт только для сведения.
-        probe_steps: пробный запуск последнего из запускаемых этапов: столько первых
-            шагов при расписании скорости обучения полного этапа, поэтому пробный
-            запуск совпадает с началом полного. Итоговым чекпойнтом он не считается.
         candidates: этапы, у которых чекпойнт сохраняется после каждой валидации;
             None значит этапы холодного старта, пустой кортеж отключает сохранение.
     """
     stages: Optional[tuple] = None
     init_from: Optional[str] = None
-    require_gate: Optional[float] = None
-    probe_steps: Optional[int] = None
     candidates: Optional[tuple] = None
 
     def __post_init__(self):
@@ -117,17 +103,6 @@ class Launch:
         if self.init_from is not None:
             path = str(self.init_from).strip()
             object.__setattr__(self, "init_from", path or None)
-        if self.require_gate is not None:
-            gate = float(self.require_gate)
-            if not (math.isfinite(gate) and gate > 0):
-                raise ValueError(f"порог ворот {self.require_gate!r}: нужно конечное число "
-                                 f"больше нуля")
-            object.__setattr__(self, "require_gate", gate)
-        if self.probe_steps is not None:
-            steps = int(self.probe_steps)
-            if steps < 1:
-                raise ValueError(f"пробный запуск на {steps} шагов: нужно не меньше одного")
-            object.__setattr__(self, "probe_steps", steps)
 
     @classmethod
     def coerce(cls, value):
@@ -187,8 +162,8 @@ def plan_stages(protocol, launch):
     Raises:
         ProtocolError: неизвестный или повторённый этап; этапы идут не подряд или не в
             порядке протокола; нет чекпойнта инициализации для этапа, который в
-            протоколе не первый, или он задан для первого; пробный запуск не может дать
-            ни одного чекпойнта; неизвестный этап в списке кандидатов.
+            протоколе не первый, или он задан для первого; неизвестный этап в списке
+            кандидатов.
     """
     names = [s.name for s in protocol.stages]
     wanted = list(launch.stages) if launch.stages is not None else list(names)
@@ -200,25 +175,13 @@ def plan_stages(protocol, launch):
     idx = [names.index(n) for n in wanted]
     if idx != list(range(idx[0], idx[0] + len(idx))):
         raise ProtocolError(f"этапы {wanted} должны идти подряд в порядке протокола {names}")
-    first, last = idx[0], idx[-1]
+    first = idx[0]
     if first > 0 and not launch.init_from:
         raise ProtocolError(f"этап {names[first]} в протоколе не первый: укажите чекпойнт этапа "
                             f"{names[first - 1]}, с которого он стартует (run.init_from)")
     if first == 0 and launch.init_from:
         raise ProtocolError(f"этап {names[0]} первый в протоколе и стартует с нуля: чекпойнт "
                             f"инициализации ему не нужен")
-    if launch.probe_steps is not None:
-        st = protocol.stages[last]
-        if last == 0:
-            raise ProtocolError("пробный запуск нужен для этапа, который стартует с чекпойнта "
-                                "предыдущего этапа, а не для первого")
-        if launch.probe_steps >= st.steps:
-            raise ProtocolError(f"пробный запуск этапа {st.name}: {launch.probe_steps} шагов не "
-                                f"меньше полного числа {st.steps}")
-        every = min(protocol.val_every, st.steps)
-        if launch.probe_steps < every:
-            raise ProtocolError(f"пробный запуск этапа {st.name}: {launch.probe_steps} шагов "
-                                f"меньше шага валидации {every}, чекпойнта не будет")
     bad = [n for n in (launch.candidates or ()) if n not in names]
     if bad:
         raise ProtocolError(f"кандидаты для неизвестных этапов {bad}; в протоколе {names}")
@@ -363,13 +326,9 @@ def init_mismatches(ck, arch, protocol, model_config, data_config, stage, data_k
     if not rec:
         out.append("нет записи об этапе: чекпойнт сохранён до раздельного запуска этапов, "
                    "обучите этап заново")
-    else:
-        if rec.get("probe_steps"):
-            out.append(f"чекпойнт пробного запуска ({rec['probe_steps']} шагов из "
-                       f"{stage.steps}): следующий этап с него не стартует")
-        if rec.get("data_key") != data_key:
-            out.append(f"данные: чекпойнт обучен на кэше {rec.get('data_key')!r}, сейчас кэш "
-                       f"{data_key!r}")
+    elif rec.get("data_key") != data_key:
+        out.append(f"данные: чекпойнт обучен на кэше {rec.get('data_key')!r}, сейчас кэш "
+                   f"{data_key!r}")
     sel = ck.get(SELECTION_KEY) or {}
     if sel.get("windows_digest") != val_digest:
         out.append(f"набор валидации этапа {stage.name}: в чекпойнте "
@@ -500,7 +459,7 @@ def load_init_weights(module, path):
         raise InitCheckpointError(f"веса чекпойнта {path} не подходят к модели этапа: {e}") from e
 
 
-def stage_record(stage, index, data_key, run_dir, journal, init_from=None, probe_steps=None):
+def stage_record(stage, index, data_key, run_dir, journal, init_from=None):
     """Запись об этапе, которая кладётся в каждый его чекпойнт.
 
     Args:
@@ -510,15 +469,13 @@ def stage_record(stage, index, data_key, run_dir, journal, init_from=None, probe
         run_dir: каталог прогона.
         journal: путь к журналу прогона.
         init_from: откуда этап стартовал: путь, отпечаток, этап и шаг; None для первого.
-        probe_steps: число шагов пробного запуска; None для полного.
 
     Returns:
         Словарь без шага сохранения: его добавляет сохранение.
     """
     return jsonable(dict(stage=stage.name, index=int(index), curriculum=stage.curriculum,
                          data_key=data_key, run_dir=os.path.abspath(run_dir),
-                         journal=os.path.abspath(journal), init_from=init_from,
-                         probe_steps=probe_steps))
+                         journal=os.path.abspath(journal), init_from=init_from))
 
 
 def lineage(prev):
@@ -535,42 +492,6 @@ def lineage(prev):
     return jsonable({k: prev.get(k) for k in ("ckpt", "digest", "stage", "step")})
 
 
-def gate_verdict(entry, threshold):
-    """Решение ворот по записи отчёта о поле.
-
-    Нечисло или отсутствие отношения считается непройденными воротами.
-
-    Args:
-        entry: запись отчёта о чекпойнте с отношением MSE.
-        threshold: порог отношения.
-
-    Returns:
-        Словарь: порог, отношение и пройдены ли ворота.
-    """
-    ratio = (entry or {}).get("mse_ratio")
-    ok = ratio is not None and math.isfinite(float(ratio)) and float(ratio) <= float(threshold)
-    return dict(threshold=float(threshold), mse_ratio=ratio, passed=bool(ok))
-
-
-def gate_message(next_stage, prev):
-    """Текст ошибки, когда ворота не пропустили чекпойнт.
-
-    Args:
-        next_stage: имя этапа, который не начат.
-        prev: запись о чекпойнте предыдущего этапа с решением ворот.
-
-    Returns:
-        Строка для пользователя.
-    """
-    g = prev["gate"]
-    ratio = "не посчитано" if g["mse_ratio"] is None else f"{g['mse_ratio']:.3f}"
-    report = f"; отчёт: {prev['report_file']}" if prev.get("report_file") else ""
-    return (f"этап {next_stage} не начат: у чекпойнта {prev['ckpt']} этапа {prev['stage']} "
-            f"(шаг {prev['step']}) отношение MSE поля к MSE климатологии на валидационных "
-            f"станциях при L=0 равно {ratio}, порог {g['threshold']}{report}. Выберите другой "
-            f"чекпойнт этапа {prev['stage']} или обучите этап заново")
-
-
 def init_summary(prev, report_summary=None):
     """Запись для журнала о том, с какого чекпойнта стартовал этап.
 
@@ -584,7 +505,7 @@ def init_summary(prev, report_summary=None):
     if prev is None:
         return None
     keys = ("ckpt", "digest", "stage", "step", "is_best", "run_dir", "journal", "report_file",
-            "gate", "warnings")
+            "warnings")
     out = {k: prev.get(k) for k in keys}
     out["report"] = report_summary
     return jsonable(out)
@@ -649,9 +570,8 @@ def warn_stale(stage_dir):
                     "версии, журнал и отчёт укажут только на новые", stage_dir, len(old))
 
 
-__all__ = ["CANDIDATE_DIR", "FIELD_CURRICULUM", "GATE_EXIT_CODE", "GateError",
-           "INIT_EXIT_CODE", "InitCheckpointError", "LAUNCH_FIELDS", "Launch", "STAGE_KEY",
-           "candidate_stages", "config_diff", "gate_message", "gate_verdict", "init_mismatches",
-           "init_summary", "inspect_init_checkpoint", "jsonable", "launch_from_config", "lineage",
-           "load_init_weights", "parse_stage_list", "plan_stages", "stage_dir_name",
-           "stage_record", "start_journal", "warn_stale"]
+__all__ = ["CANDIDATE_DIR", "FIELD_CURRICULUM", "INIT_EXIT_CODE", "InitCheckpointError",
+           "LAUNCH_FIELDS", "Launch", "STAGE_KEY", "candidate_stages", "config_diff",
+           "init_mismatches", "init_summary", "inspect_init_checkpoint", "jsonable",
+           "launch_from_config", "lineage", "load_init_weights", "parse_stage_list",
+           "plan_stages", "stage_dir_name", "stage_record", "start_journal", "warn_stale"]

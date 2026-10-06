@@ -170,13 +170,11 @@ def exit_code(err):
         err: исключение протокола.
 
     Returns:
-        Отдельный код для неподходящего чекпойнта инициализации и закрытых ворот, иначе 1.
+        Отдельный код для неподходящего чекпойнта инициализации, иначе 1.
     """
-    from mayak.stages import GATE_EXIT_CODE, INIT_EXIT_CODE, GateError, InitCheckpointError
+    from mayak.stages import INIT_EXIT_CODE, InitCheckpointError
     if isinstance(err, InitCheckpointError):
         return INIT_EXIT_CODE
-    if isinstance(err, GateError):
-        return GATE_EXIT_CODE
     return 1
 
 

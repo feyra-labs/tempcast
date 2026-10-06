@@ -1,15 +1,12 @@
-"""Отчёты для ручного решения о переходе от этапа A к этапу B.
+"""Пересчёт отчёта этапа A, по которому человек выбирает чекпойнт для старта этапа B.
 
-Команда a пересчитывает отчёт о поле для лучшего чекпойнта этапа и всех его кандидатов
-и заново строит графики: например, с другим числом примеров, с порогом ворот или после
-того, как отчёт внутри обучения не построился. Отчёт считается на том же наборе
-валидации, по которому выбирался чекпойнт; набор и кэш данных сверяются с журналом.
-Разрыв обобщения считается по окнам обучающих станций, построенным по правилу набора
-валидации.
+Отчёт о поле считается заново для лучшего чекпойнта этапа холодного старта и всех его
+кандидатов, графики строятся заново: например, с другим числом примеров или после того,
+как отчёт внутри обучения не построился. Отчёт считается на том же наборе валидации, по
+которому выбирался чекпойнт; набор и кэш данных сверяются с журналом. Разрыв обобщения
+считается по окнам обучающих станций, построенным по правилу набора валидации.
 
-Команда b сравнивает запуски этапа B, начатые с разных чекпойнтов этапа A, обычно
-пробные: кривые валидации на одних осях, значение на общем для всех шаге, pinball по
-длинам истории на лучшем шаге и числа поля у стартового чекпойнта каждого запуска.
+Отчёт ничего не решает: числа и графики нужны человеку, который выбирает кандидата.
 
 Примеры команд выводит справка.
 """
@@ -23,10 +20,9 @@ from mayak.stage_report import N_EXAMPLES
 
 EXAMPLES = """\
 Примеры:
-    python scripts/stage_report.py a --run runs/mayak
-    python scripts/stage_report.py a --run runs/mayak --examples 10 --gate 1.05
-    python scripts/stage_report.py b --runs runs/mayak-probe-a4000 runs/mayak-probe-a10000 \\
-        --out runs/plots/stageB_runs.png
+    python scripts/stage_report.py --run runs/mayak
+    python scripts/stage_report.py --run runs/mayak-no_solar --examples 10 --device cuda
+    python scripts/stage_report.py --run runs/mayak/lr_search/lr0.001
 """
 
 
@@ -34,7 +30,12 @@ def _stage_entry(journal, name):
     return next((s for s in reversed(journal.get("stages", [])) if s.get("name") == name), None)
 
 
-def cmd_a(args):
+def report(args):
+    """Пересчитывает отчёт этапа холодного старта прогона и печатает его.
+
+    Args:
+        args: разобранные аргументы командной строки.
+    """
     from mayak.config import RunConfig
     from mayak.data.datamodule import train_stations_set, validation_set
     from mayak.data.store import get_store
@@ -45,9 +46,9 @@ def cmd_a(args):
 
     journal = read_journal(args.run)
     protocol = Protocol.from_dict(journal["protocol"])
-    stage = next((s for s in protocol.stages if s.name == args.stage), None)
-    if stage is None or stage.curriculum != FIELD_CURRICULUM:
-        sys.exit(f"этап {args.stage}: отчёт о поле считается только для этапа холодного старта")
+    stage = next((s for s in protocol.stages if s.curriculum == FIELD_CURRICULUM), None)
+    if stage is None:
+        sys.exit(f"{args.run}: в протоколе нет этапа холодного старта ({FIELD_CURRICULUM})")
     entry = _stage_entry(journal, stage.name)
     if entry is None:
         sys.exit(f"{args.run}: в журнале нет этапа {stage.name}")
@@ -68,51 +69,30 @@ def cmd_a(args):
         sys.exit(f"нет файлов чекпойнтов: {missing}")
     gap_ds = train_stations_set(store, manifest, data_cfg, stage.curriculum)
     run_checklist(store, datasets=[ds, gap_ds], checkpoints=[entry["best_ckpt"], *paths])
-    report, path, plots = write_stage_report(
+    rep, path, plots = write_stage_report(
         os.path.dirname(entry["best_ckpt"]), stage.name, journal["arch"],
         describe_checkpoint(entry["best_ckpt"]), [describe_checkpoint(p) for p in paths], ds,
         train_dataset=gap_ds, device=args.device, seed=journal["seeds"]["eval"],
-        threshold=args.gate, metrics_csv=entry.get("metrics_csv"), n_examples=args.examples)
-    print("\n".join(format_field_report(report)))
+        metrics_csv=entry.get("metrics_csv"), n_examples=args.examples)
+    print("\n".join(format_field_report(rep)))
     print(f"Отчёт: {path}")
     for p in plots:
         print(f"График: {p}")
 
 
-def cmd_b(args):
-    from mayak.stage_report import format_stage_runs, plot_stage_runs, stage_runs
-    rows, warnings = stage_runs(args.runs, stage=args.stage)
-    if not rows:
-        sys.exit("\n".join(warnings) or "нет запусков для сравнения")
-    print("\n".join(format_stage_runs(rows, warnings)))
-    print(f"График: {plot_stage_runs(rows, args.out)}")
-
-
 def make_parser():
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0], epilog=EXAMPLES,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    a = sub.add_parser("a", help="отчёт о поле по чекпойнтам этапа холодного старта")
-    a.add_argument("--run", required=True, help="каталог прогона, например runs/mayak")
-    a.add_argument("--stage", default="A")
-    a.add_argument("--device", default="cpu")
-    a.add_argument("--gate", type=float, default=None,
-                   help="порог отношения MSE для пометки кандидатов; на обучение не влияет")
-    a.add_argument("--examples", type=int, default=N_EXAMPLES,
-                   help="число окон с примерами прогнозов")
-    a.set_defaults(fn=cmd_a)
-    b = sub.add_parser("b", help="сравнение запусков этапа, начатых с разных чекпойнтов")
-    b.add_argument("--runs", nargs="+", required=True, help="каталоги прогонов")
-    b.add_argument("--stage", default="B")
-    b.add_argument("--out", default="runs/plots/stageB_runs.png")
-    b.set_defaults(fn=cmd_b)
+    ap.add_argument("--run", required=True, help="каталог прогона, например runs/mayak")
+    ap.add_argument("--device", default="cpu")
+    ap.add_argument("--examples", type=int, default=N_EXAMPLES,
+                    help="число окон с примерами прогнозов")
     return ap
 
 
 def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    args = make_parser().parse_args(argv)
-    args.fn(args)
+    report(make_parser().parse_args(argv))
 
 
 if __name__ == "__main__":

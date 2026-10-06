@@ -27,10 +27,9 @@ run_protocol. Для любой архитектуры одинаковы:
 этап B с выбранного человеком чекпойнта этапа A. При подборе скорости обучения этапы идут
 одной командой, и этап B стартует с лучшего по валидации чекпойнта этапа A.
 
-Какие этапы запускать, с какого чекпойнта стартовать, порог ворот, пробный запуск и
-сохранение кандидатов в протокол не входят: этап B, запущенный отдельной командой с
-лучшего чекпойнта A, получает тот же протокол и тот же сид, что в прогоне одной командой,
-и даёт тот же чекпойнт.
+Какие этапы запускать, с какого чекпойнта стартовать и сохранение кандидатов в протокол
+не входят: этап B, запущенный отдельной командой с лучшего чекпойнта A, получает тот же
+протокол и тот же сид, что в прогоне одной командой, и даёт тот же чекпойнт.
 
 Различаются только архитектура (``arch``) и выбранная подбором скорость обучения. Что
 архитектура определяет сама: регуляризаторы, не зависящие от цели, и отличия от общего
@@ -275,9 +274,9 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
 
     После этапа холодного старта считается отчёт о поле по всем сохранённым чекпойнтам
     этапа, с разрывом обобщения по окнам обучающих станций в валидационном окне, и
-    строятся графики. Сводка отчёта о стартовом чекпойнте пишется в запись следующего этапа
-    о том, откуда он стартовал. Если задан порог ворот, следующий этап не начинается, когда
-    у стартового чекпойнта отношение MSE выше порога.
+    строятся графики. По отчёту человек выбирает чекпойнт, с которого стартует следующий
+    этап; код ничего не решает за него. Сводка отчёта о стартовом чекпойнте, если отчёт о
+    нём есть, пишется в запись следующего этапа о том, откуда он стартовал.
 
     При подборе скорости обучения сначала на каждом значении сетки протокола идёт прогон
     с полным первым этапом и укороченным последним в подкаталоге ``lr_search`` каталога
@@ -300,9 +299,8 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
             по умолчанию.
         data_config: конфиг данных, датакласс или словарь; None значит значения по
             умолчанию.
-        launch: какие этапы запустить, с какого чекпойнта стартует первый из них, порог
-            ворот, пробный запуск и сохранение кандидатов; None значит все этапы одной
-            командой.
+        launch: какие этапы запустить, с какого чекпойнта стартует первый из них и
+            сохранение кандидатов; None значит все этапы одной командой.
         tuning: подбор скорости обучения, её источник и этап сравнения; None значит
             скорость обучения из протокола без записи о подборе.
 
@@ -313,7 +311,6 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
         ProtocolError: неверный выбор этапов; этап не сохранил ни одного чекпойнта;
             подбор скорости обучения невозможен или его источник не подходит.
         InitCheckpointError: чекпойнт инициализации не подходит этому запуску.
-        GateError: поле стартового чекпойнта не прошло порог, следующий этап не начат.
     """
     import pytorch_lightning as L
     import torch
@@ -382,19 +379,10 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
                                           stage=prev_stage, store=store,
                                           val_digest=prev_val.fingerprint(), tuning=tune)
         if prev_stage.curriculum == ST.FIELD_CURRICULUM:
+            # Сводка отчёта нужна только журналу. Если отчёта о стартовом чекпойнте нет,
+            # он здесь не пересчитывается: это делает scripts/stage_report.py.
             entry, report_file = SR.find_report_entry(prev["run_dir"], prev_stage.name,
                                                       prev["digest"], prev_val.fingerprint())
-            if entry is None and launch.require_gate is not None:
-                # Отчёта для этого файла нет: чекпойнт перенесён или изменён. Для решения
-                # ворот он считается заново на том же наборе валидации.
-                items = SR.report_items(SR.describe_checkpoint(prev["ckpt"]), [])
-                prev_gap = train_stations_set(store, manifest, data_cfg, prev_stage.curriculum)
-                run_checklist(store, datasets=[prev_gap])
-                report, _ = SR.build_field_report(items, prev_val, arch=arch,
-                                                  stage=prev_stage.name, train_dataset=prev_gap,
-                                                  device=device, seed=seeds["eval"],
-                                                  n_examples=0)
-                entry, report_file = report["candidates"][0], None
             prev.update(report=entry, report_file=report_file)
         log.info("%s: этап %s стартует с %s (этап %s, шаг %s, отпечаток %s)", arch,
                  protocol.stages[first].name, prev["ckpt"], prev["stage"], prev["step"],
@@ -409,16 +397,6 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     log.info("%s: аугментации %s", arch, journal["augment"])
 
     for i, stage in plan:
-        if prev is not None and launch.require_gate is not None:
-            if prev.get("report") is None:
-                log.warning("%s: у этапа %s нет отчёта о поле, ворота перед этапом %s не "
-                            "проверяются", arch, prev["stage"], stage.name)
-            else:
-                prev["gate"] = ST.gate_verdict(prev["report"], launch.require_gate)
-                if not prev["gate"]["passed"]:
-                    if i != first:
-                        _write_journal(journal_path, journal)
-                    raise ST.GateError(ST.gate_message(stage.name, prev))
         if i == first:
             write_config(os.path.join(run_dir, CONFIG_FILE), cfg_dict)
         # Сид этапа зависит от его номера в протоколе, а не от номера в этом запуске.
@@ -449,10 +427,8 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
         stage_dir = os.path.join(run_dir, ST.stage_dir_name(stage.name))
         ST.warn_stale(stage_dir)
         write_config(os.path.join(stage_dir, CONFIG_FILE), cfg_dict)
-        probe = launch.probe_steps if i == plan[-1][0] else None
         record = ST.stage_record(stage, i, data_key=store.key, run_dir=run_dir,
-                                 journal=journal_path, init_from=ST.lineage(prev),
-                                 probe_steps=probe)
+                                 journal=journal_path, init_from=ST.lineage(prev))
         ckpt = ModelCheckpoint(dirpath=stage_dir, monitor=protocol.monitor, mode="min",
                                save_top_k=1, filename="best")
         stage_callbacks = [ckpt, SelectionProvenance(), StageProvenance(record)]
@@ -467,9 +443,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
             stage_callbacks.append(cands)
         logger = CSVLogger(out_root, name=f"{tag}/{ST.stage_dir_name(stage.name)}")
         trainer = L.Trainer(
-            # Пробный запуск короче этапа, но расписание скорости обучения и частота
-            # валидации у него полные, поэтому он совпадает с началом полного этапа.
-            max_steps=probe or stage.steps, accelerator=accelerator, devices=1,
+            max_steps=stage.steps, accelerator=accelerator, devices=1,
             precision="32-true", gradient_clip_val=protocol.grad_clip,
             val_check_interval=min(protocol.val_every, stage.steps), check_val_every_n_epoch=None,
             # Проход валидации идёт по всему набору: размер набора задаётся числом
@@ -500,22 +474,20 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
                      candidates=[{k: c[k] for k in ("step", "ckpt", "digest", "val_loss")}
                                  for c in candidates],
                      metrics_csv=os.path.join(logger.log_dir, "metrics.csv"),
-                     init_from=ST.init_summary(prev, SR.summary((prev or {}).get("report"))),
-                     probe_steps=probe)
+                     init_from=ST.init_summary(prev, SR.summary((prev or {}).get("report"))))
         report_entry = report_path = None
         if stage.curriculum == ST.FIELD_CURRICULUM:
             gap_ds = train_stations_set(dm.store, manifest, data_cfg, stage.curriculum)
             run_checklist(dm.store, datasets=[gap_ds])
             report, report_path, plots = SR.write_stage_report(
                 stage_dir, stage.name, arch, best, candidates, dm.val_ds, train_dataset=gap_ds,
-                device=device, seed=seeds["eval"], threshold=launch.require_gate,
-                metrics_csv=entry["metrics_csv"])
+                device=device, seed=seeds["eval"], metrics_csv=entry["metrics_csv"])
             report_entry = next(e for e in report["candidates"] if e.get("is_best"))
             entry.update(report=report_path, report_best=SR.summary(report_entry), plots=plots)
             for line in SR.format_field_report(report):
                 log.info("%s", line)
         journal["stages"].append(ST.jsonable(entry))
-        journal["final_ckpt"] = best_path if i == last_index and probe is None else None
+        journal["final_ckpt"] = best_path if i == last_index else None
         _write_journal(journal_path, journal)
         prev = dict(ckpt=best_path, digest=best["digest"], stage=stage.name, step=best["step"],
                     run_dir=os.path.abspath(run_dir), journal=os.path.abspath(journal_path),

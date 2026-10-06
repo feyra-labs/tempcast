@@ -1,4 +1,4 @@
-"""Отчёт о поле после этапа холодного старта и сравнение запусков следующего этапа.
+"""Отчёт о поле после этапа холодного старта: по нему человек выбирает старт этапа B.
 
 Отчёт считается на наборе валидации этапа: валидационные станции, валидационное окно,
 нулевая история. Это тот же набор, по которому выбирался чекпойнт. В отчёт идёт каждый
@@ -18,17 +18,13 @@
   бутстрапа по станциям.
 
 Вместе с числами отчёт записывает ограничители запоминания координат из конфига модели
-(``loc_freq_max`` и ``field_weight_decay``), если они у архитектуры есть. Автоматического
-порога у разрыва нет.
+(``loc_freq_max`` и ``field_weight_decay``), если они у архитектуры есть. Автоматических
+порогов в отчёте нет: числа и графики только для человека, который выбирает кандидата.
 
 Числа считаются по сырым выходам моделей и нужны только медиана и квантили, поэтому
 отчёт одинаков для всех архитектур. Графики строятся по тем же числам: кривые обучения
 с отметками сохранённых чекпойнтов, метрики по шагам, метрики по лидам и примеры
 прогнозов нескольких чекпойнтов на одних и тех же окнах.
-
-Сравнение запусков следующего этапа читает их журналы и кривые валидации и показывает,
-с какого чекпойнта стартовал каждый запуск и чего он достиг, в том числе на общем для
-всех шаге.
 """
 from __future__ import annotations
 
@@ -52,7 +48,8 @@ CI_LEVEL = 0.90
 N_WORST = 5
 N_EXAMPLES = 6
 COVERAGE_BAND = (0.86, 0.94)
-FIELD_GATE_REFERENCE = 1.05
+# Отношение MSE медианы к MSE климатологии станции, при котором модель не лучше неё.
+CLIM_LEVEL = 1.0
 PLOT_FILES = ("curves.png", "candidates.png", "leads.png", "examples.png")
 LIMIT_FIELDS = ("loc_freq_max", "field_weight_decay")
 
@@ -337,7 +334,7 @@ def pick_examples(preds, aux, n=N_EXAMPLES, seed=0):
 
 
 def build_field_report(items, dataset, arch, stage, train_dataset, device="cpu", seed=0,
-                       threshold=None, n_boot=N_BOOT, n_examples=N_EXAMPLES):
+                       n_boot=N_BOOT, n_examples=N_EXAMPLES):
     """Отчёт о поле для нескольких чекпойнтов этапа на одном наборе окон.
 
     Разрыв обобщения каждого чекпойнта считается по набору валидации и набору окон
@@ -352,7 +349,6 @@ def build_field_report(items, dataset, arch, stage, train_dataset, device="cpu",
         train_dataset: набор окон обучающих станций по правилу набора валидации.
         device: устройство.
         seed: сид бутстрапа и выбора примеров.
-        threshold: порог ворот или None.
         n_boot: число выборок бутстрапа.
         n_examples: число окон с примерами прогнозов.
 
@@ -363,7 +359,6 @@ def build_field_report(items, dataset, arch, stage, train_dataset, device="cpu",
         ValueError: набор обучающих станций не сопоставим с набором валидации.
     """
     from mayak.lit import load_model
-    from mayak.stages import gate_verdict
     check_gap_set(dataset, train_dataset)
     models = {e["name"]: load_model(e["ckpt"]) for e in items}
     preds, aux = collect_outputs(models, dataset, device=device)
@@ -375,15 +370,13 @@ def build_field_report(items, dataset, arch, stage, train_dataset, device="cpu",
         entry.update(memorization_gap(preds[e["name"]], aux,
                                       None if train_preds is None else train_preds[e["name"]],
                                       train_aux, seed=seed, n_boot=n_boot))
-        entry["gate"] = None if threshold is None else gate_verdict(entry, threshold)
         entries.append(jsonable(entry))
     best = next((e["name"] for e in entries if e.get("is_best")), None)
     limits = memorization_limits(models[best if best is not None else items[-1]["name"]])
     report = dict(arch=arch, stage=stage,
                   created_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                   val_set=_set_record(dataset), train_set=_set_record(train_dataset),
-                  limits=limits, reference_gate=FIELD_GATE_REFERENCE, gate=threshold,
-                  leads=list(REPORT_LEADS), candidates=entries, best=best)
+                  limits=limits, leads=list(REPORT_LEADS), candidates=entries, best=best)
     return jsonable(report), pick_examples(preds, aux, n_examples, seed)
 
 
@@ -457,7 +450,6 @@ def summary(entry):
                                      "picp90", "width90", "gap_ratio", "gap_ratio_ci")}
     for h in SUMMARY_LEADS:
         out[f"skill_{h}h"] = skill_at(entry, h)
-    out["gate"] = entry.get("gate")
     return jsonable(out)
 
 
@@ -480,15 +472,13 @@ def format_field_report(report):
     """
     ents = report.get("candidates") or []
     vs = report.get("val_set") or {}
-    gate = report.get("gate")
     lines = [f"Отчёт этапа {report.get('stage')} ({report.get('arch')}): чекпойнтов "
              f"{len(ents)}, окон {vs.get('windows')} на {vs.get('stations')} валидационных "
              f"станциях, L=0"]
     head = (f"{'шаг':>8} {'val/loss':>9} {'MSE/клим':>9} {'интервал 90%':>17} "
             f"{'по станц.':>9} {'PICP90':>7} {'шир.90':>7}"
             + "".join(f" {'Skill ' + str(h) + 'ч':>11}" for h in SUMMARY_LEADS)
-            + f" {'вал/обуч':>9} {'интервал 90%':>17}"
-            + ("  ворота" if gate is not None else ""))
+            + f" {'вал/обуч':>9} {'интервал 90%':>17}")
     lines.append(head)
     for e in ents:
         ci = e.get("mse_ratio_ci") or [None, None]
@@ -500,8 +490,6 @@ def format_field_report(report):
                + "".join(f" {_num(skill_at(e, h)):>11}" for h in SUMMARY_LEADS)
                + f" {_num(e.get('gap_ratio')):>9}"
                + f" {'[' + _num(gci[0]) + ', ' + _num(gci[1]) + ']':>17}")
-        if gate is not None:
-            row += "  " + ("пройдены" if (e.get("gate") or {}).get("passed") else "закрыты")
         if e.get("is_best"):
             row += "  * лучший по val/loss"
         lines.append(row)
@@ -518,9 +506,9 @@ def format_field_report(report):
     lines.append("Ограничители запоминания координат: "
                  + (", ".join(f"{k} {v:g}" for k, v in limits.items()) if limits
                     else "в конфиге модели нет"))
-    lines.append(f"Ориентир спецификации для поля: отношение не выше "
-                 f"{report.get('reference_gate')}; цель покрытия 90%-интервала "
-                 f"{COVERAGE_BAND[0]:.0%}–{COVERAGE_BAND[1]:.0%}.")
+    lines.append(f"Отсчёт MSE/клим {CLIM_LEVEL:.1f} — уровень климатологии станции; цель "
+                 f"покрытия 90%-интервала {COVERAGE_BAND[0]:.0%}–{COVERAGE_BAND[1]:.0%}. "
+                 f"Кандидата для старта этапа B выбирает человек.")
     return lines
 
 
@@ -574,11 +562,8 @@ def _plot_candidates(plt, report, out_dir, title):
     ax.errorbar(x, r, yerr=yerr, fmt="o-", capsize=3, label="по всем парам, интервал 90%")
     ax.plot(x, _arr(e.get("mse_ratio_macro") for e in ents), "s--", ms=4,
             label="в среднем по станциям")
-    ax.axhline(1.0, color="black", lw=0.8, label="климатология")
-    ax.axhline(report.get("reference_gate", FIELD_GATE_REFERENCE), color="tab:orange", ls="--",
-               lw=1.0, label="ориентир спецификации")
-    if report.get("gate") is not None:
-        ax.axhline(report["gate"], color="tab:red", lw=1.2, label="порог ворот")
+    ax.axhline(CLIM_LEVEL, color="black", lw=1.0, ls="--",
+               label="уровень климатологии станции")
     ax.set_title("MSE медианы / MSE климатологии при L=0", fontsize=10)
     ax.legend(fontsize=7)
     ax = axes[0, 1]
@@ -707,8 +692,7 @@ def plot_field_report(report, examples=None, metrics_csv=None, out_dir="."):
 
 
 def write_stage_report(stage_dir, stage, arch, best, candidates, dataset, train_dataset,
-                       device="cpu", seed=0, threshold=None, metrics_csv=None,
-                       n_examples=N_EXAMPLES):
+                       device="cpu", seed=0, metrics_csv=None, n_examples=N_EXAMPLES):
     """Считает отчёт о поле для чекпойнтов этапа, пишет его и строит графики.
 
     Сбой графиков не отменяет отчёт: он пишется в журнал и в поле plots_error.
@@ -723,7 +707,6 @@ def write_stage_report(stage_dir, stage, arch, best, candidates, dataset, train_
         train_dataset: набор окон обучающих станций по правилу набора валидации.
         device: устройство.
         seed: сид бутстрапа и примеров.
-        threshold: порог ворот или None.
         metrics_csv: журнал метрик обучения этапа или None.
         n_examples: число окон с примерами прогнозов.
 
@@ -733,8 +716,7 @@ def write_stage_report(stage_dir, stage, arch, best, candidates, dataset, train_
     items = report_items(best, candidates)
     report, examples = build_field_report(items, dataset, arch=arch, stage=stage,
                                           train_dataset=train_dataset, device=device,
-                                          seed=seed, threshold=threshold,
-                                          n_examples=n_examples)
+                                          seed=seed, n_examples=n_examples)
     path = os.path.join(stage_dir, REPORT_FILE)
     plots = []
     try:
@@ -749,133 +731,9 @@ def write_stage_report(stage_dir, stage, arch, best, candidates, dataset, train_
     return report, path, plots
 
 
-def _val_curve(metrics_csv):
-    if not metrics_csv or not os.path.isfile(metrics_csv):
-        return [], []
-    import pandas as pd
-    df = pd.read_csv(metrics_csv)
-    if "val/loss" not in df.columns:
-        return [], []
-    sub = df[["step", "val/loss"]].dropna()
-    return [int(s) for s in sub["step"]], [float(v) for v in sub["val/loss"]]
-
-
-def stage_runs(run_dirs, stage="B"):
-    """Сводка запусков одного этапа, начатых с разных чекпойнтов предыдущего.
-
-    Args:
-        run_dirs: каталоги прогонов.
-        stage: имя этапа.
-
-    Returns:
-        Пара: строки сводки по запускам и предупреждения о несопоставимости.
-    """
-    from mayak.protocol import read_journal
-    rows, warnings = [], []
-    for d in run_dirs:
-        j = read_journal(d)
-        entry = next((s for s in reversed(j.get("stages", [])) if s.get("name") == stage), None)
-        if entry is None:
-            warnings.append(f"{d}: в журнале нет этапа {stage}")
-            continue
-        init = entry.get("init_from") or {}
-        rep = init.get("report") or {}
-        steps, values = _val_curve(entry.get("metrics_csv"))
-        rows.append(dict(run=d, arch=j.get("arch"), protocol=j.get("protocol"),
-                         val_set=entry.get("val_set"), init_ckpt=init.get("ckpt"),
-                         init_step=init.get("step"), init_is_best=init.get("is_best"),
-                         init_ratio=rep.get("mse_ratio"), init_picp90=rep.get("picp90"),
-                         init_gap=rep.get("gap_ratio"),
-                         best_score=entry.get("best_score"), best_step=entry.get("best_step"),
-                         steps_done=entry.get("steps_done"), probe_steps=entry.get("probe_steps"),
-                         selection=entry.get("selection") or {}, steps=steps, values=values))
-    for key, what in (("arch", "архитектура"), ("protocol", "протокол"),
-                      ("val_set", "набор валидации")):
-        if len({json.dumps(r[key], sort_keys=True) for r in rows}) > 1:
-            warnings.append(f"{what} различается между запусками: сравнение некорректно")
-    common = set.intersection(*(set(r["steps"]) for r in rows)) if rows else set()
-    at = max(common) if common else None
-    for r in rows:
-        r["common_step"] = at
-        r["loss_at_common"] = (None if at is None
-                               else r["values"][len(r["steps"]) - 1 - r["steps"][::-1].index(at)])
-    return rows, warnings
-
-
-def format_stage_runs(rows, warnings=()):
-    """Таблица сравнения запусков этапа для консоли.
-
-    Args:
-        rows: строки сводки.
-        warnings: предупреждения о несопоставимости.
-
-    Returns:
-        Список строк.
-    """
-    at = rows[0]["common_step"] if rows else None
-    lines = [f"{'запуск':<32} {'старт: шаг':>10} {'MSE/клим':>9} {'вал/обуч':>9} {'PICP90':>7} "
-             f"{'лучший val/loss':>15} {'на шаге':>8} {'шагов':>13} "
-             f"{('val/loss на ' + str(at)) if at is not None else '':>16}"]
-    for r in rows:
-        mark = " *" if r["init_is_best"] else ""
-        probe = " (проба)" if r["probe_steps"] else ""
-        lines.append(f"{os.path.basename(os.path.normpath(r['run'])):<32} "
-                     f"{str(r['init_step']) + mark:>10} {_num(r['init_ratio']):>9} "
-                     f"{_num(r['init_gap']):>9} {_pct(r['init_picp90']):>7} "
-                     f"{_num(r['best_score'], 4):>15} "
-                     f"{str(r['best_step']):>8} {str(r['steps_done']) + probe:>13} "
-                     f"{_num(r['loss_at_common'], 4):>16}")
-    lines.append("* старт с лучшего по val/loss чекпойнта предыдущего этапа")
-    lines += [f"ВНИМАНИЕ: {w}" for w in warnings]
-    return lines
-
-
-def plot_stage_runs(rows, out_path):
-    """Кривые валидации запусков этапа и pinball по длинам истории на лучшем шаге.
-
-    Args:
-        rows: строки сводки.
-        out_path: путь к картинке.
-
-    Returns:
-        Путь к картинке.
-    """
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
-    colors = _colors(plt, len(rows))
-    bins = sorted({k for r in rows for k in r["selection"] if k.startswith("val/pinball_L")},
-                  key=lambda k: int(k[len("val/pinball_L"):].split("-")[0]))
-    width = 0.8 / max(len(rows), 1)
-    for i, (r, c) in enumerate(zip(rows, colors)):
-        label = f"старт с шага {r['init_step']}" + (" *" if r["init_is_best"] else "")
-        axes[0].plot(r["steps"], r["values"], marker=".", color=c, label=label)
-        vals = _arr(r["selection"].get(k) for k in bins)
-        axes[1].bar(np.arange(len(bins)) + i * width, vals, width=width, color=c, label=label)
-    if rows and rows[0]["common_step"] is not None:
-        axes[0].axvline(rows[0]["common_step"], color="grey", ls=":", lw=1.0,
-                        label="общий шаг")
-    axes[0].set_xlabel("шаг")
-    axes[0].set_ylabel("val/loss")
-    axes[0].set_title("Валидация следующего этапа", fontsize=10)
-    axes[1].set_xticks(np.arange(len(bins)) + 0.4 - width / 2)
-    axes[1].set_xticklabels([k[len("val/pinball_"):] for k in bins], fontsize=8)
-    axes[1].set_title("Нормированный pinball по длине истории на лучшем шаге", fontsize=10)
-    for ax in axes:
-        ax.grid(alpha=0.3)
-        ax.legend(fontsize=7)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=120)
-    plt.close(fig)
-    return out_path
-
-
-__all__ = ["FIELD_GATE_REFERENCE", "LIMIT_FIELDS", "PLOT_FILES", "REPORT_DIR", "REPORT_FILE",
+__all__ = ["CLIM_LEVEL", "LIMIT_FIELDS", "PLOT_FILES", "REPORT_DIR", "REPORT_FILE",
            "SUMMARY_LEADS", "build_field_report", "check_gap_set", "collect_outputs",
            "describe_checkpoint", "field_metrics", "find_report_entry", "format_field_report",
-           "format_stage_runs", "memorization_gap", "memorization_limits", "pick_examples",
-           "plot_field_report", "plot_stage_runs", "read_report", "report_device",
-           "report_items", "skill_at", "stage_runs", "summary", "write_report",
-           "write_stage_report"]
+           "memorization_gap", "memorization_limits", "pick_examples", "plot_field_report",
+           "read_report", "report_device", "report_items", "skill_at", "summary",
+           "write_report", "write_stage_report"]
