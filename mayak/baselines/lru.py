@@ -2,6 +2,9 @@
 
 Стек блоков с диагональной комплексной линейной рекуррентностью читает историю. Его
 последний выход - сводка истории, из которой общая по лидам голова строит прогноз.
+Рекуррентность всегда развёртывается блоками по ``LRU_CHUNK`` часов; полный
+ассоциативный скан переносит состояние между блоками, простой цикл по часам
+(``lru_recurrent``) - эталон для тестов.
 Климат-поля нет: всё, что модель знает о сезоне и суточном ходе на горизонте, она
 выводит сама из календаря, координат и истории.
 """
@@ -15,6 +18,7 @@ from mayak.baselines.neural import N_RECURRENT_INPUT, LeadHead, recurrent_inputs
 from mayak.config import LRUConfig
 
 OUTPUT_MATRICES = ("C_re", "C_im")
+LRU_CHUNK = 32
 
 
 def lambda_polar(nu_log, theta_log):
@@ -83,7 +87,7 @@ def lru_scan_associative(a_re, a_im, u_re, u_im):
     return h_re, h_im
 
 
-def lru_scan_chunked(nu, theta, u_re, u_im, chunk=32):
+def lru_scan_chunked(nu, theta, u_re, u_im, chunk=LRU_CHUNK):
     """Та же рекуррентность, развёрнутая блоками фиксированной длины.
 
     Внутри блока состояния получаются одной свёрткой со степенями собственных чисел.
@@ -166,13 +170,10 @@ class LRULayer(nn.Module):
         r_min: наименьший модуль собственного числа при инициализации.
         r_max: наибольший модуль собственного числа при инициализации.
         max_phase: наибольший поворот за час при инициализации, радианы.
-        scan: способ развёртки по умолчанию.
-        chunk: длина блока для блочной развёртки.
     """
 
-    def __init__(self, d_model, d_state, r_min, r_max, max_phase, scan="chunked", chunk=32):
+    def __init__(self, d_model, d_state, r_min, r_max, max_phase):
         super().__init__()
-        self.scan, self.chunk = scan, chunk
         u1, u2 = torch.rand(d_state), torch.rand(d_state)
         nu_log = torch.log(-0.5 * torch.log(u1 * (r_max ** 2 - r_min ** 2) + r_min ** 2))
         theta_log = torch.log(max_phase * u2.clamp_min(1e-4))
@@ -186,34 +187,33 @@ class LRULayer(nn.Module):
         self.C_im = nn.Parameter(torch.randn(d_model, d_state) / math.sqrt(d_state))
         self.D = nn.Parameter(torch.randn(d_model))
 
-    def states(self, x, scan=None):
-        """Комплексные состояния рекуррентности.
+    def drive(self, x):
+        """Собственные числа и комплексный вход рекуррентности.
 
         Args:
             x: вход, форма (B, L, d_model).
-            scan: способ развёртки; None - способ из конструктора.
+
+        Returns:
+            Четвёрка: скорость затухания и поворот за час формы (d_state,), вещественная и
+            мнимая части входа формы (B, L, d_state).
+        """
+        g = torch.exp(self.gamma_log)[:, None]
+        nu, theta = lambda_polar(self.nu_log, self.theta_log)
+        return nu, theta, x @ (self.B_re * g).T, x @ (self.B_im * g).T
+
+    def states(self, x):
+        """Комплексные состояния рекуррентности, блочная развёртка.
+
+        Args:
+            x: вход, форма (B, L, d_model).
 
         Returns:
             Пара тензоров формы (B, L, d_state).
-
-        Raises:
-            ValueError: неизвестный способ развёртки.
         """
-        scan = scan or self.scan
-        g = torch.exp(self.gamma_log)[:, None]
-        u_re, u_im = x @ (self.B_re * g).T, x @ (self.B_im * g).T
-        nu, theta = lambda_polar(self.nu_log, self.theta_log)
-        if scan == "chunked":
-            return lru_scan_chunked(nu, theta, u_re, u_im, self.chunk)
-        a_re, a_im = torch.exp(-nu) * torch.cos(theta), torch.exp(-nu) * torch.sin(theta)
-        if scan == "associative":
-            return lru_scan_associative(a_re, a_im, u_re, u_im)
-        if scan == "recurrent":
-            return lru_recurrent(a_re, a_im, u_re, u_im)
-        raise ValueError(f"неизвестная развёртка {scan!r}")
+        return lru_scan_chunked(*self.drive(x))
 
-    def forward(self, x, scan=None):
-        h_re, h_im = self.states(x, scan)
+    def forward(self, x):
+        h_re, h_im = self.states(x)
         return h_re @ self.C_re.T - h_im @ self.C_im.T + self.D * x
 
 
@@ -227,14 +227,13 @@ class LRUBlock(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.norm = nn.LayerNorm(cfg.d_model)
-        self.lru = LRULayer(cfg.d_model, cfg.d_state, cfg.r_min, cfg.r_max, cfg.max_phase,
-                            cfg.scan, cfg.chunk)
+        self.lru = LRULayer(cfg.d_model, cfg.d_state, cfg.r_min, cfg.r_max, cfg.max_phase)
         self.out1 = nn.Linear(cfg.d_model, cfg.d_model)
         self.out2 = nn.Linear(cfg.d_model, cfg.d_model)
         self.drop = nn.Dropout(cfg.dropout)
 
-    def forward(self, x, scan=None):
-        z = self.lru(self.norm(x), scan)
+    def forward(self, x):
+        z = self.lru(self.norm(x))
         z = self.drop(F.gelu(z))
         z = self.out1(z) * torch.sigmoid(self.out2(z))
         return x + self.drop(z)
@@ -276,23 +275,22 @@ class LRUForecaster(nn.Module):
         """
         return recurrent_inputs(batch)
 
-    def encode(self, batch, scan=None):
+    def encode(self, batch):
         """Выход стека на каждом часе истории.
 
         Args:
             batch: батч.
-            scan: развёртка рекуррентности; None - из конфига.
 
         Returns:
             Тензор формы (B, L, d_model).
         """
         z = self.embed(self.inputs(batch))
         for blk in self.blocks:
-            z = blk(z, scan)
+            z = blk(z)
         return self.out_norm(z)
 
-    def forward(self, batch, scan=None):
-        return self.head(self.encode(batch, scan)[:, -1], batch)
+    def forward(self, batch):
+        return self.head(self.encode(batch)[:, -1], batch)
 
     def decay_exceptions(self, weight_decay):
         """Отличия от общего правила весового затухания.

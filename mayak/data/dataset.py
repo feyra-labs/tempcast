@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, get_worker_info
 
-from mayak.config import ZONE_WEIGHTINGS, AugmentConfig
+from mayak.config import AugmentConfig
 from mayak.constants import L_MAX, H
 from mayak.data.augment import AugWindow, augment_window, record_window
 from mayak.data.masking import (DEFAULT_TARGET_MASK, FilterStats, enforce_invariant,
@@ -17,8 +17,6 @@ from mayak.data.window import issue_calendar, place_history
 from mayak.zones import normalize_zone
 
 log = logging.getLogger(__name__)
-
-STREAM_SAMPLE, STREAM_AUG = 0, 1
 
 # Распределение длины истории окна по куррикулумам этапов. Каждая часть задана тройкой:
 # верхняя граница накопленной вероятности, наименьшая и наибольшая длина, ч. Внутри части
@@ -236,37 +234,23 @@ def history_len(L, t, floor):
     return int(max(0, min(L_MAX if L is None else L, L_MAX, t - floor)))
 
 
-def zone_weights(zones, mode="inv_sqrt", cap=0.0):
+def zone_weights(zones):
     """Вероятности выбора станций по их полным зонам Кёппена.
 
-    Вес станции обратно пропорционален степени числа станций её зоны; степень
-    задаёт режим. При положительной верхней границе вес станции ограничивается этой
-    границей, умноженной на средний вес, итеративно до сходимости.
+    Вес станции равен числу станций её зоны в степени минус одна вторая: зона из n
+    станций получает суммарную долю, пропорциональную корню из n.
 
     Args:
         zones: зона каждой станции.
-        mode: режим взвешивания: ``uniform``, ``inv_sqrt`` или ``inv``.
-        cap: верхняя граница веса относительно среднего; 0 - без неё.
 
     Returns:
         Вероятности станций, их сумма равна единице.
-
-    Raises:
-        ValueError: неизвестный режим.
     """
-    if mode not in ZONE_WEIGHTINGS:
-        raise ValueError(f"zone_weighting {mode!r}; допустимо {sorted(ZONE_WEIGHTINGS)}")
     zones = [normalize_zone(z) for z in zones]
     count = {}
     for z in zones:
         count[z] = count.get(z, 0) + 1
-    w = np.array([count[z] ** -ZONE_WEIGHTINGS[mode] for z in zones], np.float64)
-    if cap and cap > 0 and len(w):
-        for _ in range(100):
-            lim = cap * w.mean()
-            if (w <= lim * (1 + 1e-12)).all():
-                break
-            w = np.minimum(w, lim)
+    w = np.array([count[z] ** -0.5 for z in zones], np.float64)
     return w / w.sum()
 
 
@@ -303,11 +287,67 @@ def footprint(t, L, floor):
     return t - n - qc_context(t, n, floor), t + H
 
 
+def build_window(s, t, L, floor, qc=True, augment=None, rng=None, info=None):
+    """Окно станции: одна сборка для обучения, выбора чекпойнта, калибровки и оценки.
+
+    Порядок как у прибора: сырая история и цель, искажения датчика и отказы (если заданы
+    аугментации), запись целыми градусами и процентами, контекст и причинный QC истории,
+    затем календарь и нормировочный масштаб. Календарь считается раньше аугментаций,
+    потому что смещению станции нужен час UTC; сам он от данных окна не зависит. История
+    и цель в кэше уже записаны прибором, поэтому без аугментаций запись значений не
+    меняет.
+
+    Args:
+        s: запись станции: сырые значения и маска наличия, ряд после QC и его маска,
+            климатология, первый час ряда, координаты и высота.
+        t: начало горизонта, индекс часа.
+        L: фактическая длина истории, ч.
+        floor: самый ранний час, доступный истории окна.
+        qc: прогонять ли историю через причинный QC.
+        augment: конфиг аугментаций; None - окно без аугментаций.
+        rng: генератор аугментаций; нужен, если заданы аугментации.
+        info: если передан словарь, в него кладутся параметры аугментаций.
+
+    Returns:
+        Словарь тензоров окна: координаты и высота, история и её маска, календарь
+        истории и горизонта, цель и её маска, нормировочный масштаб.
+    """
+    doy_h, hour_h, doy_f, hour_f = issue_calendar(s["t0"], t, L_MAX, H)
+    x_hist, mask_hist = slice_history(s["raw"], s["present"], t, L)
+    y, y_mask = slice_target(s["x"], s["mask"], t)
+    w = AugWindow(x=x_hist, m=mask_hist, y=y, y_mask=y_mask, L=L, hour=hour_h,
+                  hour_fut=hour_f, lat=float(s["lat"]), lon=float(s["lon"]),
+                  elev=float(s["elev"]), qc_elev=station_qc_elev(s))
+    if augment is not None:
+        augment_window(w, augment, rng)
+    record_window(w)
+    if info is not None:
+        info.update(w.applied)
+    x_hist, mask_hist = enforce_invariant(w.x, w.m)
+    if qc and L > 0:
+        past = slice_context(s["raw"], s["present"], t, L, floor)
+        mask_hist, _ = qc_window(x_hist, mask_hist, elev=w.qc_elev, past=past)
+        x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
+    return {
+        "lat": torch.tensor(w.lat, dtype=torch.float32),
+        "lon": torch.tensor(w.lon, dtype=torch.float32),
+        "elev": torch.tensor(w.elev, dtype=torch.float32),
+        "x_hist": torch.from_numpy(x_hist),
+        "mask_hist": torch.from_numpy(mask_hist),
+        "doy_hist": torch.from_numpy(doy_h),
+        "hour_hist": torch.from_numpy(hour_h),
+        "doy_fut": torch.from_numpy(doy_f),
+        "hour_fut": torch.from_numpy(hour_f),
+        "y": torch.from_numpy(w.y),
+        "y_mask": torch.from_numpy(y_mask),
+        "norm_scale": torch.from_numpy(norm_scale(s["clim"], doy_f, hour_f)),
+    }
+
+
 class WindowDataset(Dataset):
     def __init__(self, manifest, split="train", curriculum="full",
                  windows_per_epoch=200_000, seed=0, target_mask=DEFAULT_TARGET_MASK,
-                 store=None, aug_seed=None, augment=None, cache_root=None, window_qc=True,
-                 zone_weighting="inv_sqrt", zone_weight_cap=0.0):
+                 store=None, aug_seed=None, augment=None, cache_root=None, window_qc=True):
         assert split in ("train",)
         assert curriculum in HISTORY_MIX
         self.curriculum = curriculum
@@ -322,7 +362,7 @@ class WindowDataset(Dataset):
         self.seed_streams(worker_id=0, salt=0)
 
         store = store or get_store(manifest, cache_root=cache_root)
-        self.station_role, self.time_key = ROLE_TRAIN, "train"
+        self.time_key = "train"
         rows = store.by_role(ROLE_TRAIN)
         assert rows, "нет train-станций — запустите make_splits.py"
 
@@ -338,17 +378,16 @@ class WindowDataset(Dataset):
             self.st.append(dict(
                 id=r["id"], lat=float(r["lat"]), lon=float(r["lon"]), elev=float(r["elev"]),
                 koppen=r["koppen"], x=x, mask=mask, raw=r["raw"], present=r["present"], N=N,
-                t0=r["t0"], clim=r["clim"], qc_elev=station_qc_elev(r),
+                t0=r["t0"], clim=r["clim"], dem_elev=r.get("dem_elev"),
                 floor=layout.history_floor(self.time_key), starts=ok))
         self.filter_stats.report("train")
         assert self.st, "ни у одной train-станции нет окон, прошедших маску цели"
 
         zones = [s["koppen"] for s in self.st]
-        self.w = zone_weights(zones, zone_weighting, zone_weight_cap)
+        self.w = zone_weights(zones)
         self.zone_report = zone_distribution(zones, self.w)
-        log.info("сэмплирование станций: взвешивание %s (cap %s), %d станций в %d зонах; "
-                 "доли зон: %s", zone_weighting, zone_weight_cap or "нет", len(zones),
-                 len(self.zone_report),
+        log.info("сэмплирование станций: вес n_зоны^(-1/2), %d станций в %d зонах; "
+                 "доли зон: %s", len(zones), len(self.zone_report),
                  ", ".join(f"{z}:{n}ст/{p:.1%}" for z, (n, p) in self.zone_report.items()))
 
     def seed_streams(self, worker_id=0, salt=0):
@@ -379,8 +418,7 @@ class WindowDataset(Dataset):
     def build(self, s, t, L, info=None):
         """Окно станции s с началом горизонта t и историей L, с аугментациями.
 
-        Порядок как у прибора: искажения датчика и отказы, запись целыми градусами и
-        процентами, затем причинный QC. Запись касается и истории, и цели.
+        Тонкая обёртка над ``build_window``: аугментации и генератор - из датасета.
 
         Args:
             s: запись станции.
@@ -391,38 +429,6 @@ class WindowDataset(Dataset):
         Returns:
             Словарь тензоров окна.
         """
-        doy_h, hour_h, doy_f, hour_f = issue_calendar(s["t0"], t, L_MAX, H)
-        x_hist, mask_hist = slice_history(s["raw"], s["present"], t, L)
-
-        y, y_mask = slice_target(s["x"], s["mask"], t)
-        scale = norm_scale(s["clim"], doy_f, hour_f)
-
-        w = augment_window(AugWindow(x=x_hist, m=mask_hist, y=y, y_mask=y_mask, L=L,
-                                     hour=hour_h, hour_fut=hour_f, lat=s["lat"],
-                                     lon=s["lon"], elev=s["elev"], qc_elev=s["qc_elev"]),
-                           self.augment, self.rng_aug)
-        record_window(w)
-        if info is not None:
-            info.update(w.applied)
-        lat, lon, elev, y = w.lat, w.lon, w.elev, w.y
-        x_hist, mask_hist = enforce_invariant(w.x, w.m)
-        if self.window_qc and L > 0:
-            past = slice_context(s["raw"], s["present"], t, L, s["floor"])
-            mask_hist, _ = qc_window(x_hist, mask_hist, elev=w.qc_elev, past=past)
-            x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
-
-        return {
-            "lat": torch.tensor(lat, dtype=torch.float32),
-            "lon": torch.tensor(lon, dtype=torch.float32),
-            "elev": torch.tensor(elev, dtype=torch.float32),
-            "x_hist": torch.from_numpy(x_hist),
-            "mask_hist": torch.from_numpy(mask_hist),
-            "doy_hist": torch.from_numpy(doy_h),
-            "hour_hist": torch.from_numpy(hour_h),
-            "doy_fut": torch.from_numpy(doy_f),
-            "hour_fut": torch.from_numpy(hour_f),
-            "y": torch.from_numpy(y),
-            "y_mask": torch.from_numpy(y_mask),
-            "norm_scale": torch.from_numpy(scale),
-        }
+        return build_window(s, t, L, s["floor"], qc=self.window_qc, augment=self.augment,
+                            rng=self.rng_aug, info=info)
 

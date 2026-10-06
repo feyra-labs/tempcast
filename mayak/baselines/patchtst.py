@@ -7,10 +7,11 @@ from mayak.baselines.neural import median_centered_offsets
 from mayak.config import PatchTSTConfig
 
 REVIN_EPS = 1e-5
+REVIN_MIN_VALID = 2
 LOG_SIG_CLAMP = (-5.0, 3.0)
 
 
-def masked_instance_stats(x, m, min_valid=2, eps=REVIN_EPS):
+def masked_instance_stats(x, m, min_valid=REVIN_MIN_VALID, eps=REVIN_EPS):
     """Среднее и разброс окна по валидным часам для нормализации экземпляра.
 
     Разброс - корень из смещённой дисперсии с малой добавкой. Если валидных часов меньше
@@ -35,23 +36,19 @@ def masked_instance_stats(x, m, min_valid=2, eps=REVIN_EPS):
     return torch.where(ok, mean, torch.zeros_like(mean)), torch.where(ok, std, torch.ones_like(std))
 
 
-def make_patches(z, patch_len, stride, padding):
-    """Разбиение окна на патчи по оси времени.
+def make_patches(z, patch_len, stride):
+    """Разбиение окна на патчи по оси времени, без дополнения.
 
-    В патче сначала идут отсчёты первого канала, затем второго. Дополнение ``end``
-    повторяет последний час окна столько раз, каков шаг, и даёт ещё один патч.
+    В патче сначала идут отсчёты первого канала, затем второго.
 
     Args:
         z: окно, форма (B, L, C).
         patch_len: длина патча в часах.
         stride: шаг между началами патчей в часах.
-        padding: ``end`` или ``none``.
 
     Returns:
         Тензор формы (B, n_patches, C * patch_len).
     """
-    if padding == "end":
-        z = torch.cat([z, z[:, -1:].expand(-1, stride, -1)], dim=1)
     p = z.unfold(1, patch_len, stride)
     return p.reshape(p.shape[0], p.shape[1], -1)
 
@@ -61,10 +58,8 @@ class _Transpose(nn.Module):
         return x.transpose(1, 2)
 
 
-def _norm(kind, d):
-    if kind == "batch":
-        return nn.Sequential(_Transpose(), nn.BatchNorm1d(d), _Transpose())
-    return nn.LayerNorm(d)
+def _batch_norm(d):
+    return nn.Sequential(_Transpose(), nn.BatchNorm1d(d), _Transpose())
 
 
 class ResidualAttention(nn.Module):
@@ -101,7 +96,9 @@ class ResidualAttention(nn.Module):
 
 
 class TSTEncoderLayer(nn.Module):
-    """Слой энкодера: внимание и перцептрон, нормализация после каждой остаточной связи.
+    """Слой энкодера: внимание и перцептрон, BatchNorm после каждой остаточной связи.
+
+    К логитам внимания прибавляются логиты предыдущего слоя.
 
     Args:
         cfg: конфиг PatchTST.
@@ -109,18 +106,17 @@ class TSTEncoderLayer(nn.Module):
 
     def __init__(self, cfg):
         super().__init__()
-        self.res_attention = cfg.res_attention
         self.attn = ResidualAttention(cfg.d_model, cfg.n_heads, cfg.attn_dropout, cfg.dropout)
         self.drop_attn = nn.Dropout(cfg.dropout)
-        self.norm_attn = _norm(cfg.norm, cfg.d_model)
+        self.norm_attn = _batch_norm(cfg.d_model)
         self.ff = nn.Sequential(nn.Linear(cfg.d_model, cfg.d_ff), nn.GELU(),
                                 nn.Dropout(cfg.dropout),
                                 nn.Linear(cfg.d_ff, cfg.d_model))
         self.drop_ffn = nn.Dropout(cfg.dropout)
-        self.norm_ffn = _norm(cfg.norm, cfg.d_model)
+        self.norm_ffn = _batch_norm(cfg.d_model)
 
     def forward(self, x, prev=None):
-        a, scores = self.attn(x, prev if self.res_attention else None)
+        a, scores = self.attn(x, prev)
         x = self.norm_attn(x + self.drop_attn(a))
         x = self.norm_ffn(x + self.drop_ffn(self.ff(x)))
         return x, scores
@@ -177,10 +173,7 @@ class PatchTST(nn.Module):
         x = batch["x_hist"][:, -L:, 0]
         m = (batch["mask_hist"][:, -L:, 0] > 0).to(x.dtype)
         x = torch.where(m > 0, x, torch.zeros_like(x))
-        if self.cfg.revin:
-            mean, std = masked_instance_stats(x, m, self.cfg.revin_min_valid)
-        else:
-            mean, std = torch.zeros_like(x[:, :1]), torch.ones_like(x[:, :1])
+        mean, std = masked_instance_stats(x, m)
         return (x - mean) / std * m, m, mean, std
 
     def encode(self, batch):
@@ -195,7 +188,7 @@ class PatchTST(nn.Module):
         """
         z, m, mean, std = self.normalize(batch)
         c = self.cfg
-        p = make_patches(torch.stack([z, m], -1), c.patch_len, c.stride, c.padding_patch)
+        p = make_patches(torch.stack([z, m], -1), c.patch_len, c.stride)
         u = self.W_P(p)
         u = self.drop(u + self.W_pos)
         scores = None
@@ -213,4 +206,4 @@ class PatchTST(nn.Module):
         return {"q": q, "mu": mu_n * std + mean, "sigma": sig_n * std}
 
 
-__all__ = ["PatchTST", "make_patches", "masked_instance_stats"]
+__all__ = ["PatchTST", "REVIN_MIN_VALID", "make_patches", "masked_instance_stats"]

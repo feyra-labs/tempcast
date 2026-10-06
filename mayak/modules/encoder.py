@@ -84,7 +84,6 @@ class SynopticEncoder(nn.Module):
                  kernel=3, norm_groups=4):
         super().__init__()
         self.width = width
-        self.receptive_field = (kernel - 1) * sum(dilations) + 1
         self.stem = nn.Conv1d(n_ch, width, 1)
         self.blocks = nn.ModuleList(DSBlock(width, d, kernel, norm_groups) for d in dilations)
 

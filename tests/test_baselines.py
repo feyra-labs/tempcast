@@ -7,10 +7,10 @@ import torch
 import torch.nn as nn
 
 from mayak import baselines as BL
-from mayak.baselines.lru import (LRULayer, LRUForecaster, lambda_polar, lru_recurrent,
-                                 lru_scan_associative, lru_scan_chunked)
+from mayak.baselines.lru import (LRULayer, lambda_polar, lru_recurrent, lru_scan_associative,
+                                 lru_scan_chunked)
 from mayak.baselines.patchtst import make_patches, masked_instance_stats
-from mayak.config import ConfigError, DLinearConfig, LRUConfig, PatchTSTConfig
+from mayak.config import ConfigError, DLinearConfig, PatchTSTConfig
 from mayak.constants import H, L_MAX, NQ
 from mayak.protocol import DEFAULT_PROTOCOL, Protocol, ProtocolError
 
@@ -82,30 +82,21 @@ def test_lru_scans_match_naive_recurrence(L, chunk):
 
 
 def test_lru_scan_matches_recurrence_in_float32_on_full_window():
-    """То же во float32 на 672 ч: расхождение — ошибка округления, а не метода."""
+    """То же во float32 на 672 ч: расхождение — ошибка округления, а не метода.
+
+    Слой развёртывает рекуррентность блоками; эталон — простой цикл по часам на тех же
+    собственных числах и том же входе.
+    """
     torch.manual_seed(0)
     lay = LRULayer(16, 32, 0.7, 0.999, 0.5)
     x = torch.randn(3, L_MAX, 16)
-    ref = lay.states(x, "recurrent")
+    nu, theta, u_re, u_im = lay.drive(x)
+    a_re, a_im = torch.exp(-nu) * torch.cos(theta), torch.exp(-nu) * torch.sin(theta)
+    ref = lru_recurrent(a_re, a_im, u_re, u_im)
     scale = max(float(ref[0].detach().abs().max()), 1.0)
-    for scan in ("chunked", "associative"):
-        got = lay.states(x, scan)
+    for got in (lay.states(x), lru_scan_associative(a_re, a_im, u_re, u_im)):
         for r, v in zip(ref, got):
             assert (v - r).abs().max() / scale < 1e-5
-
-
-def test_lru_full_forecast_identical_for_all_scans():
-    """Эквивалентность на уровне полного выпуска: все лиды, все квантили."""
-    m = _trained_like(_model("lru", LRUConfig(d_model=16, d_state=16, layers=2, head_hidden=32)))
-    b = _batch(B=2)
-    with torch.no_grad():
-        ref = m(b, scan="recurrent")
-        for scan in ("chunked", "associative"):
-            out = m(b, scan=scan)
-            for k in ("q", "mu", "sigma"):
-                assert torch.allclose(out[k], ref[k], atol=1e-4, rtol=1e-5), (scan, k)
-    assert LRUForecaster(LRUConfig(scan="recurrent", d_model=8, d_state=8, layers=1)).cfg.scan \
-        == "recurrent"
 
 
 def test_lru_modulus_inside_unit_disk_for_any_parameters():
@@ -191,18 +182,17 @@ def test_weight_decay_only_on_layer_weights():
 
 
 def test_patchtst_patching():
-    """Суточные патчи без перекрытия по умолчанию; разбиение с дополнением повтором."""
+    """Суточные патчи без перекрытия по умолчанию; разбиение без дополнения."""
     cfg = PatchTSTConfig()
-    assert (cfg.patch_len, cfg.stride, cfg.padding_patch) == (24, 24, "none")
+    assert (cfg.patch_len, cfg.stride) == (24, 24)
     assert cfg.n_patches == cfg.input_len // 24 == 21
-    assert PatchTSTConfig(input_len=L_MAX, patch_len=16, stride=8,
-                          padding_patch="end").n_patches == 84
+    assert PatchTSTConfig(input_len=L_MAX, patch_len=16, stride=8).n_patches == 83
     z = torch.arange(20.0).view(1, 20, 1)
-    p = make_patches(z, 8, 4, "end")
-    assert p.shape == (1, (20 - 8) // 4 + 2, 8)
+    p = make_patches(z, 8, 4)
+    assert p.shape == (1, (20 - 8) // 4 + 1, 8)
     assert torch.equal(p[0, 0], torch.arange(8.0))
-    assert torch.equal(p[0, -1], torch.tensor([16, 17, 18, 19, 19, 19, 19, 19.0]))
-    two = make_patches(torch.stack([z[..., 0], -z[..., 0]], -1), 8, 4, "none")
+    assert torch.equal(p[0, -1], torch.arange(12.0, 20))
+    two = make_patches(torch.stack([z[..., 0], -z[..., 0]], -1), 8, 4)
     assert torch.equal(two[0, 1], torch.cat([torch.arange(4.0, 12), -torch.arange(4.0, 12)]))
 
 
@@ -210,7 +200,7 @@ def test_patchtst_last_patch_ends_at_issue_time():
     """Последний патч заканчивается последним часом истории: вход не теряет свежие часы."""
     cfg = PatchTSTConfig()
     z = torch.arange(float(cfg.input_len)).view(1, -1, 1)
-    p = make_patches(z, cfg.patch_len, cfg.stride, cfg.padding_patch)
+    p = make_patches(z, cfg.patch_len, cfg.stride)
     assert p[0, -1, -1] == cfg.input_len - 1 and p[0, 0, 0] == 0
     with pytest.raises(ConfigError, match="не делится на патчи"):
         PatchTSTConfig(input_len=500)

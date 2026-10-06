@@ -39,10 +39,6 @@ STATION_LIST_URL = ("https://www.ncei.noaa.gov/oa/global-historical-climatology-
 CHUNK = 1 << 20
 
 
-class Absent(Exception):
-    """Файла на сервере нет (404) - это ответ, а не ошибка сети."""
-
-
 def file_urls(base, sid, layout, years=(), fmt="psv"):
     """Адреса и имена файлов станции.
 

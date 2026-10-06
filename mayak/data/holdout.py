@@ -3,8 +3,9 @@
 Один класс окон на все проверки. Набор задаётся ролями станций, временным ключом и
 правилом длины истории: полный буфер, одна длина для всех окон или распределение
 куррикулума этапа. Подвыборка стратифицирована: с каждой станции берётся одинаковое
-число окон, разнесённых по всему временному окну. История проходит тот же причинный QC,
-что на приборе; аугментаций нет.
+число окон, разнесённых по всему временному окну. Окно собирает та же функция, что и
+обучающее (``build_window``), без аугментаций: история проходит тот же причинный QC,
+что на приборе.
 
 Основной внутренний тест - станции unseen_test в их тестовом окне; обучающие станции в
 тестовом окне - отдельный набор.
@@ -19,14 +20,12 @@ from torch.utils.data import Dataset
 
 from mayak import baselines as BL
 from mayak.constants import H, HISTORY_BINS, L_MAX
-from mayak.data.dataset import (HISTORY_MIX, block_starts, footprint, history_len, norm_scale,
-                                sample_history_len, slice_context, slice_history, slice_target,
+from mayak.data.dataset import (HISTORY_MIX, block_starts, build_window, footprint, history_len,
+                                sample_history_len, slice_context, slice_history,
                                 station_qc_elev)
-from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats, enforce_invariant
-from mayak.data.qc import qc_window
+from mayak.data.masking import DEFAULT_TARGET_MASK, FilterStats
 from mayak.data.splits import ROLE_TEST, time_layout
 from mayak.data.store import read_manifest
-from mayak.data.window import issue_calendar
 from mayak.timeaxis import window_month
 from mayak.zones import SEASON_RU, normalize_zone, season_of
 
@@ -396,7 +395,10 @@ class EvalSet(Dataset):
                     t=np.array([t for _sid, t in self.items], np.int64))
 
     def raw_window(self, i):
-        """Сырая история окна до QC.
+        """Сырая история окна до записи и QC.
+
+        Нужна сценариям робастности: они искажают историю до записи прибором и QC.
+        Срезы берут те же функции, что и ``build_window``.
 
         Args:
             i: номер окна.
@@ -413,34 +415,28 @@ class EvalSet(Dataset):
         return dict(x=x, m=m, past=past, L=L, qc_elev=station_qc_elev(s))
 
     def __getitem__(self, i):
+        """Окно оценки: окно ``build_window`` без аугментаций и поля эталонов.
+
+        Args:
+            i: номер окна.
+
+        Returns:
+            Словарь тензоров окна и, сверх него, климатология на горизонте, недавняя
+            аномалия с флагом её годности и фактическая длина истории.
+        """
         sid, t = self.items[i]
         s = self.clims[sid]
         clim = s["clim"]
-        t0 = s["t0"]
-        doy_h, hour_h, doy_f, hour_f = issue_calendar(t0, t, L_MAX, H)
-        w = self.raw_window(i)
-        x_hist, mask_hist = w["x"], w["m"]
-        if w["L"] > 0:
-            mask_hist, _ = qc_window(x_hist, mask_hist, elev=w["qc_elev"], past=w["past"])
-            x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
-        y, y_mask = slice_target(s["x"], s["mask"], t)
-        mu_clim_fut = clim.predict(doy_f, hour_f).astype(np.float32)
+        L = self.history_length(i)
+        out = build_window(s, t, L, self.floor[sid])
+        x_hist, mask_hist = out["x_hist"].numpy(), out["mask_hist"].numpy()
+        mu_clim_fut = clim.predict(out["doy_fut"].numpy(), out["hour_fut"].numpy())
         a_recent, a_ok = BL.recent_anomaly(x_hist[:, 0], mask_hist[:, 0], clim, L_MAX,
-                                           int(t0) + int(t) - L_MAX)
-        return {
-            "lat": torch.tensor(s["lat"], dtype=torch.float32),
-            "lon": torch.tensor(s["lon"], dtype=torch.float32),
-            "elev": torch.tensor(s["elev"], dtype=torch.float32),
-            "x_hist": torch.from_numpy(x_hist), "mask_hist": torch.from_numpy(mask_hist),
-            "doy_hist": torch.from_numpy(doy_h.astype(np.float32)),
-            "hour_hist": torch.from_numpy(hour_h.astype(np.float32)),
-            "doy_fut": torch.from_numpy(doy_f.astype(np.float32)),
-            "hour_fut": torch.from_numpy(hour_f.astype(np.float32)),
-            "y": torch.from_numpy(y),
-            "y_mask": torch.from_numpy(y_mask),
-            "norm_scale": torch.from_numpy(norm_scale(clim, doy_f, hour_f)),
-            "mu_clim_fut": torch.from_numpy(mu_clim_fut),
-            "a_recent": torch.tensor(a_recent, dtype=torch.float32),
-            "a_recent_ok": torch.tensor(bool(a_ok)),
-            "hist_len": torch.tensor(w["L"], dtype=torch.int64),
-        }
+                                           int(s["t0"]) + int(t) - L_MAX)
+        out.update(
+            mu_clim_fut=torch.from_numpy(np.asarray(mu_clim_fut, np.float32)),
+            a_recent=torch.tensor(a_recent, dtype=torch.float32),
+            a_recent_ok=torch.tensor(bool(a_ok)),
+            hist_len=torch.tensor(L, dtype=torch.int64),
+        )
+        return out

@@ -87,9 +87,7 @@ class MayakData(L.LightningDataModule):
                                       windows_per_epoch=h.windows_per_epoch,
                                       seed=h.seed, aug_seed=h.aug_seed, store=store,
                                       target_mask=c.target_mask, augment=c.augment,
-                                      window_qc=c.window_qc,
-                                      zone_weighting=c.zone_weighting,
-                                      zone_weight_cap=c.zone_weight_cap)
+                                      window_qc=c.window_qc)
         self.store = store
         self.val_ds = validation_set(store, h.manifest, c, h.curriculum)
 

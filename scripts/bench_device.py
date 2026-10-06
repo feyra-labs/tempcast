@@ -31,7 +31,6 @@ import time
 import numpy as np
 
 START_UTC = "2025-01-01T00"
-PCTL = (0.50, 0.95, 0.99)
 UNTRAINED_PERTURB = 0.05
 
 

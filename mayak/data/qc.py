@@ -204,7 +204,6 @@ class QCConfig:
 
 STATION_CHECKS = ("t_level", "solar_phase", "changepoint", "dem_elevation")
 DEFAULT_QC = QCConfig()
-QC_MODES = ("centered", "causal")
 
 
 def window_span(half, causal):

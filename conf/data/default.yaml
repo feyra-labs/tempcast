@@ -33,5 +33,4 @@ augment:
   drop_channel_prob: 0.28
   drop_channel_weights: [0.46, 0.46, 0.08]   # без P, без RH, без обоих
 window_qc: true
-zone_weighting: inv_sqrt    # вес станции при сэмплировании: uniform | inv_sqrt | inv (по полной зоне)
-zone_weight_cap: 0.0
+# Вес станции при сэмплировании всегда n_зоны^(-1/2) по полной зоне Кёппена, в конфиг не входит.

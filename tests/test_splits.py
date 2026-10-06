@@ -192,7 +192,7 @@ def test_eval_windows_do_not_depend_on_history_length(store, manifest):
 def test_datamodule_uses_role_and_window_contract(dm):
     assert dm.val_ds.station_splits == (ROLE_VAL,) and dm.val_ds.time_key == "val"
     assert dm.val_ds.history_spec() == dict(curriculum="full", L=None, seed=0)
-    assert dm.train_ds.station_role == ROLE_TRAIN and dm.train_ds.time_key == "train"
+    assert dm.train_ds.time_key == "train"
     assert {sid for sid, _t in dm.val_ds.items} == {"v0", "v1"}
 
 

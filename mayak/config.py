@@ -205,8 +205,8 @@ ABLATION_NAMES = tuple(f.name for f in fields(Ablations))
 class ModelConfig:
     """Архитектура МАЯК.
 
-    Производные размеры: число мод и групп, каналы энкодера, ширина входа голов и
-    рецептивное поле - вычисляются из этих полей.
+    Производные размеры: число мод и групп, каналы энкодера и ширина входа голов -
+    вычисляются из этих полей.
 
     Attributes:
         arch: имя архитектуры, всегда ``mayak``.
@@ -447,16 +447,6 @@ class ModelConfig:
         return 1 + self.n_groups + 1 + self.n_solar_head + 1 + self.heads_z_proj + 1 + 1
 
     @property
-    def receptive_field(self):
-        """Рецептивное поле энкодера, ч.
-
-        Каждый слой добавляет своё ядро без единицы, умноженное на дилатацию; к сумме
-        по слоям прибавляется сам текущий час. При ядре 3 это удвоенная сумма дилатаций
-        плюс один.
-        """
-        return (self.encoder_kernel - 1) * sum(self.encoder_dilations) + 1
-
-    @property
     def device_window(self):
         """Длина сырого окна наблюдений, которое устройство хранит на диске, часы.
 
@@ -566,10 +556,9 @@ class LRUConfig:
             априорной памятью.
         min_period: наименьший начальный период колебаний, часы.
         head_hidden: ширина скрытых слоёв головы, общей для всех лидов.
-        scan: развёртка рекуррентности. ``chunked`` - блоками с параллельным переносом
-            между блоками, по умолчанию; ``associative`` - параллельный скан по всей
-            длине; ``recurrent`` - простой цикл по часам, эталон для тестов.
-        chunk: длина блока для ``chunked``.
+
+    Рекуррентность всегда развёртывается блоками фиксированной длины с параллельным
+    переносом состояния между блоками; длина блока - константа модуля модели.
     """
     arch: str = "lru"
     horizon: int = H
@@ -582,8 +571,6 @@ class LRUConfig:
     tau_bounds: tuple = (3.0, 240.0)
     min_period: float = 12.0
     head_hidden: int = 128
-    scan: str = "chunked"
-    chunk: int = 32
 
     def __post_init__(self):
         s = object.__setattr__
@@ -591,8 +578,7 @@ class LRUConfig:
             raise ConfigError(f"LRUConfig: arch={self.arch!r}")
         s(self, "quantiles", _floats(self.quantiles))
         s(self, "tau_bounds", _floats(self.tau_bounds))
-        for name in ("horizon", "max_history", "d_model", "d_state", "layers", "head_hidden",
-                     "chunk"):
+        for name in ("horizon", "max_history", "d_model", "d_state", "layers", "head_hidden"):
             v = int(getattr(self, name))
             if v < 1:
                 raise ConfigError(f"LRUConfig.{name} < 1")
@@ -607,8 +593,6 @@ class LRUConfig:
                               f"неразличим на часовой сетке")
         if not 0.0 <= self.dropout < 1.0:
             raise ConfigError(f"LRUConfig.dropout = {self.dropout} вне [0, 1)")
-        if self.scan not in LRU_SCANS:
-            raise ConfigError(f"LRUConfig.scan = {self.scan!r}; допустимо {LRU_SCANS}")
 
     @property
     def n_quantiles(self):
@@ -634,24 +618,20 @@ class LRUConfig:
         return cls(**_strict_kwargs(cls, d, "model"))
 
 
-LRU_SCANS = ("chunked", "associative", "recurrent")
-PATCH_PADDINGS = ("end", "none")
-PATCHTST_NORMS = ("batch", "layer")
-
-
 @dataclass(frozen=True)
 class PatchTSTConfig:
     """Бейзлайн PatchTST, малая конфигурация.
 
-    Патчи - целые сутки без перекрытия, заканчивающиеся в момент выпуска.
+    Патчи - целые сутки без перекрытия, заканчивающиеся в момент выпуска, без
+    дополнения. Окно нормируется своими средним и разбросом по валидным часам (RevIN),
+    в слоях энкодера - BatchNorm, к логитам внимания прибавляются логиты предыдущего
+    слоя (residual attention). Эти решения зафиксированы в модели и в конфиг не входят.
 
     Attributes:
         input_len: длина входа в часах, последние часы истории окна. Не больше
             максимальной длины истории.
         patch_len: длина патча в часах.
         stride: шаг между началами патчей в часах.
-        padding_patch: ``end`` - добавить патч из повторов последнего часа; ``none`` -
-            без добавки.
         d_model: ширина представления патча.
         n_heads: число голов внимания.
         d_ff: ширина перцептрона в слое энкодера.
@@ -659,11 +639,6 @@ class PatchTSTConfig:
         dropout: прореживание в энкодере.
         attn_dropout: прореживание весов внимания.
         head_dropout: прореживание на выходе головы медианы.
-        res_attention: прибавлять логиты внимания предыдущего слоя.
-        norm: нормализация в слоях энкодера, ``batch`` или ``layer``.
-        revin: нормировать окно его средним и разбросом.
-        revin_min_valid: сколько валидных часов нужно для статистики окна; при меньшем
-            числе нормировка не применяется.
     """
     arch: str = "patchtst"
     horizon: int = H
@@ -671,7 +646,6 @@ class PatchTSTConfig:
     input_len: int = 504
     patch_len: int = 24
     stride: int = 24
-    padding_patch: str = "none"
     d_model: int = 32
     n_heads: int = 4
     d_ff: int = 64
@@ -679,10 +653,6 @@ class PatchTSTConfig:
     dropout: float = 0.2
     attn_dropout: float = 0.0
     head_dropout: float = 0.0
-    res_attention: bool = True
-    norm: str = "batch"
-    revin: bool = True
-    revin_min_valid: int = 2
 
     def __post_init__(self):
         s = object.__setattr__
@@ -690,7 +660,7 @@ class PatchTSTConfig:
             raise ConfigError(f"PatchTSTConfig: arch={self.arch!r}")
         s(self, "quantiles", _floats(self.quantiles))
         for name in ("horizon", "input_len", "patch_len", "stride", "d_model", "n_heads", "d_ff",
-                     "layers", "revin_min_valid"):
+                     "layers"):
             v = int(getattr(self, name))
             if v < 1:
                 raise ConfigError(f"PatchTSTConfig.{name} < 1")
@@ -700,14 +670,6 @@ class PatchTSTConfig:
             if not 0.0 <= v < 1.0:
                 raise ConfigError(f"PatchTSTConfig.{name} = {v} вне [0, 1)")
             s(self, name, v)
-        for name in ("res_attention", "revin"):
-            if not isinstance(getattr(self, name), bool):
-                raise ConfigError(f"PatchTSTConfig.{name} должен быть bool")
-        if self.padding_patch not in PATCH_PADDINGS:
-            raise ConfigError(f"PatchTSTConfig.padding_patch = {self.padding_patch!r}; "
-                              f"допустимо {PATCH_PADDINGS}")
-        if self.norm not in PATCHTST_NORMS:
-            raise ConfigError(f"PatchTSTConfig.norm = {self.norm!r}; допустимо {PATCHTST_NORMS}")
         if self.patch_len > self.input_len:
             raise ConfigError(f"патч {self.patch_len} ч длиннее входа {self.input_len} ч")
         if (self.input_len - self.patch_len) % self.stride:
@@ -723,9 +685,8 @@ class PatchTSTConfig:
 
     @property
     def n_patches(self):
-        """Число патчей окна, с учётом добавочного патча при дополнении ``end``."""
-        n = (self.input_len - self.patch_len) // self.stride + 1
-        return n + (1 if self.padding_patch == "end" else 0)
+        """Число патчей окна."""
+        return (self.input_len - self.patch_len) // self.stride + 1
 
     def to_dict(self):
         return to_jsonable(self)
@@ -1000,9 +961,6 @@ AUGMENT_PROFILES = {
     "none": {f: 0.0 for f in AUGMENT_PROB_FIELDS.values()},
 }
 
-ZONE_WEIGHTINGS = {"uniform": 0.0, "inv_sqrt": 0.5, "inv": 1.0}
-
-
 @dataclass(frozen=True)
 class DataConfig:
     """Данные прогона: источник, правила окон, аугментации, набор валидации.
@@ -1020,8 +978,9 @@ class DataConfig:
             поэтому набор одинаков у всех архитектур и повторов.
         augment: аугментации обучающих окон.
         window_qc: причинный QC истории обучающих окон.
-        zone_weighting: вес станции при сэмплировании по её зоне.
-        zone_weight_cap: верхняя граница веса станции относительно среднего; 0 - без неё.
+
+    Вес станции при сэмплировании обучающих окон всегда обратно пропорционален корню из
+    числа станций её полной зоны Кёппена и в конфиг не входит.
     """
     manifest: str = "data/manifest.csv"
     cache_root: Optional[str] = None
@@ -1032,17 +991,8 @@ class DataConfig:
     val_seed: int = 0
     augment: AugmentConfig = AugmentConfig()
     window_qc: bool = True
-    zone_weighting: str = "inv_sqrt"
-    zone_weight_cap: float = 0.0
 
     def __post_init__(self):
-        if self.zone_weighting not in ZONE_WEIGHTINGS:
-            raise ConfigError(f"zone_weighting = {self.zone_weighting!r}; "
-                              f"допустимо {sorted(ZONE_WEIGHTINGS)}")
-        cap = float(self.zone_weight_cap)
-        if cap != 0.0 and cap < 1.0:
-            raise ConfigError(f"zone_weight_cap = {cap}: 0 (выкл.) или ≥ 1")
-        object.__setattr__(self, "zone_weight_cap", cap)
         if not isinstance(self.target_mask, TargetMaskConfig):
             object.__setattr__(self, "target_mask", TargetMaskConfig(**_strict_kwargs(
                 TargetMaskConfig, self.target_mask, "data.target_mask")))
@@ -1578,7 +1528,7 @@ __all__ = ["ABLATION_NAMES", "AUGMENT_PROB_FIELDS", "AUGMENT_PROFILES", "Ablatio
            "COVERAGE_DIMS_EXTERNAL", "COVERAGE_DIMS_INTERNAL", "CalibrationConfig", "ConfigError",
            "DEFAULT_MODE_GROUPS",
            "DLinearConfig", "DataConfig", "ENCODER_CHANNELS", "GRUConfig", "LRUConfig",
-           "LRU_SCANS", "MODEL_CONFIGS", "ModeGroup", "ModelConfig", "PERSISTENT_GROUP",
+           "MODEL_CONFIGS", "ModeGroup", "ModelConfig", "PERSISTENT_GROUP",
            "PERSISTENT_PERIODS",
            "PatchTSTConfig",
            "DEFAULT_SCENARIOS", "ROBUSTNESS_QC", "RobustnessConfig", "RunConfig", "RuntimeConfig",

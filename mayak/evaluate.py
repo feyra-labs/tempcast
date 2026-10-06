@@ -94,10 +94,6 @@ def bin_label(value, bins):
     return "прочее"
 
 
-def coverage90(y, q, w):
-    return coverage(y, q, w)
-
-
 _AUX_KEYS = (("y", "y"), ("y_mask", "y_mask"), ("mu_clim", "mu_clim_fut"),
              ("a_recent", "a_recent"), ("a_recent_ok", "a_recent_ok"),
              ("norm_scale", "norm_scale"), ("x_hist", "x_hist"),
@@ -1137,7 +1133,7 @@ def coldstart_L0_check(model, ds):
     o_abs = float(np.abs(D["o"]).mean() + np.abs(D["o_p"]).mean())
     e_mean = float(np.abs(D["e"]).mean())
     dev = np.abs(D["mu"] - D["mu_c"])
-    p_before = coverage90(D["y"], D["q"], D["y_mask"])
+    p_before = coverage(D["y"], D["q"], D["y_mask"])
     diff_clim = float(np.abs(D["mu"] - D["mu_clim"]).mean())
 
     print(f"  средний модуль вклада мод = {o_abs:.3f} (ожидается около 0)")
