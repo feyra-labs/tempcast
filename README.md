@@ -3,36 +3,14 @@
 <p align="center"><b>Вероятностный прогноз температуры воздуха на 168 часов по одной метеостанции,
 с рантаймом для слабого устройства.</b></p>
 
-МАЯК получает почасовую историю одной точки (температура, давление, влажность и маска
-пропусков), её координаты и высоту и выдаёт 7 квантилей (5, 10, 25, 50, 75, 90 и 95 %) на
-каждый из 168 часов вперёд. Обучение идёт только на реанализе ERA5; наблюдения реальной
-сети GHCNh служат внешним тестом. На устройстве модель работает на Python с ONNX Runtime:
-нужны только `numpy` и `onnxruntime`, память фиксирована, состояние переживает перезапуск.
-Модели и их источники — [`MODELS.md`](MODELS.md); данные, обучение, оценка, калибровка,
-устройство и формулы — [`METHODS.md`](METHODS.md).
+МАЯК выдаёт 7 квантилей (5, 10, 25, 50, 75, 90 и 95 %) на каждый из 168 часов вперёд по
+почасовой истории одной точки, её координатам и высоте. Обучение — на реанализе ERA5,
+внешний тест — на наблюдениях GHCNh, устройство — Python с `numpy` и `onnxruntime`.
 
-**Ограничения.** Обоснования — в [`METHODS.md`](METHODS.md).
-
-- Температура — целые градусы Цельсия везде: в данных, кэше, обучении, оценке и на
-  устройстве. Влажность — целые проценты, давление — десятые гПа. Единицы не проверяются:
-  что прибор присылает °C, обеспечивает владелец прибора.
-- Датчик отчитывается раз в час. Пропуски и разрывы допустимы; регулярный шаг в
-  несколько часов вне области проекта.
-- Время — UTC, момент наблюдения лежит на целом часе. Нужны координаты и высота точки.
-- История модели — не больше 672 ч (28 суток), горизонт — 168 ч. Прогноз не видит того,
-  чего нет в истории одной точки, и на дальних лидах стремится к климатологии.
-- Обучение только на реанализе; перенос на реальные приборы измеряется внешним тестом.
-- Климат-поле учится на ~270 точках с шагом в сотни километров. Между ними оно
-  интерполирует; локальные особенности (побережье, долины) передаёт только высота,
-  остальное модель набирает из истории модой P. Запоминание точек ограничивают полоса
-  частот координатных признаков и затухание матриц поля; его величину показывает отчёт
-  этапа A.
-- Смещение станции модель переносит на горизонт как константу плюс суточную
-  составляющую с фиксированным периодом 24 ч.
-- Дрейфа и ошибки масштаба прибора в обучении нет.
-- Эталон скилла — климатология самой станции с базисом грубее базиса климат-поля.
-- Основные таблицы считаются по станциям, которых модель не видела при обучении
-  (`unseen_test`).
+- модели и их источники — [`MODELS.md`](MODELS.md);
+- область применения, данные, обучение, оценка, калибровка, устройство и формулы —
+  [`METHODS.md`](METHODS.md);
+- JSON таблиц результатов — [`results/`](results/README.md).
 
 ## Установка
 
@@ -41,17 +19,17 @@
 ```bash
 git clone https://github.com/feyra-labs/tempcast.git
 cd tempcast
-uv sync --extra train --group dev   # PyTorch берётся из индекса CUDA 12.8, работает и на CPU
+uv sync --extra train --group dev   # PyTorch из индекса CUDA 12.8, работает и на CPU
 uv run pytest -q                    # тесты на синтетике, данные не нужны
 ```
 
-Все команды ниже запускаются из корня репозитория через `uv run`, у каждой есть `--help`.
-Установка на устройство — в разделе «Устройство».
+Команды ниже запускаются из корня репозитория. Справка: `--help` у скриптов на argparse,
+`uv run python scripts/run.py --help` у обучения.
 
 ## Данные
 
-Данные в репозиторий не входят и собираются скриптами. Нужна карта зон Кёппена — Гейгера
-с кодами 1..30, например `Beck_KG_V1_present_0p0083.tif` из Beck et al. (2018).
+Нужна карта зон Кёппена — Гейгера с кодами 1..30, например
+`Beck_KG_V1_present_0p0083.tif` (Beck et al., 2018).
 
 ```bash
 # обучающий набор: точки на суше, ERA5 из архивного API Open-Meteo, станции и манифест
@@ -68,12 +46,14 @@ uv run python scripts/make_ghcnh.py --raw data/ghcnh/raw --out data/ghcnh \
     --koppen Beck_KG_V1_present_0p0083.tif --dem open-meteo
 uv run python scripts/build_cache.py --manifest data/ghcnh/manifest.csv
 
-# доля ложных срабатываний QC на реанализе (по ней подбираются пороги QC)
+# доля ложных срабатываний QC на реанализе
 uv run python scripts/qc_false_alarms.py --manifest data/manifest.csv
-```
 
-Для проверки конвейера без скачивания: `uv run python scripts/make_synth.py`, затем
-`make_splits.py` и `build_cache.py` как выше.
+# синтетика вместо скачивания: проверка конвейера
+uv run python scripts/make_synth.py --out data
+uv run python scripts/make_splits.py --manifest data/manifest.csv
+uv run python scripts/build_cache.py --manifest data/manifest.csv
+```
 
 | путь | что это |
 |---|---|
@@ -87,82 +67,95 @@ uv run python scripts/qc_false_alarms.py --manifest data/manifest.csv
 | `data/ghcnh/manifest.csv` | станции внешнего теста, роль `external_test` |
 | `data/ghcnh/selection_report.csv` | причина исключения каждой станции GHCNh |
 
-Роли станций (`train`, `unseen_val`, `unseen_test`, `external_test`) и временные блоки
-описаны в [`METHODS.md`](METHODS.md), раздел «Данные и сплиты».
-
-Лицензии данных: Open-Meteo — CC BY 4.0, бесплатный API только для некоммерческого
-использования; ERA5 — Copernicus Climate Change Service; GHCNh — NOAA NCEI. Полные
-ссылки — в [`METHODS.md`](METHODS.md).
+Роли станций и временные блоки — [`METHODS.md`](METHODS.md), «Данные и сплиты»; источники
+и лицензии данных — там же, «Источники».
 
 ## Обучение
 
-Этап 1 сравнения: каждая нейросеть, включая МАЯК, проходит одну сетку скоростей обучения
-(`--lr-search`), затем полный прогон с выбранным значением.
+Единственный вход — `scripts/run.py` (Hydra, конфиги в `conf/`). Поток одинаков для всех
+моделей: подбор скорости обучения → выбор человеком lr и кандидата этапа A → этап B.
+Описание потока — [`METHODS.md`](METHODS.md), «Подбор скорости обучения».
+
+**1. Подбор скорости обучения** — МАЯК и бейзлайны:
 
 ```bash
-uv run python scripts/train.py --arch mayak --lr-search --accelerator gpu
-uv run python scripts/train_neurobaselines.py --lr-search --accelerator gpu   # gru, dlinear, lru, patchtst
+uv run python scripts/run.py run.lr_search=true
+uv run python scripts/run.py -m model=gru,dlinear,lru,patchtst run.lr_search=true
 ```
 
-Каталог прогона — `runs/<arch>/`: журнал `protocol.json` с записью о подборе, прогоны
-сетки `lr_search/<lr>/`, чекпойнты `stageA/best.ckpt` и `stageB/best.ckpt`. Отчёт о поле
-этапа A — `stageA/report.json` и `stageA/report/*.png`.
-
-Этап 2, необязательный: дополнительная настройка МАЯК любыми гиперпараметрами по
-валидации. Каталог `runs/mayak-tuned/`, в таблицах — отдельная строка.
+**2. Выбор lr и кандидата этапа A** — по таблице сетки (флаг `edge`) и отчёту этапа A:
 
 ```bash
-uv run python scripts/train.py --arch mayak --extra-tuning --lr 1e-3 --accelerator gpu
+cat runs/mayak/protocol.json                                    # запись подбора: tuning.lr_search
+ls runs/mayak/lr_search/lr0.001/stageA/candidates/              # кандидаты этапа A
+cat runs/mayak/lr_search/lr0.001/stageA/report.json             # отчёт этапа A, графики — report/
+uv run python scripts/stage_report.py --run runs/mayak/lr_search/lr0.001   # пересчёт отчёта
+uv run python scripts/diagnose_stage_a.py \
+    --ckpt runs/mayak/lr_search/lr0.001/stageA/candidates/step006000.ckpt
 ```
 
-Этапы по отдельности, с решением человека между ними:
+**3. Этап B** — в том же каталоге, с выбранного кандидата:
 
 ```bash
-uv run python scripts/train.py --arch mayak --stages A --accelerator gpu   # кандидаты и отчёт о поле
-uv run python scripts/stage_report.py a --run runs/mayak                   # пересчёт отчёта
-uv run python scripts/diagnose_stage_a.py --ckpt runs/mayak/stageA/best.ckpt
-uv run python scripts/train.py --arch mayak --stages B --accelerator gpu \
-    --init-from runs/mayak/stageA/candidates/<шаг>.ckpt --require-gate 1.05
-# пробный этап B с нескольких кандидатов и их сравнение
-uv run python scripts/train.py --arch mayak --stages B --probe-steps 20000 --accelerator gpu \
-    --init-from runs/mayak/stageA/candidates/<шаг>.ckpt --tag mayak-probe-<шаг>
-uv run python scripts/stage_report.py b --runs runs/mayak-probe-<шаг1> runs/mayak-probe-<шаг2>
+uv run python scripts/run.py 'run.stages=[B]' \
+    run.init_from=runs/mayak/lr_search/lr0.001/stageA/candidates/step006000.ckpt
+uv run python scripts/run.py model=gru 'run.stages=[B]' \
+    run.init_from=runs/gru/lr_search/lr0.0003/stageA/candidates/step008000.ckpt
+# другое значение сетки, чем минимум подбора: явный train.lr (в журнал как chosen_lr)
+uv run python scripts/run.py 'run.stages=[B]' train.lr=0.003 \
+    run.init_from=runs/mayak/lr_search/lr0.003/stageA/best.ckpt
 ```
 
-Отладочный прогон на CPU: `uv run python scripts/run.py train=debug run.accelerator=cpu`
-или `model=mayak_small` (уменьшенный МАЯК).
-
-### Абляции и сиды
-
-Абляции и повторы с другими сидами берут скорость обучения основного МАЯК (`--lr-from`).
-Абляции: `no_compression`, `no_passport`, `no_solar`, `no_mode_groups`, `no_offset_aug`,
-`no_correction`, `no_persistent`; `none` — полная модель. Что снимает каждая —
-[`MODELS.md`](MODELS.md), раздел «Абляции».
+**4. Абляции, сиды, без аугментаций** — lr основного МАЯК (`run.lr_from`), этап A → выбор
+кандидата → этап B:
 
 ```bash
-ABLATIONS="no_compression no_passport no_solar no_mode_groups no_offset_aug no_correction no_persistent"
-for a in $ABLATIONS; do      # runs/mayak-<абляция>/
-    uv run python scripts/train.py --arch mayak --ablate $a --lr-from runs/mayak --accelerator gpu
-done
-for s in 1 2; do             # runs/mayak-s<сид>/
-    uv run python scripts/train.py --arch mayak --seed $s --tag mayak-s$s --lr-from runs/mayak \
-        --accelerator gpu
-done
+# этап A: runs/mayak-<абляция>, runs/mayak-s1, runs/mayak-s2, runs/mayak-aug_none
+uv run python scripts/run.py -m 'run.stages=[A]' run.lr_from=runs/mayak \
+    ablation=no_compression,no_passport,no_solar,no_mode_groups,no_offset_aug,no_correction,no_persistent
+uv run python scripts/run.py -m train.seed=1,2 run.lr_from=runs/mayak 'run.stages=[A]'
+uv run python scripts/run.py augment=none run.lr_from=runs/mayak 'run.stages=[A]'
+
+# этап B: для каждого каталога свой кандидат, выбранный по stageA/report.json
+uv run python scripts/run.py ablation=no_solar run.lr_from=runs/mayak 'run.stages=[B]' \
+    run.init_from=runs/mayak-no_solar/stageA/candidates/step006000.ckpt
+uv run python scripts/run.py train.seed=1 run.lr_from=runs/mayak 'run.stages=[B]' \
+    run.init_from=runs/mayak-s1/stageA/candidates/step006000.ckpt
+uv run python scripts/run.py augment=none run.lr_from=runs/mayak 'run.stages=[B]' \
+    run.init_from=runs/mayak-aug_none/stageA/candidates/step006000.ckpt
 ```
 
-То же через Hydra: `uv run python scripts/run.py -m ablation=no_compression,no_solar
-run.lr_from=runs/mayak`; каталог — `runs/mayak-<абляция>-s<сид>/`, конфиги — `conf/`.
-
-### Профили аугментаций
-
-Профили — `default` (по умолчанию) и `none` (`conf/augment/`). Прогон без аугментаций
-задаётся только через Hydra и получает свой каталог:
+**5. Этап 2, необязательный** — дополнительная настройка МАЯК любыми переопределениями:
 
 ```bash
-uv run python scripts/run.py augment=none run.lr_from=runs/mayak   # runs/mayak-none-aug_none-s0/
-uv run python -m mayak.evaluate --ckpt runs/mayak-none-aug_none-s0/stageB/best.ckpt \
-    --external-manifest data/ghcnh/manifest.csv --results-dir results/augment_none
+uv run python scripts/run.py run.extra_tuning=true train.lr=0.001 model.encoder_width=64
+uv run python scripts/run.py run.extra_tuning=true run.lr_search=true model.encoder_width=64
 ```
+
+**Отладка на CPU:**
+
+```bash
+uv run python scripts/run.py train=debug run.accelerator=cpu run.out_root=runs/debug
+uv run python scripts/run.py train=debug run.accelerator=cpu run.out_root=runs/debug \
+    run.lr_search=true
+```
+
+| каталог прогона | команда |
+|---|---|
+| `runs/<arch>` | `model=<arch>` |
+| `runs/mayak-<абляция>` | `ablation=<абляция>` |
+| `runs/mayak-s<сид>` | `train.seed=<сид>` |
+| `runs/mayak-aug_none` | `augment=none` |
+| `runs/mayak-tuned` | `run.extra_tuning=true` |
+
+| путь в каталоге прогона | что это |
+|---|---|
+| `protocol.json` | журнал: протокол, сиды, запись подбора, этапы |
+| `config.json` | полностью разрешённый конфиг прогона |
+| `lr_search/lr<X>/stageA/` | этап A прогона сетки: `best.ckpt`, `candidates/`, `report.json`, `report/` |
+| `lr_search/lr<X>/stageB/` | короткий этап B прогона сетки |
+| `stageA/` | этап A, обученный в самом каталоге (абляции, сиды, `augment=none`, этап 2, отладка): `best.ckpt`, `candidates/`, `report.json`, `report/` |
+| `stageB/best.ckpt` | итоговый чекпойнт |
 
 Эталонные окна аугментаций и их действие на QC: `uv run python scripts/aug_reference.py`.
 
@@ -180,12 +173,19 @@ uv run python -m mayak.evaluate --ckpt runs/mayak/stageB/best.ckpt \
     --conformal runs/conformal.npy --external-manifest data/ghcnh/manifest.csv \
     --bootstrap 1000 --save-preds runs/preds --results-dir results/evaluate
 
-# таблица 7: абляции и сиды
-uv run python -m mayak.evaluate --ckpt runs/mayak/stageB/best.ckpt \
+# таблица 7: абляции и сиды, ERA5 и GHCNh
+ABLATIONS="no_compression no_passport no_solar no_mode_groups no_offset_aug no_correction no_persistent"
+uv run python -m mayak.evaluate \
+    --ckpt runs/mayak/stageB/best.ckpt \
+           runs/mayak-s1/stageB/best.ckpt runs/mayak-s2/stageB/best.ckpt \
     --ablation-ckpt $(for a in $ABLATIONS; do echo runs/mayak-$a/stageB/best.ckpt; done) \
-    --results-dir results/ablations
-uv run python -m mayak.evaluate --ckpt runs/mayak/stageB/best.ckpt \
-    runs/mayak-s1/stageB/best.ckpt runs/mayak-s2/stageB/best.ckpt --results-dir results/seeds
+    --external-manifest data/ghcnh/manifest.csv \
+    --results-dir results/ablations --out-dir runs/plots/ablations
+
+# таблица 12: профиль аугментаций none
+uv run python -m mayak.evaluate --ckpt runs/mayak-aug_none/stageB/best.ckpt \
+    --external-manifest data/ghcnh/manifest.csv \
+    --results-dir results/augment_none --out-dir runs/plots/augment_none
 
 # разрезы покрытия и офлайн-прогон адаптивной калибровки по сохранённым предсказаниям
 uv run python -m mayak.calibration --preds runs/preds/internal.npz \
@@ -197,18 +197,16 @@ uv run python -m mayak.robustness --ckpt runs/mayak/stageB/best.ckpt \
     --external-manifest data/ghcnh/manifest.csv --out-dir results/robustness
 ```
 
-Параметры калибровки — `conf/calibration/default.yaml`, робастности —
-`conf/robustness/default.yaml`. Стенд оценки отказывает, если модели обучены по разным
-протоколам или без записи о подборе скорости обучения по одной сетке.
+| конфиг | что задаёт |
+|---|---|
+| `conf/calibration/default.yaml` | калибровка и офлайн-прогон адаптивной калибровки |
+| `conf/robustness/default.yaml` | сценарии и уровни робастности |
 
 ## Результаты
 
-Чисел пока нет: таблицы заполняются из JSON в [`results/`](results/README.md). Основной
-внутренний набор — станции `unseen_test` в тестовом году; основные таблицы — при полной
-истории 672 ч, по сырым выходам моделей. В ячейке «пул / макро»; в JSON у каждого числа
-интервал бутстрапа по станциям (90 %). Как считаются метрики — [`METHODS.md`](METHODS.md),
-раздел «Оценка». Строка «МАЯК (доп. настройка)†» появляется только с `--tuned-ckpt` и в
-сравнение на равных не входит.
+Чисел пока нет: таблицы заполняются из JSON в [`results/`](results/README.md). В ячейке
+«пул / макро», интервалы бутстрапа — в JSON. Наборы, метрики и строка «МАЯК (доп.
+настройка)†» — [`METHODS.md`](METHODS.md), «Оценка».
 
 **1. Метрики по лидам, новые станции** — `results/evaluate/internal/metrics.json`
 
@@ -263,9 +261,6 @@ uv run python -m mayak.robustness --ckpt runs/mayak/stageB/best.ckpt \
 <details>
 <summary>3–4. Роли станций, сезоны, зоны Кёппена, лид 24 ч, МАЯК — <code>results/evaluate/internal/breakdowns.json</code>, <code>results/evaluate/train_stations/metrics.json</code></summary>
 
-Строка «обучающие» — набор обучающих станций в тестовом году
-(`results/evaluate/train_stations/`), остальные строки — новые станции.
-
 | срез | Skill пул | Skill макро | MAE | CRPS | PICP90 | станций |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
 | обучающие (train) | — | — | — | — | — | — |
@@ -316,21 +311,20 @@ uv run python -m mayak.robustness --ckpt runs/mayak/stageB/best.ckpt \
 | 25–72 ч | — | — | — | — | — | — |
 | 73–168 ч | — | — | — | — | — | — |
 
-По длине истории, весь горизонт: «до» — `reliability.json` (`coverage.report`, разрез
-«длина истории»), «после» — `calibrated.json` (`report`, тот же разрез).
+По запрошенной длине истории, весь горизонт: «до» — `reliability.json` (`coverage.report`,
+разрез «длина истории»), «после» — `calibrated.json` (`report`, тот же разрез).
 
-| бин таблицы | длина истории | PICP90 до | PICP90 после | ширина 90 до, °C | ширина 90 после, °C |
-|---|:-:|:-:|:-:|:-:|:-:|
-| L=0 | 0 ч | — | — | — | — |
-| 1–24 ч | 6 ч | — | — | — | — |
-| 1–24 ч | 24 ч | — | — | — | — |
-| 25–168 ч | 72 ч | — | — | — | — |
-| 25–168 ч | 168 ч | — | — | — | — |
-| 169–672 ч | 336 ч | — | — | — | — |
-| 169–672 ч | 672 ч | — | — | — | — |
+| длина истории | PICP90 до | PICP90 после | ширина 90 до, °C | ширина 90 после, °C |
+|---|:-:|:-:|:-:|:-:|
+| 0 ч | — | — | — | — |
+| 6 ч | — | — | — | — |
+| 24 ч | — | — | — | — |
+| 72 ч | — | — | — | — |
+| 168 ч | — | — | — | — |
+| 336 ч | — | — | — | — |
+| 672 ч | — | — | — | — |
 
-Адаптивная калибровка устройства, офлайн-прогон с ежечасным выпуском: 8 станций × 720 ч
-(`calibrated.json`, ключ `aci`).
+Офлайн-прогон адаптивной калибровки устройства (`calibrated.json`, ключ `aci`):
 
 | бин лидов | PICP90 без ACI | PICP90 с ACI | ширина 90 без, °C | ширина 90 с, °C | обратных связей | θ в конце, медиана |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|
@@ -344,7 +338,7 @@ uv run python -m mayak.robustness --ckpt runs/mayak/stageB/best.ckpt \
 
 Подгонка таблицы на калибровочных окнах, в выборке — `results/calibration/conformal.report.json`:
 
-| бин длины истории | окон | строка таблицы | PICP90 до | PICP90 после |
+| бин валидных часов истории | окон | строка таблицы | PICP90 до | PICP90 после |
 |---|:-:|:-:|:-:|:-:|
 | L=0 | — | — | — | — |
 | 1–24 ч | — | — | — | — |
@@ -354,7 +348,31 @@ uv run python -m mayak.robustness --ckpt runs/mayak/stageB/best.ckpt \
 </details>
 
 <details>
-<summary>7. Абляции и сиды — <code>results/ablations/internal/metrics.json</code>, <code>results/seeds/internal/seeds.json</code></summary>
+<summary>7. Абляции и сиды — <code>results/ablations/{internal,external}/{metrics,seeds}.json</code></summary>
+
+Правило значимости — [`METHODS.md`](METHODS.md), раздел «Абляции и сиды».
+
+ERA5, станции `unseen_test` (`internal/metrics.json`, `internal/seeds.json`):
+
+| вариант | Skill@24 | Skill@72 | Skill@168 | CRPS@24 | PICP90@24 |
+|---|:-:|:-:|:-:|:-:|:-:|
+| МАЯК (эталон абляций, `none`) | — | — | — | — | — |
+| МАЯК [mayak-no_compression] | — | — | — | — | — |
+| МАЯК [mayak-no_passport] | — | — | — | — | — |
+| МАЯК [mayak-no_solar] | — | — | — | — | — |
+| МАЯК [mayak-no_mode_groups] | — | — | — | — | — |
+| МАЯК [mayak-no_offset_aug] | — | — | — | — | — |
+| МАЯК [mayak-no_correction] | — | — | — | — | — |
+| МАЯК [mayak-no_persistent] | — | — | — | — | — |
+
+| метрика, 3 сида | среднее | мин | макс | ст. откл. |
+|---|:-:|:-:|:-:|:-:|
+| Skill@24 | — | — | — | — |
+| MAE@24 | — | — | — | — |
+| CRPS@24 | — | — | — | — |
+| PICP90@24 | — | — | — | — |
+
+GHCNh, станции `external_test` (`external/metrics.json`, `external/seeds.json`):
 
 | вариант | Skill@24 | Skill@72 | Skill@168 | CRPS@24 | PICP90@24 |
 |---|:-:|:-:|:-:|:-:|:-:|
@@ -485,9 +503,9 @@ cp runs/bench_device/results.json results/device/bench.json
 
 ## Устройство
 
-На устройство копируются пакет `mayak` без дополнительных групп и каталог экспорта
-модели. Нужны 64-битная ОС (aarch64 или x86_64, например Raspberry Pi 3/4/5 с 64-битной
-Raspberry Pi OS) и Python 3.11+.
+Нужны 64-битная ОС (aarch64 или x86_64, например Raspberry Pi 3/4/5 с 64-битной Raspberry
+Pi OS) и Python 3.11+. Работа устройства — [`METHODS.md`](METHODS.md), «Устройство» и
+«Калибровка».
 
 **1. Экспорт** (на рабочей машине): два графа ONNX, манифест и конформная таблица.
 
@@ -496,8 +514,7 @@ uv run python scripts/export_runtime.py --ckpt runs/mayak/stageB/best.ckpt \
     --conformal runs/conformal.npy --aci --out runtime/model
 ```
 
-**2. Установка.** Пакет собирается на рабочей машине или ставится из git по тегу в
-виртуальное окружение на устройстве; ставятся только `numpy` и `onnxruntime`.
+**2. Установка** в виртуальное окружение на устройстве, только `numpy` и `onnxruntime`.
 
 ```bash
 ssh pi@device 'sudo mkdir -p /opt/mayak /var/lib/mayak && sudo chown $USER /opt/mayak /var/lib/mayak'
@@ -514,8 +531,8 @@ scp -r runtime/model pi@device:/opt/mayak/model
 ssh pi@device '/opt/mayak/venv/bin/python -m mayak.runtime.run_inference --help'
 ```
 
-**3. Запуск.** Хост читает команды со stdin по одной на строку и отвечает строкой JSON.
-Координаты и высота точки над уровнем моря (`--lat`, `--lon`, `--elev`) обязательны.
+**3. Запуск.** Команды — со stdin по одной на строку, ответ — строка JSON. `--lat`,
+`--lon`, `--elev` обязательны.
 
 ```bash
 printf 'obs 1767225600 11 1012.4 81\nforecast\nstatus\n' | \
@@ -530,27 +547,20 @@ printf 'obs 1767225600 11 1012.4 81\nforecast\nstatus\n' | \
 | `status` | сводка, поля ниже |
 | ошибка любой команды | `{"error": "..."}`, хост продолжает работу |
 
-Состояние пишется в `--state-dir` после каждого `obs` (`state_a.bin`, `state_b.bin`).
-Прибор рассчитан на ежечасный выпуск: `forecast` отправляется после каждого `obs`. С
-`--aci` интервал подстраивается адаптивной калибровкой; правило и поведение при выпуске
-реже раза в час — [`METHODS.md`](METHODS.md), раздел «Калибровка». Высоту нужно указать
-сразу: смена точки больше порогов манифеста (0,5° по координатам, 100 м по высоте)
-считается переносом прибора.
-
 | поле `status` | что это |
 |---|---|
-| `filled`, `history_hours` | часов в окне после холодного старта; длина истории, по которой выбирается строка конформной таблицы (не больше 672) |
+| `filled` | часов в окне после холодного старта |
+| `valid_hours` | часов с валидной температурой во входе модели; по ним выбирается строка конформной таблицы (не больше 672) |
 | `theta`, `aci_lead_bins` | θ по бинам лидов и сами бины, ч |
 | `aci_updates`, `aci_misses` | обратных связей и промахов по бинам лидов с последнего сброса |
 | `conformal` | применяется ли конформная таблица |
-| `state_bytes` | размер состояния на диске: 3236 Б |
+| `state_bytes` | размер состояния на диске: 3236 Б (`state_a.bin`, `state_b.bin` в `--state-dir`) |
 | `memory_bytes` | окно, таблица климатологии и при `--aci` кольцо калибровки: 82 368 Б без `--aci`, 95 808 Б с ним |
 | `site`, `loaded_site`, `site_change` | точка прибора, точка загруженного состояния и исход сравнения: `same`, `refined`, `moved` |
 | `idle_hours`, `fallbacks`, `last_unix_hour` | простой, откаты к климатологии, последний час |
 | `rss_bytes`, `peak_rss_bytes` | память процесса |
 
-**4. Служба.** Программа датчика пишет строки в именованный канал, хост работает службой
-systemd на Python из окружения:
+**4. Служба systemd**, датчик пишет строки в именованный канал:
 
 ```ini
 # /etc/systemd/system/mayak.service
@@ -576,9 +586,12 @@ echo "obs $(date -u +%s -d "$(date -u +%Y-%m-%dT%H:00:00)") 11 1012.4 81" > /run
 echo forecast > /run/mayak/in && tail -n 1 /var/lib/mayak/out.jsonl
 ```
 
-На рабочей машине тот же хост открывает чекпойнт напрямую:
-`uv run python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt
---conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2`.
+**5. Хост на рабочей машине** прямо по чекпойнту:
+
+```bash
+uv run python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt \
+    --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2
+```
 
 ## Скрипты
 
@@ -595,10 +608,8 @@ echo forecast > /run/mayak/in && tail -n 1 /var/lib/mayak/out.jsonl
 | `scripts/qc_false_alarms.py` | доля ложных срабатываний QC на реанализе, по ней подбираются пороги |
 | `scripts/make_qc_golden.py` | перегенерация регрессионного вектора QC, только при смене правил |
 | `scripts/aug_reference.py` | эталонные окна аугментаций и их действие на QC |
-| `scripts/train.py` | обучение одной архитектуры по протоколу: подбор lr, этапы, абляции, этап 2 |
-| `scripts/train_neurobaselines.py` | обучение всех нейробейзлайнов той же функцией |
-| `scripts/run.py` | обучение через Hydra: композиция конфигов, групповые запуски, профили аугментаций |
-| `scripts/stage_report.py` | отчёт о поле после этапа A и сравнение пробных запусков этапа B |
+| `scripts/run.py` | обучение, единственный вход: подбор lr, этапы, абляции, сиды, профили аугментаций, этап 2 |
+| `scripts/stage_report.py` | пересчёт отчёта этапа A: `--run <каталог прогона или прогона сетки>` |
 | `scripts/diagnose_stage_a.py` | диагностика поля после этапа A |
 | `scripts/calibrate.py` | подгонка конформной таблицы МАЯК |
 | `scripts/export_runtime.py` | экспорт графов, манифеста и таблицы для устройства |
@@ -606,17 +617,19 @@ echo forecast > /run/mayak/in && tail -n 1 /var/lib/mayak/out.jsonl
 
 | модуль | назначение |
 |---|---|
-| `python -m mayak.evaluate` | стенд оценки: таблицы 1–8 и 11 |
+| `python -m mayak.evaluate` | стенд оценки: таблицы 1–8, 11, 12 |
 | `python -m mayak.calibration` | разрезы покрытия и офлайн-прогон адаптивной калибровки по сохранённым предсказаниям |
 | `python -m mayak.robustness` | сценарии робастности обученной модели |
 | `python -m mayak.runtime.run_inference` | хост устройства |
 
 | конфиг | назначение |
 |---|---|
-| `conf/model/` | архитектуры: `mayak`, `mayak_small` (уменьшенный МАЯК для отладки на CPU), `gru`, `dlinear`, `lru`, `patchtst` |
+| `conf/config.yaml` | корневой конфиг Hydra: секция `run` (подбор, этапы, `lr_from`, этап 2), каталоги прогонов |
+| `conf/model/` | архитектуры: `mayak`, `gru`, `dlinear`, `lru`, `patchtst` |
 | `conf/ablation/` | `none` и семь абляций МАЯК |
 | `conf/augment/` | профили аугментаций `default` и `none` |
-| `conf/data/`, `conf/train/` | данные и протокол обучения; `train/debug.yaml` — отладка на CPU |
+| `conf/data/` | данные, раскладка времени, набор валидации, параметры аугментаций |
+| `conf/train/` | протокол обучения; `train/debug.yaml` — отладка на CPU |
 | `conf/calibration/`, `conf/robustness/`, `conf/runtime/` | калибровка, робастность, пороги смены точки устройства |
 
 ## Структура

@@ -25,7 +25,8 @@
 интервалами блочного бутстрапа по станциям, разрезы по зонам Кёппена, сезонам и доле
 валидных часов истории, внешний тест на наблюдениях реальной сети с его собственными
 разрезами и сопоставлением с внутренним тестом, проверки поля при холодном старте,
-суточные амплитуды и строки переобученных абляций.
+суточные амплитуды, строки переобученных абляций и разброс основной модели по сидам на
+внутреннем и внешнем наборах.
 
 Модели сравниваются на равных: у каждого чекпойнта есть запись о подборе скорости
 обучения по одной и той же сетке с одним и тем же числом шагов. Прогон дополнительной
@@ -495,6 +496,30 @@ def print_seed_spread(evs_by_seed, lead=24):
             continue
         print(f"{m:>10} {s['mean']:>10.3f} {s['min']:>10.3f} {s['max']:>10.3f} {s['std']:>10.3f}")
     return dict(lead=int(lead), n_seeds=len(evs_by_seed), metrics=spread)
+
+
+def seed_spread_table(models, res, ds, lead=24):
+    """Разброс метрик основной модели по сидам на окнах одного набора при полной истории.
+
+    Первая модель - основная: её предсказания уже есть в результате оценки набора.
+    Остальные - та же модель, обученная с другими сидами; они прогоняются по тем же окнам и
+    оцениваются по тем же целям и эталону. По этому разбросу проверяется значимость
+    разницы абляций с полной моделью на том же наборе.
+
+    Args:
+        models: модели основной архитектуры с разными сидами, основная первой.
+        res: результат оценки набора (``evaluate_set``) с основной моделью.
+        ds: тот же набор окон.
+        lead: лид, ч.
+
+    Returns:
+        Таблица разброса, как у ``print_seed_spread``.
+    """
+    preds, aux = res["bench"].preds, res["bench"].aux
+    nominal = ds.with_history(NOMINAL_HISTORY)
+    evs = [evaluation_for(preds[MAIN_MODEL], aux)]
+    evs += [evaluation_for(dict(zip(("mu", "q"), _mu_q(m, nominal))), aux) for m in models[1:]]
+    return print_seed_spread(evs, lead=lead)
 
 
 def zone_breakdown(preds, aux, koppen=None, leads=(24, 72), model="МАЯК",
@@ -1396,7 +1421,8 @@ def main():
     ap = argparse.ArgumentParser(description="единый стенд оценки МАЯК")
     ap.add_argument("--ckpt", required=True, nargs="+",
                     help="чекпойнты МАЯК; несколько = прогоны с разными сидами (повторы "
-                         "берут скорость обучения первого: scripts/run.py run.lr_from=...)")
+                         "берут скорость обучения первого: scripts/run.py run.lr_from=...), "
+                         "разброс по сидам - таблица seeds внутреннего и внешнего набора")
     ap.add_argument("--manifest", default="data/manifest.csv")
     for arch, name in NEURAL_BASELINES.items():
         ap.add_argument(f"--{arch}-ckpt", default=None,
@@ -1532,11 +1558,8 @@ def main():
             print("Предсказания:", p)
 
     tables = evaluation_tables(res)
-    nominal_ds = base.with_history(NOMINAL_HISTORY)
     if len(seeds) > 1:
-        evs = [evaluation_for(dict(zip(("mu", "q"), _mu_q(m, nominal_ds))), aux)
-               for m in seeds[1:]]
-        tables["seeds"] = print_seed_spread([evaluation_for(preds[MAIN_MODEL], aux)] + evs)
+        tables["seeds"] = seed_spread_table(seeds, res, base)
 
     print("\n=== Графики (сырые выходы) ===")
     for p in plot_metric_curves(build_tables(preds, aux), args.out_dir):
@@ -1580,8 +1603,11 @@ def main():
             for p in save_bench(res_e, args.save_preds, "external", shift=shift,
                                 info=dict(info, manifest=args.external_manifest)):
                 print("Предсказания:", p)
+        ext = dict(evaluation_tables(res_e), transfer=transfer_tables(tr_e))
+        if len(seeds) > 1:
+            print("\n=== Разброс по сидам, внешний тест ===")
+            ext["seeds"] = seed_spread_table(seeds, res_e, ds_e)
         if args.results_dir:
-            ext = dict(evaluation_tables(res_e), transfer=transfer_tables(tr_e))
             written += write_tables(ext, os.path.join(args.results_dir, "external"),
                                     set_record(record, ds_e))
 

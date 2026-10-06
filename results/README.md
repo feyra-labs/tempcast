@@ -16,7 +16,7 @@
 | набор данных (`data/fetch_meta.json`, ключ кэша) | — |
 | чекпойнт МАЯК | — |
 | чекпойнты бейзлайнов | — |
-| чекпойнты абляций и сидов | — |
+| чекпойнты абляций и сидов (`runs/mayak-<абляция>`, `runs/mayak-s1`, `runs/mayak-s2`) | — |
 | чекпойнт МАЯК без аугментаций (`augment=none`) | — |
 | чекпойнт дополнительной настройки МАЯК (этап 2) | — |
 | конформная таблица | — |
@@ -33,8 +33,8 @@
 | `evaluate/internal/calibrated.json`, `evaluate/internal/reliability.json` | 6. После калибровки: тестовые окна и офлайн-прогон адаптивной калибровки |
 | `calibration/conformal.report.json` | 6. Подгонка таблицы: калибровочные окна, в выборке |
 | `evaluate/internal/coldstart.json` | проверка поля при нулевой истории |
-| `ablations/internal/metrics.json` | 7. Абляции |
-| `seeds/internal/seeds.json` | 7. Сиды |
+| `ablations/internal/metrics.json`, `ablations/internal/seeds.json` | 7. Абляции и сиды, ERA5 (`unseen_test`) |
+| `ablations/external/metrics.json`, `ablations/external/seeds.json` | 7. Абляции и сиды, GHCNh (`external_test`) |
 | `evaluate/external/*.json` | 8. Внешний тест, в том числе `transfer.json` |
 | `robustness/robustness.json` | 9. Робастность |
 | `device/bench.json` | 10. Устройство |
@@ -43,5 +43,5 @@
 
 Строка «МАЯК (доп. настройка)†» есть в файлах `evaluate/` только тогда, когда оценка шла с
 `--tuned-ckpt`; запись о прогоне помечает её как неравную бейзлайнам. Стенды оценки
-абляций, сидов и профиля `none` пишут в свои каталоги и остальные таблицы набора; в README
+абляций с сидами и профиля `none` пишут в свои каталоги и остальные таблицы набора; в README
 из них берутся только перечисленные выше.
