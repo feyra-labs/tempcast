@@ -25,16 +25,21 @@ run:
   # Чекпойнт предыдущего этапа, с которого стартует первый запускаемый этап, если он в
   # протоколе не первый. Выбирает человек по отчёту этапа A (stageA/report.json и
   # графики stageA/report/); пересчёт отчёта: scripts/stage_report.py --run <каталог>.
+  # После подбора - кандидат из lr_search/lr<X>/stageA/ этого прогона, где X - выбранная
+  # подбором скорость или явный train.lr из сетки.
   init_from: null
   # Этапы, у которых чекпойнт сохраняется после каждой валидации; null - этап холодного
   # старта, [] - ни один.
   candidates: null
   # Подбор скорости обучения, этап 1 сравнения: на каждом значении train.lr_grid полный
-  # этап A и этап B на train.lr_search_steps шагов, выбор по val/loss, затем полный
-  # прогон с выбранным значением. Идёт одной командой по всем этапам.
+  # этап A с кандидатами и этап B на train.lr_search_steps шагов в lr_search/lr<X>/,
+  # минимум по val/loss и флаг edge (минимум на краю сетки) в журнал protocol.json.
+  # Полного прогона нет: этап B запускается отдельно (run.stages=[B] run.init_from=...)
+  # в том же каталоге, скорость - минимум или явный train.lr из сетки (chosen_lr).
   lr_search: false
-  # Каталог прогона основного МАЯК: из его журнала берутся выбранная скорость обучения и
-  # запись о подборе, подбор не повторяется. Для абляций и повторов с другими сидами.
+  # Каталог прогона основного МАЯК: из его журнала берутся скорость обучения и запись о
+  # подборе, подбор не повторяется. Для абляций, повторов с другими сидами и
+  # augment=none: run.stages=[A], выбор кандидата, run.stages=[B] run.init_from=...
   lr_from: null
   # Дополнительная настройка МАЯК, этап 2 сравнения: любые гиперпараметры по валидации,
   # свой каталог, отдельная строка таблиц, в сравнение на равных не входит.
@@ -60,15 +65,14 @@ hydra:
 
       Примеры:
         python scripts/run.py train=debug run.accelerator=cpu      # отладка: runs/mayak
-        python scripts/run.py model=gru                            # runs/gru
-        python scripts/run.py -m model=gru,dlinear,lru,patchtst    # runs/gru, runs/dlinear, ...
-        python scripts/run.py run.lr_search=true    # этап 1: подбор lr, затем полный прогон
+        python scripts/run.py run.lr_search=true    # этап 1: только подбор lr
         python scripts/run.py -m model=gru,dlinear,lru,patchtst run.lr_search=true
-        python scripts/run.py run.stages=[A]        # только этап A, затем отчёт о поле
-        python scripts/run.py run.stages=[B] run.init_from=runs/mayak/stageA/candidates/step006000.ckpt
-        python scripts/run.py -m ablation=no_compression,no_solar run.lr_from=runs/mayak
-        python scripts/run.py -m train.seed=1,2 run.lr_from=runs/mayak   # runs/mayak-s1, -s2
-        python scripts/run.py augment=none run.lr_from=runs/mayak        # runs/mayak-aug_none
+        python scripts/run.py run.stages=[B] run.init_from=runs/mayak/lr_search/lr0.001/stageA/candidates/step006000.ckpt
+        python scripts/run.py run.stages=[B] train.lr=0.003 run.init_from=runs/mayak/lr_search/lr0.003/stageA/best.ckpt
+        python scripts/run.py -m ablation=no_compression,no_solar run.lr_from=runs/mayak run.stages=[A]
+        python scripts/run.py ablation=no_solar run.lr_from=runs/mayak run.stages=[B] run.init_from=runs/mayak-no_solar/stageA/candidates/step006000.ckpt
+        python scripts/run.py -m train.seed=1,2 run.lr_from=runs/mayak run.stages=[A]  # runs/mayak-s1, -s2
+        python scripts/run.py augment=none run.lr_from=runs/mayak run.stages=[A]       # runs/mayak-aug_none
         python scripts/run.py run.extra_tuning=true train.lr=0.001 model.encoder_width=64
                                                     # этап 2: доп. настройка, runs/mayak-tuned
 

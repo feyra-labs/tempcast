@@ -26,8 +26,9 @@ run_protocol. Для любой архитектуры одинаковы:
 в журнал прогона и в чекпойнт.
 
 Этапы можно запускать по отдельности: этап A, потом, после просмотра отчёта о поле,
-этап B с выбранного человеком чекпойнта этапа A. При подборе скорости обучения этапы идут
-одной командой, и этап B стартует с лучшего по валидации чекпойнта этапа A.
+этап B с выбранного человеком чекпойнта этапа A. Подбор скорости обучения только
+подбирает: на каждом значении сетки идёт этап A и короткий этап B, а этап B полной длины
+человек запускает отдельно с выбранного им кандидата этапа A из прогона сетки.
 
 Какие этапы запускать, с какого чекпойнта стартовать и сохранение кандидатов в протокол
 не входят: этап B, запущенный отдельной командой с лучшего чекпойнта A, получает тот же
@@ -307,8 +308,9 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
 
     Этап, который в протоколе идёт не первым, стартует с лучшего чекпойнта предыдущего
     этапа, если этапы идут одной командой, или с явно указанного чекпойнта, если этап
-    запущен отдельно. Каждый этап идёт ровно ``steps`` шагов со своим расписанием WSD,
-    без ранней остановки; чекпойнт этапа - лучший по метрике выбора среди всех
+    запущен отдельно; после подбора скорости обучения - с чекпойнта прогона сетки.
+    Каждый этап идёт ровно ``steps`` шагов со своим расписанием WSD, без ранней
+    остановки; чекпойнт этапа - лучший по метрике выбора среди всех
     валидаций. Номер этапа в протоколе задаёт его сид инициализации, поэтому этап,
     запущенный отдельно, повторяет тот же этап прогона одной командой.
 
@@ -318,10 +320,14 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     этап; код ничего не решает за него. Сводка отчёта о стартовом чекпойнте, если отчёт о
     нём есть, пишется в запись следующего этапа о том, откуда он стартовал.
 
-    При подборе скорости обучения сначала на каждом значении сетки протокола идёт прогон
-    с полным первым этапом и укороченным последним в подкаталоге ``lr_search`` каталога
-    прогона, затем полный прогон с выбранным значением. Запись о подборе, своём или
-    взятом из журнала основного прогона, пишется в журнал и в каждый чекпойнт.
+    При подборе скорости обучения на каждом значении сетки протокола идёт прогон с
+    полными этапами, кроме последнего, и укороченным последним в подкаталоге
+    ``lr_search`` каталога прогона. Запись о подборе пишется в журнал каталога прогона, и
+    запуск на этом заканчивается. Следующий запуск в том же каталоге с
+    ``run.stages=[B]`` берёт запись из журнала, проверяет, что чекпойнт инициализации -
+    из прогона сетки с этой скоростью обучения, и обучает этап B полной длины. Запись о
+    подборе, своём или взятом из журнала основного прогона, пишется в журнал и в каждый
+    чекпойнт.
 
     Полностью разрешённый конфиг пишется в config.json в каталоге прогона, рядом с каждым
     чекпойнтом и внутрь него.
@@ -345,11 +351,13 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
             скорость обучения из протокола без записи о подборе.
 
     Returns:
-        Журнал прогона; он же лежит в protocol.json в каталоге прогона.
+        Журнал прогона; он же лежит в protocol.json в каталоге прогона. После подбора в
+        нём нет записей об этапах.
 
     Raises:
         ProtocolError: неверный выбор этапов; этап не сохранил ни одного чекпойнта;
-            подбор скорости обучения невозможен или его источник не подходит.
+            подбор скорости обучения невозможен или его источник не подходит; запуск
+            затёр бы запись о подборе в журнале каталога.
         InitCheckpointError: чекпойнт инициализации не подходит этому запуску.
     """
     import pytorch_lightning as L
@@ -390,8 +398,8 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
         return j, os.path.abspath(os.path.join(out_root, sub_tag, JOURNAL))
 
     TU.check_run_dir(journal_path, tuning)
-    protocol, tune = TU.resolve(arch, protocol, tuning, launch, model_cfg, tag,
-                                train_candidate)
+    protocol, tune, after_search = TU.resolve(arch, protocol, tuning, launch, model_cfg, tag,
+                                              train_candidate, journal_path)
     for line in TU.format_tuning(tune):
         log.info("%s: %s", arch, line)
     if data_config is None:
@@ -414,10 +422,15 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     if first > 0:
         prev_stage = protocol.stages[first - 1]
         prev_val = validation_set(store, manifest, data_cfg, prev_stage.curriculum)
-        prev = ST.inspect_init_checkpoint(launch.init_from, arch=arch, protocol=protocol,
+        init_protocol, init_tune = protocol, tune
+        if after_search and TU.search_init(launch.init_from, run_dir, protocol.lr,
+                                           prev_stage.name):
+            # Прогон сетки шёл с укороченным последним этапом и без записи о подборе.
+            init_protocol, init_tune = TU.search_protocol(protocol, protocol.lr), None
+        prev = ST.inspect_init_checkpoint(launch.init_from, arch=arch, protocol=init_protocol,
                                           model_config=model_cfg, data_config=data_cfg,
                                           stage=prev_stage, store=store,
-                                          val_digest=prev_val.fingerprint(), tuning=tune)
+                                          val_digest=prev_val.fingerprint(), tuning=init_tune)
         if prev_stage.curriculum == ST.FIELD_CURRICULUM:
             # Сводка отчёта нужна только журналу. Если отчёта о стартовом чекпойнте нет,
             # он здесь не пересчитывается: это делает scripts/stage_report.py.
@@ -432,6 +445,12 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
                 protocol=protocol.to_dict(),
                 manifest=os.path.abspath(manifest), seeds=seeds, config_file=CONFIG_FILE,
                 augment=data_cfg.augment.summary(), data_key=store.key, tuning=tune)
+    if tuning.lr_search:
+        # Подбор только подбирает: этап B запускает человек с выбранного им кандидата.
+        journal = dict(base, stages=[], final_ckpt=None)
+        write_config(os.path.join(run_dir, CONFIG_FILE), cfg_dict)
+        _write_journal(journal_path, journal)
+        return journal
     journal = ST.start_journal(journal_path, base, protocol, first, prev, run_dir)
     log.info("%s: сиды %s", arch, seeds)
     log.info("%s: аугментации %s", arch, journal["augment"])

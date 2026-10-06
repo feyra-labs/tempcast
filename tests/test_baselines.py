@@ -487,9 +487,11 @@ def test_damped_coefficients_recover_known_decay():
     assert (BL.damped_coefficients(np.zeros(H), Sxy) == 0).all()
 
 
-def _tuning(lr=DEFAULT_PROTOCOL.lr, grid=DEFAULT_PROTOCOL.lr_grid, phase=1):
+def _tuning(lr=DEFAULT_PROTOCOL.lr, grid=DEFAULT_PROTOCOL.lr_grid, phase=1, chosen=None):
     search = dict(grid=list(grid), stage_steps={"A": 10, "B": 5}, monitor="val/loss",
-                  results=[], selected_lr=lr)
+                  results=[], selected_lr=lr, edge=False)
+    if chosen is not None:
+        search["chosen_lr"] = chosen
     return dict(phase=phase, lr_search=search, inherited_from=None)
 
 
@@ -533,6 +535,14 @@ def test_check_comparable_rejects_mismatch_and_pre_protocol_checkpoints(tmp_path
     not_chosen = _fake_ckpt(tmp_path / "nc.ckpt", "gru", Protocol(lr=1e-3), _tuning())
     with pytest.raises(ProtocolError, match="не равна выбранной"):
         check_comparable(ref, [not_chosen])
+    human = _fake_ckpt(tmp_path / "h.ckpt", "gru", Protocol(lr=1e-3), _tuning(chosen=1e-3))
+    check_comparable(ref, [human])
+    other_lr = _fake_ckpt(tmp_path / "h2.ckpt", "gru", tuning=_tuning(chosen=1e-3))
+    with pytest.raises(ProtocolError, match="не равна выбранной человеком"):
+        check_comparable(ref, [other_lr])
+    off_grid = _fake_ckpt(tmp_path / "og.ckpt", "gru", Protocol(lr=2e-3), _tuning(lr=2e-3))
+    with pytest.raises(ProtocolError, match="не из сетки"):
+        check_comparable(ref, [off_grid])
     extra = _fake_ckpt(tmp_path / "extra.ckpt", tuning=_tuning(phase=2))
     with pytest.raises(ProtocolError, match="этапа 2"):
         check_comparable(ref, [extra])
