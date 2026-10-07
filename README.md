@@ -43,7 +43,7 @@ uv run python scripts/build_cache.py --manifest data/manifest.csv --jobs 8 # QC 
 uv run python scripts/fetch_ghcnh.py --out data/ghcnh/raw --years 2016-2025 \
     --bbox 35 60 -10 40 --max-stations 300 --jobs 8
 uv run python scripts/make_ghcnh.py --raw data/ghcnh/raw --out data/ghcnh \
-    --koppen Beck_KG_V1_present_0p0083.tif --dem open-meteo
+    --train-manifest data/manifest.csv --koppen Beck_KG_V1_present_0p0083.tif --dem open-meteo
 uv run python scripts/build_cache.py --manifest data/ghcnh/manifest.csv
 
 # доля ложных срабатываний QC на реанализе

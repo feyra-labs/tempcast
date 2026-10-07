@@ -6,6 +6,9 @@ r"""Сборка набора внешнего теста из скачанны�
 влажность из T и Td по формуле Магнуса. Результат: <out>/stations/<id>.npz,
 <out>/manifest.csv с ролью external_test и <out>/selection_report.csv.
 
+Станции, тестовые окна которых пересекаются по календарю с обучением основного набора
+(--train-manifest, его кэш должен быть уже собран), исключаются с причиной в отчёте
+отбора.
 Метаданные станции:
   * координаты - из списка станций;
   * высота, которую видит модель (elev) - из цифровой модели рельефа в точке
@@ -29,7 +32,8 @@ r"""Сборка набора внешнего теста из скачанны�
 
 Запуск:
     python scripts/make_ghcnh.py --raw data/ghcnh/raw --out data/ghcnh \
-        --koppen Beck_KG_V1_present_0p0083.tif --dem open-meteo
+        --train-manifest data/manifest.csv --koppen Beck_KG_V1_present_0p0083.tif \
+        --dem open-meteo
 """
 import argparse
 import json
@@ -53,6 +57,7 @@ BUILD_CODE = {
     "mayak.data.ghcnh": None,
     "mayak.data.rasters": None,
     "mayak.data.splits": None,
+    "mayak.leakage": ("station_test_first_hour",),
     "mayak.timeaxis": None,
     "mayak.zones": ("KOPPEN_ZONES", "KG_TIF_CODE", "UNKNOWN_ZONE"),
     "scripts/make_ghcnh.py": None,
@@ -105,6 +110,9 @@ def main():
     ap.add_argument("--out", default="data/ghcnh")
     ap.add_argument("--stations", default=None,
                     help="таблица станций; по умолчанию <raw>/selected_stations.csv")
+    ap.add_argument("--train-manifest", required=True,
+                    help="манифест основного набора с ролями станций, его кэш уже собран; "
+                         "по нему считается последний час обучения")
     ap.add_argument("--koppen", default="Beck_KG_V1_present_0p0083.tif")
     ap.add_argument("--dem", default="open-meteo", help="open-meteo | <путь к растру> | station")
     ap.add_argument("--tol-minutes", type=int, default=20,
@@ -115,6 +123,15 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     from mayak.data.rasters import dem_reader, koppen_reader
+    from mayak.data.store import get_store
+    from mayak.leakage import train_last_hour
+    train_last = train_last_hour(get_store(args.train_manifest, mmap=True,
+                                           build_if_missing=False))
+    if train_last is None:
+        sys.exit(f"в {args.train_manifest} нет обучающих станций: сначала make_splits.py и "
+                 f"build_cache.py для основного набора")
+    log.info("последний час обучения основного набора: %s UTC",
+             np.datetime64(int(train_last), "h"))
     stations = read_station_list(args.stations or os.path.join(args.raw, "selected_stations.csv"))
     os.makedirs(args.out, exist_ok=True)
 
@@ -133,7 +150,8 @@ def main():
 
     rows, report = build_external_dataset(args.raw, args.out, stations, dem, koppen,
                                           tol_minutes=args.tol_minutes,
-                                          min_train_years=args.min_train_years)
+                                          min_train_years=args.min_train_years,
+                                          train_last_hour=train_last)
     if args.dem == "station":
         import csv
         mpath = os.path.join(args.out, "manifest.csv")

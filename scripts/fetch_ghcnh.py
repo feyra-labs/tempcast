@@ -15,7 +15,7 @@ r"""Скачивание наблюдений GHCNh (NOAA/NCEI) для внеш�
 Зеркало в открытом реестре AWS (registry.opendata.aws/noaa-ghcnh) - через --base-url.
 
 Запуск:
-    python scripts/fetch_ghcnh.py --out data/ghcnh/raw --years 2015-2024 \
+    python scripts/fetch_ghcnh.py --out data/ghcnh/raw --years 2016-2025 \
         --bbox 35 60 -10 40 --max-stations 300 --jobs 8
 """
 import argparse

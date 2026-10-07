@@ -120,7 +120,9 @@ temporal, spatial, hierarchical, or phylogenetic structure*. Ecography 40(8), 20
 6. окна внешних станций — только в тестовом окне; внешние станции не встречаются в
    основном наборе под другой ролью, в записи о выборе чекпойнта и в метаданных
    конформной таблицы; самый поздний час обучающих окон раньше самого раннего часа,
-   который читают тестовые окна внешнего набора.
+   который читают тестовые окна внешнего набора. Станции GHCNh, у которых это не так,
+   исключаются ещё при сборке набора (`scripts/make_ghcnh.py`), причина — в
+   `selection_report.csv`.
 
 Источник: S. Kapoor, A. Narayanan. *Leakage and the reproducibility crisis in
 machine-learning-based science*. Patterns 4(9), 2023, 100804.

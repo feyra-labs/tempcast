@@ -432,12 +432,15 @@ def station_files(raw_dir, sid):
 
 
 def build_external_dataset(raw_dir, out_dir, stations, dem, koppen, tol_minutes=20,
-                           min_train_years=None, min_valid_frac_T=0.5):
+                           min_train_years=None, min_valid_frac_T=0.5, train_last_hour=None):
     """Собирает каталог набора внешнего теста из скачанных файлов GHCNh.
 
-    Предотбор здесь грубый: длина ряда, шаг отчётности и доля валидной температуры.
-    Станция проходит, только если самый частый интервал между её отчётами температуры
-    по всему скачанному ряду равен одному часу; отдельные пропуски на это не влияют.
+    Предотбор здесь грубый: длина ряда, шаг отчётности, доля валидной температуры и
+    календарь теста. Станция проходит, только если самый частый интервал между её
+    отчётами температуры по всему скачанному ряду равен одному часу; отдельные пропуски
+    на это не влияют. Если задан последний час обучения основного набора, станция
+    проходит, только если её тестовые окна вместе с историей и контекстом QC начинаются
+    позже него: то же правило проверяет чек-лист утечек перед оценкой.
     Окончательный отбор делают правила QC при сборке кэша, в том числе требование
     полных лет в обучающем окне станции.
 
@@ -451,6 +454,8 @@ def build_external_dataset(raw_dir, out_dir, stations, dem, koppen, tol_minutes=
         tol_minutes: допуск от целого часа, мин.
         min_train_years: полных лет в обучающем окне; None - значение проекта.
         min_valid_frac_T: наименьшая доля часов ряда с валидной температурой.
+        train_last_hour: самый поздний час, который читают обучающие окна основного
+            набора, час от эпохи UTC; None - без проверки календаря.
 
     Returns:
         Пара: строки манифеста включённых станций и строки отчёта отбора по всем
@@ -460,6 +465,7 @@ def build_external_dataset(raw_dir, out_dir, stations, dem, koppen, tol_minutes=
     """
     from mayak.data.splits import EXTERNAL_MIN_TRAIN_YEARS, ROLE_EXTERNAL, \
         min_hours_for_train_years
+    from mayak.leakage import station_test_first_hour
     years = EXTERNAL_MIN_TRAIN_YEARS if min_train_years is None else int(min_train_years)
     need_hours = min_hours_for_train_years(years)
     os.makedirs(os.path.join(out_dir, "stations"), exist_ok=True)
@@ -484,6 +490,12 @@ def build_external_dataset(raw_dir, out_dir, stations, dem, koppen, tol_minutes=
             reason = reporting_exclusion(rec["report_every"], rec["T_valid"], min_valid_frac_T)
             if reason:
                 raise ValueError(reason)
+            if train_last_hour is not None:
+                first = station_test_first_hour(series.t0_utc_h, series.n)
+                if first <= int(train_last_hour):
+                    raise ValueError(f"тест пересекается с обучением по календарю: окна теста "
+                                     f"читают часы с {first}, обучение - до "
+                                     f"{int(train_last_hour)} (часы от эпохи UTC)")
             h = dem(st.lat, st.lon)
             if h is None or not np.isfinite(h):
                 raise ValueError("нет высоты из ЦМР в точке станции")

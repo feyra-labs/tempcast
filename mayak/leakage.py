@@ -420,11 +420,30 @@ def train_last_hour(store):
     return max(ends) if ends else None
 
 
+def station_test_first_hour(t0, n_hours):
+    """Самый ранний час, который читают тестовые окна одной станции.
+
+    Считается по самому раннему окну: горизонт с первого часа тестового окна, полная
+    история и часы перед ней, которые смотрит причинный QC.
+
+    Args:
+        t0: абсолютный час первой строки ряда станции.
+        n_hours: длина ряда, ч.
+
+    Returns:
+        Час от эпохи UTC.
+
+    Raises:
+        ValueError: ряд слишком короток для раскладки.
+    """
+    from mayak.data.dataset import footprint
+    lay = time_layout(n_hours)
+    lo, _hi = footprint(lay.span("test")[0], None, lay.history_floor("test"))
+    return int(t0) + int(lo)
+
+
 def external_first_hour(external_store):
     """Самый ранний час, который читают тестовые окна внешнего набора.
-
-    Считается по самому раннему окну каждой станции: горизонт с первого часа
-    тестового окна, полная история и часы перед ней, которые смотрит причинный QC.
 
     Args:
         external_store: набор внешнего теста.
@@ -432,12 +451,8 @@ def external_first_hour(external_store):
     Returns:
         Час от эпохи UTC или None, если набор пуст.
     """
-    from mayak.data.dataset import footprint
-    starts = []
-    for s in external_store.stations.values():
-        lay = time_layout(s["N"])
-        lo, _hi = footprint(lay.span("test")[0], None, lay.history_floor("test"))
-        starts.append(int(s["t0"]) + int(lo))
+    starts = [station_test_first_hour(s["t0"], s["N"])
+              for s in external_store.stations.values()]
     return min(starts) if starts else None
 
 
