@@ -5,6 +5,12 @@
 нескольку точек, с паузой между ними. Временные сбои повторяются с растущей
 паузой. Если запрос так и не прошёл, скрипт останавливается, и его запускают ещё
 раз позже.
+
+Бесплатный API Open-Meteo ограничивает взвешенные вызовы в минуту, час и сутки; вес
+запроса растёт с числом точек, дней и переменных. Пауза между запросами выбирается так,
+чтобы держаться в доле ``--quota-share`` минутного и часового лимитов. Ответ «лимит
+исчерпан» на минуту или час пережидается; на сутки - скрипт сразу останавливается, его
+запускают на следующий день.
 """
 import argparse
 import csv
@@ -31,6 +37,80 @@ RAW_DIR = "era5"
 META_NAME = "fetch_meta.json"
 LOG_NAME = "fetch_log.csv"
 RETRY_CODES = (429, 500, 502, 503, 504)
+# Лимиты бесплатного API Open-Meteo, взвешенных вызовов: минута, час, сутки.
+QUOTA_LIMITS = dict(minute=600.0, hour=5000.0, day=10000.0)
+QUOTA_SHARE = 0.8
+QUOTA_WAITS = 3
+MINUTE_WAIT = 65.0
+
+
+class QuotaExhausted(ConnectionError):
+    """Суточный лимит API исчерпан: продолжать имеет смысл только на следующий день."""
+
+
+def request_weight(n_points, signature):
+    """Вес запроса в вызовах API по правилу Open-Meteo.
+
+    Вес - число точек, умноженное на число дней, делённое на 14 (не меньше 14 дней), и на
+    число переменных, делённое на 10.
+
+    Args:
+        n_points: точек в запросе.
+        signature: подпись запроса: период и переменные.
+
+    Returns:
+        Вес запроса, вызовов.
+    """
+    days = (parse_date(signature["end_date"]) - parse_date(signature["start_date"])).days + 1
+    return n_points * max(days, 14) / 14.0 * len(signature["variables"]) / 10.0
+
+
+def throttle_pause(weight, share=QUOTA_SHARE):
+    """Пауза перед запросом, при которой поток держится в доле минутного и часового лимитов.
+
+    Args:
+        weight: вес запроса, вызовов.
+        share: доля лимитов; 0 - без паузы по лимитам.
+
+    Returns:
+        Пауза, с.
+    """
+    if share <= 0:
+        return 0.0
+    return max(60.0 * weight / (share * QUOTA_LIMITS["minute"]),
+               3600.0 * weight / (share * QUOTA_LIMITS["hour"]))
+
+
+def quota_kind(body):
+    """Какой лимит API исчерпан, по тексту ответа 429.
+
+    Args:
+        body: тело ответа.
+
+    Returns:
+        ``day``, ``hour``, ``minute`` или None, если лимит не назван.
+    """
+    text = body.lower()
+    for word, kind in (("daily", "day"), ("hourly", "hour"), ("minutely", "minute")):
+        if word in text:
+            return kind
+    return None
+
+
+def quota_wait(kind, now=None):
+    """Сколько ждать после ответа «лимит исчерпан» на минуту или час.
+
+    Args:
+        kind: ``minute`` или ``hour``.
+        now: текущее время, секунды от эпохи; None - часы системы.
+
+    Returns:
+        Пауза, с: минута с запасом или до начала следующего часа плюс минута.
+    """
+    if kind == "minute":
+        return MINUTE_WAIT
+    now = time.time() if now is None else float(now)
+    return 3600.0 - now % 3600.0 + 60.0
 
 
 def fetch_batch(points, signature, base_url=ARCHIVE_URL, retries=5, backoff=30.0,
@@ -38,7 +118,9 @@ def fetch_batch(points, signature, base_url=ARCHIVE_URL, retries=5, backoff=30.0
     """Один запрос к API по пачке точек с повторами при временных сбоях.
 
     Повторяются сетевые ошибки, таймауты и ответы HTTP 429 и 5xx. Пауза перед
-    первым повтором равна backoff и каждый раз удваивается.
+    первым повтором равна backoff и каждый раз удваивается. Ответ 429 с исчерпанным
+    минутным или часовым лимитом пережидается до его сброса, не больше ``QUOTA_WAITS``
+    раз и без учёта в числе повторов; с исчерпанным суточным - запрос сразу прекращается.
 
     Args:
         points: список словарей с полями id, lat, lon.
@@ -53,22 +135,35 @@ def fetch_batch(points, signature, base_url=ARCHIVE_URL, retries=5, backoff=30.0
 
     Raises:
         ApiError: запрос отвергнут окончательно или ответ не разбирается.
+        QuotaExhausted: суточный лимит API исчерпан.
         ConnectionError: запрос не прошёл за все попытки.
     """
     query = urllib.parse.urlencode(request_params([p["lat"] for p in points],
                                                   [p["lon"] for p in points], signature))
     req = urllib.request.Request(f"{base_url}?{query}")
-    last = None
-    for attempt in range(retries + 1):
+    last, attempt, waits = None, 0, 0
+    while attempt <= retries:
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 payload = json.loads(resp.read().decode("utf-8"))
             parse_response(payload, len(points))
             return payload if isinstance(payload, list) else [payload]
         except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", "replace")
             if e.code not in RETRY_CODES:
-                raise ApiError(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')}") from e
-            last = f"HTTP {e.code}"
+                raise ApiError(f"HTTP {e.code}: {body}") from e
+            last = f"HTTP {e.code}: {body}" if e.code == 429 else f"HTTP {e.code}"
+            kind = quota_kind(body) if e.code == 429 else None
+            if kind == "day":
+                raise QuotaExhausted(f"суточный лимит API исчерпан ({body}); запустите ту же "
+                                     f"команду завтра") from e
+            if kind in ("hour", "minute") and waits < QUOTA_WAITS:
+                waits += 1
+                pause = quota_wait(kind)
+                log.info("лимит API на %s исчерпан, ожидание %.0f с",
+                         "час" if kind == "hour" else "минуту", pause)
+                time.sleep(pause)
+                continue
         except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError,
                 UnicodeDecodeError) as e:
             last = str(e)
@@ -77,6 +172,7 @@ def fetch_batch(points, signature, base_url=ARCHIVE_URL, retries=5, backoff=30.0
             log.info("сбой запроса (%s), повтор через %.0f с (%d/%d)", last, pause,
                      attempt + 1, retries)
             time.sleep(pause)
+        attempt += 1
     raise ConnectionError(f"запрос не прошёл за {retries + 1} попыток: {last}")
 
 
@@ -124,7 +220,8 @@ def _now_iso():
 
 
 def fetch_all(points, raw_dir, signature, batch=2, pause=1.0, base_url=ARCHIVE_URL, retries=5,
-              backoff=30.0, timeout=180.0, refetch=False, log_path=None):
+              backoff=30.0, timeout=180.0, refetch=False, log_path=None,
+              quota_share=QUOTA_SHARE):
     """Скачать все недостающие точки.
 
     Args:
@@ -132,13 +229,15 @@ def fetch_all(points, raw_dir, signature, batch=2, pause=1.0, base_url=ARCHIVE_U
         raw_dir: каталог скачанных точек.
         signature: подпись запроса.
         batch: число точек в запросе.
-        pause: пауза между запросами, с.
+        pause: наименьшая пауза между запросами, с.
         base_url: адрес эндпоинта архива.
         retries: число повторов при временном сбое.
         backoff: пауза перед первым повтором, с.
         timeout: таймаут запроса, с.
         refetch: перекачивать файлы, скачанные с другими параметрами.
         log_path: журнал запросов в формате CSV; None отключает журнал.
+        quota_share: доля минутного и часового лимитов API, в которой держится поток
+            запросов; 0 - без паузы по лимитам.
 
     Returns:
         Словарь счётчиков cached, done, failed, pending и stopped с причиной
@@ -148,13 +247,20 @@ def fetch_all(points, raw_dir, signature, batch=2, pause=1.0, base_url=ARCHIVE_U
     counts = dict(cached=len(cached), done=0, failed=0, pending=0, stopped="")
     size = max(1, int(batch))
     batches = [todo[i:i + size] for i in range(0, len(todo), size)]
+    total = sum(request_weight(len(b), signature) for b in batches)
+    if batches:
+        log.info("вес запросов %.0f вызовов API: не меньше %d сут при суточном лимите %.0f; "
+                 "пауза между запросами %.0f с", total,
+                 -(-total // QUOTA_LIMITS["day"]), QUOTA_LIMITS["day"],
+                 max(pause, throttle_pause(request_weight(size, signature), quota_share)))
     log_file = open(log_path, "a", newline="") if log_path else None
     writer = csv.writer(log_file) if log_file else None
     try:
         for k, chunk in enumerate(batches):
             ids = " ".join(str(p["id"]) for p in chunk)
             if k:
-                time.sleep(pause)
+                time.sleep(max(pause, throttle_pause(request_weight(len(chunk), signature),
+                                                     quota_share)))
             try:
                 payloads = fetch_batch(chunk, signature, base_url, retries, backoff, timeout)
             except ApiError as e:
@@ -256,7 +362,11 @@ def main():
     ap.add_argument("--base-url", default=ARCHIVE_URL,
                     help="эндпоинт архива, например своего сервера Open-Meteo")
     ap.add_argument("--batch", type=int, default=2, help="точек в одном запросе")
-    ap.add_argument("--pause", type=float, default=1.0, help="пауза между запросами, с")
+    ap.add_argument("--pause", type=float, default=1.0,
+                    help="наименьшая пауза между запросами, с")
+    ap.add_argument("--quota-share", type=float, default=QUOTA_SHARE,
+                    help="доля минутного и часового лимитов бесплатного API, в которой "
+                         "держится поток; 0 - без паузы по лимитам (свой сервер, платный план)")
     ap.add_argument("--retries", type=int, default=5, help="повторов при временном сбое")
     ap.add_argument("--backoff", type=float, default=30.0,
                     help="пауза перед первым повтором, дальше удваивается, с")
@@ -289,7 +399,7 @@ def main():
     try:
         counts = fetch_all(points, raw_dir, signature, args.batch, args.pause, args.base_url,
                            args.retries, args.backoff, args.timeout, args.refetch,
-                           os.path.join(raw_dir, LOG_NAME))
+                           os.path.join(raw_dir, LOG_NAME), args.quota_share)
     except ValueError as e:
         sys.exit(str(e))
     write_meta(meta_path, signature, args.base_url, args.points, len(points), counts, previous)

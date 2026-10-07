@@ -34,7 +34,7 @@ uv run pytest -q                    # тесты на синтетике, дан
 ```bash
 # обучающий набор: точки на суше, ERA5 из архивного API Open-Meteo, станции и манифест
 uv run python scripts/make_points.py --koppen Beck_KG_V1_present_0p0083.tif --out data/points.csv
-uv run python scripts/fetch_era5.py --points data/points.csv --out data     # 2016–2025, докачка
+uv run python scripts/fetch_era5.py --points data/points.csv --out data     # 2016–2025, повторять до «осталось 0»
 uv run python scripts/make_era5.py --data data
 uv run python scripts/make_splits.py --manifest data/manifest.csv          # роли станций
 uv run python scripts/build_cache.py --manifest data/manifest.csv --jobs 8 # QC и климатология
