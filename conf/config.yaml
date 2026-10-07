@@ -19,27 +19,16 @@ run:
   # Примеры: mayak, mayak-no_solar, mayak-aug_none, mayak-s1, mayak-tuned, gru.
   tag: ${run_tag:${model.arch},${hydra:runtime.choices.ablation},${data.augment.profile},${run.extra_tuning},${train.seed}}
   accelerator: gpu
-  # Раздельный запуск этапов; в протокол не входит и на сравнение моделей не влияет.
-  # Этапы этого запуска подряд в порядке протокола, например [A] или [B]; null - все.
-  stages: null
-  # Чекпойнт предыдущего этапа, с которого стартует первый запускаемый этап, если он в
-  # протоколе не первый. Выбирает человек по отчёту этапа A (stageA/report.json и
-  # графики stageA/report/); пересчёт отчёта: scripts/stage_report.py --run <каталог>.
-  # После подбора - кандидат из lr_search/lr<X>/stageA/ этого прогона, где X - выбранная
-  # подбором скорость или явный train.lr из сетки.
-  init_from: null
-  # Этапы, у которых чекпойнт сохраняется после каждой валидации; null - этап холодного
-  # старта, [] - ни один.
-  candidates: null
-  # Подбор скорости обучения, этап 1 сравнения: на каждом значении train.lr_grid полный
-  # этап A с кандидатами и этап B на train.lr_search_steps шагов в lr_search/lr<X>/,
-  # минимум по val/loss и флаг edge (минимум на краю сетки) в журнал protocol.json.
-  # Полного прогона нет: этап B запускается отдельно (run.stages=[B] run.init_from=...)
-  # в том же каталоге, скорость - минимум или явный train.lr из сетки (chosen_lr).
+  # Подбор скорости обучения, этап 1 сравнения: на каждом значении train.lr_grid этапы
+  # протокола с последним на train.lr_search_steps шагов в lr_search/lr<X>/, минимум по
+  # val/loss (selected_lr) и флаг edge (минимум на краю сетки) в журнал protocol.json.
+  # При edge: true запуск завершается ошибкой: расширить train.lr_grid и повторить подбор
+  # всех моделей. Иначе в том же запуске полный этап B со старта с
+  # lr_search/lr<selected_lr>/stageA/best.ckpt.
   lr_search: false
   # Каталог прогона основного МАЯК: из его журнала берутся скорость обучения и запись о
-  # подборе, подбор не повторяется. Для абляций, повторов с другими сидами и
-  # augment=none: run.stages=[A], выбор кандидата, run.stages=[B] run.init_from=...
+  # подборе, подбор не повторяется, этапы A и B идут подряд. Для абляций, повторов с
+  # другими сидами и augment=none.
   lr_from: null
   # Дополнительная настройка МАЯК, этап 2 сравнения: любые гиперпараметры по валидации,
   # свой каталог, отдельная строка таблиц, в сравнение на равных не входит.
@@ -65,15 +54,12 @@ hydra:
 
       Примеры:
         python scripts/run.py train=debug run.accelerator=cpu      # отладка: runs/mayak
-        python scripts/run.py run.lr_search=true    # этап 1: только подбор lr
+        python scripts/run.py run.lr_search=true    # этап 1: подбор lr и этап B
         python scripts/run.py -m model=gru,dlinear,lru,patchtst run.lr_search=true
-        python scripts/run.py run.stages=[B] run.init_from=runs/mayak/lr_search/lr0.001/stageA/candidates/step006000.ckpt
-        python scripts/run.py run.stages=[B] train.lr=0.003 run.init_from=runs/mayak/lr_search/lr0.003/stageA/best.ckpt
-        python scripts/run.py -m ablation=no_compression,no_solar run.lr_from=runs/mayak run.stages=[A]
-        python scripts/run.py ablation=no_solar run.lr_from=runs/mayak run.stages=[B] run.init_from=runs/mayak-no_solar/stageA/candidates/step006000.ckpt
-        python scripts/run.py -m train.seed=1,2 run.lr_from=runs/mayak run.stages=[A]  # runs/mayak-s1, -s2
-        python scripts/run.py augment=none run.lr_from=runs/mayak run.stages=[A]       # runs/mayak-aug_none
-        python scripts/run.py run.extra_tuning=true train.lr=0.001 model.encoder_width=64
+        python scripts/run.py -m run.lr_from=runs/mayak ablation=no_compression,no_solar
+        python scripts/run.py -m run.lr_from=runs/mayak train.seed=1,2   # runs/mayak-s1, -s2
+        python scripts/run.py run.lr_from=runs/mayak augment=none        # runs/mayak-aug_none
+        python scripts/run.py run.extra_tuning=true run.lr_search=true model.encoder_width=64
                                                     # этап 2: доп. настройка, runs/mayak-tuned
 
       Hydra: python scripts/run.py --hydra-help

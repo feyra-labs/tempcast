@@ -23,7 +23,7 @@ import functools
 import pytorch_lightning as L
 import torch
 import torch.nn as nn
-from pytorch_lightning.callbacks import Callback, ModelCheckpoint
+from pytorch_lightning.callbacks import Callback
 
 from mayak.baselines import DLinear, GRUSeq2Seq, LRUForecaster, PatchTST
 from mayak.config import DataConfig, RunConfig, model_config_for
@@ -230,7 +230,6 @@ class StageProvenance(Callback):
 
     В записи имя и номер этапа в протоколе, ключ кэша данных, каталог и журнал прогона,
     чекпойнт, с которого этап стартовал, и шаг сохранения.
-    По этой записи следующий этап проверяет, что стартует с совместимой точки.
 
     Args:
         record: запись об этапе без шага сохранения.
@@ -255,16 +254,6 @@ class TuningProvenance(Callback):
 
     def on_save_checkpoint(self, trainer, pl_module, checkpoint):
         checkpoint[TUNING_KEY] = self.record
-
-
-class CandidateCheckpoint(ModelCheckpoint):
-    """Сохранение чекпойнта после каждой валидации этапа.
-
-    Сохранение идёт в конце прохода валидации, пока в модели стоят усреднённые веса,
-    поэтому кандидат несёт те же веса, что увидела валидация. Отдельный класс нужен,
-    чтобы состояние этого сохранения хранилось в чекпойнте отдельно от состояния выбора
-    лучшего.
-    """
 
 
 class EMA:
@@ -465,8 +454,7 @@ def check_comparable(reference, others, ignore=()):
     ``ignore``. Скорость обучения у каждой модели своя, поэтому у каждого чекпойнта,
     включая эталон, должна быть запись о подборе этапа 1 сравнения с той же сеткой, тем
     же числом шагов этапов и той же метрикой выбора, что у эталона, а скорость обучения
-    чекпойнта - значение этой сетки: выбранное человеком (``chosen_lr``), если он его
-    задал, иначе выбранное подбором.
+    чекпойнта - значение этой сетки, выбранное подбором (``selected_lr``).
 
     Args:
         reference: путь к эталонному чекпойнту.

@@ -1,10 +1,8 @@
-"""Отчёт о поле после этапа холодного старта: по нему человек выбирает старт этапа B.
+"""Отчёт о поле после этапа холодного старта.
 
-Отчёт считается на наборе валидации этапа: валидационные станции, валидационное окно,
-нулевая история. Это тот же набор, по которому выбирался чекпойнт. В отчёт идёт каждый
-сохранённый чекпойнт этапа, а не только лучший по метрике выбора: чекпойнт с меньшим
-числом шагов иногда оказывается лучшей стартовой точкой для следующего этапа, и выбирать
-между ними должен человек. По каждому чекпойнту считаются:
+Отчёт считается для лучшего по метрике выбора чекпойнта этапа на наборе валидации этапа:
+валидационные станции, валидационное окно, нулевая история. Это тот же набор, по
+которому выбирался чекпойнт. Считаются:
 
 * отношение MSE медианы модели к MSE эмпирической климатологии станции по всем парам
   «окно и лид», его интервал блочного бутстрапа по станциям и то же отношение в среднем
@@ -18,13 +16,12 @@
   бутстрапа по станциям.
 
 Вместе с числами отчёт записывает ограничители запоминания координат из конфига модели
-(``loc_freq_max`` и ``field_weight_decay``), если они у архитектуры есть. Автоматических
-порогов в отчёте нет: числа и графики только для человека, который выбирает кандидата.
+(``loc_freq_max`` и ``field_weight_decay``), если они у архитектуры есть. Отчёт
+информационный: автоматических порогов в нём нет, на ход обучения он не влияет.
 
 Числа считаются по сырым выходам моделей и нужны только медиана и квантили, поэтому
 отчёт одинаков для всех архитектур. Графики строятся по тем же числам: кривые обучения
-с отметками сохранённых чекпойнтов, метрики по шагам, метрики по лидам и примеры
-прогнозов нескольких чекпойнтов на одних и тех же окнах.
+с отметкой лучшего чекпойнта, метрики по лидам и примеры прогнозов.
 """
 from __future__ import annotations
 
@@ -50,7 +47,7 @@ N_EXAMPLES = 6
 COVERAGE_BAND = (0.86, 0.94)
 # Отношение MSE медианы к MSE климатологии станции, при котором модель не лучше неё.
 CLIM_LEVEL = 1.0
-PLOT_FILES = ("curves.png", "candidates.png", "leads.png", "examples.png")
+PLOT_FILES = ("curves.png", "leads.png", "examples.png")
 LIMIT_FIELDS = ("loc_freq_max", "field_weight_decay")
 
 
@@ -88,71 +85,37 @@ def describe_checkpoint(path):
                          stage=(ck.get("hyper_parameters") or {}).get("stage")))
 
 
-def report_items(best, candidates):
-    """Список чекпойнтов для отчёта: все кандидаты и лучший по метрике выбора.
-
-    Кандидат, сохранённый на том же шаге, что и лучший, несёт те же веса и помечается
-    как лучший; отдельной записи у лучшего тогда нет.
+def collect_outputs(model, dataset, device="cpu", batch_size=256):
+    """Медиана и квантили модели на наборе окон.
 
     Args:
-        best: запись о лучшем чекпойнте.
-        candidates: записи о кандидатах.
-
-    Returns:
-        Записи, упорядоченные по шагу.
-    """
-    items, found = [], False
-    for c in sorted(candidates, key=lambda c: c["step"]):
-        e = dict(name=f"step{c['step']:06d}", ckpt=c["ckpt"], digest=c["digest"],
-                 step=c["step"], val_loss=c.get("val_loss"), is_best=False)
-        if c["step"] == best["step"]:
-            e.update(is_best=True, best_ckpt=best["ckpt"], best_digest=best["digest"])
-            found = True
-        items.append(e)
-    if not found:
-        items.append(dict(name=f"best{best['step']:06d}", ckpt=best["ckpt"],
-                          digest=best["digest"], step=best["step"],
-                          val_loss=best.get("val_loss"), is_best=True, best_ckpt=best["ckpt"],
-                          best_digest=best["digest"]))
-    return sorted(items, key=lambda e: e["step"])
-
-
-def collect_outputs(models, dataset, device="cpu", batch_size=256):
-    """Медиана и квантили всех моделей на наборе окон за один проход.
-
-    Args:
-        models: словарь из имени в модель.
+        model: модель.
         dataset: набор окон.
         device: устройство.
         batch_size: размер батча.
 
     Returns:
-        Пара: словарь из имени модели в медиану формы (N, H) и квантили формы (N, H, 7);
-        данные окон: цель, маска цели, климатология на горизонте, станция и час начала
-        горизонта каждого окна.
+        Пара: медиана формы (N, H) и квантили формы (N, H, 7); данные окон: цель, маска
+        цели, климатология на горизонте, станция и час начала горизонта каждого окна.
     """
     import torch
     from torch.utils.data import DataLoader
-    for m in models.values():
-        m.eval().to(device)
-    outs = {n: dict(mu=[], q=[]) for n in models}
-    y, w, muc = [], [], []
+    model.eval().to(device)
+    mu, q, y, w, muc = [], [], [], [], []
     with torch.no_grad():
         for b in DataLoader(dataset, batch_size=batch_size):
             y.append(b["y"].numpy())
             w.append(b["y_mask"].numpy())
             muc.append(b["mu_clim_fut"].numpy())
-            bb = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()}
-            for n, m in models.items():
-                o = m(bb)
-                outs[n]["mu"].append(o["mu"].float().cpu().numpy())
-                outs[n]["q"].append(o["q"].float().cpu().numpy())
+            o = model({k: (v.to(device) if torch.is_tensor(v) else v) for k, v in b.items()})
+            mu.append(o["mu"].float().cpu().numpy())
+            q.append(o["q"].float().cpu().numpy())
     cat = lambda parts: np.concatenate(parts, 0)
-    preds = {n: {k: cat(v) for k, v in d.items()} for n, d in outs.items()}
+    pred = dict(mu=cat(mu), q=cat(q))
     aux = dict(y=cat(y), y_mask=cat(w), mu_clim=cat(muc),
                station=np.array([sid for sid, _t in dataset.items], object),
                t=np.array([t for _sid, t in dataset.items], np.int64))
-    return preds, aux
+    return pred, aux
 
 
 def field_metrics(pred, aux, seed=0, n_boot=N_BOOT, leads=REPORT_LEADS, n_worst=N_WORST):
@@ -308,11 +271,11 @@ def skill_at(entry, lead):
     return None
 
 
-def pick_examples(preds, aux, n=N_EXAMPLES, seed=0):
-    """Окна для примеров прогнозов: одни и те же для всех чекпойнтов.
+def pick_examples(pred, aux, n=N_EXAMPLES, seed=0):
+    """Окна для примеров прогнозов.
 
     Args:
-        preds: словарь из имени модели в медиану и квантили.
+        pred: медиана и квантили модели.
         aux: данные окон.
         n: число окон.
         seed: сид выбора окон.
@@ -329,20 +292,18 @@ def pick_examples(preds, aux, n=N_EXAMPLES, seed=0):
     return dict(station=[str(s) for s in aux["station"][idx]],
                 t=[int(v) for v in aux["t"][idx]],
                 y=np.where(w[idx] > 0, aux["y"][idx], np.nan),
-                mu_clim=aux["mu_clim"][idx],
-                preds={k: dict(mu=v["mu"][idx], q=v["q"][idx]) for k, v in preds.items()})
+                mu_clim=aux["mu_clim"][idx], mu=pred["mu"][idx], q=pred["q"][idx])
 
 
-def build_field_report(items, dataset, arch, stage, train_dataset, device="cpu", seed=0,
+def build_field_report(best, dataset, arch, stage, train_dataset, device="cpu", seed=0,
                        n_boot=N_BOOT, n_examples=N_EXAMPLES):
-    """Отчёт о поле для нескольких чекпойнтов этапа на одном наборе окон.
+    """Отчёт о поле для лучшего чекпойнта этапа.
 
-    Разрыв обобщения каждого чекпойнта считается по набору валидации и набору окон
-    обучающих станций в том же временном окне.
+    Разрыв обобщения считается по набору валидации и набору окон обучающих станций в том
+    же временном окне.
 
     Args:
-        items: записи о чекпойнтах: имя, путь, отпечаток, шаг, метрика выбора и пометка
-            лучшего.
+        best: запись о лучшем чекпойнте этапа (``describe_checkpoint``).
         dataset: набор валидации этапа.
         arch: архитектура.
         stage: имя этапа.
@@ -360,24 +321,17 @@ def build_field_report(items, dataset, arch, stage, train_dataset, device="cpu",
     """
     from mayak.lit import load_model
     check_gap_set(dataset, train_dataset)
-    models = {e["name"]: load_model(e["ckpt"]) for e in items}
-    preds, aux = collect_outputs(models, dataset, device=device)
-    train_preds, train_aux = ((None, None) if len(train_dataset) == 0
-                              else collect_outputs(models, train_dataset, device=device))
-    entries = []
-    for e in items:
-        entry = dict(e, **field_metrics(preds[e["name"]], aux, seed=seed, n_boot=n_boot))
-        entry.update(memorization_gap(preds[e["name"]], aux,
-                                      None if train_preds is None else train_preds[e["name"]],
-                                      train_aux, seed=seed, n_boot=n_boot))
-        entries.append(jsonable(entry))
-    best = next((e["name"] for e in entries if e.get("is_best")), None)
-    limits = memorization_limits(models[best if best is not None else items[-1]["name"]])
+    model = load_model(best["ckpt"])
+    pred, aux = collect_outputs(model, dataset, device=device)
+    train_pred, train_aux = ((None, None) if len(train_dataset) == 0
+                             else collect_outputs(model, train_dataset, device=device))
+    entry = dict(best, **field_metrics(pred, aux, seed=seed, n_boot=n_boot))
+    entry.update(memorization_gap(pred, aux, train_pred, train_aux, seed=seed, n_boot=n_boot))
     report = dict(arch=arch, stage=stage,
                   created_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                   val_set=_set_record(dataset), train_set=_set_record(train_dataset),
-                  limits=limits, leads=list(REPORT_LEADS), candidates=entries, best=best)
-    return jsonable(report), pick_examples(preds, aux, n_examples, seed)
+                  limits=memorization_limits(model), leads=list(REPORT_LEADS), best=entry)
+    return jsonable(report), pick_examples(pred, aux, n_examples, seed)
 
 
 def write_report(path, report):
@@ -392,47 +346,6 @@ def write_report(path, report):
     with open(tmp, "w") as f:
         json.dump(report, f, ensure_ascii=False, indent=1)
     os.replace(tmp, path)
-
-
-def read_report(path):
-    """Отчёт из JSON.
-
-    Args:
-        path: путь к файлу.
-
-    Returns:
-        Отчёт.
-    """
-    with open(path) as f:
-        return json.load(f)
-
-
-def find_report_entry(run_dir, stage_name, digest, val_digest):
-    """Запись отчёта о поле для чекпойнта с заданным отпечатком.
-
-    Args:
-        run_dir: каталог прогона, где сохранён чекпойнт.
-        stage_name: имя этапа.
-        digest: отпечаток файла чекпойнта.
-        val_digest: отпечаток набора валидации, на котором нужен отчёт.
-
-    Returns:
-        Пара: запись и путь к отчёту; запись None, если отчёта нет, он посчитан на
-        другом наборе или чекпойнта в нём нет.
-    """
-    from mayak.stages import stage_dir_name
-    if not run_dir:
-        return None, None
-    path = os.path.join(run_dir, stage_dir_name(stage_name), REPORT_FILE)
-    if not os.path.isfile(path):
-        return None, None
-    report = read_report(path)
-    if (report.get("val_set") or {}).get("fingerprint") != val_digest:
-        return None, path
-    for e in report.get("candidates", []):
-        if digest in (e.get("digest"), e.get("best_digest")):
-            return e, path
-    return None, path
 
 
 def summary(entry):
@@ -470,45 +383,40 @@ def format_field_report(report):
     Returns:
         Список строк.
     """
-    ents = report.get("candidates") or []
+    e = report.get("best") or {}
     vs = report.get("val_set") or {}
-    lines = [f"Отчёт этапа {report.get('stage')} ({report.get('arch')}): чекпойнтов "
-             f"{len(ents)}, окон {vs.get('windows')} на {vs.get('stations')} валидационных "
+    lines = [f"Отчёт этапа {report.get('stage')} ({report.get('arch')}): лучший по val/loss "
+             f"чекпойнт, окон {vs.get('windows')} на {vs.get('stations')} валидационных "
              f"станциях, L=0"]
     head = (f"{'шаг':>8} {'val/loss':>9} {'MSE/клим':>9} {'интервал 90%':>17} "
             f"{'по станц.':>9} {'PICP90':>7} {'шир.90':>7}"
             + "".join(f" {'Skill ' + str(h) + 'ч':>11}" for h in SUMMARY_LEADS)
             + f" {'вал/обуч':>9} {'интервал 90%':>17}")
     lines.append(head)
-    for e in ents:
-        ci = e.get("mse_ratio_ci") or [None, None]
-        gci = e.get("gap_ratio_ci") or [None, None]
-        row = (f"{e['step']:>8} {_num(e.get('val_loss'), 4):>9} {_num(e.get('mse_ratio')):>9} "
-               f"{'[' + _num(ci[0]) + ', ' + _num(ci[1]) + ']':>17} "
-               f"{_num(e.get('mse_ratio_macro')):>9} {_pct(e.get('picp90')):>7} "
-               f"{_num(e.get('width90'), 2):>7}"
-               + "".join(f" {_num(skill_at(e, h)):>11}" for h in SUMMARY_LEADS)
-               + f" {_num(e.get('gap_ratio')):>9}"
-               + f" {'[' + _num(gci[0]) + ', ' + _num(gci[1]) + ']':>17}")
-        if e.get("is_best"):
-            row += "  * лучший по val/loss"
-        lines.append(row)
-    best = next((e for e in ents if e.get("is_best")), None)
-    if best and best.get("worst_stations"):
-        worst = ", ".join(f"{w['station']} {_num(w['mse_ratio'])}"
-                          for w in best["worst_stations"])
-        lines.append(f"Худшие станции у лучшего по val/loss: {worst}")
+    ci = e.get("mse_ratio_ci") or [None, None]
+    gci = e.get("gap_ratio_ci") or [None, None]
+    lines.append(f"{e.get('step', -1):>8} {_num(e.get('val_loss'), 4):>9} "
+                 f"{_num(e.get('mse_ratio')):>9} "
+                 f"{'[' + _num(ci[0]) + ', ' + _num(ci[1]) + ']':>17} "
+                 f"{_num(e.get('mse_ratio_macro')):>9} {_pct(e.get('picp90')):>7} "
+                 f"{_num(e.get('width90'), 2):>7}"
+                 + "".join(f" {_num(skill_at(e, h)):>11}" for h in SUMMARY_LEADS)
+                 + f" {_num(e.get('gap_ratio')):>9}"
+                 + f" {'[' + _num(gci[0]) + ', ' + _num(gci[1]) + ']':>17}")
+    if e.get("worst_stations"):
+        worst = ", ".join(f"{w['station']} {_num(w['mse_ratio'])}" for w in e["worst_stations"])
+        lines.append(f"Худшие станции: {worst}")
     ts = report.get("train_set") or {}
     lines.append(f"Разрыв обобщения вал/обуч: MSE медианы на валидационных станциях к MSE на "
                  f"{ts.get('stations')} обучающих станциях ({ts.get('windows')} окон) в том же "
-                 f"окне {vs.get('time_key')}, L=0; автоматического порога нет.")
+                 f"окне {vs.get('time_key')}, L=0.")
     limits = report.get("limits")
     lines.append("Ограничители запоминания координат: "
                  + (", ".join(f"{k} {v:g}" for k, v in limits.items()) if limits
                     else "в конфиге модели нет"))
     lines.append(f"Отсчёт MSE/клим {CLIM_LEVEL:.1f} — уровень климатологии станции; цель "
                  f"покрытия 90%-интервала {COVERAGE_BAND[0]:.0%}–{COVERAGE_BAND[1]:.0%}. "
-                 f"Кандидата для старта этапа B выбирает человек.")
+                 f"Отчёт информационный, на ход обучения не влияет.")
     return lines
 
 
@@ -516,30 +424,21 @@ def _arr(values):
     return np.array([np.nan if v is None else float(v) for v in values], np.float64)
 
 
-def _mark_best(ax, best):
-    if best is not None:
-        ax.axvline(best["step"], color="tab:red", lw=1.0, ls="--", alpha=0.7)
-
-
 def _plot_curves(plt, report, metrics_csv, out_dir, title):
     import pandas as pd
     df = pd.read_csv(metrics_csv)
-    ents = report["candidates"]
-    best = next((e for e in ents if e.get("is_best")), None)
+    best = report["best"]
     fig, ax = plt.subplots(figsize=(8.5, 4.6))
     for col, label, kw in (("train/pinball", "обучение", dict(lw=1.0, alpha=0.6)),
                            ("val/loss", "валидация", dict(marker=".", ms=7, lw=1.5))):
         if col in df.columns:
             sub = df[["step", col]].dropna()
             ax.plot(sub["step"], sub[col], label=label, **kw)
-    for e in ents:
-        ax.axvline(e["step"], color="grey", lw=0.6, ls=":")
-    if best is not None:
-        ax.axvline(best["step"], color="tab:red", lw=1.2, ls="--",
-                   label=f"лучший по val/loss, шаг {best['step']}")
+    ax.axvline(best["step"], color="tab:red", lw=1.2, ls="--",
+               label=f"лучший по val/loss, шаг {best['step']}")
     ax.set_xlabel("шаг")
     ax.set_ylabel("нормированный pinball")
-    ax.set_title(f"{title}: кривые обучения; пунктир — сохранённые чекпойнты", fontsize=10)
+    ax.set_title(f"{title}: кривые обучения", fontsize=10)
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
     p = os.path.join(out_dir, PLOT_FILES[0])
@@ -549,45 +448,22 @@ def _plot_curves(plt, report, metrics_csv, out_dir, title):
     return p
 
 
-def _plot_candidates(plt, report, out_dir, title):
-    ents = report["candidates"]
-    best = next((e for e in ents if e.get("is_best")), None)
-    x = np.array([e["step"] for e in ents], np.float64)
-    fig, axes = plt.subplots(2, 2, figsize=(11.5, 7.5), sharex=True)
-    ax = axes[0, 0]
-    r = _arr(e.get("mse_ratio") for e in ents)
-    lo = _arr((e.get("mse_ratio_ci") or [None, None])[0] for e in ents)
-    hi = _arr((e.get("mse_ratio_ci") or [None, None])[1] for e in ents)
-    yerr = np.nan_to_num(np.clip(np.vstack([r - lo, hi - r]), 0.0, None))
-    ax.errorbar(x, r, yerr=yerr, fmt="o-", capsize=3, label="по всем парам, интервал 90%")
-    ax.plot(x, _arr(e.get("mse_ratio_macro") for e in ents), "s--", ms=4,
-            label="в среднем по станциям")
-    ax.axhline(CLIM_LEVEL, color="black", lw=1.0, ls="--",
-               label="уровень климатологии станции")
-    ax.set_title("MSE медианы / MSE климатологии при L=0", fontsize=10)
-    ax.legend(fontsize=7)
-    ax = axes[0, 1]
-    ax.plot(x, _arr(e.get("picp90") for e in ents), "o-", label="90%")
-    ax.plot(x, _arr(e.get("picp80") for e in ents), "o-", label="80%")
-    ax.axhspan(*COVERAGE_BAND, color="tab:green", alpha=0.12, label="цель для 90%")
-    ax.axhline(0.8, color="grey", lw=0.8, ls=":")
-    ax.set_title("Покрытие интервалов при L=0, сырые выходы", fontsize=10)
-    ax.legend(fontsize=7)
-    ax = axes[1, 0]
-    for h in SUMMARY_LEADS:
-        ax.plot(x, _arr(skill_at(e, h) for e in ents), "o-", label=f"лид {h} ч")
-    ax.axhline(0.0, color="black", lw=0.8)
-    ax.set_title("Скилл относительно климатологии", fontsize=10)
-    ax.legend(fontsize=7)
-    ax = axes[1, 1]
-    ax.plot(x, _arr(e.get("val_loss") for e in ents), "o-")
-    ax.set_title("Метрика выбора val/loss", fontsize=10)
-    for ax in axes.ravel():
-        _mark_best(ax, best)
+def _plot_leads(plt, report, out_dir, title):
+    rows = report["best"].get("by_lead", [])
+    leads = [row["lead"] for row in rows]
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.3))
+    axes[0].plot(leads, _arr(row.get("Skill") for row in rows), "o-", ms=3)
+    axes[0].axhline(0.0, color="black", lw=0.8)
+    axes[0].set_title("Скилл по лидам", fontsize=10)
+    axes[1].plot(leads, _arr(row.get("PICP90") for row in rows), "o-", ms=3)
+    axes[1].axhspan(*COVERAGE_BAND, color="tab:green", alpha=0.12, label="цель для 90%")
+    axes[1].set_title("Покрытие 90%-интервала по лидам", fontsize=10)
+    axes[1].legend(fontsize=7)
+    for ax in axes:
+        ax.set_xscale("log")
+        ax.set_xlabel("лид, ч")
         ax.grid(alpha=0.3)
-    for ax in axes[1]:
-        ax.set_xlabel("шаг чекпойнта")
-    fig.suptitle(f"{title}: чекпойнты этапа; красный пунктир — лучший по val/loss", fontsize=11)
+    fig.suptitle(f"{title}: по лидам, лучший по val/loss", fontsize=11)
     fig.tight_layout()
     p = os.path.join(out_dir, PLOT_FILES[1])
     fig.savefig(p, dpi=120)
@@ -595,59 +471,23 @@ def _plot_candidates(plt, report, out_dir, title):
     return p
 
 
-def _colors(plt, n):
-    cmap = plt.get_cmap("viridis")
-    return [cmap(v) for v in np.linspace(0.05, 0.9, max(n, 1))]
-
-
-def _plot_leads(plt, report, out_dir, title):
-    ents = report["candidates"]
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.3))
-    for e, c in zip(ents, _colors(plt, len(ents))):
-        leads = [row["lead"] for row in e.get("by_lead", [])]
-        kw = dict(color=c, lw=2.4 if e.get("is_best") else 1.2, marker="o", ms=3,
-                  label=f"шаг {e['step']}" + (" *" if e.get("is_best") else ""))
-        axes[0].plot(leads, _arr(row.get("Skill") for row in e.get("by_lead", [])), **kw)
-        axes[1].plot(leads, _arr(row.get("PICP90") for row in e.get("by_lead", [])), **kw)
-    axes[0].axhline(0.0, color="black", lw=0.8)
-    axes[0].set_title("Скилл по лидам", fontsize=10)
-    axes[1].axhspan(*COVERAGE_BAND, color="tab:green", alpha=0.12)
-    axes[1].set_title("Покрытие 90%-интервала по лидам", fontsize=10)
-    for ax in axes:
-        ax.set_xscale("log")
-        ax.set_xlabel("лид, ч")
-        ax.grid(alpha=0.3)
-        ax.legend(fontsize=7)
-    fig.suptitle(f"{title}: по лидам, * — лучший по val/loss", fontsize=11)
-    fig.tight_layout()
-    p = os.path.join(out_dir, PLOT_FILES[2])
-    fig.savefig(p, dpi=120)
-    plt.close(fig)
-    return p
-
-
 def _plot_examples(plt, report, examples, out_dir, title):
-    ents = report["candidates"]
     n = len(examples["station"])
     cols = 2
     rows = (n + cols - 1) // cols
     fig, axes = plt.subplots(rows, cols, figsize=(13, 2.9 * rows), squeeze=False)
     axes = axes.ravel()
     leads = np.arange(1, examples["y"].shape[1] + 1)
-    best = next((e for e in ents if e.get("is_best")), ents[-1])
-    colors = dict(zip([e["name"] for e in ents], _colors(plt, len(ents))))
     for k in range(n):
         ax = axes[k]
-        qb = examples["preds"][best["name"]]["q"][k]
-        ax.fill_between(leads, qb[:, 0], qb[:, -1], color="tab:blue", alpha=0.15,
-                        label="90%-интервал лучшего")
+        q = examples["q"][k]
+        ax.fill_between(leads, q[:, 0], q[:, -1], color="tab:blue", alpha=0.15,
+                        label="90%-интервал")
         ax.plot(leads, examples["y"][k], color="black", lw=1.5, label="факт")
         ax.plot(leads, examples["mu_clim"][k], color="tab:red", lw=1.0, ls="--",
                 label="климатология станции")
-        for e in ents:
-            mu = examples["preds"][e["name"]]["mu"][k]
-            ax.plot(leads, mu, color=colors[e["name"]], lw=2.0 if e is best else 0.9,
-                    label=f"медиана, шаг {e['step']}")
+        ax.plot(leads, examples["mu"][k], color="tab:blue", lw=2.0,
+                label=f"медиана, шаг {report['best']['step']}")
         ax.set_title(f"{examples['station'][k]}, час {examples['t'][k]}", fontsize=9)
         ax.set_xlabel("лид, ч")
         ax.set_ylabel("T, °C")
@@ -658,7 +498,7 @@ def _plot_examples(plt, report, examples, out_dir, title):
         ax.axis("off")
     fig.suptitle(f"{title}: примеры прогнозов при L=0 на валидационных станциях", fontsize=11)
     fig.tight_layout()
-    p = os.path.join(out_dir, PLOT_FILES[3])
+    p = os.path.join(out_dir, PLOT_FILES[2])
     fig.savefig(p, dpi=120, bbox_inches="tight")
     plt.close(fig)
     return p
@@ -684,16 +524,15 @@ def plot_field_report(report, examples=None, metrics_csv=None, out_dir="."):
     paths = []
     if metrics_csv and os.path.isfile(metrics_csv):
         paths.append(_plot_curves(plt, report, metrics_csv, out_dir, title))
-    paths.append(_plot_candidates(plt, report, out_dir, title))
     paths.append(_plot_leads(plt, report, out_dir, title))
     if examples is not None:
         paths.append(_plot_examples(plt, report, examples, out_dir, title))
     return paths
 
 
-def write_stage_report(stage_dir, stage, arch, best, candidates, dataset, train_dataset,
-                       device="cpu", seed=0, metrics_csv=None, n_examples=N_EXAMPLES):
-    """Считает отчёт о поле для чекпойнтов этапа, пишет его и строит графики.
+def write_stage_report(stage_dir, stage, arch, best, dataset, train_dataset, device="cpu",
+                       seed=0, metrics_csv=None, n_examples=N_EXAMPLES):
+    """Считает отчёт о поле для лучшего чекпойнта этапа, пишет его и строит графики.
 
     Сбой графиков не отменяет отчёт: он пишется в журнал и в поле plots_error.
 
@@ -701,8 +540,7 @@ def write_stage_report(stage_dir, stage, arch, best, candidates, dataset, train_
         stage_dir: каталог этапа.
         stage: имя этапа.
         arch: архитектура.
-        best: запись о лучшем чекпойнте.
-        candidates: записи о кандидатах.
+        best: запись о лучшем чекпойнте (``describe_checkpoint``).
         dataset: набор валидации этапа.
         train_dataset: набор окон обучающих станций по правилу набора валидации.
         device: устройство.
@@ -713,8 +551,7 @@ def write_stage_report(stage_dir, stage, arch, best, candidates, dataset, train_
     Returns:
         Тройка: отчёт, путь к нему и пути к картинкам.
     """
-    items = report_items(best, candidates)
-    report, examples = build_field_report(items, dataset, arch=arch, stage=stage,
+    report, examples = build_field_report(best, dataset, arch=arch, stage=stage,
                                           train_dataset=train_dataset, device=device,
                                           seed=seed, n_examples=n_examples)
     path = os.path.join(stage_dir, REPORT_FILE)
@@ -723,7 +560,7 @@ def write_stage_report(stage_dir, stage, arch, best, candidates, dataset, train_
         plots = plot_field_report(report, examples, metrics_csv,
                                   os.path.join(stage_dir, REPORT_DIR))
     except Exception as e:
-        # Картинки нужны человеку, но их сбой не должен отменять посчитанный отчёт.
+        # Сбой картинок не отменяет посчитанный отчёт.
         log.exception("графики отчёта этапа %s не построены", stage)
         report["plots_error"] = f"{type(e).__name__}: {e}"
     report["plots"] = plots
@@ -733,7 +570,6 @@ def write_stage_report(stage_dir, stage, arch, best, candidates, dataset, train_
 
 __all__ = ["CLIM_LEVEL", "LIMIT_FIELDS", "PLOT_FILES", "REPORT_DIR", "REPORT_FILE",
            "SUMMARY_LEADS", "build_field_report", "check_gap_set", "collect_outputs",
-           "describe_checkpoint", "field_metrics", "find_report_entry", "format_field_report",
-           "memorization_gap", "memorization_limits", "pick_examples", "plot_field_report",
-           "read_report", "report_device", "report_items", "skill_at", "summary",
-           "write_report", "write_stage_report"]
+           "describe_checkpoint", "field_metrics", "format_field_report", "memorization_gap",
+           "memorization_limits", "pick_examples", "plot_field_report", "report_device",
+           "skill_at", "summary", "write_report", "write_stage_report"]

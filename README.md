@@ -72,63 +72,29 @@ uv run python scripts/build_cache.py --manifest data/manifest.csv
 
 ## Обучение
 
-Единственный вход — `scripts/run.py` (Hydra, конфиги в `conf/`). Поток одинаков для всех
-моделей: подбор скорости обучения → выбор человеком lr и кандидата этапа A → этап B.
-Описание потока — [`METHODS.md`](METHODS.md), «Подбор скорости обучения».
+Единственный вход — `scripts/run.py` (Hydra, конфиги в `conf/`). Одна команда на модель.
+Правила подбора и перехода между этапами — [`METHODS.md`](METHODS.md), «Подбор скорости
+обучения».
 
-**1. Подбор скорости обучения** — МАЯК и бейзлайны:
+**1. Подбор скорости обучения и этап B** — МАЯК и бейзлайны:
 
 ```bash
 uv run python scripts/run.py run.lr_search=true
 uv run python scripts/run.py -m model=gru,dlinear,lru,patchtst run.lr_search=true
 ```
 
-**2. Выбор lr и кандидата этапа A** — по таблице сетки (флаг `edge`) и отчёту этапа A:
+**2. Абляции, сиды, без аугментаций** — lr основного МАЯК, этапы A и B одной командой:
 
 ```bash
-cat runs/mayak/protocol.json                                    # запись подбора: tuning.lr_search
-ls runs/mayak/lr_search/lr0.001/stageA/candidates/              # кандидаты этапа A
-cat runs/mayak/lr_search/lr0.001/stageA/report.json             # отчёт этапа A, графики — report/
-uv run python scripts/stage_report.py --run runs/mayak/lr_search/lr0.001   # пересчёт отчёта
-uv run python scripts/diagnose_stage_a.py \
-    --ckpt runs/mayak/lr_search/lr0.001/stageA/candidates/step006000.ckpt
-```
-
-**3. Этап B** — в том же каталоге, с выбранного кандидата:
-
-```bash
-uv run python scripts/run.py 'run.stages=[B]' \
-    run.init_from=runs/mayak/lr_search/lr0.001/stageA/candidates/step006000.ckpt
-uv run python scripts/run.py model=gru 'run.stages=[B]' \
-    run.init_from=runs/gru/lr_search/lr0.0003/stageA/candidates/step008000.ckpt
-# другое значение сетки, чем минимум подбора: явный train.lr (в журнал как chosen_lr)
-uv run python scripts/run.py 'run.stages=[B]' train.lr=0.003 \
-    run.init_from=runs/mayak/lr_search/lr0.003/stageA/best.ckpt
-```
-
-**4. Абляции, сиды, без аугментаций** — lr основного МАЯК (`run.lr_from`), этап A → выбор
-кандидата → этап B:
-
-```bash
-# этап A: runs/mayak-<абляция>, runs/mayak-s1, runs/mayak-s2, runs/mayak-aug_none
-uv run python scripts/run.py -m 'run.stages=[A]' run.lr_from=runs/mayak \
+uv run python scripts/run.py -m run.lr_from=runs/mayak \
     ablation=no_compression,no_passport,no_solar,no_mode_groups,no_offset_aug,no_correction,no_persistent
-uv run python scripts/run.py -m train.seed=1,2 run.lr_from=runs/mayak 'run.stages=[A]'
-uv run python scripts/run.py augment=none run.lr_from=runs/mayak 'run.stages=[A]'
-
-# этап B: для каждого каталога свой кандидат, выбранный по stageA/report.json
-uv run python scripts/run.py ablation=no_solar run.lr_from=runs/mayak 'run.stages=[B]' \
-    run.init_from=runs/mayak-no_solar/stageA/candidates/step006000.ckpt
-uv run python scripts/run.py train.seed=1 run.lr_from=runs/mayak 'run.stages=[B]' \
-    run.init_from=runs/mayak-s1/stageA/candidates/step006000.ckpt
-uv run python scripts/run.py augment=none run.lr_from=runs/mayak 'run.stages=[B]' \
-    run.init_from=runs/mayak-aug_none/stageA/candidates/step006000.ckpt
+uv run python scripts/run.py -m run.lr_from=runs/mayak train.seed=1,2
+uv run python scripts/run.py run.lr_from=runs/mayak augment=none
 ```
 
-**5. Этап 2, необязательный** — дополнительная настройка МАЯК любыми переопределениями:
+**3. Этап 2, необязательный:**
 
 ```bash
-uv run python scripts/run.py run.extra_tuning=true train.lr=0.001 model.encoder_width=64
 uv run python scripts/run.py run.extra_tuning=true run.lr_search=true model.encoder_width=64
 ```
 
@@ -152,9 +118,9 @@ uv run python scripts/run.py train=debug run.accelerator=cpu run.out_root=runs/d
 |---|---|
 | `protocol.json` | журнал: протокол, сиды, запись подбора, этапы |
 | `config.json` | полностью разрешённый конфиг прогона |
-| `lr_search/lr<X>/stageA/` | этап A прогона сетки: `best.ckpt`, `candidates/`, `report.json`, `report/` |
+| `lr_search/lr<X>/stageA/` | этап A прогона сетки: `best.ckpt`, `report.json`, `report/` |
 | `lr_search/lr<X>/stageB/` | короткий этап B прогона сетки |
-| `stageA/` | этап A, обученный в самом каталоге (абляции, сиды, `augment=none`, этап 2, отладка): `best.ckpt`, `candidates/`, `report.json`, `report/` |
+| `stageA/` | этап A прогона с `run.lr_from` или без подбора: `best.ckpt`, `report.json`, `report/` |
 | `stageB/best.ckpt` | итоговый чекпойнт |
 
 Эталонные окна аугментаций и их действие на QC: `uv run python scripts/aug_reference.py`.
@@ -609,8 +575,6 @@ uv run python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt 
 | `scripts/make_qc_golden.py` | перегенерация регрессионного вектора QC, только при смене правил |
 | `scripts/aug_reference.py` | эталонные окна аугментаций и их действие на QC |
 | `scripts/run.py` | обучение, единственный вход: подбор lr, этапы, абляции, сиды, профили аугментаций, этап 2 |
-| `scripts/stage_report.py` | пересчёт отчёта этапа A: `--run <каталог прогона или прогона сетки>` |
-| `scripts/diagnose_stage_a.py` | диагностика поля после этапа A |
 | `scripts/calibrate.py` | подгонка конформной таблицы МАЯК |
 | `scripts/export_runtime.py` | экспорт графов, манифеста и таблицы для устройства |
 | `scripts/bench_device.py` | замеры устройства: час, выпуск, память, расхождение с оценкой |
@@ -624,7 +588,7 @@ uv run python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt 
 
 | конфиг | назначение |
 |---|---|
-| `conf/config.yaml` | корневой конфиг Hydra: секция `run` (подбор, этапы, `lr_from`, этап 2), каталоги прогонов |
+| `conf/config.yaml` | корневой конфиг Hydra: секция `run` (подбор, `lr_from`, этап 2), каталоги прогонов |
 | `conf/model/` | архитектуры: `mayak`, `gru`, `dlinear`, `lru`, `patchtst` |
 | `conf/ablation/` | `none` и семь абляций МАЯК |
 | `conf/augment/` | профили аугментаций `default` и `none` |

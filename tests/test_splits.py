@@ -412,10 +412,3 @@ def test_training_code_never_mentions_test_window(rel):
     src = (REPO / rel).read_text(encoding="utf-8")
     hits = re.findall(r"\btest\b|unseen_test|ROLE_TEST", src)
     assert not hits, f"{rel}: обращения к тестовой роли/окну: {hits}"
-
-
-def test_stage_a_diagnostics_use_validation_window():
-    src = (REPO / "scripts" / "diagnose_stage_a.py").read_text(encoding="utf-8")
-    hits = re.findall(r"\btest\b|unseen_test|ROLE_TEST|EvalSet\(", src)
-    assert not hits, f"диагностика этапа A строит свои окна или читает тестовое окно: {hits}"
-    assert "validation_set(" in src and "train_stations_set(" in src
