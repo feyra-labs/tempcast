@@ -15,10 +15,14 @@ pinball) без регуляризаторов: одно и то же число
 и конфиг данных, под ключом ``RUN_KEY`` - полностью разрешённый конфиг прогона,
 сиды, хеш коммита и версии библиотек, а под ключом ``TUNING_KEY`` - запись о подборе
 скорости обучения, если прогон шёл с ней. ``load_model`` восстанавливает архитектуру
-из чекпойнта, а не из значений по умолчанию.
+из чекпойнта, а не из значений по умолчанию. ``check_comparable`` сверяет по этим записям
+условия обучения чекпойнтов сравнения.
 """
 import copy
 import functools
+import json
+from dataclasses import dataclass
+from typing import Optional
 
 import pytorch_lightning as L
 import torch
@@ -33,7 +37,7 @@ from mayak.loss import forecast_loss, forecast_terms, masked_mean
 from mayak.model import MAYAK
 from mayak.protocol import (ARCH_NAMES, DEFAULT_PROTOCOL, LR_FIELDS, Protocol, ProtocolError,
                             protocol_diff)
-from mayak.stages import STAGE_KEY
+from mayak.stages import STAGE_KEY, jsonable
 from mayak.tuning import (EXTRA_ARCH, PHASE_EXTRA, TUNING_KEY, describe_phase,
                           equal_terms_problems, search_terms)
 
@@ -421,14 +425,35 @@ def load_model(path, map_location="cpu"):
     return LitForecaster.load_from_checkpoint(path, map_location=map_location).model
 
 
+@dataclass(frozen=True)
+class CheckpointTerms:
+    """Условия обучения чекпойнта, которые сверяет стенд оценки.
+
+    Attributes:
+        arch: имя архитектуры.
+        protocol: протокол обучения.
+        tuning: запись о подборе скорости обучения или None.
+        model_config: словарь конфига архитектуры или None.
+        data_config: словарь конфига данных или None.
+        data_key: ключ кэша данных из записи этапа или None.
+    """
+    arch: str
+    protocol: Protocol
+    tuning: Optional[dict] = None
+    model_config: Optional[dict] = None
+    data_config: Optional[dict] = None
+    data_key: Optional[str] = None
+
+
 def checkpoint_terms(path):
-    """Архитектура, протокол обучения и запись о подборе чекпойнта.
+    """Условия обучения чекпойнта.
 
     Args:
         path: путь к чекпойнту.
 
     Returns:
-        Тройка: имя архитектуры, протокол и запись о подборе или None.
+        Условия обучения: архитектура, протокол, запись о подборе, конфиги модели и
+        данных и ключ кэша данных. Отсутствующие в чекпойнте записи - None.
 
     Raises:
         ProtocolError: в чекпойнте нет протокола или он не читается текущим протоколом,
@@ -444,52 +469,184 @@ def checkpoint_terms(path):
         raise ProtocolError(f"{path}: протокол чекпойнта несовместим с текущим ({e}); "
                             f"чекпойнт обучен по старому протоколу, обучите модель заново"
                             ) from e
-    return hp["arch"], protocol, ck.get(TUNING_KEY)
+    stage = ck.get(STAGE_KEY) or {}
+    return CheckpointTerms(arch=hp["arch"], protocol=protocol, tuning=ck.get(TUNING_KEY),
+                           model_config=hp.get("model_config"),
+                           data_config=hp.get("data_config"), data_key=stage.get("data_key"))
 
 
-def check_comparable(reference, others, ignore=()):
+# Путь к манифесту и каталог кэша зависят от того, откуда запущена команда. Совпадение
+# данных проверяется по ключу кэша: он строится по содержимому манифеста и источников.
+DATA_PATH_FIELDS = ("manifest", "cache_root")
+ABLATIONS_FIELD = "ablations"
+
+
+def _normalized(value):
+    return json.loads(json.dumps(jsonable(value), sort_keys=True))
+
+
+def config_diff(where, ref, own):
+    """Отличия конфига чекпойнта от эталонного, по одной строке на поле.
+
+    Args:
+        where: имя конфига в начале каждой строки.
+        ref: эталонное значение.
+        own: значение чекпойнта.
+
+    Returns:
+        Список строк вида «data.augment.offset_max: у эталона 2.0, у чекпойнта 0.0».
+    """
+    ref, own = _normalized(ref), _normalized(own)
+    if isinstance(ref, dict) and isinstance(own, dict):
+        out = []
+        for k in sorted(set(ref) | set(own)):
+            if k not in ref:
+                out.append(f"{where}.{k}: нет у эталона, у чекпойнта {own[k]!r}")
+            elif k not in own:
+                out.append(f"{where}.{k}: у эталона {ref[k]!r}, нет у чекпойнта")
+            else:
+                out += config_diff(f"{where}.{k}", ref[k], own[k])
+        return out
+    if ref != own:
+        return [f"{where}: у эталона {ref!r}, у чекпойнта {own!r}"]
+    return []
+
+
+def _data_fields(d):
+    return {k: v for k, v in dict(d or {}).items() if k not in DATA_PATH_FIELDS}
+
+
+def _model_fields(d):
+    return {k: v for k, v in dict(d or {}).items() if k != ABLATIONS_FIELD}
+
+
+def missing_terms(terms):
+    """Каких записей для сверки данных и модели в чекпойнте нет.
+
+    Args:
+        terms: условия обучения чекпойнта.
+
+    Returns:
+        Список причин; пустой, если все записи есть.
+    """
+    out = []
+    if terms.model_config is None:
+        out.append("нет конфига модели (hyper_parameters.model_config)")
+    if terms.data_config is None:
+        out.append("нет конфига данных (hyper_parameters.data_config)")
+    if terms.data_key is None:
+        out.append(f"нет ключа кэша данных в записи этапа ({STAGE_KEY})")
+    return out
+
+
+def data_problems(ref, terms):
+    """Отличия данных чекпойнта от эталона.
+
+    Ключ кэша данных должен совпадать с эталонным. Конфиг данных без полей путей должен
+    совпадать с конфигом данных эталона, в который перенесены эффекты абляций модели
+    чекпойнта (``RunConfig.resolved``).
+
+    Args:
+        ref: условия обучения эталона.
+        terms: условия обучения чекпойнта.
+
+    Returns:
+        Список отличий; пустой, если данные те же.
+    """
+    out = []
+    if terms.data_key != ref.data_key:
+        out.append(f"ключ кэша данных {terms.data_key} отличается от эталонного {ref.data_key}")
+    try:
+        expected = RunConfig(model=model_config_for(terms.arch, terms.model_config),
+                             data=DataConfig.from_dict(ref.data_config)).resolved().data
+    except (TypeError, ValueError) as e:
+        return [*out, f"конфиг данных или модели не читается текущим кодом ({e})"]
+    diff = config_diff("data", _data_fields(expected.to_dict()), _data_fields(terms.data_config))
+    if diff:
+        out.append("конфиг данных отличается: " + "; ".join(diff))
+    return out
+
+
+def model_problems(ref, terms):
+    """Отличия абляции или повтора основной модели от эталона.
+
+    Скорость обучения должна совпадать с эталонной, конфиг модели - с эталонным во всех
+    полях, кроме ``ablations``.
+
+    Args:
+        ref: условия обучения эталона.
+        terms: условия обучения чекпойнта.
+
+    Returns:
+        Список отличий; пустой, если модель та же.
+    """
+    out = []
+    lr, ref_lr = float(terms.protocol.lr), float(ref.protocol.lr)
+    if lr != ref_lr:
+        out.append(f"скорость обучения {lr:g} отличается от эталонной {ref_lr:g}")
+    diff = config_diff("model", _model_fields(ref.model_config), _model_fields(terms.model_config))
+    if diff:
+        out.append("конфиг модели отличается не только абляциями: " + "; ".join(diff))
+    return out
+
+
+def check_comparable(reference, others, ignore=(), same_model=False):
     """Проверка, что все чекпойнты сравнения обучены в одинаковых условиях.
 
     Протоколы должны совпадать во всех полях, кроме скорости обучения и полей из
     ``ignore``. Скорость обучения у каждой модели своя, поэтому у каждого чекпойнта,
     включая эталон, должна быть запись о подборе этапа 1 сравнения с той же сеткой, тем
     же числом шагов этапов и той же метрикой выбора, что у эталона, а скорость обучения
-    чекпойнта - значение этой сетки, выбранное подбором (``selected_lr``).
+    чекпойнта - значение этой сетки, выбранное подбором (``selected_lr``). Данные
+    сверяются по ``data_problems``, а с ``same_model`` ещё скорость обучения и конфиг
+    модели по ``model_problems``. Все отличия собираются в одно сообщение.
 
     Args:
         reference: путь к эталонному чекпойнту.
         others: пути к остальным чекпойнтам.
         ignore: поля протокола, которые могут различаться, например сиды у повторов
             основной модели.
+        same_model: чекпойнты - абляции или повторы эталонной модели.
 
     Returns:
         Словарь из пути чекпойнта в его архитектуру.
 
     Raises:
-        ProtocolError: протоколы различаются, у чекпойнта нет протокола или записи о
-            подборе, или подбор шёл в других условиях.
+        ProtocolError: протоколы, данные или, с ``same_model``, модели различаются; у
+            чекпойнта нет протокола, записи о подборе или записей для сверки; подбор шёл в
+            других условиях.
     """
     ignore = (*ignore, *LR_FIELDS)
-    ref_arch, ref, ref_tune = checkpoint_terms(reference)
-    archs = {reference: ref_arch}
-    bad = [f"{reference} ({ref_arch}): {p}" for p in equal_terms_problems(ref_tune, ref)]
-    ref_terms = search_terms(ref_tune)
+    ref = checkpoint_terms(reference)
+    archs = {reference: ref.arch}
+    ref_missing = missing_terms(ref)
+    bad = [f"{reference} ({ref.arch}): {p}"
+           for p in [*equal_terms_problems(ref.tuning, ref.protocol), *ref_missing]]
+    ref_terms = search_terms(ref.tuning)
     for path in others:
-        arch, p, tune = checkpoint_terms(path)
-        archs[path] = arch
-        diff = protocol_diff(ref, p, ignore)
+        t = checkpoint_terms(path)
+        archs[path] = t.arch
+        problems = []
+        diff = protocol_diff(ref.protocol, t.protocol, ignore)
         if diff:
-            bad.append(f"{path} ({arch}): отличаются {diff}")
-        own = equal_terms_problems(tune, p)
-        bad += [f"{path} ({arch}): {x}" for x in own]
-        terms = search_terms(tune)
-        terms_diff = sorted(k for k in ref_terms if ref_terms[k] != terms[k])
-        if not own and ref_tune and terms_diff:
-            bad.append(f"{path} ({arch}): подбор скорости обучения шёл в других условиях, "
-                       f"отличаются {terms_diff}")
+            problems.append(f"отличаются {diff}")
+        own = equal_terms_problems(t.tuning, t.protocol)
+        problems += own
+        own_terms = search_terms(t.tuning)
+        terms_diff = sorted(k for k in ref_terms if ref_terms[k] != own_terms[k])
+        if not own and ref.tuning and terms_diff:
+            problems.append(f"подбор скорости обучения шёл в других условиях, "
+                            f"отличаются {terms_diff}")
+        missing = missing_terms(t)
+        problems += missing
+        if not missing and not ref_missing:
+            problems += data_problems(ref, t)
+            if same_model:
+                problems += model_problems(ref, t)
+        bad += [f"{path} ({t.arch}): {p}" for p in problems]
     if bad:
         raise ProtocolError(f"модели сравнения обучены в разных условиях (эталон — "
-                            f"{reference}, {ref_arch}):\n  " + "\n  ".join(bad))
+                            f"{reference}, {ref.arch}):\n  " + "\n  ".join(bad))
     return archs
 
 
@@ -502,10 +659,10 @@ def check_extra_tuning(path):
     Raises:
         ProtocolError: архитектура не МАЯК или прогон не помечен как этап 2 сравнения.
     """
-    arch, _protocol, tune = checkpoint_terms(path)
-    phase = (tune or {}).get("phase")
-    if arch != EXTRA_ARCH or phase != PHASE_EXTRA:
-        raise ProtocolError(f"{path} ({arch}): нужен прогон {describe_phase(PHASE_EXTRA)} "
+    t = checkpoint_terms(path)
+    phase = (t.tuning or {}).get("phase")
+    if t.arch != EXTRA_ARCH or phase != PHASE_EXTRA:
+        raise ProtocolError(f"{path} ({t.arch}): нужен прогон {describe_phase(PHASE_EXTRA)} "
                             f"(scripts/run.py run.extra_tuning=true), а это прогон "
                             f"{describe_phase(phase)}")
 

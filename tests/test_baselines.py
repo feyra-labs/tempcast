@@ -483,12 +483,17 @@ def _tuning(lr=DEFAULT_PROTOCOL.lr, grid=DEFAULT_PROTOCOL.lr_grid, phase=1):
     return dict(phase=phase, lr_search=search, inherited_from=None)
 
 
-def _fake_ckpt(path, arch="mayak", protocol=DEFAULT_PROTOCOL, tuning=None):
+def _fake_ckpt(path, arch="mayak", protocol=DEFAULT_PROTOCOL, tuning=None, model_config=None,
+               data_config=None, data_key="data0"):
+    from mayak.config import DataConfig, model_config_for
+    from mayak.stages import STAGE_KEY
     from mayak.tuning import TUNING_KEY
-    hp = {"arch": arch}
+    mcfg = model_config_for(arch, model_config)
+    dcfg = DataConfig() if data_config is None else data_config
+    hp = {"arch": arch, "model_config": mcfg.to_dict(), "data_config": dcfg.to_dict()}
     if protocol is not None:
         hp["protocol"] = protocol.to_dict()
-    ck = {"hyper_parameters": hp, "state_dict": {}}
+    ck = {"hyper_parameters": hp, "state_dict": {}, STAGE_KEY: {"data_key": data_key}}
     if tuning is not None:
         ck[TUNING_KEY] = tuning
     torch.save(ck, path)
@@ -496,6 +501,7 @@ def _fake_ckpt(path, arch="mayak", protocol=DEFAULT_PROTOCOL, tuning=None):
 
 
 def test_check_comparable_rejects_mismatch_and_pre_protocol_checkpoints(tmp_path):
+    from mayak.config import Ablations, DataConfig, ModelConfig, RunConfig
     from mayak.lit import check_comparable
     from mayak.protocol import SEED_FIELDS
     ref = _fake_ckpt(tmp_path / "m.ckpt", tuning=_tuning())
@@ -529,3 +535,17 @@ def test_check_comparable_rejects_mismatch_and_pre_protocol_checkpoints(tmp_path
     extra = _fake_ckpt(tmp_path / "extra.ckpt", tuning=_tuning(phase=2))
     with pytest.raises(ProtocolError, match="этапа 2"):
         check_comparable(ref, [extra])
+    no_solar = ModelConfig(ablations=Ablations(no_solar=True))
+    abl_lr = _fake_ckpt(tmp_path / "abl_lr.ckpt", "mayak", Protocol(lr=1e-3), _tuning(lr=1e-3),
+                        model_config=no_solar)
+    with pytest.raises(ProtocolError, match="отличается от эталонной"):
+        check_comparable(ref, [abl_lr], same_model=True)
+    other_data = _fake_ckpt(tmp_path / "key.ckpt", "gru", tuning=_tuning(), data_key="data1")
+    with pytest.raises(ProtocolError, match="ключ кэша данных"):
+        check_comparable(ref, [other_data])
+    no_offset = ModelConfig(ablations=Ablations(no_offset_aug=True))
+    zeroed = RunConfig(model=no_offset, data=DataConfig()).resolved().data
+    assert zeroed.augment.offset_max == 0.0
+    no_offset_aug = _fake_ckpt(tmp_path / "noa.ckpt", tuning=_tuning(), model_config=no_offset,
+                               data_config=zeroed)
+    check_comparable(ref, [no_offset_aug], same_model=True)

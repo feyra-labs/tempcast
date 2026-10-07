@@ -61,46 +61,6 @@ def jsonable(obj):
     return str(obj)
 
 
-def _normalized(value):
-    return json.loads(json.dumps(jsonable(value), sort_keys=True))
-
-
-def config_diff(where, old, new):
-    """Отличия двух конфигов, по одной строке на поле.
-
-    Args:
-        where: имя конфига в начале каждой строки.
-        old: значение из чекпойнта.
-        new: значение этого запуска.
-
-    Returns:
-        Список строк вида «модель.encoder_width: в чекпойнте 16, в запуске 64».
-    """
-    old, new = _normalized(old), _normalized(new)
-    if isinstance(old, dict) and isinstance(new, dict):
-        out = []
-        for k in sorted(set(old) | set(new)):
-            if k not in old:
-                out.append(f"{where}.{k}: нет в чекпойнте, в запуске {new[k]!r}")
-            elif k not in new:
-                out.append(f"{where}.{k}: в чекпойнте {old[k]!r}, нет в запуске")
-            else:
-                out += config_diff(f"{where}.{k}", old[k], new[k])
-        return out
-    if old != new:
-        return [f"{where}: в чекпойнте {old!r}, в запуске {new!r}"]
-    return []
-
-
-# Путь к манифесту и каталог кэша зависят от того, откуда запущена команда. Совпадение
-# данных проверяется по ключу кэша: он строится по содержимому манифеста и источников.
-DATA_PATH_FIELDS = ("manifest", "cache_root")
-
-
-def _data_fields(d):
-    return {k: v for k, v in dict(d or {}).items() if k not in DATA_PATH_FIELDS}
-
-
 def journal_stage(journal_path, stage_name):
     """Последняя запись этапа из журнала прогона.
 
@@ -184,6 +144,5 @@ def warn_stale(stage_dir):
                     "версии, журнал и отчёт укажут только на новые", stage_dir, len(old))
 
 
-__all__ = ["DATA_PATH_FIELDS", "FIELD_CURRICULUM", "STAGE_KEY", "config_diff", "journal_stage",
-           "jsonable", "lineage", "load_init_weights", "stage_dir_name", "stage_record",
-           "warn_stale"]
+__all__ = ["FIELD_CURRICULUM", "STAGE_KEY", "journal_stage", "jsonable", "lineage",
+           "load_init_weights", "stage_dir_name", "stage_record", "warn_stale"]

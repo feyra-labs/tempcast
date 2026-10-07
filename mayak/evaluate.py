@@ -1361,8 +1361,10 @@ def main():
                              f"(scripts/run.py model={arch})")
     ap.add_argument("--allow-protocol-mismatch", action="store_true",
                     help="не падать, если модели обучены в разных условиях: по разным "
-                         "протоколам или без одинакового подбора скорости обучения (только "
-                         "для диагностики: такие таблицы несопоставимы)")
+                         "протоколам, без одинакового подбора скорости обучения, на других "
+                         "данных или с другим профилем аугментаций, а абляции и сиды - ещё "
+                         "с другой скоростью обучения или архитектурой (только для "
+                         "диагностики: такие таблицы несопоставимы)")
     ap.add_argument("--ablation-ckpt", nargs="*", default=[],
                     help="чекпойнты переобученных абляций МАЯК (тот же сид и протокол, "
                          "скорость обучения основного МАЯК: run.lr_from); имя строки таблицы "
@@ -1415,8 +1417,9 @@ def main():
         check_extra_tuning(args.tuned_ckpt)
         all_ckpts.append(args.tuned_ckpt)
     try:
-        check_comparable(args.ckpt[0], [*baseline_ckpts.values(), *args.ablation_ckpt])
-        check_comparable(args.ckpt[0], args.ckpt[1:], ignore=SEED_FIELDS)
+        check_comparable(args.ckpt[0], list(baseline_ckpts.values()))
+        check_comparable(args.ckpt[0], args.ablation_ckpt, same_model=True)
+        check_comparable(args.ckpt[0], args.ckpt[1:], ignore=SEED_FIELDS, same_model=True)
     except ProtocolError as e:
         if not args.allow_protocol_mismatch:
             raise
