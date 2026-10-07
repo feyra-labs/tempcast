@@ -515,6 +515,10 @@ ssh pi@device '/opt/mayak/venv/bin/python -m mayak.runtime.run_inference --help'
 printf 'obs 1767225600 11 1012.4 81\nforecast\nstatus\n' | \
     /opt/mayak/venv/bin/python -m mayak.runtime.run_inference --model /opt/mayak/model \
     --lat 52.37 --lon 4.90 --elev -2 --state-dir /var/lib/mayak --aci
+
+# на рабочей машине после экспорта
+uv run python -m mayak.runtime.run_inference --model runtime/model \
+    --lat 52.37 --lon 4.90 --elev -2
 ```
 
 | команда | ответ |
@@ -561,13 +565,6 @@ WantedBy=multi-user.target
 sudo systemctl enable --now mayak
 echo "obs $(date -u +%s -d "$(date -u +%Y-%m-%dT%H:00:00)") 11 1012.4 81" > /run/mayak/in
 echo forecast > /run/mayak/in && tail -n 1 /var/lib/mayak/out.jsonl
-```
-
-**5. Хост на рабочей машине** прямо по чекпойнту:
-
-```bash
-uv run python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt \
-    --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2
 ```
 
 ## Скрипты
