@@ -7,10 +7,11 @@ import pytest
 from mayak.constants import H, QUANTILES
 from mayak.data import store as S
 from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL
-from mayak.metrics import (HISTORY_BINS, I_MED, LEAD_BINS, METRICS, NQ, ACIParams,
-                           AdaptiveCalibration, Evaluation, apply_conformal, breakdown, by_lead,
-                           calibrate_forecast, conformal_table, fit_conformal_shift,
-                           lead_bin_index, lead_bin_of, metric_table, seed_spread, spread)
+from mayak.metrics import (ABLATION_CELLS, HISTORY_BINS, I_MED, LEAD_BINS, METRICS, NQ,
+                           ACIParams, AdaptiveCalibration, Evaluation, ablation_significance,
+                           apply_conformal, breakdown, by_lead, calibrate_forecast,
+                           conformal_table, fit_conformal_shift, lead_bin_index, lead_bin_of,
+                           metric_table, seed_spread, significance_verdict, spread)
 from mayak.zones import KOPPEN_ZONES, UNKNOWN_ZONE, normalize_zone, season_of
 
 Q = np.asarray(QUANTILES, np.float64)
@@ -450,6 +451,38 @@ def test_seed_spread_reports_mean_and_range():
     assert sp["MAE"]["max"] == pytest.approx(max(maes))
     assert spread([1.0, 1.0])["std"] == pytest.approx(0.0)
     assert spread([])["n"] == 0
+
+
+def _lead_summaries(skill24):
+    """Сводки по лидам таблицы абляций: меняется только Skill@24, остальные ячейки равны."""
+    out = {h: {"pooled": {"Skill": 0.5, "CRPS": 1.0, "PICP90": 0.9}}
+           for h in {h for _m, h in ABLATION_CELLS}}
+    out[24]["pooled"]["Skill"] = skill24
+    return out
+
+
+def test_ablation_significance_needs_twice_seed_range_and_one_sign():
+    seeds = [_lead_summaries(v) for v in (0.50, 0.51, 0.49)]  # R = 0.02
+    internal = ablation_significance(seeds, {"a": _lead_summaries(0.45),
+                                             "b": _lead_summaries(0.47),
+                                             "c": _lead_summaries(0.44)})
+    assert internal["spread"]["Skill@24"] == pytest.approx(0.02)
+    assert internal["rows"]["a"]["Skill@24"]["delta"] == pytest.approx(-0.05)
+    assert internal["rows"]["a"]["Skill@24"]["expressed"]
+    assert not internal["rows"]["b"]["Skill@24"]["expressed"], "|Δ| > R, но не больше 2R"
+    assert not internal["rows"]["a"]["Skill@72"]["expressed"], "Δ = 0 при нулевом размахе"
+
+    external = ablation_significance(seeds, {"a": _lead_summaries(0.56),
+                                             "b": _lead_summaries(0.40),
+                                             "c": _lead_summaries(0.45)})
+    assert external["rows"]["a"]["Skill@24"]["expressed"]
+    verdict = significance_verdict(internal, external)
+    assert not verdict["a"]["Skill@24"], "выражена на обоих наборах, но знаки Δ разные"
+    assert not verdict["b"]["Skill@24"], "на одном наборе не выражена"
+    assert verdict["c"]["Skill@24"]
+    assert not any(verdict["c"][c] for c in verdict["c"] if c != "Skill@24")
+    with pytest.raises(ValueError):
+        ablation_significance(seeds[:2], {"a": _lead_summaries(0.45)})
 
 
 def test_stratified_subsample_keeps_every_station():

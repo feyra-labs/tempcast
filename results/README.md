@@ -35,6 +35,7 @@
 | `evaluate/internal/coldstart.json` | проверка поля при нулевой истории |
 | `ablations/internal/metrics.json`, `ablations/internal/seeds.json` | 7. Абляции и сиды, ERA5 (`unseen_test`) |
 | `ablations/external/metrics.json`, `ablations/external/seeds.json` | 7. Абляции и сиды, GHCNh (`external_test`) |
+| `ablations/significance.json` | 7. Значимость абляций: ERA5 и GHCNh |
 | `evaluate/external/*.json` | 8. Внешний тест, в том числе `transfer.json` |
 | `robustness/robustness.json` | 9. Робастность |
 | `device/bench.json` | 10. Устройство |

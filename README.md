@@ -139,7 +139,7 @@ uv run python -m mayak.evaluate --ckpt runs/mayak/stageB/best.ckpt \
     --conformal runs/conformal.npy --external-manifest data/ghcnh/manifest.csv \
     --bootstrap 1000 --save-preds runs/preds --results-dir results/evaluate
 
-# таблица 7: абляции и сиды, ERA5 и GHCNh
+# таблица 7: абляции и сиды, ERA5 и GHCNh, значимость абляций
 ABLATIONS="no_compression no_passport no_solar no_mode_groups no_offset_aug no_correction no_persistent"
 uv run python -m mayak.evaluate \
     --ckpt runs/mayak/stageB/best.ckpt \
@@ -314,7 +314,7 @@ uv run python -m mayak.robustness --ckpt runs/mayak/stageB/best.ckpt \
 </details>
 
 <details>
-<summary>7. Абляции и сиды — <code>results/ablations/{internal,external}/{metrics,seeds}.json</code></summary>
+<summary>7. Абляции и сиды — <code>results/ablations/{internal,external}/{metrics,seeds}.json</code>, <code>results/ablations/significance.json</code></summary>
 
 Правило значимости — [`METHODS.md`](METHODS.md), раздел «Абляции и сиды».
 
@@ -334,6 +334,8 @@ ERA5, станции `unseen_test` (`internal/metrics.json`, `internal/seeds.jso
 | метрика, 3 сида | среднее | мин | макс | ст. откл. |
 |---|:-:|:-:|:-:|:-:|
 | Skill@24 | — | — | — | — |
+| Skill@72 | — | — | — | — |
+| Skill@168 | — | — | — | — |
 | MAE@24 | — | — | — | — |
 | CRPS@24 | — | — | — | — |
 | PICP90@24 | — | — | — | — |
@@ -354,9 +356,23 @@ GHCNh, станции `external_test` (`external/metrics.json`, `external/seeds.
 | метрика, 3 сида | среднее | мин | макс | ст. откл. |
 |---|:-:|:-:|:-:|:-:|
 | Skill@24 | — | — | — | — |
+| Skill@72 | — | — | — | — |
+| Skill@168 | — | — | — | — |
 | MAE@24 | — | — | — | — |
 | CRPS@24 | — | — | — | — |
 | PICP90@24 | — | — | — | — |
+
+Значимость: выражена на ERA5 и GHCNh с одним знаком Δ (`significance.json`, ключ `verdict`):
+
+| абляция | Skill@24 | Skill@72 | Skill@168 | CRPS@24 | PICP90@24 |
+|---|:-:|:-:|:-:|:-:|:-:|
+| МАЯК [mayak-no_compression] | — | — | — | — | — |
+| МАЯК [mayak-no_passport] | — | — | — | — | — |
+| МАЯК [mayak-no_solar] | — | — | — | — | — |
+| МАЯК [mayak-no_mode_groups] | — | — | — | — | — |
+| МАЯК [mayak-no_offset_aug] | — | — | — | — | — |
+| МАЯК [mayak-no_correction] | — | — | — | — | — |
+| МАЯК [mayak-no_persistent] | — | — | — | — | — |
 
 </details>
 

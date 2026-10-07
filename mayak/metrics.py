@@ -18,6 +18,10 @@ NO_HOUR = int(np.iinfo(np.int64).min)
 
 LEAD_BINS = ((1, 6), (7, 24), (25, 72), (73, 168))
 FINE_LEADS = (1, 2, 3, 4, 6, 8, 12, 18, 24, 36, 48, 72, 96, 120, 168)
+# Ячейки таблицы абляций: метрика и лид, ч.
+ABLATION_CELLS = (("Skill", 24), ("Skill", 72), ("Skill", 168), ("CRPS", 24), ("PICP90", 24))
+SIGNIFICANCE_FACTOR = 2.0
+MIN_SEEDS = 3
 
 METRICS = ("MAE", "RMSE", "Skill", "CRPS", "PICP80", "PICP90", "Winkler90", "Width90")
 _MEAN_METRIC = {"ae": "MAE", "crps": "CRPS", "cov80": "PICP80", "cov90": "PICP90",
@@ -1283,6 +1287,82 @@ def seed_spread(summaries, key="pooled"):
     return {m: spread([s[key][m] for s in summaries]) for m in METRICS}
 
 
+def cell_name(metric, lead):
+    return f"{metric}@{int(lead)}"
+
+
+def ablation_significance(seeds, ablations, cells=ABLATION_CELLS, key="pooled",
+                          factor=SIGNIFICANCE_FACTOR):
+    """Разница абляций с основной моделью против размаха сидов на одном наборе окон.
+
+    Δ - метрика абляции минус метрика основной модели (первый сид). R - разность максимума
+    и минимума метрики по всем сидам основной модели на том же лиде. Разница выражена, если
+    |Δ| > ``factor`` · R. Если Δ не посчитана или хотя бы у одного сида метрика не
+    посчитана, разница не выражена.
+
+    Args:
+        seeds: сводки основной модели по лидам для каждого сида, первым - сид основной
+            модели; у каждого сида словарь из лида в сводку.
+        ablations: словарь из имени абляции в её сводки по лидам.
+        cells: пары «метрика, лид».
+        key: какие метрики брать из сводки: ``pooled`` или ``macro``.
+        factor: множитель размаха.
+
+    Returns:
+        Словарь: число сидов, множитель, значения основной модели и размах R по ячейкам,
+        строки абляций - по каждой ячейке значение, Δ и признак «выражена». Ячейка
+        называется «метрика@лид».
+
+    Raises:
+        ValueError: сидов меньше ``MIN_SEEDS``.
+    """
+    if len(seeds) < MIN_SEEDS:
+        raise ValueError(f"для правила значимости нужно не меньше {MIN_SEEDS} сидов, "
+                         f"передано {len(seeds)}")
+    main, ranges = {}, {}
+    for m, h in cells:
+        c = cell_name(m, h)
+        sp = spread([s[h][key][m] for s in seeds])
+        main[c] = float(seeds[0][h][key][m])
+        ranges[c] = sp["max"] - sp["min"] if sp["n"] == len(seeds) else float("nan")
+    rows = {}
+    for name, summ in ablations.items():
+        row = {}
+        for m, h in cells:
+            c = cell_name(m, h)
+            value = float(summ[h][key][m])
+            delta = value - main[c]
+            expressed = bool(np.isfinite(delta) and np.isfinite(ranges[c])
+                             and abs(delta) > factor * ranges[c])
+            row[c] = dict(value=value, delta=delta, expressed=expressed)
+        rows[name] = row
+    return dict(n_seeds=len(seeds), factor=float(factor), main=main, spread=ranges, rows=rows)
+
+
+def significance_verdict(internal, external):
+    """Значимость разницы абляций по двум наборам окон.
+
+    Разница значима, если она выражена на обоих наборах и Δ на них одного знака.
+
+    Args:
+        internal: результат ``ablation_significance`` на первом наборе.
+        external: результат ``ablation_significance`` на втором наборе.
+
+    Returns:
+        Словарь из имени абляции в словарь из ячейки в признак значимости. Абляции, которой
+        нет на одном из наборов, в вердикте нет.
+    """
+    out = {}
+    for name, row in internal["rows"].items():
+        other = external["rows"].get(name)
+        if other is None:
+            continue
+        out[name] = {c: bool(a["expressed"] and other[c]["expressed"]
+                             and np.sign(a["delta"]) == np.sign(other[c]["delta"]))
+                     for c, a in row.items() if c in other}
+    return out
+
+
 def coverage(y, q, w, lo=I_LO90, hi=I_HI90):
     return float(wmean(inside(y, q[..., lo], q[..., hi]), w))
 
@@ -1305,14 +1385,15 @@ def metric_table(y, mu, q, mu_clim, w, leads=(1, 3, 6, 12, 24, 48, 72, 120, 168)
     return out
 
 
-__all__ = ["ACIParams", "AdaptiveCalibration", "CENTRAL_INTERVALS", "Evaluation", "FINE_LEADS",
-           "HISTORY_BINS", "LEAD_BINS", "METRICS", "NO_HOUR", "NQ", "Q", "SHARPNESS_POINTS",
-           "SHARPNESS_RANGE", "ZQ", "aci_effective_level", "aci_score",
+__all__ = ["ABLATION_CELLS", "ACIParams", "AdaptiveCalibration", "CENTRAL_INTERVALS",
+           "Evaluation", "FINE_LEADS", "HISTORY_BINS", "LEAD_BINS", "METRICS", "MIN_SEEDS",
+           "NO_HOUR", "NQ", "Q", "SHARPNESS_POINTS", "SHARPNESS_RANGE", "SIGNIFICANCE_FACTOR",
+           "ZQ", "ablation_significance", "aci_effective_level", "aci_score",
            "aci_score_bounds", "apply_adaptive", "apply_conformal", "breakdown", "by_lead",
            "by_lead_bin",
-           "calibrate_forecast", "check_conformal_shape", "check_history_bins",
+           "calibrate_forecast", "cell_name", "check_conformal_shape", "check_history_bins",
            "check_median_free", "conformal_table", "coverage", "fit_conformal_shift",
            "history_bin_of", "inside", "interval_indices",
            "lead_bin_index", "lead_bin_of", "lead_mask", "metric_table", "order_around_median",
            "ordered_labels", "pair_terms", "pinball_crps", "seed_spread", "sharpness_scales",
-           "spread", "width_at_coverage", "winkler", "wmean"]
+           "significance_verdict", "spread", "width_at_coverage", "winkler", "wmean"]

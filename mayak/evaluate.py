@@ -26,7 +26,9 @@
 валидных часов истории, внешний тест на наблюдениях реальной сети с его собственными
 разрезами и сопоставлением с внутренним тестом, проверки поля при холодном старте,
 суточные амплитуды, строки переобученных абляций и разброс основной модели по сидам на
-внутреннем и внешнем наборах.
+внутреннем и внешнем наборах. Если есть абляции и не меньше трёх сидов основной модели,
+стенд сравнивает разницу каждой абляции с основной моделью с размахом сидов на каждом
+наборе и выносит вердикт о значимости по двум наборам.
 
 Модели сравниваются на равных: у каждого чекпойнта есть запись о подборе скорости
 обучения по одной и той же сетке с одним и тем же числом шагов. Прогон дополнительной
@@ -47,8 +49,9 @@ from mayak.data.holdout import (HISTORY_GRID, NOMINAL_HISTORY, EvalSet, check_hi
 from mayak.data.splits import ROLE_EXTERNAL, ROLE_TEST, ROLE_TRAIN
 from mayak.data.window import valid_history_hours
 from mayak.loss import NORM_SCALE_CLAMP
-from mayak.metrics import (FINE_LEADS, LEAD_BINS, NQ, Evaluation, breakdown, by_lead, coverage,
-                           metric_table, seed_spread)
+from mayak.metrics import (ABLATION_CELLS, FINE_LEADS, LEAD_BINS, MIN_SEEDS, NQ, Evaluation,
+                           ablation_significance, breakdown, by_lead, cell_name, coverage,
+                           metric_table, seed_spread, significance_verdict)
 from mayak.results import (evaluation_tables, lead_tables, run_record, set_record,
                            transfer_tables, write_tables)
 from mayak.zones import normalize_zone
@@ -62,6 +65,11 @@ BOOTSTRAP = dict(n_boot=1000, seed=0, level=0.90)
 TABLE_LEADS = (1, 3, 6, 12, 24, 48, 72, 120, 168)
 HISTORY_LEADS = (24, 72, 168)
 BREAKDOWN_LEAD = 24
+SEED_LEADS = tuple(sorted({h for _m, h in ABLATION_CELLS}))
+SIGNIFICANCE_RULE = ("Δ = абляция − МАЯК (сид 0); R = максимум − минимум по сидам МАЯК; "
+                     "выражена: |Δ| > factor·R на наборе; значима: выражена на internal и "
+                     "external с одним знаком Δ")
+NO_EXTERNAL_NOTE = "внешнего набора нет: только строки internal, вердикта о значимости нет"
 
 MAIN_MODEL = "МАЯК"
 TUNED_MODEL = "МАЯК (доп. настройка)†"
@@ -477,49 +485,102 @@ def print_reliability(ev, lead_bins=LEAD_BINS):
         print(f"{r['nominal']:>9.0%} {r['coverage']:>9.1%} {r['width']:>12.2f}")
 
 
-def print_seed_spread(evs_by_seed, lead=24):
-    """Печатает разброс метрик основной модели по сидам на одном лиде.
+def seed_summaries(models, res, ds, leads=SEED_LEADS):
+    """Сводки основной модели и её повторов с другими сидами по лидам на окнах одного набора.
 
-    Args:
-        evs_by_seed: оценки одной и той же модели, обученной с разными сидами.
-        lead: лид, ч.
-
-    Returns:
-        Словарь из имени метрики в среднее, минимум, максимум и стандартное отклонение.
-    """
-    summaries = [ev.restrict(leads=[lead]).summary() for ev in evs_by_seed]
-    spread = seed_spread(summaries)
-    print(f"\n--- разброс по {len(evs_by_seed)} сидам, лид {lead} ч ---")
-    print(f"{'метрика':>10} {'среднее':>10} {'мин':>10} {'макс':>10} {'ст.откл.':>10}")
-    for m, s in spread.items():
-        if not np.isfinite(s["mean"]):
-            continue
-        print(f"{m:>10} {s['mean']:>10.3f} {s['min']:>10.3f} {s['max']:>10.3f} {s['std']:>10.3f}")
-    return dict(lead=int(lead), n_seeds=len(evs_by_seed), metrics=spread)
-
-
-def seed_spread_table(models, res, ds, lead=24):
-    """Разброс метрик основной модели по сидам на окнах одного набора при полной истории.
-
-    Первая модель - основная: её предсказания уже есть в результате оценки набора.
-    Остальные - та же модель, обученная с другими сидами; они прогоняются по тем же окнам и
-    оцениваются по тем же целям и эталону. По этому разбросу проверяется значимость
-    разницы абляций с полной моделью на том же наборе.
+    Первая модель - основная: её сводки берутся из результата оценки набора. Остальные -
+    та же модель, обученная с другими сидами; они прогоняются по тем же окнам при полной
+    истории и оцениваются по тем же целям и эталону.
 
     Args:
         models: модели основной архитектуры с разными сидами, основная первой.
         res: результат оценки набора (``evaluate_set``) с основной моделью.
         ds: тот же набор окон.
-        lead: лид, ч.
+        leads: лиды, ч.
 
     Returns:
-        Таблица разброса, как у ``print_seed_spread``.
+        Список по сидам, основной первой: словарь из лида в сводку.
     """
-    preds, aux = res["bench"].preds, res["bench"].aux
+    aux = res["bench"].aux
     nominal = ds.with_history(NOMINAL_HISTORY)
-    evs = [evaluation_for(preds[MAIN_MODEL], aux)]
-    evs += [evaluation_for(dict(zip(("mu", "q"), _mu_q(m, nominal))), aux) for m in models[1:]]
-    return print_seed_spread(evs, lead=lead)
+    out = [{int(h): res["leads"][MAIN_MODEL][int(h)] for h in leads}]
+    for m in models[1:]:
+        ev = evaluation_for(dict(zip(("mu", "q"), _mu_q(m, nominal))), aux)
+        out.append(by_lead(ev, leads=leads))
+    return out
+
+
+def print_seed_spread(summaries, leads=SEED_LEADS):
+    """Печатает разброс метрик основной модели по сидам на каждом лиде.
+
+    Args:
+        summaries: сводки по лидам для каждого сида, как их возвращает ``seed_summaries``.
+        leads: лиды, ч.
+
+    Returns:
+        Словарь: лиды, число сидов и по каждому лиду словарь из имени метрики в среднее,
+        минимум, максимум и стандартное отклонение.
+    """
+    out = {}
+    for h in leads:
+        spread = seed_spread([s[int(h)] for s in summaries])
+        print(f"\n--- разброс по {len(summaries)} сидам, лид {h} ч ---")
+        print(f"{'метрика':>10} {'среднее':>10} {'мин':>10} {'макс':>10} {'ст.откл.':>10}")
+        for m, v in spread.items():
+            if not np.isfinite(v["mean"]):
+                continue
+            print(f"{m:>10} {v['mean']:>10.3f} {v['min']:>10.3f} {v['max']:>10.3f} "
+                  f"{v['std']:>10.3f}")
+        out[int(h)] = spread
+    return dict(leads=[int(h) for h in leads], n_seeds=len(summaries), metrics=out)
+
+
+def significance_table(internal, external=None):
+    """Таблица значимости абляций по результатам ``ablation_significance`` на наборах.
+
+    Args:
+        internal: результат на внутреннем наборе.
+        external: результат на внешнем наборе; None - без вердикта.
+
+    Returns:
+        Словарь: правило, ячейки, строки каждого набора и вердикт; без внешнего набора
+        вердикт - None и есть пометка об этом.
+    """
+    table = dict(rule=SIGNIFICANCE_RULE, cells=[cell_name(m, h) for m, h in ABLATION_CELLS],
+                 internal=internal, external=external, verdict=None)
+    if external is None:
+        table["note"] = NO_EXTERNAL_NOTE
+    else:
+        table["verdict"] = significance_verdict(internal, external)
+    return table
+
+
+def print_significance(table):
+    """Печатает Δ абляций, размах сидов и вердикт о значимости.
+
+    Args:
+        table: таблица ``significance_table``.
+    """
+    cols = table["cells"]
+    head = f"{'вариант':<34}" + "".join(f"{c:>14}" for c in cols)
+    for set_name in ("internal", "external"):
+        sig = table.get(set_name)
+        if sig is None:
+            continue
+        print(f"\n--- {set_name}: Δ к МАЯК (сид 0); * - |Δ| > {sig['factor']:g}·R ---")
+        print(head)
+        print(f"{'R по ' + str(sig['n_seeds']) + ' сидам':<34}"
+              + "".join(f"{sig['spread'][c]:>14.4f}" for c in cols))
+        for name, row in sig["rows"].items():
+            print(f"{name:<34}" + "".join(
+                f"{row[c]['delta']:>+13.4f}{'*' if row[c]['expressed'] else ' '}" for c in cols))
+    if table["verdict"] is None:
+        print(f"\n{table['note']}")
+        return
+    print("\n--- значимость: выражена на обоих наборах с одним знаком Δ ---")
+    print(head)
+    for name, row in table["verdict"].items():
+        print(f"{name:<34}" + "".join(f"{'да' if row.get(c) else 'нет':>14}" for c in cols))
 
 
 def zone_breakdown(preds, aux, koppen=None, leads=(24, 72), model="МАЯК",
@@ -1353,7 +1414,9 @@ def main():
     ap.add_argument("--ckpt", required=True, nargs="+",
                     help="чекпойнты МАЯК; несколько = прогоны с разными сидами (повторы "
                          "берут скорость обучения первого: scripts/run.py run.lr_from=...), "
-                         "разброс по сидам - таблица seeds внутреннего и внешнего набора")
+                         "разброс по сидам - таблица seeds внутреннего и внешнего набора; "
+                         "с --ablation-ckpt и не меньше чем тремя чекпойнтами - значимость "
+                         "абляций, DIR/significance.json")
     ap.add_argument("--manifest", default="data/manifest.csv")
     for arch, name in NEURAL_BASELINES.items():
         ap.add_argument(f"--{arch}-ckpt", default=None,
@@ -1404,7 +1467,8 @@ def main():
                     help="записать каждую таблицу в свой JSON с записью о прогоне: "
                          "DIR/internal/*.json (станции unseen_test), "
                          f"DIR/{TRAIN_STATIONS_DIR}/metrics.json (обучающие станции в "
-                         "тестовом окне), DIR/external/*.json, DIR/params.json")
+                         "тестовом окне), DIR/external/*.json, DIR/params.json, с абляциями и "
+                         "сидами ещё DIR/significance.json")
     args = ap.parse_args()
     grid = parse_grid(args.history_grid)
 
@@ -1443,10 +1507,12 @@ def main():
 
     seeds = [load_model(c) for c in args.ckpt]
     mayak = seeds[0]
-    named_extra = {}
+    named_extra, ablation_names = {}, []
     for c in args.ablation_ckpt:
         m = load_model(c)
-        named_extra[f"МАЯК [{run_label(m.cfg)}]"] = m
+        name = f"МАЯК [{run_label(m.cfg)}]"
+        named_extra[name] = m
+        ablation_names.append(name)
     for arch, c in baseline_ckpts.items():
         named_extra[NEURAL_BASELINES[arch]] = load_model(c)
 
@@ -1492,8 +1558,14 @@ def main():
             print("Предсказания:", p)
 
     tables = evaluation_tables(res)
+    with_significance = bool(ablation_names) and len(seeds) >= MIN_SEEDS
+    significance = {}
     if len(seeds) > 1:
-        tables["seeds"] = seed_spread_table(seeds, res, base)
+        summ = seed_summaries(seeds, res, base)
+        tables["seeds"] = print_seed_spread(summ)
+        if with_significance:
+            significance["internal"] = ablation_significance(
+                summ, {n: res["leads"][n] for n in ablation_names})
 
     print("\n=== Графики (сырые выходы) ===")
     for p in plot_metric_curves(build_tables(preds, aux), args.out_dir):
@@ -1540,10 +1612,21 @@ def main():
         ext = dict(evaluation_tables(res_e), transfer=transfer_tables(tr_e))
         if len(seeds) > 1:
             print("\n=== Разброс по сидам, внешний тест ===")
-            ext["seeds"] = seed_spread_table(seeds, res_e, ds_e)
+            summ_e = seed_summaries(seeds, res_e, ds_e)
+            ext["seeds"] = print_seed_spread(summ_e)
+            if with_significance:
+                significance["external"] = ablation_significance(
+                    summ_e, {n: res_e["leads"][n] for n in ablation_names})
         if args.results_dir:
             written += write_tables(ext, os.path.join(args.results_dir, "external"),
                                     set_record(record, ds_e))
+
+    if with_significance:
+        print("\n=== Значимость абляций ===")
+        sig_table = significance_table(significance["internal"], significance.get("external"))
+        print_significance(sig_table)
+        if args.results_dir:
+            written += write_tables(dict(significance=sig_table), args.results_dir, record)
 
     if written:
         print("\n=== Таблицы результатов (JSON) ===")
