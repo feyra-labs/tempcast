@@ -79,6 +79,7 @@ uv run python scripts/build_cache.py --manifest data/manifest.csv
 **1. Подбор скорости обучения и этап B** — МАЯК и бейзлайны:
 
 ```bash
+# порядок: подбор и этап B всех моделей → абляции, сиды, augment=none (когда в runs/mayak/protocol.json есть запись о подборе) → калибровка → оценка
 uv run python scripts/run.py run.lr_search=true
 uv run python scripts/run.py -m model=gru,dlinear,lru,patchtst run.lr_search=true
 ```
@@ -130,6 +131,7 @@ uv run python scripts/run.py train=debug run.accelerator=cpu run.out_root=runs/d
 ```bash
 # конформная таблица: runs/conformal.npy, .meta.json, .report.json
 uv run python scripts/calibrate.py --ckpt runs/mayak/stageB/best.ckpt --out runs/conformal.npy
+mkdir -p results/calibration
 cp runs/conformal.report.json results/calibration/conformal.report.json
 
 # таблицы 1–6, 8, 11; строка этапа 2 — с --tuned-ckpt runs/mayak-tuned/stageB/best.ckpt
@@ -357,7 +359,7 @@ GHCNh, станции `external_test` (`external/metrics.json`, `external/seeds.
 | CRPS@24 | — | — | — | — |
 | PICP90@24 | — | — | — | — |
 
-Значимость: выражена на ERA5 и GHCNh с одним знаком Δ (`significance.json`, ключ `verdict`):
+Значимость, «да / нет» (`significance.json`, ключ `verdict`):
 
 | абляция | Skill@24 | Skill@72 | Skill@168 | CRPS@24 | PICP90@24 |
 |---|:-:|:-:|:-:|:-:|:-:|
@@ -443,6 +445,7 @@ GHCNh, станции `external_test` (`external/metrics.json`, `external/seeds.
 ```bash
 uv run python scripts/bench_device.py --ckpt runs/mayak/stageB/best.ckpt \
     --conformal runs/conformal.npy --lat 52.37 --lon 4.90 --elev -2 --out-dir runs/bench_device
+mkdir -p results/device
 cp runs/bench_device/results.json results/device/bench.json
 ```
 
@@ -528,15 +531,18 @@ uv run python -m mayak.runtime.run_inference --model runtime/model \
 | `status` | сводка, поля ниже |
 | ошибка любой команды | `{"error": "..."}`, хост продолжает работу |
 
+Выбор строки конформной таблицы, состояние и память устройства — [`METHODS.md`](METHODS.md),
+«Устройство».
+
 | поле `status` | что это |
 |---|---|
 | `filled` | часов в окне после холодного старта |
-| `valid_hours` | часов с валидной температурой во входе модели; по ним выбирается строка конформной таблицы (не больше 672) |
+| `valid_hours` | часов с валидной температурой во входе модели |
 | `theta`, `aci_lead_bins` | θ по бинам лидов и сами бины, ч |
 | `aci_updates`, `aci_misses` | обратных связей и промахов по бинам лидов с последнего сброса |
 | `conformal` | применяется ли конформная таблица |
-| `state_bytes` | размер состояния на диске: 3236 Б (`state_a.bin`, `state_b.bin` в `--state-dir`) |
-| `memory_bytes` | окно, таблица климатологии и при `--aci` кольцо калибровки: 82 368 Б без `--aci`, 95 808 Б с ним |
+| `state_bytes` | размер состояния на диске, Б |
+| `memory_bytes` | рабочая память устройства, Б |
 | `site`, `loaded_site`, `site_change` | точка прибора, точка загруженного состояния и исход сравнения: `same`, `refined`, `moved` |
 | `idle_hours`, `fallbacks`, `last_unix_hour` | простой, откаты к климатологии, последний час |
 | `rss_bytes`, `peak_rss_bytes` | память процесса |
@@ -579,7 +585,7 @@ echo forecast > /run/mayak/in && tail -n 1 /var/lib/mayak/out.jsonl
 | `scripts/build_cache.py` | кэш: QC, станционные проверки, отбор, климатология |
 | `scripts/fetch_ghcnh.py` | скачивание наблюдений GHCNh для внешнего теста |
 | `scripts/make_ghcnh.py` | сборка набора внешнего теста из наблюдений GHCNh |
-| `scripts/qc_false_alarms.py` | доля ложных срабатываний QC на реанализе, по ней подбираются пороги |
+| `scripts/qc_false_alarms.py` | доля ложных срабатываний QC на реанализе |
 | `scripts/make_qc_golden.py` | перегенерация регрессионного вектора QC, только при смене правил |
 | `scripts/aug_reference.py` | эталонные окна аугментаций и их действие на QC |
 | `scripts/run.py` | обучение, единственный вход: подбор lr, этапы, абляции, сиды, профили аугментаций, этап 2 |
@@ -600,7 +606,7 @@ echo forecast > /run/mayak/in && tail -n 1 /var/lib/mayak/out.jsonl
 | `conf/ablation/` | `none` и семь абляций МАЯК |
 | `conf/augment/` | профили аугментаций `default` и `none` |
 | `conf/data/` | данные, раскладка времени, набор валидации, параметры аугментаций |
-| `conf/train/` | протокол обучения; `train/debug.yaml` — отладка на CPU |
+| `conf/train/` | протокол обучения: `default`, `debug` — отладка на CPU |
 | `conf/calibration/`, `conf/robustness/`, `conf/runtime/` | калибровка, робастность, пороги смены точки устройства |
 
 ## Структура
