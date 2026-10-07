@@ -7,12 +7,30 @@
 окон этого набора. Файлы пишутся строгим JSON: пропуски и бесконечности становятся null.
 Таблицы берутся из уже посчитанного результата оценки, ничего не пересчитывается.
 """
+import json
 import os
 
-from mayak.calibration import save_json
 from mayak.provenance import provenance
+from mayak.stages import jsonable
 
 SCHEMA = 1
+
+
+def save_json(obj, path):
+    """Записывает значение в файл строгим JSON.
+
+    Args:
+        obj: значение из словарей, списков, массивов и чисел; пропуски и бесконечности
+            записываются как null.
+        path: путь к файлу; каталог создаётся при необходимости.
+
+    Returns:
+        Путь к файлу.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(jsonable(obj), f, ensure_ascii=False, indent=1, allow_nan=False)
+    return path
 
 
 def run_record(**info):

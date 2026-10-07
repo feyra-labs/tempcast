@@ -147,8 +147,9 @@ def print_table(shift, rec):
 def main(argv=None):
     import logging
 
-    from mayak.calibration import load_config, print_fit_report, save_json
+    from mayak.calibration import load_config, print_fit_report
     from mayak.lit import load_model
+    from mayak.results import save_json
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     ap = argparse.ArgumentParser(
         description="сплит-конформная таблица МАЯК: валидационные станции, блоки калибровки "

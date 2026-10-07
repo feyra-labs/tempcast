@@ -10,10 +10,10 @@
 наборов: строка train - из набора обучающих станций, строка unseen_test - из основного.
 
 Сравнение моделей идёт только по их сырым выходам. Основные таблицы, разрезы,
-надёжность, острота против покрытия, графики и сохранённые предсказания не зависят от
+надёжность, острота против покрытия, покрытие по разрезам и их графики не зависят от
 того, задана ли конформная таблица. Таблица МАЯК даёт отдельный раздел «МАЯК после
-калибровки»: сырой и откалиброванный МАЯК рядом, покрытие по тем же разрезам и
-офлайн-прогон адаптивной калибровки устройства.
+калибровки»: сырой и откалиброванный МАЯК рядом, покрытие по тем же разрезам с графиком
+и офлайн-прогон адаптивной калибровки устройства.
 
 Каждое окно оценивается на сетке длин истории, от холодного старта до полной истории.
 Основные таблицы считаются при полной истории. Разрез по длине истории и кривые скилла
@@ -722,6 +722,120 @@ def plot_pit(ev, out_dir="runs/plots"):
     return p
 
 
+def plot_sharpness(curves, out_dir="runs/plots", set_name="internal", nominal=0.9):
+    """Кривые «острота против покрытия» всех моделей, по панели на бин лидов.
+
+    Args:
+        curves: кривые остроты всех моделей.
+        out_dir: каталог картинок.
+        set_name: имя набора в имени файла.
+        nominal: номинал интервала.
+
+    Returns:
+        Путь к картинке.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    os.makedirs(out_dir, exist_ok=True)
+    panels = list(next(iter(curves.values())))
+    fig, axes = plt.subplots(1, len(panels), figsize=(4.2 * len(panels), 4.2), squeeze=False)
+    for ax, panel in zip(axes[0], panels):
+        for name, c in curves.items():
+            p = c[panel]
+            line, = ax.plot(p["coverage"], p["width"], lw=1.4, label=name)
+            ax.plot([p["model_coverage"]], [p["model_width"]], "o", color=line.get_color(), ms=5)
+        ax.axvline(nominal, ls="--", lw=1, color="gray")
+        ax.set_title(f"лиды: {panel}", fontsize=10)
+        ax.set_xlabel(f"фактическое покрытие {nominal:.0%}-интервала")
+        ax.grid(alpha=0.3)
+    axes[0][0].set_ylabel("средняя ширина интервала, °C")
+    axes[0][0].legend(fontsize=7)
+    fig.suptitle(f"[{set_name}] острота против покрытия (точка - выход модели как есть)",
+                 fontsize=11)
+    fig.tight_layout()
+    p = os.path.join(out_dir, f"sharpness_coverage_{set_name}.png")
+    fig.savefig(p, dpi=120)
+    plt.close(fig)
+    return p
+
+
+def plot_coverage_strata(report, out_dir="runs/plots", set_name="internal", model=MAIN_MODEL):
+    """Точечный график покрытия страт с интервалами бутстрапа по всем разрезам.
+
+    Args:
+        report: отчёт о покрытии.
+        out_dir: каталог картинок.
+        set_name: имя набора в имени файла.
+        model: модель, покрытие которой показывается.
+
+    Returns:
+        Путь к картинке.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from mayak.calibration import LEAD_DIM
+    os.makedirs(out_dir, exist_ok=True)
+    labels, vals, los, his, colors = [], [], [], [], []
+    for name, rows in report["dims"].items():
+        if name == LEAD_DIM:
+            continue
+        for k, r in rows.items():
+            labels.append(f"{name}: {k}")
+            vals.append(r["coverage"])
+            lo, hi = r["ci"]
+            los.append(r["coverage"] - lo if np.isfinite(lo) else 0.0)
+            his.append(hi - r["coverage"] if np.isfinite(hi) else 0.0)
+            colors.append("tab:red" if r["heterogeneous"] else
+                          ("tab:orange" if r["off_nominal"] else "tab:blue"))
+    nom, tol = report["nominal"], report["tolerance"]
+    fig, ax = plt.subplots(figsize=(7.5, 0.28 * max(len(labels), 4) + 1.5))
+    y = np.arange(len(labels))[::-1]
+    ax.axvspan(nom - tol, nom + tol, color="green", alpha=0.12, label="номинал ± допуск")
+    ax.axvline(nom, color="gray", lw=1, ls="--")
+    ax.axvline(report["overall"]["coverage"], color="black", lw=1, ls=":", label="весь набор")
+    ax.errorbar(vals, y, xerr=[los, his], fmt="none", ecolor="gray", lw=1)
+    ax.scatter(vals, y, c=colors, s=18, zorder=3)
+    ax.set_yticks(y)
+    ax.set_yticklabels(labels, fontsize=7)
+    ax.set_xlabel(f"фактическое покрытие {nom:.0%}-интервала")
+    ax.set_title(f"[{set_name}] {model}: покрытие по разрезам (красный - отличается от набора)",
+                 fontsize=10)
+    ax.grid(alpha=0.3, axis="x")
+    ax.legend(fontsize=7, loc="lower left")
+    fig.tight_layout()
+    p = os.path.join(out_dir, f"coverage_strata_{set_name}.png")
+    fig.savefig(p, dpi=120)
+    plt.close(fig)
+    return p
+
+
+def plot_calibration(res, out_dir="runs/plots", set_name="internal"):
+    """Графики калибровки одного набора: острота и покрытие по разрезам.
+
+    Острота всех моделей и покрытие основной модели рисуются по сырым выходам. Если в
+    результате есть раздел после калибровки, покрытие основной модели после калибровки
+    рисуется отдельной картинкой с суффиксом ``_calibrated``.
+
+    Args:
+        res: результат оценки набора.
+        out_dir: каталог картинок.
+        set_name: имя набора в именах файлов.
+
+    Returns:
+        Пути к картинкам.
+    """
+    main = res["main"]
+    paths = [plot_sharpness(res["sharpness"], out_dir, set_name, res["config"].nominal),
+             plot_coverage_strata(res["coverage"]["report"], out_dir, set_name, main)]
+    if res["calibrated"] is not None:
+        paths.append(plot_coverage_strata(res["calibrated"]["report"], out_dir,
+                                          f"{set_name}_calibrated", main))
+    return paths
+
+
 @torch.no_grad()
 def plot_forecast_examples(model, clims, manifest="data/manifest.csv", n=10,
                            out_dir="runs/plots", time_key="test",
@@ -943,29 +1057,6 @@ def history_evaluations(bench, shift=None):
         yield history_label(L), ev.with_conformal(shift, p["meta"]["history_valid"])
 
 
-def history_predictions(bench):
-    """Предсказания основной модели по всей сетке, сложенные в один набор окон.
-
-    Каждое окно повторяется столько раз, сколько длин в сетке; метаданные повтора - те,
-    что у окна при этой длине истории.
-
-    Args:
-        bench: результат прогона по сетке.
-
-    Returns:
-        Пара из предсказаний основной модели и данных окон в том виде, в каком их
-        сохраняют для анализа калибровки.
-    """
-    parts = [bench.main_history[L] for L in bench.grid]
-    aux = bench.aux
-    n = len(parts)
-    pred = {k: np.concatenate([p[k] for p in parts], 0) for k in ("mu", "q")}
-    out = {k: np.concatenate([aux[k]] * n, 0) for k in ("y", "y_mask", "mu_clim")}
-    out["meta"] = {k: np.concatenate([p["meta"][k] for p in parts], 0)
-                   for k in parts[0]["meta"]}
-    return {bench.main: pred}, out
-
-
 def calibration_config(ci, bootstrap):
     """Настройки анализа калибровки с параметрами бутстрапа стенда оценки.
 
@@ -1017,8 +1108,7 @@ def evaluate_set(named, base, grid=HISTORY_GRID, r_damped=None, shift=None, ci=T
         Словарь. Сравнительная часть: прогон по сетке, таблицы по лидам и сводки по всему
         горизонту для всех моделей, разрезы по длине истории для всех моделей, разрезы
         основной модели, её надёжность, кривые остроты всех моделей и покрытие основной
-        модели по разрезам. Отдельно: раздел после калибровки или None и ежечасные
-        выпуски основной модели для сохранения или None.
+        модели по разрезам. Отдельно: раздел после калибровки или None.
     """
     from mayak.calibration import (aci_hourly_replay, calibration_effect, conditional_gate,
                                    coverage_report, sharpness_curves)
@@ -1044,14 +1134,13 @@ def evaluate_set(named, base, grid=HISTORY_GRID, r_damped=None, shift=None, ci=T
         history=history, breakdowns=breakdowns, reliability=evs[main],
         sharpness=sharpness_curves(evs, cfg),
         coverage=dict(report=report, gate=conditional_gate(report, cfg)),
-        calibrated=None, hourly=None, config=cfg)
+        calibrated=None, config=cfg)
     if shift is not None:
         ev_cal = evs[main].with_conformal(shift, meta["history_valid"])
         rep = coverage_report(ev_cal, meta, cfg, external=external,
                               history=history_evaluations(bench, shift))
         hourly = collect_predictions({main: named[main]},
                                      base.hourly(cfg.aci_stations, cfg.aci_hours), device=device)
-        res["hourly"] = hourly
         res["calibrated"] = dict(effect=calibration_effect(evs[main], ev_cal), report=rep,
                                  gate=conditional_gate(rep, cfg),
                                  aci=aci_hourly_replay(hourly[0][main], hourly[1], cfg.aci(),
@@ -1316,39 +1405,6 @@ def print_external_isolation(summary):
     print("  внешних станций по расстоянию до обучающей точки: " + ", ".join(cells))
 
 
-def save_bench(res, out_dir, set_name, shift=None, info=None):
-    """Сохраняет сырые предсказания набора для анализа калибровки без повторного прогона.
-
-    Пишутся два файла: предсказания всех моделей при полной истории и предсказания
-    основной модели на всей сетке длин истории. Если в результате есть ежечасные
-    выпуски основной модели, они ложатся третьим файлом.
-
-    Args:
-        res: результат оценки набора.
-        out_dir: каталог.
-        set_name: имя набора в именах файлов.
-        shift: конформная таблица; сохраняется рядом, сами предсказания сырые.
-        info: сведения о прогоне для заголовка файлов.
-
-    Returns:
-        Пути к записанным файлам.
-    """
-    from mayak.calibration import save_predictions
-    bench = res["bench"]
-    info = dict(info or {}, history_grid=list(bench.grid))
-    nominal = save_predictions(os.path.join(out_dir, f"{set_name}.npz"), bench.preds,
-                               bench.aux, shift=shift, info=dict(info, history=NOMINAL_HISTORY))
-    h_preds, h_aux = history_predictions(bench)
-    grid_path = save_predictions(os.path.join(out_dir, f"{set_name}_history.npz"), h_preds,
-                                 h_aux, shift=shift, info=info)
-    if res.get("hourly") is None:
-        return nominal, grid_path
-    r_preds, r_aux = res["hourly"]
-    hourly = save_predictions(os.path.join(out_dir, f"{set_name}_hourly.npz"), r_preds, r_aux,
-                              shift=shift, info=dict(info, rhythm="hourly"))
-    return nominal, grid_path, hourly
-
-
 def save_history_table(res, out_dir, set_name):
     """Сводки всех моделей по длине истории в JSON рядом с графиком.
 
@@ -1360,7 +1416,7 @@ def save_history_table(res, out_dir, set_name):
     Returns:
         Путь к файлу.
     """
-    from mayak.calibration import save_json
+    from mayak.results import save_json
     blob = dict(grid=list(res["bench"].grid), leads=list(HISTORY_LEADS),
                 models={n: {str(h): rows for h, rows in by_lead_rows.items()}
                         for n, by_lead_rows in res["history"].items()})
@@ -1456,13 +1512,6 @@ def main():
                          "например data/ghcnh/manifest.csv; собирается scripts/make_ghcnh.py")
     ap.add_argument("--transfer-zones", choices=("group", "full"), default="group",
                     help="уровень зон для сопоставления внутреннего и внешнего теста")
-    ap.add_argument("--save-preds", default=None, metavar="DIR",
-                    help="сохранить сырые предсказания основного внутреннего набора "
-                         "(станции unseen_test): DIR/internal.npz (все модели при полной "
-                         "истории) и DIR/internal_history.npz (МАЯК на всей сетке длин "
-                         "истории), с --conformal ещё DIR/internal_hourly.npz (МАЯК с "
-                         "ежечасным выпуском), для внешнего теста - DIR/external*.npz; их "
-                         "читает python -m mayak.calibration")
     ap.add_argument("--results-dir", default=None, metavar="DIR",
                     help="записать каждую таблицу в свой JSON с записью о прогоне: "
                          "DIR/internal/*.json (станции unseen_test), "
@@ -1551,11 +1600,6 @@ def main():
           f"лидам ##########")
     print_leads(res_train, "[обучающие] ")
     preds, aux = res["bench"].preds, res["bench"].aux
-    info = dict(ckpt=args.ckpt, conformal=args.conformal, manifest=args.manifest,
-                eval_seed=eval_seed, n_params=n_params)
-    if args.save_preds:
-        for p in save_bench(res, args.save_preds, "internal", shift=shift, info=info):
-            print("Предсказания:", p)
 
     tables = evaluation_tables(res)
     with_significance = bool(ablation_names) and len(seeds) >= MIN_SEEDS
@@ -1573,6 +1617,8 @@ def main():
     ev_mayak = evaluation_for(preds[MAIN_MODEL], aux)
     print("  ", plot_reliability(ev_mayak, args.out_dir))
     print("  ", plot_pit(ev_mayak, args.out_dir))
+    for p in plot_calibration(res, args.out_dir, "internal"):
+        print("  ", p)
     print("  ", plot_history_curves(res["history"], args.out_dir, "internal"))
     print("  ", save_history_table(res, args.out_dir, "internal"))
 
@@ -1605,10 +1651,8 @@ def main():
             internal=(preds, aux), transfer_level=args.transfer_zones)
         print("  ", plot_history_curves(res_e["history"], args.out_dir, "external"))
         print("  ", save_history_table(res_e, args.out_dir, "external"))
-        if args.save_preds:
-            for p in save_bench(res_e, args.save_preds, "external", shift=shift,
-                                info=dict(info, manifest=args.external_manifest)):
-                print("Предсказания:", p)
+        for p in plot_calibration(res_e, args.out_dir, "external"):
+            print("  ", p)
         ext = dict(evaluation_tables(res_e), transfer=transfer_tables(tr_e))
         if len(seeds) > 1:
             print("\n=== Разброс по сидам, внешний тест ===")

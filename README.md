@@ -137,7 +137,7 @@ uv run python -m mayak.evaluate --ckpt runs/mayak/stageB/best.ckpt \
     --gru-ckpt runs/gru/stageB/best.ckpt --dlinear-ckpt runs/dlinear/stageB/best.ckpt \
     --lru-ckpt runs/lru/stageB/best.ckpt --patchtst-ckpt runs/patchtst/stageB/best.ckpt \
     --conformal runs/conformal.npy --external-manifest data/ghcnh/manifest.csv \
-    --bootstrap 1000 --save-preds runs/preds --results-dir results/evaluate
+    --bootstrap 1000 --results-dir results/evaluate
 
 # таблица 7: абляции и сиды, ERA5 и GHCNh, значимость абляций
 ABLATIONS="no_compression no_passport no_solar no_mode_groups no_offset_aug no_correction no_persistent"
@@ -152,11 +152,6 @@ uv run python -m mayak.evaluate \
 uv run python -m mayak.evaluate --ckpt runs/mayak-aug_none/stageB/best.ckpt \
     --external-manifest data/ghcnh/manifest.csv \
     --results-dir results/augment_none --out-dir runs/plots/augment_none
-
-# разрезы покрытия и офлайн-прогон адаптивной калибровки по сохранённым предсказаниям
-uv run python -m mayak.calibration --preds runs/preds/internal.npz \
-    --history-preds runs/preds/internal_history.npz --hourly-preds runs/preds/internal_hourly.npz \
-    --external-preds runs/preds/external.npz --out-dir runs/calibration
 
 # таблица 9: робастность
 uv run python -m mayak.robustness --ckpt runs/mayak/stageB/best.ckpt \
@@ -598,7 +593,6 @@ uv run python -m mayak.runtime.run_inference --ckpt runs/mayak/stageB/best.ckpt 
 | модуль | назначение |
 |---|---|
 | `python -m mayak.evaluate` | стенд оценки: таблицы 1–8, 11, 12 |
-| `python -m mayak.calibration` | разрезы покрытия и офлайн-прогон адаптивной калибровки по сохранённым предсказаниям |
 | `python -m mayak.robustness` | сценарии робастности обученной модели |
 | `python -m mayak.runtime.run_inference` | хост устройства |
 
