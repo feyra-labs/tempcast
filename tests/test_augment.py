@@ -137,9 +137,18 @@ def test_offset_shifts_history_and_target_consistently():
         assert np.array_equal(v.y, w0.y), "вариант без цели трогает цель"
 
 
-def test_offset_needs_history_and_obeys_ablation():
-    w = augment_window(_window(0, L=0), _only("offset"), np.random.default_rng(0))
-    assert "offset" not in w.applied, "без истории смещение не выучить - цель не трогаем"
+def test_offset_without_history_shifts_only_target_and_obeys_ablation():
+    cfg = AugmentConfig.from_profile("default", **ALL_ON, offset_min=2.0,
+                                     offset_diurnal_frac=0.0)
+    tol = A.DITHER_FRAC * 0.5 + 1e-4
+    for seed in range(5):
+        w0 = _window(seed, L=0)
+        w = augment_window(_copy(w0), cfg, np.random.default_rng(seed))
+        assert set(w.applied) == {"offset"}, "без истории - только аугментации цели"
+        b = w.applied["offset"]["b"]
+        assert abs(b) == pytest.approx(2.0)
+        assert np.all(np.abs(w.y - w0.y - b) <= tol), "цель сдвинута смещением станции"
+        assert not w.x.any() and not w.m.any(), "история пустая и не меняется"
     rc = RunConfig(model={"arch": "mayak", "ablations": {"no_offset_aug": True}}).resolved()
     cfg = dataclasses.replace(rc.data.augment, **ALL_ON)
     for seed in range(5):
