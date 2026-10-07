@@ -130,19 +130,24 @@ def lineage(prev):
     return jsonable({k: prev.get(k) for k in ("ckpt", "digest", "stage", "step")})
 
 
-def warn_stale(stage_dir):
-    """Предупреждает, если в каталоге этапа остались чекпойнты прежнего запуска.
+def clear_stale(stage_dir):
+    """Удаляет чекпойнты прежнего запуска из каталога этапа.
+
+    Чекпойнт этапа всегда лежит под одним именем, и путь к нему не зависит от того,
+    сколько раз этап запускали. Чекпойнт прежнего запуска удаляется до обучения: иначе
+    при сбое до первого сохранения под этим именем остались бы старые веса.
 
     Args:
         stage_dir: каталог этапа.
     """
     if not os.path.isdir(stage_dir):
         return
-    old = [n for n in os.listdir(stage_dir) if n.endswith(".ckpt")]
+    old = sorted(n for n in os.listdir(stage_dir) if n.endswith(".ckpt"))
     if old:
-        log.warning("в %s уже есть чекпойнты прежнего запуска (%d); новые получат суффикс "
-                    "версии, журнал и отчёт укажут только на новые", stage_dir, len(old))
+        log.warning("в %s удаляются чекпойнты прежнего запуска: %s", stage_dir, ", ".join(old))
+        for n in old:
+            os.remove(os.path.join(stage_dir, n))
 
 
-__all__ = ["FIELD_CURRICULUM", "STAGE_KEY", "journal_stage", "jsonable", "lineage",
-           "load_init_weights", "stage_dir_name", "stage_record", "warn_stale"]
+__all__ = ["FIELD_CURRICULUM", "STAGE_KEY", "clear_stale", "journal_stage", "jsonable",
+           "lineage", "load_init_weights", "stage_dir_name", "stage_record"]

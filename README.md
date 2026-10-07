@@ -96,7 +96,7 @@ uv run python scripts/run.py run.lr_from=runs/mayak augment=none
 **3. Этап 2, необязательный:**
 
 ```bash
-uv run python scripts/run.py run.extra_tuning=true run.lr_search=true model.encoder_width=64
+uv run python scripts/run.py run.extra_tuning=true run.lr_search=true model.encoder_width=96
 ```
 
 **Отладка на CPU:**

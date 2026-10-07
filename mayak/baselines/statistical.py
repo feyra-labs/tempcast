@@ -8,7 +8,6 @@ import numpy as np
 
 from mayak.constants import H
 from mayak.data.splits import time_layout
-from mayak.data.store import get_store
 from mayak.metrics import ZQ
 from mayak.timeaxis import window_calendar
 
@@ -44,20 +43,6 @@ def recent_anomaly(xT, mT, clim, t, t0,
     doy, hour = window_calendar(t0, kh)
     a = ((xT[kh] - clim.predict(doy, hour)) * mh).sum() / mh.sum()
     return float(a), True
-
-
-def fit_climatologies(manifest, force=False):
-    """Климатологии всех станций манифеста из кэша, без повторного QC и подгонки.
-
-    Args:
-        manifest: путь к манифесту станций.
-        force: пересобрать кэш, даже если он актуален.
-
-    Returns:
-        Словарь из идентификатора станции в её запись: климатология, ряд, маски, длина,
-        начало ряда, координаты, высота и зона.
-    """
-    return get_store(manifest, rebuild=force).clims()
 
 
 def quantiles_from_normal(mu, sigma):

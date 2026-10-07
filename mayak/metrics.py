@@ -1204,11 +1204,6 @@ def by_lead(ev, leads=FINE_LEADS, ci=False, **kw):
     return {int(h): ev.restrict(leads=[h]).summary(ci=ci, **kw) for h in leads}
 
 
-def by_lead_bin(ev, lead_bins=LEAD_BINS, ci=False, **kw):
-    return {f"{a}-{b}": ev.restrict(leads=np.arange(a, b + 1)).summary(ci=ci, **kw)
-            for a, b in lead_bins}
-
-
 def ordered_labels(keys, order=None):
     """Метки разреза в порядке показа.
 
@@ -1390,7 +1385,6 @@ __all__ = ["ABLATION_CELLS", "ACIParams", "AdaptiveCalibration", "CENTRAL_INTERV
            "NO_HOUR", "NQ", "Q", "SHARPNESS_POINTS", "SHARPNESS_RANGE", "SIGNIFICANCE_FACTOR",
            "ZQ", "ablation_significance", "aci_effective_level", "aci_score",
            "aci_score_bounds", "apply_adaptive", "apply_conformal", "breakdown", "by_lead",
-           "by_lead_bin",
            "calibrate_forecast", "cell_name", "check_conformal_shape", "check_history_bins",
            "check_median_free", "conformal_table", "coverage", "fit_conformal_shift",
            "history_bin_of", "inside", "interval_indices",

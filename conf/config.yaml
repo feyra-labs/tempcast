@@ -59,7 +59,7 @@ hydra:
         python scripts/run.py -m run.lr_from=runs/mayak ablation=no_compression,no_solar
         python scripts/run.py -m run.lr_from=runs/mayak train.seed=1,2   # runs/mayak-s1, -s2
         python scripts/run.py run.lr_from=runs/mayak augment=none        # runs/mayak-aug_none
-        python scripts/run.py run.extra_tuning=true run.lr_search=true model.encoder_width=64
+        python scripts/run.py run.extra_tuning=true run.lr_search=true model.encoder_width=96
                                                     # этап 2: доп. настройка, runs/mayak-tuned
 
       Hydra: python scripts/run.py --hydra-help

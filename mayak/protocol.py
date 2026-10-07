@@ -142,7 +142,7 @@ class Protocol:
     num_workers: int = 8
     seed: int = 0
     lr: float = 3e-3
-    lr_grid: tuple = (3e-4, 1e-3, 3e-3)
+    lr_grid: tuple = (1e-4, 3e-4, 1e-3, 3e-3, 1e-2)
     lr_search_steps: int = 20_000
     weight_decay: float = 1e-2
     betas: tuple = (0.9, 0.95)
@@ -453,12 +453,14 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
                      ", ".join(f"{k} {v}" for k, v in counts["by_module"].items()))
 
         stage_dir = os.path.join(run_dir, ST.stage_dir_name(stage.name))
-        ST.warn_stale(stage_dir)
+        ST.clear_stale(stage_dir)
         write_config(os.path.join(stage_dir, CONFIG_FILE), cfg_dict)
         record = ST.stage_record(stage, i, data_key=store.key, run_dir=run_dir,
                                  journal=journal_path, init_from=ST.lineage(prev))
+        # Одно имя чекпойнта этапа при любом числе запусков: путь stage<X>/best.ckpt
+        # всегда указывает на веса последнего запуска.
         ckpt = ModelCheckpoint(dirpath=stage_dir, monitor=protocol.monitor, mode="min",
-                               save_top_k=1, filename="best")
+                               save_top_k=1, filename="best", enable_version_counter=False)
         stage_callbacks = [ckpt, SelectionProvenance(), StageProvenance(record)]
         if tune is not None:
             stage_callbacks.append(TuningProvenance(tune))
@@ -531,11 +533,6 @@ def run_experiment(cfg, out_root="runs", tag=None, accelerator="auto", callbacks
                         data_config=cfg.data, tuning=tuning)
 
 
-def read_journal(run_dir):
-    with open(os.path.join(run_dir, JOURNAL)) as f:
-        return json.load(f)
-
-
 __all__ = ["ARCH_NAMES", "CONFIG_FILE", "DEFAULT_PROTOCOL", "JOURNAL", "LR_FIELDS", "Protocol",
            "ProtocolError", "SEED_FIELDS", "SEED_NAMES", "Seeds", "Stage", "protocol_diff",
-           "protocol_for", "read_journal", "run_experiment", "run_protocol", "strict_fp32"]
+           "protocol_for", "run_experiment", "run_protocol", "strict_fp32"]
