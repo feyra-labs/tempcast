@@ -43,6 +43,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import ssl
 
 import numpy as np
 
@@ -66,10 +67,26 @@ BUILD_CODE = {
 OPEN_METEO_ELEVATION = "https://api.open-meteo.com/v1/elevation"
 
 
+def _ssl_context():
+    """Проверка сертификатов через хранилище ОС (truststore), иначе - стандартная."""
+    try:
+        import truststore
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except ImportError:
+        return ssl.create_default_context()
+
+
+_SSL_CTX = _ssl_context()
+
+
+def _urlopen(url, timeout):
+    return urllib.request.urlopen(url, timeout=timeout, context=_SSL_CTX)
+
+
 class OpenMeteoElevation:
     """Высота из Elevation API Open-Meteo с дисковым кэшем. prefetch - пакетами по 100."""
 
-    def __init__(self, cache_path, open_url=urllib.request.urlopen, batch=100, pause=0.5):
+    def __init__(self, cache_path, open_url=_urlopen, batch=100, pause=0.5):
         self.cache_path = cache_path
         self.open_url, self.batch, self.pause = open_url, batch, pause
         self.cache = {}
