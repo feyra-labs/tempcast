@@ -95,7 +95,7 @@ def main():
         rows.append(dict(id=sid, lat=round(lat, 4), lon=round(lon, 4),
                          elev=round(elev, 1), koppen=koppen_for(lat)))
 
-    with open(os.path.join(args.out, "manifest.csv"), "w", newline="") as f:
+    with open(os.path.join(args.out, "manifest.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["id", "lat", "lon", "elev", "koppen"])
         w.writeheader()
         w.writerows(rows)

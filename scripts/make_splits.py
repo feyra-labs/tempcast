@@ -120,7 +120,7 @@ def main():
     fields = list(rows[0].keys()) + ([] if "split" in rows[0] else ["split"])
     for r in rows:
         r["split"] = roles[r["id"]]
-    with open(args.manifest, "w", newline="") as f:
+    with open(args.manifest, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
         w.writerows(rows)

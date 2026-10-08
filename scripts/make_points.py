@@ -38,7 +38,7 @@ def main():
                         args.include_antarctica, args.seed)
     rows = sel.rows()
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-    with open(args.out, "w", newline="") as f:
+    with open(args.out, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=POINTS_FIELDS)
         writer.writeheader()
         writer.writerows(rows)

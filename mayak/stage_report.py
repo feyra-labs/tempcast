@@ -343,7 +343,7 @@ def write_report(path, report):
     """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=1)
     os.replace(tmp, path)
 

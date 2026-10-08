@@ -278,7 +278,7 @@ def read_source_journal(path):
     jp = path if os.path.isfile(path) else os.path.join(path, JOURNAL)
     if not os.path.isfile(jp):
         raise ProtocolError(f"журнал прогона {jp} не найден")
-    with open(jp) as f:
+    with open(jp, encoding="utf-8") as f:
         return json.load(f), os.path.abspath(jp)
 
 
@@ -345,7 +345,7 @@ def check_run_dir(journal_path, tuning):
     """
     if not os.path.isfile(journal_path):
         return
-    with open(journal_path) as f:
+    with open(journal_path, encoding="utf-8") as f:
         old = (json.load(f).get("tuning") or {}).get("phase")
     new = tuning.phase if tuning.active else None
     if PHASE_EXTRA in (old, new) and old != new:

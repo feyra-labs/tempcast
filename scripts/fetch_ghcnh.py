@@ -114,7 +114,7 @@ def download(url, dest, retries=5, timeout=60, backoff=2.0, open_url=urllib.requ
             return "done"
         except urllib.error.HTTPError as e:
             if e.code == 404:
-                open(dest + ".absent", "w").close()
+                open(dest + ".absent", "w", encoding="utf-8").close()
                 return "absent"
             if e.code == 416 and os.path.exists(part):
                 os.replace(part, dest)
@@ -207,7 +207,7 @@ def main():
     stations = read_station_list(sl)
     ids = None
     if args.ids:
-        with open(args.ids) as f:
+        with open(args.ids, encoding="utf-8") as f:
             ids = [line.strip() for line in f if line.strip()]
     sel = select_stations(stations, args.bbox, args.countries, args.networks, ids,
                           args.max_stations, args.seed)
@@ -228,7 +228,8 @@ def main():
             return sid, url, "failed", str(e)
 
     with ThreadPoolExecutor(args.jobs) as ex, \
-            open(os.path.join(args.out, "download_log.csv"), "a", newline="") as f:
+            open(os.path.join(args.out, "download_log.csv"), "a", newline="",
+                 encoding="utf-8") as f:
         w = csv.writer(f)
         counts = {}
         for sid, url, status, err in ex.map(run, jobs):

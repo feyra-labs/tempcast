@@ -253,7 +253,7 @@ def fetch_all(points, raw_dir, signature, batch=2, pause=1.0, base_url=ARCHIVE_U
                  "пауза между запросами %.0f с", total,
                  -(-total // QUOTA_LIMITS["day"]), QUOTA_LIMITS["day"],
                  max(pause, throttle_pause(request_weight(size, signature), quota_share)))
-    log_file = open(log_path, "a", newline="") if log_path else None
+    log_file = open(log_path, "a", newline="", encoding="utf-8") if log_path else None
     writer = csv.writer(log_file) if log_file else None
     try:
         for k, chunk in enumerate(batches):
@@ -302,7 +302,7 @@ def read_points(path):
     Raises:
         ValueError: нет нужных колонок или повторяются id.
     """
-    with open(path, newline="") as f:
+    with open(path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     need = {"id", "lat", "lon"}
     if rows and not need <= set(rows[0]):

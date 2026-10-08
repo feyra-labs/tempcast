@@ -513,11 +513,12 @@ def build_external_dataset(raw_dir, out_dir, stations, dem, koppen, tol_minutes=
                          name=getattr(st, "name", "")))
         rec["status"] = "included"
         report.append(rec)
-    with open(os.path.join(out_dir, "manifest.csv"), "w", newline="") as f:
+    with open(os.path.join(out_dir, "manifest.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
         w.writeheader()
         w.writerows(rows)
-    with open(os.path.join(out_dir, "selection_report.csv"), "w", newline="") as f:
+    with open(os.path.join(out_dir, "selection_report.csv"), "w", newline="",
+              encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(report[0]) if report else ["id"])
         w.writeheader()
         w.writerows(report)

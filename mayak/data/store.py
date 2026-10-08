@@ -64,7 +64,7 @@ def new_climatology():
 
 
 def read_manifest(manifest):
-    with open(manifest, newline="") as f:
+    with open(manifest, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     ids = [r["id"] for r in rows]
     if len(set(ids)) != len(ids):
@@ -547,7 +547,7 @@ def load_cache(path, rows, mmap=False):
     beta = np.load(os.path.join(path, "clim_beta.npy"))
     scale_beta = np.load(os.path.join(path, "clim_scale_beta.npy"))
     basis = {k: CLIM_PARAMS[k] for k in CLIM_BASIS}
-    with open(os.path.join(path, "index.json")) as f:
+    with open(os.path.join(path, "index.json"), encoding="utf-8") as f:
         index = json.load(f)
     meta_of = {r["id"]: r for r in rows}
     store = StationStore(key=os.path.basename(path), path=path)

@@ -347,7 +347,7 @@ def save_conformal(path, shift, record):
     check_conformal_shape(shift)
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     np.save(path, shift)
-    with open(conformal_meta_path(path), "w") as f:
+    with open(conformal_meta_path(path), "w", encoding="utf-8") as f:
         json.dump(record, f, ensure_ascii=False, indent=1)
 
 
@@ -369,7 +369,7 @@ def load_conformal(path):
     if not os.path.exists(meta):
         _fail(f"конформная таблица {path}: нет метаданных {meta} — неизвестно, на каких "
               f"данных и по какому чекпойнту она подогнана")
-    with open(meta) as f:
+    with open(meta, encoding="utf-8") as f:
         rec = json.load(f)
     shift = np.load(path).astype(np.float32)
     try:
@@ -534,7 +534,7 @@ def check_external(store, external_store, checkpoints=(), conformal=None):
         if hit:
             _fail(f"чекпойнт {c}: выбран с участием станций внешнего теста {hit[:5]}")
     if conformal:
-        with open(conformal_meta_path(conformal)) as f:
+        with open(conformal_meta_path(conformal), encoding="utf-8") as f:
             rec = json.load(f)
         hit = sorted(ext_ids & set(rec.get("stations", [])))
         if hit or ROLE_EXTERNAL in rec.get("station_roles", []):

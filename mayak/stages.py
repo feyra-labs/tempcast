@@ -73,7 +73,7 @@ def journal_stage(journal_path, stage_name):
     """
     if not journal_path or not os.path.isfile(journal_path):
         return {}
-    with open(journal_path) as f:
+    with open(journal_path, encoding="utf-8") as f:
         journal = json.load(f)
     return next((s for s in reversed(journal.get("stages", []))
                  if s.get("name") == stage_name), {})

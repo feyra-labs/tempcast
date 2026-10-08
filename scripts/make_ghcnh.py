@@ -91,7 +91,7 @@ class OpenMeteoElevation:
         self.open_url, self.batch, self.pause = open_url, batch, pause
         self.cache = {}
         if os.path.exists(cache_path):
-            with open(cache_path) as f:
+            with open(cache_path, encoding="utf-8") as f:
                 self.cache = json.load(f)
 
     @staticmethod
@@ -109,7 +109,7 @@ class OpenMeteoElevation:
                 elev = json.loads(r.read().decode())["elevation"]
             for p, h in zip(chunk, elev):
                 self.cache[self.key(*p)] = h
-            with open(self.cache_path, "w") as f:
+            with open(self.cache_path, "w", encoding="utf-8") as f:
                 json.dump(self.cache, f)
             time.sleep(self.pause)
 
@@ -172,11 +172,11 @@ def main():
     if args.dem == "station":
         import csv
         mpath = os.path.join(args.out, "manifest.csv")
-        with open(mpath) as f:
+        with open(mpath, encoding="utf-8") as f:
             mrows = list(csv.DictReader(f))
         for r in mrows:
             r["dem_elev"] = ""
-        with open(mpath, "w", newline="") as f:
+        with open(mpath, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=list(mrows[0]) if mrows else ["id"])
             w.writeheader()
             w.writerows(mrows)

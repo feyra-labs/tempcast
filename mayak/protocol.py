@@ -283,7 +283,7 @@ def protocol_diff(a, b, ignore=()):
 def _write_journal(path, journal):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + ".tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(journal, f, ensure_ascii=False, indent=1)
     os.replace(tmp, path)
 
