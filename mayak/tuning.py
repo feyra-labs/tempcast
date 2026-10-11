@@ -42,7 +42,8 @@ import os
 from dataclasses import dataclass, fields, replace
 from typing import Optional
 
-from mayak.protocol import CONFIG_FILE, JOURNAL, LR_FIELDS, SEED_FIELDS, Protocol, ProtocolError, protocol_diff
+from mayak.protocol import (CONFIG_FILE, JOURNAL, LR_FIELDS, SEED_FIELDS, Protocol,
+                            ProtocolError, protocol_diff)
 from mayak.stages import jsonable
 
 log = logging.getLogger(__name__)
@@ -564,6 +565,6 @@ def format_tuning(record):
 __all__ = ["EXTRA_SUFFIX", "GRID_CONFIG", "PHASE_EQUAL", "PHASE_EXTRA", "SEARCH_DIR",
            "TUNING_FIELDS", "TUNING_KEY", "Tuning", "check_run_dir", "check_search",
            "describe_phase", "edge_error", "equal_terms_problems", "format_tuning",
-           "inherit_search", "lr_label", "read_source_journal", "resolve", "reusable_grid_run", "run_lr_search",
-           "search_protocol", "search_start", "search_terms", "select_lr",
+           "inherit_search", "lr_label", "read_source_journal", "resolve", "reusable_grid_run",
+           "run_lr_search","search_protocol", "search_start", "search_terms", "select_lr",
            "tuning_from_config", "tuning_record"]
