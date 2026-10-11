@@ -5,7 +5,10 @@
 этапами протокола, кроме последнего, и последним этапом, укороченным до
 ``lr_search_steps`` шагов со своим расписанием WSD, которое до начала спада совпадает с
 расписанием полного этапа. Внутри прогона сетки каждый этап стартует с лучшего по
-метрике выбора чекпойнта предыдущего. Подбор отмечает значение с наименьшей метрикой
+метрике выбора чекпойнта предыдущего. Завершённый прогон значения сетки, у которого
+конфиг совпадает с нужным во всём, кроме самой сетки, и данные те же, заново не
+обучается (``reusable_grid_run``): расширение сетки стоит столько прогонов, сколько
+значений добавлено. Подбор отмечает значение с наименьшей метрикой
 выбора на последнем этапе (``selected_lr``, при равенстве - меньшее) и то, лежит ли оно
 на краю сетки (``edge``), и пишет запись в журнал каталога прогона.
 
@@ -39,7 +42,7 @@ import os
 from dataclasses import dataclass, fields, replace
 from typing import Optional
 
-from mayak.protocol import JOURNAL, LR_FIELDS, SEED_FIELDS, Protocol, ProtocolError, protocol_diff
+from mayak.protocol import CONFIG_FILE, JOURNAL, LR_FIELDS, SEED_FIELDS, Protocol, ProtocolError, protocol_diff
 from mayak.stages import jsonable
 
 log = logging.getLogger(__name__)
@@ -230,6 +233,79 @@ def run_lr_search(protocol, train, tag):
     return jsonable(dict(grid=grid, stage_steps={s.name: s.steps for s in short.stages},
                          monitor=protocol.monitor, results=results, selected_lr=selected,
                          edge=selected in (grid[0], grid[-1])))
+
+
+def _without_grid(cfg):
+    """Конфиг прогона без сетки скоростей обучения.
+
+    Args:
+        cfg: конфиг прогона в виде словаря.
+
+    Returns:
+        Копия конфига без ``train.lr_grid``.
+    """
+    cfg = dict(cfg)
+    cfg["train"] = {k: v for k, v in dict(cfg.get("train") or {}).items() if k != "lr_grid"}
+    return cfg
+
+
+def reusable_grid_run(run_dir, arch, expected_cfg, data_key):
+    """Журнал завершённого прогона значения сетки, если его можно взять без обучения.
+
+    Прогон берётся, когда в каталоге лежат журнал и конфиг, архитектура и ключ кэша
+    данных те же, конфиг совпадает с нужным во всём, кроме сетки ``train.lr_grid``
+    (скорость обучения, этапы, шаги, сиды, оптимизатор, модель, данные, аугментации),
+    каждый этап прошёл все свои шаги, а лучшие чекпойнты этапов лежат на диске. Иначе
+    прогон обучается заново.
+
+    Args:
+        run_dir: каталог прогона значения сетки.
+        arch: архитектура.
+        expected_cfg: конфиг, с которым прогон обучался бы сейчас, в виде словаря.
+        data_key: ключ кэша данных.
+
+    Returns:
+        Журнал прогона или None, если его нужно обучить.
+    """
+    jp, cp = os.path.join(run_dir, JOURNAL), os.path.join(run_dir, CONFIG_FILE)
+    if not (os.path.isfile(jp) and os.path.isfile(cp)):
+        return None
+
+    def skip(reason):
+        log.info("подбор скорости обучения: %s обучается заново: %s", run_dir, reason)
+
+    try:
+        with open(jp, encoding="utf-8") as f:
+            journal = json.load(f)
+        with open(cp, encoding="utf-8") as f:
+            saved_cfg = json.load(f)
+    except (OSError, ValueError) as e:
+        return skip(f"журнал или конфиг не читается ({e})")
+    if journal.get("arch") != arch:
+        return skip(f"архитектура {journal.get('arch')!r}, нужна {arch!r}")
+    if journal.get("data_key") != data_key:
+        return skip("другой ключ кэша данных")
+    want = jsonable(_without_grid(expected_cfg))
+    have = jsonable(_without_grid(saved_cfg))
+    if want != have:
+        diff = sorted(f"{sec}.{k}" for sec in set(want) | set(have)
+                      for k in set(want.get(sec) or {}) | set(have.get(sec) or {})
+                      if (want.get(sec) or {}).get(k) != (have.get(sec) or {}).get(k))
+        return skip(f"конфиг отличается: {', '.join(diff) or 'структура'}")
+    stages = [dict(name=s["name"], steps=int(s["steps"])) for s in expected_cfg["train"]["stages"]]
+    done = journal.get("stages") or []
+    if [s.get("name") for s in done] != [s["name"] for s in stages]:
+        return skip("прогон не завершён")
+    for s, d in zip(stages, done):
+        if int(d.get("steps_done") or 0) < s["steps"]:
+            return skip(f"этап {s['name']} прошёл {d.get('steps_done')} из {s['steps']} шагов")
+        if not d.get("best_ckpt") or not os.path.isfile(d["best_ckpt"]):
+            return skip(f"нет чекпойнта этапа {s['name']}")
+        if d.get("best_score") is None:
+            return skip(f"нет метрики выбора этапа {s['name']}")
+    log.info("подбор скорости обучения: %s уже обучен с тем же конфигом, берётся с диска",
+             run_dir)
+    return journal
 
 
 def edge_error(search):
@@ -488,6 +564,6 @@ def format_tuning(record):
 __all__ = ["EXTRA_SUFFIX", "GRID_CONFIG", "PHASE_EQUAL", "PHASE_EXTRA", "SEARCH_DIR",
            "TUNING_FIELDS", "TUNING_KEY", "Tuning", "check_run_dir", "check_search",
            "describe_phase", "edge_error", "equal_terms_problems", "format_tuning",
-           "inherit_search", "lr_label", "read_source_journal", "resolve", "run_lr_search",
+           "inherit_search", "lr_label", "read_source_journal", "resolve", "reusable_grid_run", "run_lr_search",
            "search_protocol", "search_start", "search_terms", "select_lr",
            "tuning_from_config", "tuning_record"]

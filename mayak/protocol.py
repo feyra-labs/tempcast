@@ -315,7 +315,9 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
 
     При подборе скорости обучения на каждом значении сетки протокола идёт прогон с
     полными этапами, кроме последнего, и укороченным последним в подкаталоге
-    ``lr_search`` каталога прогона. Запись о подборе пишется в журнал каталога прогона до
+    ``lr_search`` каталога прогона. Завершённый прогон значения сетки с тем же конфигом
+    (кроме самой сетки) и теми же данными не обучается заново, а берётся с диска
+    (``mayak.tuning.reusable_grid_run``). Запись о подборе пишется в журнал каталога прогона до
     обучения в нём. При минимуме на краю сетки запуск на этом завершается ошибкой. Иначе
     в каталоге прогона обучается последний этап полной длины со скоростью
     ``selected_lr`` со старта с лучшего чекпойнта предпоследнего этапа прогона сетки с
@@ -373,17 +375,6 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     run_dir = os.path.join(out_root, tag)
     journal_path = os.path.join(run_dir, JOURNAL)
 
-    def train_grid(p, sub_tag):
-        j = run_protocol(arch, manifest, p, out_root=out_root, accelerator=accelerator,
-                         tag=sub_tag, callbacks=callbacks,
-                         enable_progress_bar=enable_progress_bar, model_config=model_config,
-                         data_config=data_config)
-        return j, os.path.abspath(os.path.join(out_root, sub_tag, JOURNAL))
-
-    TU.check_run_dir(journal_path, tuning)
-    protocol, tune = TU.resolve(arch, protocol, tuning, model_cfg, tag, train_grid)
-    for line in TU.format_tuning(tune):
-        log.info("%s: %s", arch, line)
     if data_config is None:
         data_cfg = DataConfig()
     elif isinstance(data_config, DataConfig):
@@ -392,6 +383,25 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
         data_cfg = DataConfig.from_dict(data_config)
     if manifest is not None:
         data_cfg = replace(data_cfg, manifest=str(manifest))
+
+    def train_grid(p, sub_tag):
+        sub_dir = os.path.join(out_root, sub_tag)
+        sub_journal = os.path.abspath(os.path.join(sub_dir, JOURNAL))
+        expected = RunConfig(model=model_cfg, data=data_cfg, train=p).resolved()
+        store_key = get_store(expected.data.manifest, cache_root=expected.data.cache_root).key
+        done = TU.reusable_grid_run(sub_dir, arch, expected.to_dict(), store_key)
+        if done is not None:
+            return done, sub_journal
+        j = run_protocol(arch, manifest, p, out_root=out_root, accelerator=accelerator,
+                         tag=sub_tag, callbacks=callbacks,
+                         enable_progress_bar=enable_progress_bar, model_config=model_config,
+                         data_config=data_config)
+        return j, sub_journal
+
+    TU.check_run_dir(journal_path, tuning)
+    protocol, tune = TU.resolve(arch, protocol, tuning, model_cfg, tag, train_grid)
+    for line in TU.format_tuning(tune):
+        log.info("%s: %s", arch, line)
     run_cfg = RunConfig(model=model_cfg, data=data_cfg, train=protocol).resolved()
     data_cfg = run_cfg.data
     manifest = data_cfg.manifest
