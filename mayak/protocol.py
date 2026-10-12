@@ -11,7 +11,7 @@ run_protocol. Для любой архитектуры одинаковы:
   вычислений: fp32 без TF32, та же, в которой модель оценивают, калибруют и
   экспортируют;
 * сетка скоростей обучения ``lr_grid`` и число шагов последнего этапа при подборе
-  ``lr_search_steps``. Скорость обучения ``lr`` каждая архитектура получает подбором по
+  ``lr_search_steps``, допуск выбора ``lr_tol``. Скорость обучения ``lr`` каждая архитектура получает подбором по
   этой сетке (``mayak.tuning``), поэтому ``lr`` - единственное поле протокола, которое у
   сравниваемых моделей различается;
 * функция потерь и метрика выбора чекпойнта ``val/loss`` - общий нормированный
@@ -144,6 +144,7 @@ class Protocol:
     lr: float = 3e-3
     lr_grid: tuple = (1e-4, 3e-4, 1e-3, 3e-3, 1e-2)
     lr_search_steps: int = 20_000
+    lr_tol: float = 0.01
     weight_decay: float = 1e-2
     betas: tuple = (0.9, 0.95)
     lr_schedule: str = "wsd"
@@ -171,6 +172,9 @@ class Protocol:
             raise ValueError(f"сетка скоростей обучения {grid}: нужны конечные числа больше нуля")
         if int(self.lr_search_steps) < 1:
             raise ValueError("число шагов подбора скорости обучения < 1")
+        object.__setattr__(self, "lr_tol", float(self.lr_tol))
+        if not (math.isfinite(self.lr_tol) and 0.0 <= self.lr_tol < 1.0):
+            raise ValueError(f"допуск подбора скорости обучения {self.lr_tol}: нужно от 0 до 1")
         if not st:
             raise ValueError("протокол без этапов")
         if len({s.name for s in st}) != len(st):
