@@ -21,8 +21,9 @@ run:
   accelerator: gpu
   # Подбор скорости обучения, этап 1 сравнения: на каждом значении train.lr_grid этапы
   # протокола с последним на train.lr_search_steps шагов в lr_search/lr<X>/, минимум по
-  # val/loss (min_lr), флаг edge (минимум на краю сетки) и выбранное значение (selected_lr:
-  # наименьшее lr в пределах train.lr_tol от минимума) в журнал protocol.json.
+  # val/loss (min_lr), выбранное значение (selected_lr: соседнее снизу от минимума, если
+  # оно в пределах train.lr_tol, иначе минимум) и флаг edge (минимум на краю сетки и лучше
+  # соседа больше чем на train.lr_tol) в журнал protocol.json.
   # При edge: true запуск завершается ошибкой: расширить train.lr_grid и повторить подбор
   # всех моделей. Иначе в том же запуске полный этап B со старта с
   # lr_search/lr<selected_lr>/stageA/best.ckpt.

@@ -8,12 +8,19 @@
 метрике выбора чекпойнта предыдущего. Завершённый прогон значения сетки, у которого
 конфиг совпадает с нужным во всём, кроме самой сетки, и данные те же, заново не
 обучается (``reusable_grid_run``): расширение сетки стоит столько прогонов, сколько
-значений добавлено. Подбор отмечает значение с наименьшей метрикой
-выбора на последнем этапе (``min_lr``) и то, лежит ли оно на краю сетки (``edge``).
-Выбранное значение (``selected_lr``) - наименьшее из сетки, чья метрика выбора не больше
-минимума более чем на долю ``lr_tol`` протокола. Короткий горизонт подбора смещает
-оптимум в сторону больших скоростей обучения, поэтому из неразличимых в пределах допуска
-значений берётся меньшее. Запись о подборе пишется в журнал каталога прогона.
+значений добавлено. Подбор отмечает значение с наименьшей метрикой выбора на последнем
+этапе (``min_lr``), выбранное значение (``selected_lr``) и то, упирается ли минимум в
+край сетки (``edge``). Оба правила - с допуском ``lr_tol`` протокола, доля от модуля
+минимума (``select_lr``, ``search_edge``):
+
+* поправка на горизонт не больше одной клетки: короткий подбор смещает оптимум к большим
+  скоростям обучения, поэтому выбирается сосед снизу от минимума, если его метрика в
+  пределах допуска, иначе сам минимум. Дальше вниз по плато выбор не сползает;
+* край настоящий, только если минимум лежит на краю сетки и лучше соседа внутри сетки
+  больше чем на допуск. Если сосед в пределах допуска, кривая у края плоская и сетку не
+  расширяют.
+
+Запись о подборе пишется в журнал каталога прогона.
 
 Дальше правило одно для всех моделей, без решений человека
 (``mayak.protocol.run_protocol``):
@@ -57,6 +64,9 @@ PHASE_EQUAL, PHASE_EXTRA = 1, 2
 EXTRA_SUFFIX = "-tuned"
 EXTRA_ARCH = "mayak"
 GRID_CONFIG = "conf/train/default.yaml"
+# Правило выбора по сетке, пишется в запись о подборе: сосед снизу от минимума в пределах
+# допуска, край - только при отрыве от соседа больше допуска.
+SELECT_RULE = "neighbor_below_tol+edge_tol"
 
 
 @dataclass(frozen=True)
@@ -187,8 +197,40 @@ def lr_label(lr):
     return f"lr{float(lr):g}"
 
 
+def _scored(results, stage):
+    """Значения сетки с конечной метрикой выбора, по возрастанию скорости обучения.
+
+    Args:
+        results: записи по значениям сетки со скоростью обучения и метрикой по этапам.
+        stage: имя этапа, по которому идёт выбор.
+
+    Returns:
+        Пара: список пар (скорость обучения, метрика) и номер в нём значения с
+        наименьшей метрикой (при равенстве - с меньшей скоростью обучения).
+
+    Raises:
+        ProtocolError: ни одно значение не дало конечной метрики.
+    """
+    scored = [(float(r["lr"]), r["val_loss"].get(stage)) for r in results]
+    finite = sorted((lr, float(v)) for lr, v in scored if v is not None and math.isfinite(v))
+    if not finite:
+        raise ProtocolError(f"подбор скорости обучения: ни одно значение сетки не дало "
+                            f"конечной метрики выбора на этапе {stage}")
+    i = min(range(len(finite)), key=lambda k: (finite[k][1], finite[k][0]))
+    return finite, i
+
+
+def _within(v, best, tol):
+    """Метрика не хуже минимума больше чем на долю ``tol`` от его модуля."""
+    return v <= best + float(tol) * abs(best)
+
+
 def select_lr(results, stage, tol=0.0):
-    """Наименьшее значение сетки с метрикой выбора в пределах допуска от минимума.
+    """Скорость обучения, выбранная подбором.
+
+    Поправка на горизонт подбора не больше одной клетки сетки: берётся соседнее снизу
+    значение с конечной метрикой, если его метрика в пределах допуска от минимума, иначе
+    само значение с наименьшей метрикой.
 
     Args:
         results: записи по значениям сетки со скоростью обучения и метрикой по этапам.
@@ -197,19 +239,50 @@ def select_lr(results, stage, tol=0.0):
             метрикой.
 
     Returns:
-        Наименьшая скорость обучения, чья метрика не больше ``min + tol * |min|``; при
-        ``tol=0`` - значение с наименьшей метрикой, при равенстве - меньшее.
+        Скорость обучения; при ``tol=0`` - значение с наименьшей метрикой, при
+        равенстве - меньшее.
 
     Raises:
         ProtocolError: ни одно значение не дало конечной метрики.
     """
-    scored = [(r["val_loss"].get(stage), r["lr"]) for r in results]
-    finite = [(float(v), float(lr)) for v, lr in scored if v is not None and math.isfinite(v)]
-    if not finite:
-        raise ProtocolError(f"подбор скорости обучения: ни одно значение сетки не дало "
-                            f"конечной метрики выбора на этапе {stage}")
-    best = min(v for v, _ in finite)
-    return min(lr for v, lr in finite if v <= best + float(tol) * abs(best))
+    finite, i = _scored(results, stage)
+    best = finite[i][1]
+    if i > 0 and _within(finite[i - 1][1], best, tol):
+        return finite[i - 1][0]
+    return finite[i][0]
+
+
+def search_edge(results, stage, grid, tol=0.0):
+    """Упирается ли минимум подбора в край сетки.
+
+    Край настоящий, когда значение с наименьшей метрикой - крайнее в сетке и его сосед
+    внутри сетки хуже больше чем на допуск или не дал конечной метрики. Если сосед в
+    пределах допуска, кривая у края плоская, и расширять сетку незачем.
+
+    Args:
+        results: записи по значениям сетки со скоростью обучения и метрикой по этапам.
+        stage: имя этапа, по которому идёт выбор.
+        grid: сетка скоростей обучения.
+        tol: допуск, доля от модуля минимума метрики; 0 - край по самому минимуму.
+
+    Returns:
+        True, если сетку нужно расширять.
+
+    Raises:
+        ProtocolError: ни одно значение не дало конечной метрики.
+    """
+    finite, i = _scored(results, stage)
+    lr, best = finite[i]
+    grid = sorted(float(v) for v in grid)
+    if lr not in (grid[0], grid[-1]):
+        return False
+    if len(grid) < 2:
+        return True
+    inner = grid[1] if lr == grid[0] else grid[-2]
+    neighbor = next((v for g, v in finite if g == inner), None)
+    if neighbor is None:
+        return True
+    return not _within(neighbor, best, tol)
 
 
 def run_lr_search(protocol, train, tag):
@@ -224,8 +297,8 @@ def run_lr_search(protocol, train, tag):
     Returns:
         Запись о подборе: сетка, число шагов этапов, метрика выбора, метрика выбора и
         лучший чекпойнт по этапам на каждом значении, пути к журналам, значение с
-        наименьшей метрикой (``min_lr``), лежит ли оно на краю сетки (``edge``), допуск
-        (``lr_tol``) и выбранное с ним значение (``selected_lr``).
+        наименьшей метрикой (``min_lr``), допуск (``lr_tol``), выбранное с ним значение
+        (``selected_lr``) и упирается ли минимум в край сетки (``edge``).
     """
     results = []
     for lr in protocol.lr_grid:
@@ -241,13 +314,18 @@ def run_lr_search(protocol, train, tag):
     best = select_lr(results, stage)
     selected = select_lr(results, stage, protocol.lr_tol)
     grid = list(protocol.lr_grid)
+    edge = search_edge(results, stage, grid, protocol.lr_tol)
     if selected != best:
-        log.info("подбор скорости обучения: минимум при lr %g, в пределах допуска %g "
-                 "выбрано меньшее lr %g", best, protocol.lr_tol, selected)
+        log.info("подбор скорости обучения: минимум при lr %g, соседнее снизу lr %g в "
+                 "пределах допуска %g - выбрано оно", best, selected, protocol.lr_tol)
+    if best in (grid[0], grid[-1]) and not edge:
+        log.info("подбор скорости обучения: минимум при крайнем lr %g, но соседнее значение "
+                 "в пределах допуска %g: кривая у края плоская, сетка не расширяется",
+                 best, protocol.lr_tol)
     return jsonable(dict(grid=grid, stage_steps={s.name: s.steps for s in short.stages},
                          monitor=protocol.monitor, lr_tol=protocol.lr_tol, results=results,
-                         min_lr=best, selected_lr=selected,
-                         edge=best in (grid[0], grid[-1])))
+                         min_lr=best, selected_lr=selected, edge=edge,
+                         select_rule=SELECT_RULE))
 
 
 SELECTION_ONLY = ("lr_grid", "lr_tol")
@@ -273,9 +351,9 @@ def reusable_grid_run(run_dir, arch, expected_cfg, data_key):
 
     Прогон берётся, когда в каталоге лежат журнал и конфиг, архитектура и ключ кэша
     данных те же, конфиг совпадает с нужным во всём, кроме сетки ``train.lr_grid`` и
-    допуска выбора ``train.lr_tol`` (скорость обучения, этапы, шаги, сиды, оптимизатор, модель, данные, аугментации),
-    каждый этап прошёл все свои шаги, а лучшие чекпойнты этапов лежат на диске. Иначе
-    прогон обучается заново.
+    допуска выбора ``train.lr_tol`` (скорость обучения, этапы, шаги, сиды,
+    оптимизатор, модель, данные, аугментации), каждый этап прошёл все свои шаги,
+    а лучшие чекпойнты этапов лежат на диске. Иначе прогон обучается заново.
 
     Args:
         run_dir: каталог прогона значения сетки.
@@ -336,8 +414,11 @@ def edge_error(search):
     Returns:
         Строка с правилом: расширить сетку и повторить подбор всех моделей.
     """
+    lr = float(search.get("min_lr", search["selected_lr"]))
+    tol = search.get("lr_tol")
+    beyond = "" if tol is None else f" и лучше соседа больше чем на допуск {float(tol):g}"
     return (f"подбор скорости обучения: минимум {search['monitor']} на краю сетки "
-            f"{search['grid']} (lr {float(search.get('min_lr', search['selected_lr'])):g}), оптимум может лежать "
+            f"{search['grid']} (lr {lr:g}){beyond}, оптимум может лежать "
             f"за её пределами. Правило: расширьте train.lr_grid в {GRID_CONFIG} и повторите "
             f"подбор всех моделей")
 
@@ -588,6 +669,7 @@ def format_tuning(record):
 __all__ = ["EXTRA_SUFFIX", "GRID_CONFIG", "PHASE_EQUAL", "PHASE_EXTRA", "SEARCH_DIR",
            "TUNING_FIELDS", "TUNING_KEY", "Tuning", "check_run_dir", "check_search",
            "describe_phase", "edge_error", "equal_terms_problems", "format_tuning",
+           "search_edge",
            "inherit_search", "lr_label", "read_source_journal", "resolve", "reusable_grid_run",
            "run_lr_search","search_protocol", "search_start", "search_terms", "select_lr",
            "tuning_from_config", "tuning_record"]
