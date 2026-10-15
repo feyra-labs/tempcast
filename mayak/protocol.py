@@ -435,8 +435,6 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
     first, prev = 0, None
     if tuning.lr_search:
         search = tune["lr_search"]
-        if search["edge"]:
-            raise ProtocolError(f"{arch}: {TU.edge_error(search)}")
         first = last_index
         prev_name = protocol.stages[first - 1].name
         init_ckpt, grid_journal = TU.search_start(search, prev_name)
