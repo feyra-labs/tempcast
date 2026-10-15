@@ -8,8 +8,8 @@ run_protocol. Для любой архитектуры одинаковы:
 * размер батча, число окон в эпохе, число воркеров и сид, то есть поток окон;
 * оптимизатор AdamW (betas, базовое весовое затухание), расписание скорости обучения
   WSD (прогрев, плато, линейный спад до нуля в конце этапа), обрезка градиента, точность
-  вычислений: fp32 без TF32, та же, в которой модель оценивают, калибруют и
-  экспортируют;
+  вычислений: fp32 с TF32 в умножениях и свёртках (``tf32``); оценка, калибровка и
+  экспорт идут в строгом fp32;
 * сетка скоростей обучения ``lr_grid`` и число шагов последнего этапа при подборе
   ``lr_search_steps``, допуск выбора ``lr_tol``. Скорость обучения ``lr`` каждая
   архитектура получает подбором по этой сетке (``mayak.tuning``), поэтому
@@ -136,7 +136,7 @@ class Protocol:
     подбора совпадает с началом полного этапа до начала спада, а спад у всех моделей
     приходится на одну и ту же долю этапа.
     """
-    stages: tuple = (Stage("A", "L0", 10_000), Stage("B", "full", 200_000))
+    stages: tuple = (Stage("A", "L0", 10_000), Stage("B", "full", 80_000))
     batch_size: int = 256
     windows_per_epoch: int = 200_000
     num_workers: int = 8
@@ -151,6 +151,7 @@ class Protocol:
     warmup_steps: int = 1000
     decay_frac: float = 0.2
     grad_clip: float = 1.0
+    tf32: bool = True
     ema_decay: float = 0.999
     monitor: str = "val/loss"
     val_every: int = 2000
@@ -164,6 +165,7 @@ class Protocol:
         object.__setattr__(self, "betas", tuple(float(b) for b in self.betas))
         object.__setattr__(self, "warmup_steps", int(self.warmup_steps))
         object.__setattr__(self, "decay_frac", float(self.decay_frac))
+        object.__setattr__(self, "tf32", bool(self.tf32))
         grid = tuple(sorted(float(v) for v in self.lr_grid))
         object.__setattr__(self, "lr_grid", grid)
         if not grid or len(set(grid)) != len(grid):
@@ -238,17 +240,25 @@ class Protocol:
 
 DEFAULT_PROTOCOL = Protocol()
 
-def strict_fp32():
-    """Выключить TF32 в матричных умножениях и свёртках.
+def set_fp32_precision(tf32):
+    """Точность fp32-умножений и свёрток на GPU.
 
-    Обучение идёт в fp32, и на GPU с TF32 умножения и свёртки молча считались бы с
-    10-битной мантиссой. Свёртки cuDNN по умолчанию TF32 разрешают, поэтому запрет
-    ставится явно для обоих путей.
+    При ``tf32=True`` умножения и свёртки идут на тензорных ядрах в TF32 (хранение fp32,
+    10-битная мантисса в умножении). При ``tf32=False`` - строгий fp32: TF32 запрещён и в
+    умножениях, и в свёртках cuDNN, которые по умолчанию его разрешают.
+
+    Args:
+        tf32: разрешить ли TF32.
     """
     import torch
-    torch.set_float32_matmul_precision("highest")
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    torch.set_float32_matmul_precision("high" if tf32 else "highest")
+    torch.backends.cuda.matmul.allow_tf32 = bool(tf32)
+    torch.backends.cudnn.allow_tf32 = bool(tf32)
+
+
+def strict_fp32():
+    """Строгий fp32 без TF32: оценка, калибровка, робастность и экспорт, как на устройстве."""
+    set_fp32_precision(False)
 
 
 def protocol_for(arch, base=DEFAULT_PROTOCOL):
@@ -371,7 +381,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
 
     tuning = TU.Tuning.coerce(tuning)
     protocol = protocol_for(arch, protocol or DEFAULT_PROTOCOL)
-    strict_fp32()
+    set_fp32_precision(protocol.tf32)
     last_index = len(protocol.stages) - 1
     model_cfg = check_pipeline_compat(model_config_for(arch, model_config))
 
@@ -494,6 +504,7 @@ def run_protocol(arch, manifest=None, protocol=None, out_root="runs", accelerato
             raise ProtocolError(f"{arch}: этап {stage.name} не сохранил чекпойнт — "
                                 f"валидация ни разу не прошла")
         best_path = ckpt.best_model_path
+        ST.mark_complete(best_path, stage.steps, int(trainer.global_step))
         best = SR.describe_checkpoint(best_path)
         score = ckpt.best_model_score
         chosen = torch.load(best_path, map_location="cpu", weights_only=False)
@@ -549,4 +560,5 @@ def run_experiment(cfg, out_root="runs", tag=None, accelerator="auto", callbacks
 
 __all__ = ["ARCH_NAMES", "CONFIG_FILE", "DEFAULT_PROTOCOL", "JOURNAL", "LR_FIELDS", "Protocol",
            "ProtocolError", "SEED_FIELDS", "SEED_NAMES", "Seeds", "Stage", "protocol_diff",
-           "protocol_for", "run_experiment", "run_protocol", "strict_fp32"]
+           "protocol_for", "run_experiment", "run_protocol", "set_fp32_precision",
+           "strict_fp32"]

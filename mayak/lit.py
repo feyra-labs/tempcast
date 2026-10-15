@@ -436,6 +436,7 @@ class CheckpointTerms:
         model_config: словарь конфига архитектуры или None.
         data_config: словарь конфига данных или None.
         data_key: ключ кэша данных из записи этапа или None.
+        stage: запись этапа чекпойнта или None.
     """
     arch: str
     protocol: Protocol
@@ -443,6 +444,7 @@ class CheckpointTerms:
     model_config: Optional[dict] = None
     data_config: Optional[dict] = None
     data_key: Optional[str] = None
+    stage: Optional[dict] = None
 
 
 def checkpoint_terms(path):
@@ -472,7 +474,50 @@ def checkpoint_terms(path):
     stage = ck.get(STAGE_KEY) or {}
     return CheckpointTerms(arch=hp["arch"], protocol=protocol, tuning=ck.get(TUNING_KEY),
                            model_config=hp.get("model_config"),
-                           data_config=hp.get("data_config"), data_key=stage.get("data_key"))
+                           data_config=hp.get("data_config"), data_key=stage.get("data_key"),
+                           stage=stage or None)
+
+
+def completion_problems(terms):
+    """Почему чекпойнт не годится как итоговый: этап не завершён или этап не последний.
+
+    Итоговый чекпойнт - лучший чекпойнт последнего этапа протокола, прошедшего все шаги.
+    Прерванный этап отметки о завершении не получает (``mark_complete``): его чекпойнт
+    снят до спада скорости обучения, и сравнение с ним не на равных.
+
+    Args:
+        terms: условия обучения чекпойнта.
+
+    Returns:
+        Список причин; пустой, если чекпойнт итоговый.
+    """
+    from mayak.stages import COMPLETE_FIELD
+    st = terms.stage or {}
+    last = terms.protocol.stages[-1]
+    done = st.get(COMPLETE_FIELD)
+    if not done:
+        return [f"этап {st.get('stage', '?')} не отмечен как завершённый: прогон прерван "
+                f"или обучен до этой проверки, обучите этап до конца"]
+    out = []
+    if st.get("stage") is not None and st.get("stage") != last.name:
+        out.append(f"чекпойнт этапа {st.get('stage')}, а итоговый — этапа {last.name}")
+    if int(done.get("steps_done", 0)) < last.steps:
+        out.append(f"этап прошёл {done.get('steps_done')} из {last.steps} шагов")
+    return out
+
+
+def check_complete(path):
+    """Проверка, что чекпойнт итоговый: последний этап протокола прошёл все шаги.
+
+    Args:
+        path: путь к чекпойнту.
+
+    Raises:
+        ProtocolError: этап не завершён или этап не последний.
+    """
+    problems = completion_problems(checkpoint_terms(path))
+    if problems:
+        raise ProtocolError(f"{path}: " + "; ".join(problems))
 
 
 # Путь к манифесту и каталог кэша зависят от того, откуда запущена команда. Совпадение
@@ -614,14 +659,15 @@ def check_comparable(reference, others, ignore=(), same_model=False):
     Raises:
         ProtocolError: протоколы, данные или, с ``same_model``, модели различаются; у
             чекпойнта нет протокола, записи о подборе или записей для сверки; подбор шёл в
-            других условиях.
+            других условиях; чекпойнт не итоговый (``completion_problems``).
     """
     ignore = (*ignore, *LR_FIELDS)
     ref = checkpoint_terms(reference)
     archs = {reference: ref.arch}
     ref_missing = missing_terms(ref)
     bad = [f"{reference} ({ref.arch}): {p}"
-           for p in [*equal_terms_problems(ref.tuning, ref.protocol), *ref_missing]]
+           for p in [*equal_terms_problems(ref.tuning, ref.protocol), *ref_missing,
+                     *completion_problems(ref)]]
     ref_terms = search_terms(ref.tuning)
     for path in others:
         t = checkpoint_terms(path)
@@ -639,6 +685,7 @@ def check_comparable(reference, others, ignore=(), same_model=False):
                             f"отличаются {terms_diff}")
         missing = missing_terms(t)
         problems += missing
+        problems += completion_problems(t)
         if not missing and not ref_missing:
             problems += data_problems(ref, t)
             if same_model:
@@ -665,6 +712,9 @@ def check_extra_tuning(path):
         raise ProtocolError(f"{path} ({t.arch}): нужен прогон {describe_phase(PHASE_EXTRA)} "
                             f"(scripts/run.py run.extra_tuning=true), а это прогон "
                             f"{describe_phase(phase)}")
+    problems = completion_problems(t)
+    if problems:
+        raise ProtocolError(f"{path} ({t.arch}): " + "; ".join(problems))
 
 
 def load_run_record(path):

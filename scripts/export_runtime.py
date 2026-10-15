@@ -28,6 +28,9 @@ def main():
                          "conf/runtime/default.yaml)")
     args = ap.parse_args()
 
+    from mayak.protocol import strict_fp32
+    strict_fp32()  # TF32 только при обучении; здесь строгий fp32, как на устройстве
+
     from mayak.export import export_graphs
     from mayak.lit import load_model
     from mayak.runtime.site import load_runtime_config

@@ -723,6 +723,9 @@ def main(argv=None):
     ap.add_argument("--out-dir", default="runs/robustness")
     args = ap.parse_args(argv)
 
+    from mayak.protocol import strict_fp32
+    strict_fp32()  # TF32 только при обучении; здесь строгий fp32, как на устройстве
+
     from mayak.data.splits import ROLE_EXTERNAL, ROLE_TRAIN
     from mayak.data.store import get_store
     from mayak.leakage import check_external, run_checklist

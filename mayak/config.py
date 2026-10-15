@@ -227,7 +227,8 @@ class ModelConfig:
         encoder_kernel: ядро свёрток энкодера.
         encoder_norm_groups: число групп канальной нормализации энкодера.
         loc_freqs: число случайных частот признаков координат.
-        loc_freq_scale: разброс случайных частот.
+        loc_freq_scale: разброс случайных частот. Ограничитель запоминания координат,
+            как и ``loc_freq_max``.
         loc_freq_max: наибольшая длина вектора частоты признаков координат: более длинные
             векторы укорачиваются до неё. Ограничитель запоминания координат, пишется в
             чекпойнт и в отчёт этапа холодного старта рядом с разрывом обобщения поля.
@@ -255,8 +256,8 @@ class ModelConfig:
     encoder_kernel: int = 3
     encoder_norm_groups: int = 4
     loc_freqs: int = 48
-    loc_freq_scale: float = 12.0
-    loc_freq_max: float = 30.0
+    loc_freq_scale: float = 3.0
+    loc_freq_max: float = 8.0
     loc_seed: int = 7
     field_hidden: int = 128
     heads_hidden: int = 48

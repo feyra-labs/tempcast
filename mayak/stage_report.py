@@ -16,7 +16,7 @@
   бутстрапа по станциям.
 
 Вместе с числами отчёт записывает ограничители запоминания координат из конфига модели
-(``loc_freq_max`` и ``field_weight_decay``), если они у архитектуры есть. Отчёт
+(``loc_freq_scale``, ``loc_freq_max`` и ``field_weight_decay``), если они у архитектуры есть. Отчёт
 информационный: автоматических порогов в нём нет, на ход обучения он не влияет.
 
 Числа считаются по сырым выходам моделей и нужны только медиана и квантили, поэтому
@@ -48,7 +48,7 @@ COVERAGE_BAND = (0.86, 0.94)
 # Отношение MSE медианы к MSE климатологии станции, при котором модель не лучше неё.
 CLIM_LEVEL = 1.0
 PLOT_FILES = ("curves.png", "leads.png", "examples.png")
-LIMIT_FIELDS = ("loc_freq_max", "field_weight_decay")
+LIMIT_FIELDS = ("loc_freq_scale", "loc_freq_max", "field_weight_decay")
 
 
 def report_device(accelerator):

@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mayak.modules import inv_softplus
+from mayak.modules.loc import ELEV_SCALE_M
 
 N_YEAR_BASIS = 7
 N_DAY_BASIS = 5
@@ -12,6 +13,7 @@ N_SIG = N_YEAR_BASIS * N_DAY_SMOOTH
 N_DEF = N_YEAR_BASIS * N_DAY_SMOOTH
 SIGMA_INIT = 2.2
 FILM_STRENGTH = 0.3
+LAPSE_INIT = -6.5e-3 * ELEV_SCALE_M
 
 
 class ClimateField(nn.Module):
@@ -20,6 +22,11 @@ class ClimateField(nn.Module):
     Климатическое среднее раскладывается по произведениям годовых и суточных гармоник,
     климатологический разброс и дефицит точки росы - по сглаженному базису с меньшим
     числом суточных гармоник.
+
+    Среднее содержит явный член градиента по высоте: обучаемый наклон, умноженный на
+    признак высоты (последний признак координат), прибавляется к постоянному
+    коэффициенту среднего. Старт - стандартный градиент атмосферы. Так перепад высот
+    между соседними точками не приходится выучивать по редкой сети.
 
     Паспорт станции модулирует скрытый слой через FiLM, сила модуляции ограничена
     константой. Модуляция действует только на разброс и дефицит точки росы:
@@ -45,6 +52,7 @@ class ClimateField(nn.Module):
                 head.weight.mul_(0.1)
                 head.bias.zero_()
             self.head_scale.bias[0] = inv_softplus(torch.tensor(SIGMA_INIT)).item()
+        self.lapse = nn.Parameter(torch.tensor(LAPSE_INIT))
         self.film = nn.Linear(dz, 2 * hidden)
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)
@@ -65,7 +73,7 @@ class ClimateField(nn.Module):
         """Коэффициенты поля точки.
 
         Args:
-            loc: признаки координат, форма (B, loc_dim).
+            loc: признаки координат, форма (B, loc_dim); последний признак - высота.
             z: паспорт станции, форма (B, dz); None - без модуляции.
 
         Returns:
@@ -74,6 +82,8 @@ class ClimateField(nn.Module):
         """
         h = self.fc2(F.gelu(self.fc1(loc)))
         c_mu = self.head_mu(F.gelu(h))
+        # Постоянный член базиса среднего (первый) плюс градиент по высоте.
+        c_mu = torch.cat([c_mu[:, :1] + self.lapse * loc[:, -1:], c_mu[:, 1:]], dim=-1)
         if z is not None:
             gb = torch.tanh(self.film(z))
             k = self.hidden

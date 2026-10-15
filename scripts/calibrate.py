@@ -165,6 +165,11 @@ def main(argv=None):
                     help="повторов бутстрапа для отчёта (по умолчанию из конфига; 0 - без)")
     args = ap.parse_args(argv)
 
+    from mayak.protocol import strict_fp32
+    strict_fp32()  # TF32 только при обучении; здесь строгий fp32, как на устройстве
+    from mayak.lit import check_complete
+    check_complete(args.ckpt)
+
     from dataclasses import replace
     cfg = load_config(args.config)
     if args.bootstrap is not None:

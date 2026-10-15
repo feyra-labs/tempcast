@@ -446,3 +446,28 @@ def test_horizon_starts_one_hour_after_the_last_history_hour():
     assert len(doy_f) == H
     assert hour_f[0] == pytest.approx((hour_h[-1] + 1) % 24.0, abs=1e-4)
     assert (doy_f >= 0).all() and (doy_f < 366.0).all()
+
+
+def test_field_location_features_and_lapse_rate():
+    """Поле видит гладкие координаты и высоту, градиент по высоте - явный член среднего.
+
+    При обнулённой сети поля разница постоянного коэффициента среднего между точками на
+    высотах 0 и 1000 м равна стартовому градиенту -6,5 °C/км; наклон без затухания.
+    """
+    from mayak.lit import optim_groups
+    from mayak.modules.loc import ELEV_SCALE_M
+    m = MAYAK()
+    W = m.loc.W
+    assert float(W.norm(dim=0).max()) <= m.cfg.loc_freq_max + 1e-5
+    lat, lon = torch.tensor([45.0, 45.0]), torch.tensor([10.0, 10.0])
+    loc = m.loc(lat, lon, torch.tensor([0.0, 1000.0]))
+    assert loc.shape[-1] == m.loc.out_dim == 2 * m.cfg.loc_freqs + 5
+    assert torch.allclose(loc[:, -1], torch.tensor([0.0, 1000.0 / ELEV_SCALE_M]))
+    with torch.no_grad():
+        for p in m.field.head_mu.parameters():
+            p.zero_()
+    c_mu, _, _ = m.field.coefficients(loc)
+    assert float(c_mu[1, 0] - c_mu[0, 0]) == pytest.approx(-6.5, abs=1e-4)
+    assert torch.equal(c_mu[:, 1:], torch.zeros_like(c_mu[:, 1:]))
+    groups = {g["name"]: g for g in optim_groups(m, 0.01)}
+    assert any(p is m.field.lapse for p in groups["no_decay"]["params"])

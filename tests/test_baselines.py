@@ -484,7 +484,7 @@ def _tuning(lr=DEFAULT_PROTOCOL.lr, grid=DEFAULT_PROTOCOL.lr_grid, phase=1):
 
 
 def _fake_ckpt(path, arch="mayak", protocol=DEFAULT_PROTOCOL, tuning=None, model_config=None,
-               data_config=None, data_key="data0"):
+               data_config=None, data_key="data0", steps_done=None):
     from mayak.config import DataConfig, model_config_for
     from mayak.stages import STAGE_KEY
     from mayak.tuning import TUNING_KEY
@@ -493,7 +493,12 @@ def _fake_ckpt(path, arch="mayak", protocol=DEFAULT_PROTOCOL, tuning=None, model
     hp = {"arch": arch, "model_config": mcfg.to_dict(), "data_config": dcfg.to_dict()}
     if protocol is not None:
         hp["protocol"] = protocol.to_dict()
-    ck = {"hyper_parameters": hp, "state_dict": {}, STAGE_KEY: {"data_key": data_key}}
+    stage = {"data_key": data_key}
+    last = (protocol or DEFAULT_PROTOCOL).stages[-1]
+    done = last.steps if steps_done is None else steps_done
+    if done >= 0:
+        stage.update(stage=last.name, completed={"steps": last.steps, "steps_done": done})
+    ck = {"hyper_parameters": hp, "state_dict": {}, STAGE_KEY: stage}
     if tuning is not None:
         ck[TUNING_KEY] = tuning
     torch.save(ck, path)
@@ -549,3 +554,32 @@ def test_check_comparable_rejects_mismatch_and_pre_protocol_checkpoints(tmp_path
     no_offset_aug = _fake_ckpt(tmp_path / "noa.ckpt", tuning=_tuning(), model_config=no_offset,
                                data_config=zeroed)
     check_comparable(ref, [no_offset_aug], same_model=True)
+
+
+def test_check_comparable_rejects_incomplete_stage(tmp_path):
+    """Чекпойнт прерванного этапа или без отметки о завершении в сравнение не идёт."""
+    from mayak.lit import check_comparable, check_complete
+    last = DEFAULT_PROTOCOL.stages[-1]
+    ref = _fake_ckpt(tmp_path / "m.ckpt", tuning=_tuning())
+    check_complete(ref)
+    unmarked = _fake_ckpt(tmp_path / "u.ckpt", "gru", tuning=_tuning(), steps_done=-1)
+    with pytest.raises(ProtocolError, match="не отмечен как завершённый"):
+        check_comparable(ref, [unmarked])
+    with pytest.raises(ProtocolError, match="не отмечен как завершённый"):
+        check_comparable(unmarked, [ref])
+    short = _fake_ckpt(tmp_path / "s.ckpt", "gru", tuning=_tuning(), steps_done=last.steps // 2)
+    with pytest.raises(ProtocolError, match="из"):
+        check_comparable(ref, [short])
+    with pytest.raises(ProtocolError, match="не отмечен"):
+        check_complete(unmarked)
+
+
+def test_mark_complete_refuses_interrupted_stage(tmp_path):
+    from mayak.stages import COMPLETE_FIELD, STAGE_KEY, mark_complete
+    path = tmp_path / "b.ckpt"
+    torch.save({STAGE_KEY: {"stage": "B"}}, path)
+    with pytest.raises(ProtocolError, match="из 100 шагов"):
+        mark_complete(path, 100, 60)
+    mark_complete(path, 100, 100)
+    rec = torch.load(path, weights_only=False)[STAGE_KEY]
+    assert rec[COMPLETE_FIELD] == {"steps": 100, "steps_done": 100} and rec["stage"] == "B"

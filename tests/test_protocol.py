@@ -503,14 +503,16 @@ def test_stage_b_starts_from_stage_a_weights(runs):
         assert torch.equal(lit.state_dict()[k], v)
 
 
-def test_strict_fp32_disables_tf32():
-    """TF32 не включается ни в умножениях, ни в свёртках."""
-    from mayak.protocol import strict_fp32
+def test_fp32_precision_switch():
+    """Обучение разрешает TF32 по протоколу, строгий режим запрещает его везде."""
+    from mayak.protocol import set_fp32_precision, strict_fp32
     prev = (torch.get_float32_matmul_precision(), torch.backends.cuda.matmul.allow_tf32,
             torch.backends.cudnn.allow_tf32)
     try:
-        torch.set_float32_matmul_precision("high")
-        torch.backends.cudnn.allow_tf32 = True
+        assert DEFAULT_PROTOCOL.tf32
+        set_fp32_precision(True)
+        assert torch.get_float32_matmul_precision() == "high"
+        assert torch.backends.cuda.matmul.allow_tf32 and torch.backends.cudnn.allow_tf32
         strict_fp32()
         assert torch.get_float32_matmul_precision() == "highest"
         assert not torch.backends.cuda.matmul.allow_tf32

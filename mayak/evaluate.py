@@ -1521,6 +1521,9 @@ def main():
     args = ap.parse_args()
     grid = parse_grid(args.history_grid)
 
+    from mayak.protocol import strict_fp32
+    strict_fp32()  # TF32 только при обучении; здесь строгий fp32, как на устройстве
+
     from mayak.data.store import get_store
     from mayak.leakage import run_checklist
     baseline_ckpts = {a: getattr(args, f"{a}_ckpt") for a in NEURAL_BASELINES

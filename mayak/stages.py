@@ -18,6 +18,8 @@ from mayak.protocol import ProtocolError
 log = logging.getLogger(__name__)
 
 STAGE_KEY = "mayak_stage"
+# Отметка в записи этапа: этап прошёл все шаги. Ставится после обучения в лучший чекпойнт.
+COMPLETE_FIELD = "completed"
 FIELD_CURRICULUM = "L0"
 
 
@@ -116,6 +118,32 @@ def stage_record(stage, index, data_key, run_dir, journal, init_from=None):
                          journal=os.path.abspath(journal), init_from=init_from))
 
 
+def mark_complete(path, steps, steps_done):
+    """Отметить в лучшем чекпойнте этапа, что этап прошёл все шаги.
+
+    Чекпойнт сохраняется во время обучения, когда ещё неизвестно, дойдёт ли этап до
+    конца. Прерванный этап отметки не получает, и стенд оценки его не принимает: у него
+    не было спада скорости обучения.
+
+    Args:
+        path: путь к лучшему чекпойнту этапа.
+        steps: число шагов этапа по протоколу.
+        steps_done: сделано шагов.
+
+    Raises:
+        ProtocolError: этап не дошёл до конца.
+    """
+    import torch
+    if int(steps_done) < int(steps):
+        raise ProtocolError(f"этап прошёл {steps_done} из {steps} шагов; чекпойнт {path} "
+                            f"не отмечен как завершённый")
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    rec = dict(ck.get(STAGE_KEY) or {})
+    rec[COMPLETE_FIELD] = dict(steps=int(steps), steps_done=int(steps_done))
+    ck[STAGE_KEY] = rec
+    torch.save(ck, path)
+
+
 def lineage(prev):
     """Короткая запись о том, откуда стартовал этап, для чекпойнта.
 
@@ -149,5 +177,6 @@ def clear_stale(stage_dir):
             os.remove(os.path.join(stage_dir, n))
 
 
-__all__ = ["FIELD_CURRICULUM", "STAGE_KEY", "clear_stale", "journal_stage", "jsonable",
-           "lineage", "load_init_weights", "stage_dir_name", "stage_record"]
+__all__ = ["COMPLETE_FIELD", "FIELD_CURRICULUM", "STAGE_KEY", "clear_stale", "journal_stage",
+           "jsonable", "lineage", "load_init_weights", "mark_complete", "stage_dir_name",
+           "stage_record"]
