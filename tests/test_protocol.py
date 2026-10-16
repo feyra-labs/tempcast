@@ -1,0 +1,523 @@
+"""Тесты климатологического масштаба, единой нормировки функции потерь и протокола обучения."""
+import csv
+import hashlib
+import re
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+from mayak.constants import H, L_MAX, QUANTILES
+from mayak.data import store as S
+from mayak.data.climatology import ABS_TO_SD, SCALE_FLOOR_FRAC, Climatology
+from mayak.data.splits import ROLE_TEST, ROLE_TRAIN, ROLE_VAL, time_layout
+from mayak.leakage import SELECTION_KEY
+from mayak.loss import NORM_SCALE_CLAMP, forecast_loss, masked_mean, pinball_terms
+from mayak.protocol import (ARCH_NAMES, DEFAULT_PROTOCOL, Protocol, ProtocolError, Stage,
+                            protocol_for, run_protocol)
+from mayak.timeaxis import window_calendar
+
+REPO = Path(__file__).resolve().parents[1]
+N_HOURS = 12_000
+STATIONS = [("t0", ROLE_TRAIN), ("t1", ROLE_TRAIN), ("t2", ROLE_TRAIN),
+            ("v0", ROLE_VAL), ("v1", ROLE_VAL), ("x0", ROLE_TEST)]
+
+
+def _write_station(root, sid, seed, n=N_HOURS):
+    """Шум с суточным ходом масштаба: ночью спокойнее, днём разброс больше."""
+    rng = np.random.default_rng(seed)
+    h = np.arange(n)
+    sd = 1.0 + 0.5 * np.cos(2 * np.pi * h / 24)
+    T = 10 + 6 * np.sin(2 * np.pi * (h - 8) / 24) + sd * rng.standard_normal(n)
+    P = 1000 + 2 * np.sin(2 * np.pi * h / 100) + 0.2 * rng.standard_normal(n)
+    RH = 60 + 10 * np.cos(2 * np.pi * h / 24) + rng.standard_normal(n)
+    np.savez(root / "stations" / f"{sid}.npz", T=T.astype(np.float32), P=P.astype(np.float32),
+             RH=RH.astype(np.float32), valid=np.ones((n, 3), np.uint8), t0_utc_h=np.int64(0))
+
+
+@pytest.fixture(scope="module")
+def manifest(tmp_path_factory):
+    root = tmp_path_factory.mktemp("data4")
+    (root / "stations").mkdir()
+    rows = []
+    for i, (sid, role) in enumerate(STATIONS):
+        _write_station(root, sid, seed=i)
+        rows.append(dict(id=sid, lat=40.0 + i, lon=5.0 * i, elev=100.0, koppen="Cfb", split=role))
+    path = root / "manifest.csv"
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(rows[0]))
+        w.writeheader()
+        w.writerows(rows)
+    return str(path)
+
+
+@pytest.fixture(scope="module")
+def store(manifest):
+    S._STORES.clear()
+    return S.get_store(manifest)
+
+
+def _hetero_series(n_years=8, seed=0, t0=0):
+    """Ряд с известным масштабом остатка sd(doy, hour), представимым базисом масштаба."""
+    rng = np.random.default_rng(seed)
+    k = np.arange(int(n_years * 8766))
+    doy, hour = (v.astype(np.float64) for v in window_calendar(t0, k))
+    wy, wd = 2 * np.pi / 365.24, 2 * np.pi / 24
+    mean = 8 + 10 * np.cos(wy * doy) + 5 * np.sin(wd * hour)
+    sd = 2.0 + 0.8 * np.cos(wd * hour) + 0.5 * np.cos(wy * doy)
+    T = mean + sd * rng.standard_normal(k.size)
+    return doy, hour, T, sd
+
+
+def test_scale_recovers_known_heteroscedastic_noise():
+    doy, hour, T, sd = _hetero_series()
+    clim = Climatology().fit(doy, hour, T, np.ones_like(T))
+    est = clim.scale(doy, hour)
+    rel = np.abs(est / sd - 1)
+    assert rel.mean() < 0.02 and rel.max() < 0.08, (rel.mean(), rel.max())
+    day, night = np.abs(hour - 0) < 0.5, np.abs(hour - 12) < 0.5
+    assert est[day].mean() / est[night].mean() == pytest.approx(2.8 / 1.2, rel=0.05)
+
+
+def test_constant_noise_scale_matches_scalar_sigma():
+    rng = np.random.default_rng(1)
+    doy, hour, _, _ = _hetero_series(n_years=5)
+    T = 5 + 3 * np.sin(2 * np.pi * hour / 24) + 1.7 * rng.standard_normal(doy.size)
+    clim = Climatology().fit(doy, hour, T, np.ones_like(T))
+    est = clim.scale(doy, hour)
+    assert est.std() / est.mean() < 0.03
+    assert est.mean() == pytest.approx(clim.sigma, rel=0.03)
+    assert est.mean() == pytest.approx(1.7, rel=0.03)
+
+
+def test_scale_fit_ignores_values_under_mask():
+    doy, hour, T, _ = _hetero_series(n_years=4, seed=2)
+    m = (np.random.default_rng(3).random(T.size) < 0.6).astype(np.float32)
+    ref = Climatology().fit(doy, hour, np.where(m > 0, T, 0.0), m)
+    got = Climatology().fit(doy, hour, np.where(m > 0, T, 1e6), m)
+    assert np.array_equal(ref.scale_beta, got.scale_beta) and np.array_equal(ref.beta, got.beta)
+
+
+def test_scale_is_positive_with_floor():
+    doy, hour, T, _ = _hetero_series(n_years=3, seed=4)
+    clim = Climatology().fit(doy, hour, T, np.ones_like(T))
+    clim.scale_beta = -np.abs(clim.scale_beta)
+    s = clim.scale(doy[:100], hour[:100])
+    assert np.all(s == pytest.approx(SCALE_FLOOR_FRAC * clim.sigma)) and np.all(s > 0)
+
+
+def test_scale_uses_abs_residual_convention():
+    """Для нормального остатка масштаб равен его разбросу, а не среднему модулю.
+
+    Средний модуль нормальной величины меньше разброса в постоянное число раз, и
+    масштаб это учитывает.
+    """
+    assert ABS_TO_SD == pytest.approx(np.sqrt(np.pi / 2))
+
+
+def test_cache_stores_scale_fitted_on_train_window(store):
+    cache = Path(store.path)
+    assert (cache / "clim_scale_beta.npy").exists()
+    for sid, s in store.stations.items():
+        lo, hi = time_layout(s["N"]).span("train")
+        d, h = window_calendar(s["t0"], np.arange(lo, hi))
+        ref = S.new_climatology().fit(d.astype(np.float64), h.astype(np.float64),
+                                      s["x"][lo:hi, 0], s["mask"][lo:hi, 0])
+        assert np.allclose(s["clim"].scale_beta, ref.scale_beta, rtol=1e-10, atol=1e-10), sid
+        dd, hh = window_calendar(s["t0"], np.arange(24))
+        sc = s["clim"].scale(dd, hh)
+        assert sc[0] > 1.8 * sc[12], sid
+
+
+def test_deep_check_catches_scale_not_from_train_window(store):
+    import copy
+    from mayak.leakage import LeakageError, check_climatology
+    bad = copy.copy(store)
+    bad.stations = {k: dict(v) for k, v in store.stations.items()}
+    s = bad.stations["t1"]
+    lo, hi = time_layout(s["N"]).span("test")
+    d, h = window_calendar(s["t0"], np.arange(lo, hi))
+    other = S.new_climatology().fit(d.astype(float), h.astype(float), s["x"][lo:hi, 0],
+                                    s["mask"][lo:hi, 0])
+    s["clim"] = Climatology.from_params(s["clim"].beta, s["clim"].sigma, other.scale_beta,
+                                        **{k: S.CLIM_PARAMS[k] for k in S.CLIM_BASIS})
+    check_climatology(bad)
+    with pytest.raises(LeakageError, match="масштаба"):
+        check_climatology(bad, deep=True)
+
+
+def _expected_scale(clim, t0, t):
+    d, h = window_calendar(t0, np.arange(t, t + H))
+    return clim.scale(d, h).astype(np.float32)
+
+
+def test_window_dataset_norm_scale_is_station_climatology(manifest, store):
+    from mayak.data.dataset import WindowDataset
+    ds = WindowDataset(manifest, windows_per_epoch=8, seed=0, store=store)
+    for s in ds.st:
+        t = int(s["starts"][len(s["starts"]) // 2])
+        item = ds.build(s, t, L_MAX)
+        ns = item["norm_scale"].numpy()
+        assert ns.shape == (H,) and ns.dtype == np.float32 and np.all(ns > 0)
+        assert np.allclose(ns, _expected_scale(store.stations[s["id"]]["clim"], s["t0"], t))
+    for i in range(4):
+        assert ds[i]["norm_scale"].shape == (H,)
+
+
+def test_norm_scale_unaffected_by_augmentations(manifest, store):
+    from mayak.data.dataset import WindowDataset, make_streams
+    ds = WindowDataset(manifest, windows_per_epoch=8, seed=0, store=store)
+    s = ds.st[0]
+    t = int(s["starts"][10])
+    items = []
+    for aug_seed in range(4):
+        _, ds.rng_aug = make_streams(1000 + aug_seed)
+        items.append(ds.build(s, t, L_MAX))
+    assert any(not torch.equal(items[0]["x_hist"], it["x_hist"]) for it in items[1:])
+    assert all(torch.equal(items[0]["norm_scale"], it["norm_scale"]) for it in items[1:])
+
+
+def test_validation_and_eval_sets_emit_same_norm_scale(manifest, store):
+    from mayak.data.datamodule import MayakData
+    from mayak.evaluate import EvalSet
+    dm = MayakData(manifest, windows_per_epoch=4, num_workers=0)
+    dm.setup()
+    hd = dm.val_ds
+    for i in range(0, len(hd), max(1, len(hd) // 5)):
+        sid, t = hd.items[i]
+        s = store.stations[sid]
+        assert np.allclose(hd[i]["norm_scale"].numpy(), _expected_scale(s["clim"], s["t0"], t))
+    ev = EvalSet(store.clims(), station_splits=(ROLE_VAL,), manifest=manifest, time_key="val")
+    by_key = {item: hd[i]["norm_scale"] for i, item in enumerate(hd.items)}
+    n = 0
+    for i, item in enumerate(ev.items):
+        if item in by_key:
+            assert torch.equal(ev[i]["norm_scale"], by_key[item])
+            n += 1
+    assert n > 0
+
+
+def _toy_batch(B=3, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    mask = (torch.rand(B, L_MAX, 3, generator=g) < 0.8).float()
+    x = torch.stack([15 + 3 * torch.randn(B, L_MAX, generator=g),
+                     1000 + 5 * torch.randn(B, L_MAX, generator=g),
+                     (60 + 10 * torch.randn(B, L_MAX, generator=g)).clamp(5, 100)], -1) * mask
+    y_mask = (torch.rand(B, H, generator=g) < 0.7).float()
+    y_mask[:, 0] = 1
+    return {
+        "lat": torch.rand(B, generator=g) * 120 - 60,
+        "lon": torch.rand(B, generator=g) * 360 - 180,
+        "elev": torch.rand(B, generator=g) * 500,
+        "x_hist": x, "mask_hist": mask,
+        "doy_hist": torch.rand(B, L_MAX, generator=g) * 365,
+        "hour_hist": torch.rand(B, L_MAX, generator=g) * 24,
+        "doy_fut": torch.rand(B, H, generator=g) * 365,
+        "hour_fut": torch.rand(B, H, generator=g) * 24,
+        "y": (12 + 4 * torch.randn(B, H, generator=g)) * y_mask, "y_mask": y_mask,
+        "norm_scale": 0.3 + 5 * torch.rand(B, H, generator=g),
+    }
+
+
+def _shared_q(B=3, seed=5):
+    g = torch.Generator().manual_seed(seed)
+    mu = 10 + 5 * torch.randn(B, H, generator=g)
+    offs = torch.cat([torch.zeros(B, H, 1), torch.rand(B, H, 6, generator=g).cumsum(-1)], -1)
+    return mu[..., None] + offs - offs[..., 3:4]
+
+
+def _lit(arch):
+    from mayak.lit import LitForecaster
+    torch.manual_seed(0)
+    return LitForecaster(arch=arch).eval()
+
+
+def test_loss_identical_for_all_models_on_identical_inputs():
+    """Функция потерь одна у всех архитектур.
+
+    При одинаковых квантилях, цели, маске и масштабе значение и градиент по квантилям
+    совпадают, а значение совпадает с ручным расчётом.
+    """
+    batch = _toy_batch()
+    q0 = _shared_q()
+    vals, grads = [], []
+    for arch in ARCH_NAMES:
+        lit = _lit(arch)
+        with torch.no_grad():
+            out = lit.model(batch)
+        q = q0.clone().requires_grad_(True)
+        out = dict(out, q=q)
+        loss = forecast_loss(out, batch)
+        (gq,) = torch.autograd.grad(loss, q)
+        vals.append(loss.detach())
+        grads.append(gq)
+    assert all(torch.equal(vals[0], v) for v in vals[1:])
+    assert all(torch.equal(grads[0], gr) for gr in grads[1:])
+
+    taus = torch.tensor(QUANTILES)
+    sc = batch["norm_scale"].clamp(*NORM_SCALE_CLAMP)
+    err = (batch["y"][..., None] - q0) / sc[..., None]
+    per = torch.maximum(taus * err, (taus - 1) * err).mean(-1)
+    w = batch["y_mask"]
+    assert torch.allclose(vals[0], (per * w).sum() / w.sum(), rtol=1e-6)
+
+
+@pytest.mark.parametrize("arch", ARCH_NAMES)
+def test_loss_ignores_model_own_scale(arch):
+    """Ни одна модель не нормирует функцию потерь на свой выход."""
+    batch = _toy_batch(seed=1)
+    lit = _lit(arch)
+    with torch.no_grad():
+        out = lit.model(batch)
+    ref = forecast_loss(out, batch)
+    own = [k for k in ("sigma_c", "sigma") if k in out]
+    assert own, "у модели должен быть собственный разброс — иначе проверка пуста"
+    for k in own:
+        for f in (1e-3, 1e3):
+            assert torch.equal(forecast_loss(dict(out, **{k: out[k] * f}), batch), ref)
+    changed = dict(batch, norm_scale=batch["norm_scale"] * 2 + 1)
+    assert not torch.equal(forecast_loss(out, changed), ref)
+
+
+def test_norm_scale_clamped_by_shared_constants():
+    batch = _toy_batch()
+    q = _shared_q()
+    lo, hi = NORM_SCALE_CLAMP
+    a = forecast_loss({"q": q}, dict(batch, norm_scale=torch.full((3, H), lo / 10)))
+    b = forecast_loss({"q": q}, dict(batch, norm_scale=torch.full((3, H), lo)))
+    c = forecast_loss({"q": q}, dict(batch, norm_scale=torch.full((3, H), hi * 10)))
+    d = forecast_loss({"q": q}, dict(batch, norm_scale=torch.full((3, H), hi)))
+    assert torch.equal(a, b) and torch.equal(c, d)
+    ref = masked_mean(*pinball_terms(q, batch["y"], batch["y_mask"], torch.full((3, H), lo)))
+    assert torch.equal(b, ref)
+
+
+@pytest.mark.parametrize("arch", ARCH_NAMES)
+def test_regularizers_do_not_depend_on_target(arch):
+    batch = _toy_batch(seed=2)
+    lit = _lit(arch)
+    other = dict(batch, y=batch["y"] + 7.0, y_mask=torch.ones_like(batch["y_mask"]),
+                 norm_scale=batch["norm_scale"] + 1)
+    with torch.no_grad():
+        _, d0, r0 = lit.losses(batch)
+        _, d1, r1 = lit.losses(other)
+    assert torch.equal(r0, r1)
+    assert not torch.equal(d0, d1)
+    assert torch.isfinite(r0) and r0.ndim == 0
+
+
+@pytest.mark.parametrize("arch", ARCH_NAMES)
+def test_training_objective_is_common_loss_plus_regularizer(arch):
+    from mayak.lit import regularization
+    batch = _toy_batch(seed=3)
+    lit = _lit(arch)
+    with torch.no_grad():
+        out, data, reg = lit.losses(batch)
+    assert torch.equal(data, forecast_loss(out, batch))
+    assert torch.equal(reg, regularization(lit.model, out))
+    if arch != "mayak":
+        assert reg.item() == 0.0
+
+
+def test_every_architecture_gets_the_same_protocol():
+    ps = [protocol_for(a) for a in ARCH_NAMES]
+    assert all(p is DEFAULT_PROTOCOL for p in ps)
+    with pytest.raises(ProtocolError):
+        protocol_for("transformer")
+
+
+def test_optimizer_and_schedule_identical_across_architectures():
+    seen = []
+    for arch in ARCH_NAMES:
+        lit = _lit(arch)
+        cfg = lit.configure_optimizers()
+        opt, sched = cfg["optimizer"], cfg["lr_scheduler"]["scheduler"]
+        n_opt = sum(p.numel() for g in opt.param_groups for p in g["params"])
+        n_all = sum(p.numel() for p in lit.model.parameters() if p.requires_grad)
+        assert n_opt == n_all, f"{arch}: не все параметры попали в оптимизатор"
+        w, total = lit.protocol.warmup_steps, lit.hparams.total_steps
+        at = (0, w - 1, w, total // 2, total - 1, total)
+        factors = {tuple(f(s) for s in at) for f in sched.lr_lambdas}
+        assert len(factors) == 1, f"{arch}: у групп параметров разные расписания"
+        seen.append((type(opt), {g["initial_lr"] for g in opt.param_groups},
+                     {tuple(g["betas"]) for g in opt.param_groups}, type(sched), factors,
+                     cfg["lr_scheduler"]["interval"], lit.protocol.ema_decay))
+    assert all(s == seen[0] for s in seen[1:]), seen
+
+
+def test_protocol_module_never_mentions_test_window():
+    src = (REPO / "mayak" / "protocol.py").read_text(encoding="utf-8")
+    assert not re.findall(r"\btest\b|unseen_test|ROLE_TEST", src)
+
+
+TINY = Protocol(stages=(Stage("A", "L0", 2), Stage("B", "full", 2)),
+                batch_size=2, windows_per_epoch=8, num_workers=0, seed=3, val_every=1)
+TINY_DATA = dict(val_windows_per_station=3)
+
+
+class _BatchRecorder:
+    """Колбэк: хеш каждого обучающего батча по порядку."""
+
+    def __new__(cls):
+        from pytorch_lightning.callbacks import Callback
+
+        class Rec(Callback):
+            def __init__(self):
+                self.hashes = []
+
+            def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+                h = hashlib.sha256()
+                for k in ("x_hist", "mask_hist", "y", "y_mask", "norm_scale", "lat", "doy_fut"):
+                    h.update(batch[k].detach().cpu().numpy().tobytes())
+                self.hashes.append(h.hexdigest())
+
+        return Rec()
+
+
+class _ValRecorder:
+    """Колбэк: окна каждого прохода валидации (без проверочного прохода перед обучением)."""
+
+    def __new__(cls):
+        from pytorch_lightning.callbacks import Callback
+
+        class Rec(Callback):
+            def __init__(self):
+                self.passes = []
+
+            def on_validation_epoch_start(self, trainer, pl_module):
+                if not trainer.sanity_checking:
+                    self.passes.append(dict(stage=pl_module.hparams.stage, n=0, hist=[]))
+
+            def on_validation_batch_start(self, trainer, pl_module, batch, batch_idx,
+                                          dataloader_idx=0):
+                if not trainer.sanity_checking:
+                    self.passes[-1]["n"] += int(batch["y"].shape[0])
+                    self.passes[-1]["hist"] += batch["hist_len"].tolist()
+
+        return Rec()
+
+
+@pytest.fixture(scope="module")
+def runs(manifest, store, tmp_path_factory):
+    out = tmp_path_factory.mktemp("runs4")
+    res = {}
+    for arch in ARCH_NAMES:
+        rec, val = _BatchRecorder(), _ValRecorder()
+        journal = run_protocol(arch, manifest, TINY, out_root=str(out), accelerator="cpu",
+                               callbacks=[rec, val], enable_progress_bar=False,
+                               data_config=TINY_DATA)
+        res[arch] = dict(journal=journal, hashes=rec.hashes, val=val.passes)
+    return out, res
+
+
+def test_all_architectures_see_identical_window_stream(runs):
+    _, res = runs
+    ref = res[ARCH_NAMES[0]]["hashes"]
+    assert len(ref) == sum(s.steps for s in TINY.stages)
+    for arch in ARCH_NAMES[1:]:
+        assert res[arch]["hashes"] == ref, f"{arch}: другой поток окон"
+
+
+def test_checkpoints_carry_protocol_and_pass_checklist(runs, store):
+    from mayak.leakage import run_checklist
+    from mayak.lit import LitForecaster
+    _, res = runs
+    ckpts = []
+    for arch in ARCH_NAMES:
+        for st in res[arch]["journal"]["stages"]:
+            ck = torch.load(st["best_ckpt"], map_location="cpu", weights_only=False)
+            hp = ck["hyper_parameters"]
+            assert hp["arch"] == arch and hp["stage"] == st["name"]
+            assert Protocol.from_dict(hp["protocol"]) == TINY
+            ckpts.append(st["best_ckpt"])
+        lit = LitForecaster.load_from_checkpoint(res[arch]["journal"]["final_ckpt"],
+                                                 map_location="cpu")
+        assert type(lit.model).__name__ == type(_lit(arch).model).__name__
+    run_checklist(store, checkpoints=ckpts)
+
+
+def test_validation_set_is_the_same_for_every_architecture(runs):
+    _, res = runs
+    ref = res[ARCH_NAMES[0]]
+    for arch in ARCH_NAMES:
+        j = res[arch]["journal"]
+        assert [s["val_set"] for s in j["stages"]] == \
+            [s["val_set"] for s in ref["journal"]["stages"]], arch
+        assert res[arch]["val"] == ref["val"], f"{arch}: другие окна валидации"
+        for st in j["stages"]:
+            rec = torch.load(st["best_ckpt"], map_location="cpu", weights_only=False)
+            sel = rec[SELECTION_KEY]
+            assert sel["windows_digest"] == st["val_set"]
+            assert sel["history"]["curriculum"] == st["curriculum"]
+            assert sel["scores"]["val/loss"] == pytest.approx(st["best_score"])
+            assert st["selection"] == sel["scores"]
+
+
+def test_validation_set_does_not_depend_on_protocol_seeds(manifest):
+    """Набор выбора чекпойнта строится из конфига данных и куррикулума этапа.
+
+    Сиды протокола (поток окон и аугментации) в него не входят, поэтому прогоны с разными
+    сидами выбирают чекпойнт на одних и тех же окнах валидационных станций.
+    """
+    from mayak.config import DataConfig
+    from mayak.data.datamodule import MayakData
+    sets = []
+    for seed, aug_seed in ((0, None), (11, 12)):
+        dm = MayakData(manifest, curriculum="full", windows_per_epoch=4, num_workers=0, seed=seed,
+                       aug_seed=aug_seed, data_config=DataConfig(manifest=manifest,
+                                                                 val_windows_per_station=8))
+        dm.setup()
+        sets.append(dm.val_ds)
+    assert {sid for sid, _t in sets[0].items} == {"v0", "v1"}
+    assert sets[0].fingerprint() == sets[1].fingerprint()
+    assert sets[0].requested == sets[1].requested
+
+
+def test_every_validation_pass_covers_the_whole_set(runs, manifest, store):
+    from mayak.evaluate import EvalSet
+    _, res = runs
+    for arch in ARCH_NAMES:
+        passes = res[arch]["val"]
+        assert passes and {p["stage"] for p in passes} == {"A", "B"}
+        for p in passes:
+            curriculum = next(s.curriculum for s in TINY.stages if s.name == p["stage"])
+            full = EvalSet(store.clims(), station_splits=(ROLE_VAL,), manifest=manifest,
+                           time_key="val", every_hours=24, max_windows=None,
+                           windows_per_station=TINY_DATA["val_windows_per_station"],
+                           curriculum=curriculum)
+            assert p["n"] == len(full) > TINY.batch_size, "проход валидации обрезан"
+            assert p["hist"] == full.requested
+            if p["stage"] == "A":
+                assert set(p["hist"]) == {0}
+
+
+def test_stage_b_starts_from_stage_a_weights(runs):
+    _, res = runs
+    j = res["dlinear"]["journal"]
+    a = torch.load(j["stages"][0]["best_ckpt"], map_location="cpu", weights_only=False)
+    from mayak.lit import LitForecaster
+    lit = LitForecaster(arch="dlinear", protocol=TINY, stage="B", total_steps=2)
+    lit.load_state_dict(a["state_dict"])
+    for k, v in a["state_dict"].items():
+        assert torch.equal(lit.state_dict()[k], v)
+
+
+def test_fp32_precision_switch():
+    """Обучение разрешает TF32 по протоколу, строгий режим запрещает его везде."""
+    from mayak.protocol import set_fp32_precision, strict_fp32
+    prev = (torch.get_float32_matmul_precision(), torch.backends.cuda.matmul.allow_tf32,
+            torch.backends.cudnn.allow_tf32)
+    try:
+        assert DEFAULT_PROTOCOL.tf32
+        set_fp32_precision(True)
+        assert torch.get_float32_matmul_precision() == "high"
+        assert torch.backends.cuda.matmul.allow_tf32 and torch.backends.cudnn.allow_tf32
+        strict_fp32()
+        assert torch.get_float32_matmul_precision() == "highest"
+        assert not torch.backends.cuda.matmul.allow_tf32
+        assert not torch.backends.cudnn.allow_tf32
+    finally:
+        torch.set_float32_matmul_precision(prev[0])
+        torch.backends.cuda.matmul.allow_tf32 = prev[1]
+        torch.backends.cudnn.allow_tf32 = prev[2]

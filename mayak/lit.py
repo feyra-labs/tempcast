@@ -1,18 +1,272 @@
-"""LightningModule для МАЯК"""
+"""LightningModule - один на все архитектуры.
+
+Оптимизатор, расписание, EMA весов, функция потерь, правило весового затухания и
+логирование валидации берутся из протокола обучения и одинаковы для любой архитектуры;
+скорость обучения каждая архитектура получает подбором по общей сетке протокола.
+Архитектура отвечает только за прямой проход, свои регуляризаторы (не зависят от цели)
+и объявленные отличия от правила весового затухания.
+
+Критерий выбора чекпойнта ``val/loss`` - общая часть функции потерь (нормированный
+pinball) без регуляризаторов: одно и то же число для всех моделей. Рядом пишется тот же
+нормированный pinball по бинам длины истории; на выбор он не влияет и нужен, чтобы видеть,
+на каком участке от холодного старта до полной истории модель лучше или хуже.
+
+Чекпойнт самодостаточен: в гиперпараметрах лежат архитектура, её конфиг, протокол
+и конфиг данных, под ключом ``RUN_KEY`` - полностью разрешённый конфиг прогона,
+сиды, хеш коммита и версии библиотек, а под ключом ``TUNING_KEY`` - запись о подборе
+скорости обучения, если прогон шёл с ней. ``load_model`` восстанавливает архитектуру
+из чекпойнта, а не из значений по умолчанию. ``check_comparable`` сверяет по этим записям
+условия обучения чекпойнтов сравнения.
+"""
 import copy
-import torch
+import functools
+import json
+from dataclasses import dataclass
+from typing import Optional
+
 import pytorch_lightning as L
+import torch
+import torch.nn as nn
+from pytorch_lightning.callbacks import Callback
 
+from mayak.baselines import DLinear, GRUSeq2Seq, LRUForecaster, PatchTST
+from mayak.config import DataConfig, RunConfig, model_config_for
+from mayak.data.holdout import HISTORY_BINS
+from mayak.leakage import SELECTION_KEY, selection_record
+from mayak.loss import forecast_loss, forecast_terms, masked_mean
 from mayak.model import MAYAK
-from mayak.loss import mayak_loss, pinball_loss
-from mayak.baselines import GRUSeq2Seq, DLinear
+from mayak.protocol import (ARCH_NAMES, DEFAULT_PROTOCOL, LR_FIELDS, Protocol, ProtocolError,
+                            protocol_diff)
+from mayak.stages import STAGE_KEY, jsonable
+from mayak.tuning import (EXTRA_ARCH, PHASE_EXTRA, TUNING_KEY, describe_phase,
+                          equal_terms_problems, search_terms)
 
-NO_WD_SUFFIX = ("raw_tau", "p_w", "p_k")
 LEADS = [1, 3, 6, 12, 24, 48, 72, 120, 168]
+RUN_KEY = "mayak_run"
+
+DECAY_LAYERS = (nn.Linear, nn.Conv1d, nn.GRU)
+
+ARCHS = {"mayak": MAYAK, "gru": GRUSeq2Seq, "dlinear": DLinear, "lru": LRUForecaster,
+         "patchtst": PatchTST}
+assert tuple(ARCHS) == ARCH_NAMES, "реестр архитектур расходится с mayak.protocol.ARCH_NAMES"
+
+
+def build_model(arch, model_config=None):
+    """Модель архитектуры по её конфигу.
+
+    Args:
+        arch: имя архитектуры.
+        model_config: None, словарь или датакласс конфига.
+
+    Returns:
+        Новая модель.
+
+    Raises:
+        ValueError: архитектура неизвестна.
+    """
+    if arch not in ARCHS:
+        raise ValueError(f"неизвестная архитектура {arch!r}; есть {tuple(ARCHS)}")
+    return ARCHS[arch](model_config_for(arch, model_config))
+
+
+def regularization(model, out):
+    """Регуляризаторы архитектуры, не зависящие от цели.
+
+    Args:
+        model: модель любой архитектуры.
+        out: выход модели.
+
+    Returns:
+        Скаляр; ноль, если у архитектуры регуляризаторов нет.
+    """
+    fn = getattr(model, "regularization", None)
+    return fn(out) if fn is not None else out["q"].new_zeros(())
+
+
+def decayed_by_rule(model):
+    """Параметры, которые по общему правилу получают весовое затухание.
+
+    Args:
+        model: модель любой архитектуры.
+
+    Returns:
+        Множество имён параметров: веса слоёв ``Linear``, ``Conv1d`` и ``GRU``.
+    """
+    return {f"{mod_name}.{name}" if mod_name else name
+            for mod_name, mod in model.named_modules() if isinstance(mod, DECAY_LAYERS)
+            for name, _ in mod.named_parameters(recurse=False) if name.startswith("weight")}
+
+
+def optim_groups(model, weight_decay):
+    """Группы параметров для оптимизатора по общему правилу весового затухания.
+
+    Базовое затухание протокола получают только веса слоёв ``Linear``, ``Conv1d`` и
+    ``GRU``. Все остальные параметры - смещения, нормы, скалярные, векторные и прочие
+    обучаемые тензоры - идут без затухания. Архитектура может объявить отличия методом
+    ``decay_exceptions(weight_decay)``: список групп с именем, затуханием и признаком
+    ``match(имя параметра, затухание по правилу)``. Параметр попадает в первую
+    подходящую группу отличий, иначе - в группу по правилу.
+
+    Args:
+        model: модель любой архитектуры.
+        weight_decay: базовое весовое затухание протокола.
+
+    Returns:
+        Список групп с ключами name, params и weight_decay: группы отличий в порядке
+        объявления, затем ``decay`` и ``no_decay``. Каждый обучаемый параметр - ровно в
+        одной группе; группа может быть пустой.
+    """
+    rule = decayed_by_rule(model)
+    fn = getattr(model, "decay_exceptions", None)
+    special = list(fn(weight_decay)) if fn is not None else []
+    groups = [dict(name=s["name"], params=[], weight_decay=float(s["weight_decay"]))
+              for s in special]
+    decay = dict(name="decay", params=[], weight_decay=float(weight_decay))
+    no_decay = dict(name="no_decay", params=[], weight_decay=0.0)
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        by_rule = name in rule
+        for s, g in zip(special, groups):
+            if s["match"](name, by_rule):
+                g["params"].append(p)
+                break
+        else:
+            (decay if by_rule else no_decay)["params"].append(p)
+    return [*groups, decay, no_decay]
+
+
+def parameter_counts(model):
+    """Число параметров модели: всего и по верхним блокам.
+
+    Args:
+        model: модель любой архитектуры.
+
+    Returns:
+        Словарь с ключами total (все параметры) и by_module (число параметров каждого
+        дочернего блока верхнего уровня, в порядке объявления; блоки без параметров
+        тоже перечислены). Параметры, объявленные прямо на модели, идут под ключом
+        own, если они есть. Сумма by_module равна total.
+    """
+    by_module = {name: int(sum(p.numel() for p in child.parameters()))
+                 for name, child in model.named_children()}
+    own = int(sum(p.numel() for p in model.parameters(recurse=False)))
+    if own:
+        by_module["own"] = own
+    return dict(total=int(sum(p.numel() for p in model.parameters())), by_module=by_module)
+
+
+def param_group_summary(model, weight_decay):
+    """Сводка групп весового затухания для журнала прогона.
+
+    Args:
+        model: модель любой архитектуры.
+        weight_decay: базовое весовое затухание протокола.
+
+    Returns:
+        Список по группам: имя, затухание, число тензоров и параметров и имена
+        параметров группы.
+    """
+    names = {id(p): n for n, p in model.named_parameters()}
+    return [dict(name=g["name"], n_tensors=len(g["params"]),
+                 n_params=int(sum(p.numel() for p in g["params"])),
+                 weight_decay=float(g["weight_decay"]),
+                 params=[names[id(p)] for p in g["params"]])
+            for g in optim_groups(model, weight_decay)]
+
+
+def history_bin_key(lo, hi):
+    """Имя записи журнала для бина длины истории.
+
+    Args:
+        lo: наименьшая длина истории бина, ч.
+        hi: наибольшая длина истории бина, ч.
+
+    Returns:
+        Имя вида val/pinball_L0 или val/pinball_L1-24.
+    """
+    return f"val/pinball_L{lo}" if lo == hi else f"val/pinball_L{lo}-{hi}"
+
+
+HISTORY_LOG = tuple((lo, hi, history_bin_key(lo, hi)) for lo, hi, _name in HISTORY_BINS)
+
+
+def log_history_bins(module, per_pair, weight, hist_len):
+    """Нормированный pinball валидации по бинам длины истории.
+
+    Вес записи равен числу валидных пар окна и лида бина в батче. Поэтому среднее за
+    проход валидации совпадает со средним по всем парам бина во всём наборе, так же как
+    у общего числа. Бин без пар в батче не пишется.
+
+    Args:
+        module: модуль, в журнал которого идут записи.
+        per_pair: нормированный pinball пар, форма (B, H).
+        weight: вес пар, форма (B, H).
+        hist_len: длина истории окон, ч, форма (B,).
+    """
+    for lo, hi, key in HISTORY_LOG:
+        inside = ((hist_len >= lo) & (hist_len <= hi)).to(weight.dtype)
+        sel = weight * inside[:, None]
+        n = int(sel.sum())
+        if n:
+            module.log(key, masked_mean(per_pair, sel), batch_size=n)
+
+
+class SelectionProvenance(Callback):
+    """Кладёт в каждый сохраняемый чекпойнт запись о том, на чём он выбирался.
+
+    В записи метрика монитора, роль станций, временное окно и правило длины истории
+    набора валидации, его отпечаток и все валидационные числа на момент сохранения.
+    Без этой записи чек-лист не примет чекпойнт.
+    """
+
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        cb = trainer.checkpoint_callback
+        monitor = getattr(cb, "monitor", None)
+        scores = {k: float(v) for k, v in trainer.callback_metrics.items()
+                  if k.startswith("val/")}
+        checkpoint[SELECTION_KEY] = selection_record(trainer.datamodule.val_ds, monitor,
+                                                     scores=scores)
+
+
+class StageProvenance(Callback):
+    """Кладёт в каждый сохраняемый чекпойнт запись об этапе.
+
+    В записи имя и номер этапа в протоколе, ключ кэша данных, каталог и журнал прогона,
+    чекпойнт, с которого этап стартовал, и шаг сохранения.
+
+    Args:
+        record: запись об этапе без шага сохранения.
+    """
+
+    def __init__(self, record):
+        self.record = dict(record)
+
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        checkpoint[STAGE_KEY] = dict(self.record, step=int(trainer.global_step))
+
+
+class TuningProvenance(Callback):
+    """Кладёт в каждый сохраняемый чекпойнт запись о подборе скорости обучения прогона.
+
+    Args:
+        record: запись о подборе.
+    """
+
+    def __init__(self, record):
+        self.record = dict(record)
+
+    def on_save_checkpoint(self, trainer, pl_module, checkpoint):
+        checkpoint[TUNING_KEY] = self.record
 
 
 class EMA:
-    """Экспоненциальное скользящее среднее весов модели"""
+    """Экспоненциальное скользящее среднее весов модели.
+
+    Args:
+        model: модель, веса которой усредняются.
+        decay: доля старого среднего на каждом шаге.
+    """
 
     def __init__(self, model, decay=0.999):
         self.decay = decay
@@ -38,22 +292,72 @@ class EMA:
             self.backup = None
 
 
-class LitMayak(L.LightningModule):
-    def __init__(self, lr=3e-3, weight_decay=1e-2, total_steps=200_000,
-                 ema_decay=0.999):
+def log_val_metrics(module, out, batch, loss):
+    y, w = batch["y"], batch["y_mask"]
+    module.log("val/loss", loss, prog_bar=True, batch_size=max(int(w.sum()), 1))
+    med = out["q"][..., 3]
+    for h in LEADS:
+        wj = w[:, h - 1]
+        n = int(wj.sum())
+        if n == 0:
+            continue
+        mae = ((med[:, h - 1] - y[:, h - 1]).abs() * wj).sum() / n
+        module.log(f"val/mae_{h}h", mae, batch_size=n)
+
+
+class LitForecaster(L.LightningModule):
+    """Обучение любой архитектуры проекта по протоколу.
+
+    Args:
+        arch: имя архитектуры.
+        protocol: протокол или его словарь; словарь хранится в гиперпараметрах
+            чекпойнта.
+        stage: имя этапа протокола для журнала.
+        total_steps: число шагов этого этапа; по нему расписание WSD ставит спад.
+        model_config: конфиг архитектуры.
+        data_config: конфиг данных, с которым шло обучение; пишется в чекпойнт.
+    """
+
+    def __init__(self, arch="mayak", protocol=None, stage=None, total_steps=None,
+                 model_config=None, data_config=None):
         super().__init__()
-        self.save_hyperparameters()
-        self.model = MAYAK()
+        if isinstance(protocol, Protocol):
+            protocol = protocol.to_dict()
+        if protocol is None:
+            protocol = DEFAULT_PROTOCOL.to_dict()
+        p = Protocol.from_dict(protocol)
+        if total_steps is None:
+            total_steps = p.total_steps
+        mcfg = model_config_for(arch, model_config)
+        dcfg = DataConfig() if data_config is None else (
+            data_config if isinstance(data_config, DataConfig)
+            else DataConfig.from_dict(data_config))
+        self.save_hyperparameters(dict(arch=arch, protocol=p.to_dict(), stage=stage,
+                                       total_steps=int(total_steps),
+                                       model_config=mcfg.to_dict(),
+                                       data_config=dcfg.to_dict()))
+        self.protocol = p
+        self.run_config = RunConfig(model=mcfg, data=dcfg, train=p)
+        self.model = build_model(arch, mcfg)
         self.ema = None
+
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint[RUN_KEY] = run_record(self.run_config)
+
+    def losses(self, batch):
+        out = self.model(batch)
+        return out, forecast_loss(out, batch), regularization(self.model, out)
 
     def on_train_start(self):
         if self.ema is None:
-            self.ema = EMA(self.model, self.hparams.ema_decay)
+            self.ema = EMA(self.model, self.protocol.ema_decay)
 
     def training_step(self, batch, _):
-        out = self.model(batch)
-        loss = mayak_loss(out, batch["y"])
-        self.log("train/loss", loss, prog_bar=True, batch_size=batch["y"].shape[0])
+        _out, data, reg = self.losses(batch)
+        loss = data + reg
+        bs = batch["y"].shape[0]
+        self.log("train/loss", loss, prog_bar=True, batch_size=bs)
+        self.log("train/pinball", data, batch_size=bs)
         return loss
 
     def on_before_zero_grad(self, *args, **kwargs):
@@ -70,80 +374,362 @@ class LitMayak(L.LightningModule):
 
     def validation_step(self, batch, _):
         out = self.model(batch)
-        y = batch["y"]
-        loss = mayak_loss(out, y)
-        self.log("val/loss", loss, prog_bar=True, batch_size=y.shape[0])
-        med = out["q"][..., 3]
-        for h in LEADS:
-            mae = (med[:, h - 1] - y[:, h - 1]).abs().mean()
-            self.log(f"val/mae_{h}h", mae, batch_size=y.shape[0])
-        return loss
+        per_pair, weight = forecast_terms(out, batch)
+        data = masked_mean(per_pair, weight)
+        reg = regularization(self.model, out)
+        log_val_metrics(self, out, batch, data)
+        if "hist_len" in batch:
+            log_history_bins(self, per_pair, weight, batch["hist_len"])
+        self.log("val/total", data + reg, batch_size=batch["y"].shape[0])
+        return data
 
     def configure_optimizers(self):
-        no_decay, field, rest = [], [], []
-        for n, p in self.model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if n.split(".")[-1] in NO_WD_SUFFIX:
-                no_decay.append(p)
-            elif n.startswith("field."):
-                field.append(p)
+        p = self.protocol
+        groups = optim_groups(self.model, p.weight_decay)
+        opt = torch.optim.AdamW([dict(params=g["params"], weight_decay=g["weight_decay"])
+                                 for g in groups if g["params"]],
+                                lr=p.lr, betas=p.betas)
+        # Множитель - функция номера шага этапа (Protocol.lr_factor). Лямбда-планировщик
+        # шагает после каждого шага оптимизатора, поэтому шаг s идёт со скоростью lr * f(s).
+        factor = functools.partial(p.lr_factor, total_steps=int(self.hparams.total_steps))
+        sched = torch.optim.lr_scheduler.LambdaLR(opt, factor)
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+
+
+def run_record(run_config):
+    """Запись о прогоне для чекпойнта.
+
+    Args:
+        run_config: полная конфигурация прогона.
+
+    Returns:
+        Словарь: разрешённый конфиг, сиды, коммит и версии библиотек.
+    """
+    from mayak.provenance import provenance
+    return dict(config=run_config.to_dict(), seeds=run_config.train.resolved_seeds(),
+                provenance=provenance())
+
+
+def load_model(path, map_location="cpu"):
+    """Модель из чекпойнта любой архитектуры.
+
+    Архитектура и её конфиг берутся из гиперпараметров чекпойнта.
+
+    Args:
+        path: путь к чекпойнту.
+        map_location: устройство для весов.
+
+    Returns:
+        Модель с весами чекпойнта.
+    """
+    return LitForecaster.load_from_checkpoint(path, map_location=map_location).model
+
+
+@dataclass(frozen=True)
+class CheckpointTerms:
+    """Условия обучения чекпойнта, которые сверяет стенд оценки.
+
+    Attributes:
+        arch: имя архитектуры.
+        protocol: протокол обучения.
+        tuning: запись о подборе скорости обучения или None.
+        model_config: словарь конфига архитектуры или None.
+        data_config: словарь конфига данных или None.
+        data_key: ключ кэша данных из записи этапа или None.
+        stage: запись этапа чекпойнта или None.
+    """
+    arch: str
+    protocol: Protocol
+    tuning: Optional[dict] = None
+    model_config: Optional[dict] = None
+    data_config: Optional[dict] = None
+    data_key: Optional[str] = None
+    stage: Optional[dict] = None
+
+
+def checkpoint_terms(path):
+    """Условия обучения чекпойнта.
+
+    Args:
+        path: путь к чекпойнту.
+
+    Returns:
+        Условия обучения: архитектура, протокол, запись о подборе, конфиги модели и
+        данных и ключ кэша данных. Отсутствующие в чекпойнте записи - None.
+
+    Raises:
+        ProtocolError: в чекпойнте нет протокола или он не читается текущим протоколом,
+            например чекпойнт обучен до смены расписания.
+    """
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    hp = ck.get("hyper_parameters") or {}
+    if "protocol" not in hp:
+        raise ProtocolError(f"{path}: в чекпойнте нет протокола обучения")
+    try:
+        protocol = Protocol.from_dict(hp["protocol"])
+    except (TypeError, ValueError) as e:
+        raise ProtocolError(f"{path}: протокол чекпойнта несовместим с текущим ({e}); "
+                            f"чекпойнт обучен по старому протоколу, обучите модель заново"
+                            ) from e
+    stage = ck.get(STAGE_KEY) or {}
+    return CheckpointTerms(arch=hp["arch"], protocol=protocol, tuning=ck.get(TUNING_KEY),
+                           model_config=hp.get("model_config"),
+                           data_config=hp.get("data_config"), data_key=stage.get("data_key"),
+                           stage=stage or None)
+
+
+def completion_problems(terms):
+    """Почему чекпойнт не годится как итоговый: этап не завершён или этап не последний.
+
+    Итоговый чекпойнт - лучший чекпойнт последнего этапа протокола, прошедшего все шаги.
+    Прерванный этап отметки о завершении не получает (``mark_complete``): его чекпойнт
+    снят до спада скорости обучения, и сравнение с ним не на равных.
+
+    Args:
+        terms: условия обучения чекпойнта.
+
+    Returns:
+        Список причин; пустой, если чекпойнт итоговый.
+    """
+    from mayak.stages import COMPLETE_FIELD
+    st = terms.stage or {}
+    last = terms.protocol.stages[-1]
+    done = st.get(COMPLETE_FIELD)
+    if not done:
+        return [f"этап {st.get('stage', '?')} не отмечен как завершённый: прогон прерван "
+                f"или обучен до этой проверки, обучите этап до конца"]
+    out = []
+    if st.get("stage") is not None and st.get("stage") != last.name:
+        out.append(f"чекпойнт этапа {st.get('stage')}, а итоговый — этапа {last.name}")
+    if int(done.get("steps_done", 0)) < last.steps:
+        out.append(f"этап прошёл {done.get('steps_done')} из {last.steps} шагов")
+    return out
+
+
+def check_complete(path):
+    """Проверка, что чекпойнт итоговый: последний этап протокола прошёл все шаги.
+
+    Args:
+        path: путь к чекпойнту.
+
+    Raises:
+        ProtocolError: этап не завершён или этап не последний.
+    """
+    problems = completion_problems(checkpoint_terms(path))
+    if problems:
+        raise ProtocolError(f"{path}: " + "; ".join(problems))
+
+
+# Путь к манифесту и каталог кэша зависят от того, откуда запущена команда. Совпадение
+# данных проверяется по ключу кэша: он строится по содержимому манифеста и источников.
+DATA_PATH_FIELDS = ("manifest", "cache_root")
+ABLATIONS_FIELD = "ablations"
+
+
+def _normalized(value):
+    return json.loads(json.dumps(jsonable(value), sort_keys=True))
+
+
+def config_diff(where, ref, own):
+    """Отличия конфига чекпойнта от эталонного, по одной строке на поле.
+
+    Args:
+        where: имя конфига в начале каждой строки.
+        ref: эталонное значение.
+        own: значение чекпойнта.
+
+    Returns:
+        Список строк вида «data.augment.offset_max: у эталона 2.0, у чекпойнта 0.0».
+    """
+    ref, own = _normalized(ref), _normalized(own)
+    if isinstance(ref, dict) and isinstance(own, dict):
+        out = []
+        for k in sorted(set(ref) | set(own)):
+            if k not in ref:
+                out.append(f"{where}.{k}: нет у эталона, у чекпойнта {own[k]!r}")
+            elif k not in own:
+                out.append(f"{where}.{k}: у эталона {ref[k]!r}, нет у чекпойнта")
             else:
-                rest.append(p)
-        opt = torch.optim.AdamW(
-            [{"params": rest, "weight_decay": self.hparams.weight_decay},
-             {"params": field, "weight_decay": 0.5},
-             {"params": no_decay, "weight_decay": 0.0}],
-            lr=self.hparams.lr, betas=(0.9, 0.95))
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.hparams.total_steps)
-        return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+                out += config_diff(f"{where}.{k}", ref[k], own[k])
+        return out
+    if ref != own:
+        return [f"{where}: у эталона {ref!r}, у чекпойнта {own!r}"]
+    return []
 
 
-class LitBaseline(L.LightningModule):
-    """Обучение нейробейзлайнов GRU/DLinear"""
+def _data_fields(d):
+    return {k: v for k, v in dict(d or {}).items() if k not in DATA_PATH_FIELDS}
 
-    def __init__(self, model_name="gru", lr=3e-3, weight_decay=1e-2,
-                 total_steps=200_000, ema_decay=0.999):
-        super().__init__()
-        self.save_hyperparameters()
-        self.model = {"gru": GRUSeq2Seq, "dlinear": DLinear}[model_name]()
-        self.ema = None
 
-    def on_train_start(self):
-        if self.ema is None:
-            self.ema = EMA(self.model, self.hparams.ema_decay)
+def _model_fields(d):
+    return {k: v for k, v in dict(d or {}).items() if k != ABLATIONS_FIELD}
 
-    def training_step(self, batch, _):
-        out = self.model(batch)
-        loss = pinball_loss(out, batch["y"])
-        self.log("train/loss", loss, prog_bar=True, batch_size=batch["y"].shape[0])
-        return loss
 
-    def on_before_zero_grad(self, *a, **k):
-        if self.ema is not None:
-            self.ema.update(self.model)
+def missing_terms(terms):
+    """Каких записей для сверки данных и модели в чекпойнте нет.
 
-    def on_validation_start(self):
-        if self.ema is not None:
-            self.ema.store_and_apply(self.model)
+    Args:
+        terms: условия обучения чекпойнта.
 
-    def on_validation_end(self):
-        if self.ema is not None:
-            self.ema.restore(self.model)
+    Returns:
+        Список причин; пустой, если все записи есть.
+    """
+    out = []
+    if terms.model_config is None:
+        out.append("нет конфига модели (hyper_parameters.model_config)")
+    if terms.data_config is None:
+        out.append("нет конфига данных (hyper_parameters.data_config)")
+    if terms.data_key is None:
+        out.append(f"нет ключа кэша данных в записи этапа ({STAGE_KEY})")
+    return out
 
-    def validation_step(self, batch, _):
-        out = self.model(batch);
-        y = batch["y"]
-        loss = pinball_loss(out, y)
-        self.log("val/loss", loss, prog_bar=True, batch_size=y.shape[0])
-        med = out["q"][..., 3]
-        for h in LEADS:
-            self.log(f"val/mae_{h}h", (med[:, h - 1] - y[:, h - 1]).abs().mean(),
-                     batch_size=y.shape[0])
-        return loss
 
-    def configure_optimizers(self):
-        opt = torch.optim.AdamW(self.model.parameters(), lr=self.hparams.lr,
-                                weight_decay=self.hparams.weight_decay, betas=(0.9, 0.95))
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=self.hparams.total_steps)
-        return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+def data_problems(ref, terms):
+    """Отличия данных чекпойнта от эталона.
+
+    Ключ кэша данных должен совпадать с эталонным. Конфиг данных без полей путей должен
+    совпадать с конфигом данных эталона, в который перенесены эффекты абляций модели
+    чекпойнта (``RunConfig.resolved``).
+
+    Args:
+        ref: условия обучения эталона.
+        terms: условия обучения чекпойнта.
+
+    Returns:
+        Список отличий; пустой, если данные те же.
+    """
+    out = []
+    if terms.data_key != ref.data_key:
+        out.append(f"ключ кэша данных {terms.data_key} отличается от эталонного {ref.data_key}")
+    try:
+        expected = RunConfig(model=model_config_for(terms.arch, terms.model_config),
+                             data=DataConfig.from_dict(ref.data_config)).resolved().data
+    except (TypeError, ValueError) as e:
+        return [*out, f"конфиг данных или модели не читается текущим кодом ({e})"]
+    diff = config_diff("data", _data_fields(expected.to_dict()), _data_fields(terms.data_config))
+    if diff:
+        out.append("конфиг данных отличается: " + "; ".join(diff))
+    return out
+
+
+def model_problems(ref, terms):
+    """Отличия абляции или повтора основной модели от эталона.
+
+    Скорость обучения должна совпадать с эталонной, конфиг модели - с эталонным во всех
+    полях, кроме ``ablations``.
+
+    Args:
+        ref: условия обучения эталона.
+        terms: условия обучения чекпойнта.
+
+    Returns:
+        Список отличий; пустой, если модель та же.
+    """
+    out = []
+    lr, ref_lr = float(terms.protocol.lr), float(ref.protocol.lr)
+    if lr != ref_lr:
+        out.append(f"скорость обучения {lr:g} отличается от эталонной {ref_lr:g}")
+    diff = config_diff("model", _model_fields(ref.model_config), _model_fields(terms.model_config))
+    if diff:
+        out.append("конфиг модели отличается не только абляциями: " + "; ".join(diff))
+    return out
+
+
+def check_comparable(reference, others, ignore=(), same_model=False):
+    """Проверка, что все чекпойнты сравнения обучены в одинаковых условиях.
+
+    Протоколы должны совпадать во всех полях, кроме скорости обучения и полей из
+    ``ignore``. Скорость обучения у каждой модели своя, поэтому у каждого чекпойнта,
+    включая эталон, должна быть запись о подборе этапа 1 сравнения с той же сеткой, тем
+    же числом шагов этапов и той же метрикой выбора, что у эталона, а скорость обучения
+    чекпойнта - значение этой сетки, выбранное подбором (``selected_lr``). Данные
+    сверяются по ``data_problems``, а с ``same_model`` ещё скорость обучения и конфиг
+    модели по ``model_problems``. Все отличия собираются в одно сообщение.
+
+    Args:
+        reference: путь к эталонному чекпойнту.
+        others: пути к остальным чекпойнтам.
+        ignore: поля протокола, которые могут различаться, например сиды у повторов
+            основной модели.
+        same_model: чекпойнты - абляции или повторы эталонной модели.
+
+    Returns:
+        Словарь из пути чекпойнта в его архитектуру.
+
+    Raises:
+        ProtocolError: протоколы, данные или, с ``same_model``, модели различаются; у
+            чекпойнта нет протокола, записи о подборе или записей для сверки; подбор шёл в
+            других условиях; чекпойнт не итоговый (``completion_problems``).
+    """
+    ignore = (*ignore, *LR_FIELDS)
+    ref = checkpoint_terms(reference)
+    archs = {reference: ref.arch}
+    ref_missing = missing_terms(ref)
+    bad = [f"{reference} ({ref.arch}): {p}"
+           for p in [*equal_terms_problems(ref.tuning, ref.protocol), *ref_missing,
+                     *completion_problems(ref)]]
+    ref_terms = search_terms(ref.tuning)
+    for path in others:
+        t = checkpoint_terms(path)
+        archs[path] = t.arch
+        problems = []
+        diff = protocol_diff(ref.protocol, t.protocol, ignore)
+        if diff:
+            problems.append(f"отличаются {diff}")
+        own = equal_terms_problems(t.tuning, t.protocol)
+        problems += own
+        own_terms = search_terms(t.tuning)
+        terms_diff = sorted(k for k in ref_terms if ref_terms[k] != own_terms[k])
+        if not own and ref.tuning and terms_diff:
+            problems.append(f"подбор скорости обучения шёл в других условиях, "
+                            f"отличаются {terms_diff}")
+        missing = missing_terms(t)
+        problems += missing
+        problems += completion_problems(t)
+        if not missing and not ref_missing:
+            problems += data_problems(ref, t)
+            if same_model:
+                problems += model_problems(ref, t)
+        bad += [f"{path} ({t.arch}): {p}" for p in problems]
+    if bad:
+        raise ProtocolError(f"модели сравнения обучены в разных условиях (эталон — "
+                            f"{reference}, {ref.arch}):\n  " + "\n  ".join(bad))
+    return archs
+
+
+def check_extra_tuning(path):
+    """Проверка, что чекпойнт - прогон дополнительной настройки МАЯК.
+
+    Args:
+        path: путь к чекпойнту.
+
+    Raises:
+        ProtocolError: архитектура не МАЯК или прогон не помечен как этап 2 сравнения.
+    """
+    t = checkpoint_terms(path)
+    phase = (t.tuning or {}).get("phase")
+    if t.arch != EXTRA_ARCH or phase != PHASE_EXTRA:
+        raise ProtocolError(f"{path} ({t.arch}): нужен прогон {describe_phase(PHASE_EXTRA)} "
+                            f"(scripts/run.py run.extra_tuning=true), а это прогон "
+                            f"{describe_phase(phase)}")
+    problems = completion_problems(t)
+    if problems:
+        raise ProtocolError(f"{path} ({t.arch}): " + "; ".join(problems))
+
+
+def load_run_record(path):
+    """Запись о прогоне из чекпойнта.
+
+    Args:
+        path: путь к чекпойнту.
+
+    Returns:
+        Запись о прогоне: разрешённый конфиг, сиды, коммит и версии библиотек.
+
+    Raises:
+        ValueError: в чекпойнте нет записи о прогоне.
+    """
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    if RUN_KEY not in ck:
+        raise ValueError(f"{path}: в чекпойнте нет записи о прогоне")
+    return ck[RUN_KEY]

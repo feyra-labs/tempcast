@@ -1,0 +1,11 @@
+# @package data.augment
+# Профиль аугментаций «none»: без аугментаций; значения параметров те же, что у default.
+# Отличия от значений по умолчанию (= default).
+profile: none
+offset_prob: 0.0
+noise_prob: 0.0
+rh_dewpoint_prob: 0.0
+stuck_prob: 0.0
+dropout_prob: 0.0
+gap_prob: 0.0
+drop_channel_prob: 0.0

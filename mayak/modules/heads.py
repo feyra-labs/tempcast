@@ -1,40 +1,166 @@
+from statistics import NormalDist
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mayak.constants import DZ, NQ, inv_softplus
+from mayak.modules import inv_softplus
+
+R_MAX = 0.6
+R_KAPPA_FLOOR = 1.0
+R_KAPPA_RAW_INIT = 2.3
+
+
+def normal_gaps(quantiles, decimals=3):
+    """Начальные зазоры между соседними квантилями стандартного нормального распределения.
+
+    Зазоры идут от медианы наружу, квантили нормального распределения округляются до
+    тысячных.
+
+    Args:
+        quantiles: уровни квантилей по возрастанию, среди них есть медиана.
+        decimals: число знаков после запятой при округлении.
+
+    Returns:
+        Пара списков: зазоры ниже медианы и зазоры выше медианы.
+    """
+    q = list(quantiles)
+    m = q.index(0.5)
+    z = [round(NormalDist().inv_cdf(x), decimals) for x in q]
+    lower = [z[i + 1] - z[i] for i in range(m - 1, -1, -1)]
+    upper = [z[i] - z[i - 1] for i in range(m + 1, len(q))]
+    return lower, upper
 
 
 class Heads(nn.Module):
+    """Головы прогноза: поправка к аномалии, масштаб интервала и квантильные смещения.
 
-    def __init__(self):
+    Поправка ограничена по модулю и умножается на вес доверия к истории. Вес растёт
+    со средней по модам массой свидетельств так же, как доказательное сжатие мод:
+    масса делится на сумму массы и обучаемого порога. Без истории масса равна нулю,
+    вес равен нулю, и медиана совпадает с климат-полем при любых весах голов.
+    Масштаб интервала и зазоры между квантилями от веса не зависят: при пустой истории
+    интервал по-прежнему учится быть климатологическим.
+
+    Средняя масса свидетельств - в весе поправки и во входе голов - берётся только по
+    модам погоды. Масса квазипостоянных мод на полной истории в разы больше и растёт
+    почти линейно с длиной истории, в среднем она заслонила бы остальные моды.
+
+    Без поправки (абляция ``no_correction``) выходного канала поправки и порога её веса
+    нет, поправка тождественно равна нулю; масштаб интервала и зазоры квантилей
+    считаются так же.
+
+    Args:
+        dz: размер паспорта станции.
+        n_groups: число групп мод.
+        n_sun: число солнечных ковариат на лидах.
+        quantiles: уровни квантилей по возрастанию, среди них медиана.
+        hidden: ширина скрытого слоя.
+        z_proj: размер проекции паспорта на вход голов.
+        evidence_modes: флаги мод, входящих в среднюю массу свидетельств, по одному на
+            моду; None - все моды.
+        correction: есть ли поправка к аномалии; ложь - абляция ``no_correction``.
+
+    Attributes:
+        r_kappa: сырой параметр порога веса поправки, только при включённой поправке.
+            Сам порог не меньше одного часа свидетельств, чтобы вес не превращался в
+            ступеньку при исчезающе малой массе. При инициализации порог около 3.4 ч,
+            как у сжатия мод: поправка набирает силу с той же скоростью, что и аномалия.
+    """
+
+    def __init__(self, dz, n_groups, n_sun, quantiles, hidden=48, z_proj=4,
+                 evidence_modes=None, correction=True):
         super().__init__()
-        self.zproj = nn.Linear(DZ, 4)
-        self.fc1 = nn.Linear(16, 48)
-        self.fc2 = nn.Linear(48, 2 + (NQ - 1))
-        gaps = torch.tensor([0.674, 0.608, 0.363, 0.674, 0.608, 0.363])
+        self.correction = bool(correction)
+        n_r = int(self.correction)
+        if evidence_modes is None:
+            self.register_buffer("evidence_w", None)
+        else:
+            w = torch.tensor([float(bool(f)) for f in evidence_modes])
+            if not w.sum() > 0:
+                raise ValueError("ни одна мода не входит в массу свидетельств голов")
+            # Веса среднего следуют из конфига, в состояние модуля они не пишутся.
+            self.register_buffer("evidence_w", w / w.sum(), persistent=False)
+        lower, upper = normal_gaps(quantiles)
+        self.n_lo, self.n_hi = len(lower), len(upper)
+        self.z_proj = z_proj
+        self.in_dim = 1 + n_groups + 1 + n_sun + 1 + z_proj + 1 + 1
+        self.zproj = nn.Linear(dz, z_proj)
+        self.fc1 = nn.Linear(self.in_dim, hidden)
+        self.fc2 = nn.Linear(hidden, n_r + 1 + self.n_lo + self.n_hi)
+        if self.correction:
+            self.r_kappa = nn.Parameter(torch.tensor(R_KAPPA_RAW_INIT))
+        gaps = torch.tensor(lower + upper)
         with torch.no_grad():
             self.fc2.weight.zero_()
             self.fc2.bias.zero_()
-            self.fc2.bias[1] = 0.9
-            self.fc2.bias[2:] = inv_softplus(gaps)
+            self.fc2.bias[n_r] = 0.9
+            self.fc2.bias[n_r + 1:] = inv_softplus(gaps)
+
+    def evidence_mass(self, e):
+        """Средняя масса свидетельств по модам погоды.
+
+        Args:
+            e: масса свидетельств по модам, форма (B, M).
+
+        Returns:
+            Средняя масса, форма (B,).
+        """
+        if self.evidence_w is None:
+            return e.mean(-1)
+        return e @ self.evidence_w
+
+    def evidence_gate(self, e):
+        """Вес поправки по массе свидетельств.
+
+        Args:
+            e: масса свидетельств по модам, форма (B, M).
+
+        Returns:
+            Вес от нуля до единицы, форма (B,). Он равен нулю ровно тогда, когда в
+            истории нет ни одного валидного часа.
+        """
+        e_mean = self.evidence_mass(e)
+        kappa = R_KAPPA_FLOOR + F.softplus(self.r_kappa)
+        return e_mean / (e_mean + kappa)
 
     def forward(self, o, Eg, sun_fut, log_sigma, z, e):
+        """Поправка, масштаб интервала и смещения квантилей на всех лидах.
+
+        Args:
+            o: аномалия из мод погоды в единицах климатологического разброса точки без
+                паспорта, форма (B, H).
+            Eg: энергии групп мод на лидах, форма (B, H, число групп).
+            sun_fut: солнечные ковариаты на лидах, форма (B, H, n_sun).
+            log_sigma: логарифм климатологического разброса с паспортом на лидах - того,
+                что задаёт ширину интервала, форма (B, H).
+            z: паспорт станции, форма (B, dz).
+            e: масса свидетельств по модам, форма (B, M).
+
+        Returns:
+            Тройка: поправка к аномалии мод погоды (B, H) - нулевая без поправки, -
+            масштаб интервала (B, H) и смещения квантилей от медианы
+            (B, H, число квантилей) с нулём на месте медианы.
+        """
         Bsz, Hn = o.shape
-        zp = self.zproj(z)[:, None, :].expand(Bsz, Hn, 4)
+        zp = self.zproj(z)[:, None, :].expand(Bsz, Hn, self.z_proj)
         hn = (torch.arange(1, Hn + 1, dtype=o.dtype, device=o.device) / Hn
               )[None, :, None].expand(Bsz, Hn, 1)
-        le = torch.log1p(e.mean(-1))[:, None, None].expand(Bsz, Hn, 1)
+        le = torch.log1p(self.evidence_mass(e))[:, None, None].expand(Bsz, Hn, 1)
 
         x = torch.cat([o[..., None], Eg, Eg.sum(-1, keepdim=True), sun_fut,
                        log_sigma[..., None], zp, hn, le], dim=-1)
         out = self.fc2(F.gelu(self.fc1(x)))
 
-        r = 0.6 * torch.tanh(out[..., 0])
-        ratio = 0.08 + torch.sigmoid(out[..., 1] + 1.5)
-        gaps = F.softplus(out[..., 2:])
+        n_r = int(self.correction)
+        if self.correction:
+            r = R_MAX * torch.tanh(out[..., 0]) * self.evidence_gate(e)[:, None]
+        else:
+            r = torch.zeros_like(o)
+        ratio = 0.08 + torch.sigmoid(out[..., n_r] + 1.5)
+        gaps = F.softplus(out[..., n_r + 1:])
 
-        lo = torch.flip(torch.cumsum(gaps[..., :3], dim=-1), dims=(-1,))
-        hi = torch.cumsum(gaps[..., 3:], dim=-1)
+        lo = torch.flip(torch.cumsum(gaps[..., :self.n_lo], dim=-1), dims=(-1,))
+        hi = torch.cumsum(gaps[..., self.n_lo:], dim=-1)
         off = torch.cat([-lo, torch.zeros_like(r)[..., None], hi], dim=-1)
         return r, ratio, off

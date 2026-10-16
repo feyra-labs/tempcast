@@ -2,23 +2,58 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from mayak.constants import DZ, inv_softplus
-from mayak.modules.loc import LocEncoder
+from mayak.modules import inv_softplus
+from mayak.modules.loc import ELEV_SCALE_M
+
+N_YEAR_BASIS = 7
+N_DAY_BASIS = 5
+N_DAY_SMOOTH = 3
+N_MU = N_YEAR_BASIS * N_DAY_BASIS + 1
+N_SIG = N_YEAR_BASIS * N_DAY_SMOOTH
+N_DEF = N_YEAR_BASIS * N_DAY_SMOOTH
+SIGMA_INIT = 2.2
+FILM_STRENGTH = 0.3
+LAPSE_INIT = -6.5e-3 * ELEV_SCALE_M
 
 
 class ClimateField(nn.Module):
-    """Имплицитное климат-поле: координаты → коэффициенты гармонического базиса"""
+    """Имплицитное климат-поле: по признакам координат - коэффициенты гармонического базиса.
 
-    def __init__(self):
+    Климатическое среднее раскладывается по произведениям годовых и суточных гармоник,
+    климатологический разброс и дефицит точки росы - по сглаженному базису с меньшим
+    числом суточных гармоник.
+
+    Среднее содержит явный член градиента по высоте: обучаемый наклон, умноженный на
+    признак высоты (последний признак координат), прибавляется к постоянному
+    коэффициенту среднего. Старт - стандартный градиент атмосферы. Так перепад высот
+    между соседними точками не приходится выучивать по редкой сети.
+
+    Паспорт станции модулирует скрытый слой через FiLM, сила модуляции ограничена
+    константой. Модуляция действует только на разброс и дефицит точки росы:
+    коэффициенты среднего берутся своей головой из скрытого слоя без модуляции. Поэтому
+    среднее поля от паспорта не зависит и одно и то же у нормировки истории и у выпуска,
+    а устойчивое смещение станции проходит только через моды.
+
+    Args:
+        loc_dim: размер признаков координат.
+        dz: размер паспорта станции.
+        hidden: ширина скрытых слоёв.
+    """
+
+    def __init__(self, loc_dim, dz, hidden=48):
         super().__init__()
-        self.fc1 = nn.Linear(LocEncoder.OUT, 48) # 128
-        self.fc2 = nn.Linear(48, 48) # 128
-        self.head = nn.Linear(48, 36 + 21 + 21) # 128
+        self.hidden = hidden
+        self.fc1 = nn.Linear(loc_dim, hidden)
+        self.fc2 = nn.Linear(hidden, hidden)
+        self.head_mu = nn.Linear(hidden, N_MU)
+        self.head_scale = nn.Linear(hidden, N_SIG + N_DEF)
         with torch.no_grad():
-            self.head.weight.mul_(0.1)
-            self.head.bias.zero_()
-            self.head.bias[36] = inv_softplus(torch.tensor(2.2)).item()
-        self.film = nn.Linear(DZ, 2 * 48) # 128
+            for head in (self.head_mu, self.head_scale):
+                head.weight.mul_(0.1)
+                head.bias.zero_()
+            self.head_scale.bias[0] = inv_softplus(torch.tensor(SIGMA_INIT)).item()
+        self.lapse = nn.Parameter(torch.tensor(LAPSE_INIT))
+        self.film = nn.Linear(dz, 2 * hidden)
         nn.init.zeros_(self.film.weight)
         nn.init.zeros_(self.film.bias)
 
@@ -31,24 +66,48 @@ class ClimateField(nn.Module):
         d2, e2 = 2 * sin_d * cos_d, 1 - 2 * sin_d ** 2
         D5 = torch.stack([one, sin_d, cos_d, d2, e2], dim=-1)
         b35 = (S.unsqueeze(-1) * D5.unsqueeze(-2)).flatten(-2)
-        b21 = (S.unsqueeze(-1) * D5[..., :3].unsqueeze(-2)).flatten(-2)
+        b21 = (S.unsqueeze(-1) * D5[..., :N_DAY_SMOOTH].unsqueeze(-2)).flatten(-2)
         return b35, b21
-    
+
     def coefficients(self, loc, z=None):
-        h = F.gelu(self.fc1(loc))
-        h = self.fc2(h)
+        """Коэффициенты поля точки.
+
+        Args:
+            loc: признаки координат, форма (B, loc_dim); последний признак - высота.
+            z: паспорт станции, форма (B, dz); None - без модуляции.
+
+        Returns:
+            Тройка коэффициентов: среднего (B, N_MU), разброса (B, N_SIG) и дефицита
+            точки росы (B, N_DEF). Коэффициенты среднего от паспорта не зависят.
+        """
+        h = self.fc2(F.gelu(self.fc1(loc)))
+        c_mu = self.head_mu(F.gelu(h))
+        # Постоянный член базиса среднего (первый) плюс градиент по высоте.
+        c_mu = torch.cat([c_mu[:, :1] + self.lapse * loc[:, -1:], c_mu[:, 1:]], dim=-1)
         if z is not None:
             gb = torch.tanh(self.film(z))
-            h = h * (1 + 0.3 * gb[:, :48]) + 0.3 * gb[:, 48:]  # 128
-        c = self.head(F.gelu(h))
-        return c[:, :36], c[:, 36:57], c[:, 57:78]
+            k = self.hidden
+            h = h * (1 + FILM_STRENGTH * gb[:, :k]) + FILM_STRENGTH * gb[:, k:]
+        c = self.head_scale(F.gelu(h))
+        return c_mu, c[:, :N_SIG], c[:, N_SIG:]
 
     def evaluate(self, coefs, astro):
-        """Поле в наборе моментов. astro — кортеж из astro_features"""
+        """Поле в наборе моментов.
+
+        Args:
+            coefs: тройка коэффициентов среднего, разброса и дефицита точки росы.
+            astro: солнечно-календарные признаки моментов, кортеж из шести тензоров
+                формы (B, K).
+
+        Returns:
+            Тройка тензоров формы (B, K): климатическое среднее, °C, климатологический
+            разброс, °C, и дефицит точки росы, °C.
+        """
         c_mu, c_sig, c_def = coefs
         sin_d, cos_d, _, czp, sin_y, cos_y = astro
         b35, b21 = self._basis(sin_y, cos_y, sin_d, cos_d)
-        mu = torch.einsum("bi,bki->bk", c_mu[:, :35], b35) + c_mu[:, 35:36] * czp
+        mu = (torch.einsum("bi,bki->bk", c_mu[:, :N_MU - 1], b35)
+              + c_mu[:, N_MU - 1:N_MU] * czp)
         sigma = (0.8 + F.softplus(torch.einsum("bi,bki->bk", c_sig, b21))).clamp(max=12.0)
         defc = F.softplus(torch.einsum("bi,bki->bk", c_def, b21))
         return mu, sigma, defc

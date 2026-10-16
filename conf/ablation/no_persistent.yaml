@@ -1,0 +1,3 @@
+# @package model.ablations
+# Абляция «no_persistent»: без квазипостоянной группы P: смещение станции идёт через моды погоды, без слагаемого с P_MODE_SCALE. Только для model=mayak*.
+no_persistent: true

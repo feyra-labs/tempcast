@@ -1,187 +1,434 @@
-"""Датасет обучающих окон с куррикулумом холодного старта и аугментациями"""
-import csv
-import os
+"""Датасет обучающих окон с куррикулумом холодного старта и аугментациями."""
+import logging
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, get_worker_info
 
+from mayak.config import AugmentConfig
 from mayak.constants import L_MAX, H
-from mayak.data.qc import run_qc
-from mayak.data.splits import time_bounds
+from mayak.data.augment import AugWindow, augment_window, record_window
+from mayak.data.masking import (DEFAULT_TARGET_MASK, FilterStats, enforce_invariant,
+                                target_window_ok)
+from mayak.data.qc import DEFAULT_QC, qc_window
+from mayak.data.splits import ROLE_TRAIN, time_layout
+from mayak.data.store import get_store
+from mayak.data.window import issue_calendar, place_history
+from mayak.zones import normalize_zone
+
+log = logging.getLogger(__name__)
+
+# Распределение длины истории окна по куррикулумам этапов. Каждая часть задана тройкой:
+# верхняя граница накопленной вероятности, наименьшая и наибольшая длина, ч. Внутри части
+# длина равномерна. Одно распределение служит обучению и выбору чекпойнта.
+HISTORY_MIX = {
+    "L0": ((1.0, 0, 0),),
+    "full": ((0.05, 0, 0), (0.20, 1, 48), (0.45, 48, 240), (1.0, 240, L_MAX)),
+}
 
 
-def _calendar(t0_doy, t0_hour, abs_hours):
-    doy = (t0_doy + (t0_hour + abs_hours) / 24.0) % 365.24
-    hour = (t0_hour + abs_hours) % 24.0
-    return doy.astype(np.float32), hour.astype(np.float32)
+def sample_history_len(rng, curriculum):
+    """Длина истории одного окна по распределению куррикулума.
+
+    Если распределение сводится к одной длине, генератор не трогается.
+
+    Args:
+        rng: генератор numpy.
+        curriculum: имя куррикулума.
+
+    Returns:
+        Длина истории, ч.
+
+    Raises:
+        ValueError: неизвестный куррикулум.
+    """
+    if curriculum not in HISTORY_MIX:
+        raise ValueError(f"неизвестный куррикулум {curriculum!r}; есть {tuple(HISTORY_MIX)}")
+    parts = HISTORY_MIX[curriculum]
+    if len(parts) == 1 and parts[0][1] == parts[0][2]:
+        return int(parts[0][1])
+    u = rng.random()
+    lo, hi = parts[-1][1:]
+    for upper, a, b in parts[:-1]:
+        if u < upper:
+            lo, hi = a, b
+            break
+    return int(lo) if lo == hi else int(rng.integers(lo, hi + 1))
+
+
+def make_streams(base_seed, worker_id=0, salt=0, aug_seed=None):
+    """Два независимых генератора: поток окон и аугментации.
+
+    Args:
+        base_seed: сид потока окон.
+        worker_id: номер воркера загрузчика.
+        salt: база итератора загрузчика данных. При непостоянных воркерах она своя на
+            каждую эпоху, иначе каждая эпоха повторяла бы предыдущую окно в окно.
+        aug_seed: отдельный сид аугментаций; None - тот же, что у потока окон. Поток
+            окон зависит только от своего сида: смена сида аугментаций его не сдвигает.
+
+    Returns:
+        Пара генераторов: для окон и для аугментаций.
+    """
+    def children(seed):
+        ss = np.random.SeedSequence(entropy=[int(seed), int(salt)], spawn_key=(int(worker_id),))
+        return ss.spawn(2)
+    sample, aug = children(base_seed)
+    if aug_seed is not None:
+        aug = children(aug_seed)[1]
+    return np.random.default_rng(sample), np.random.default_rng(aug)
+
+
+def seed_worker(worker_id):
+    info = get_worker_info()
+    ds = info.dataset
+    if hasattr(ds, "seed_streams"):
+        ds.seed_streams(worker_id=info.id, salt=int(info.seed) - int(info.id))
+
+
+def slice_history(x, mask, t, L):
+    """История заданной длины, выровненная по правому краю буфера наибольшей длины.
+
+    Args:
+        x: значения ряда, форма (N, 3).
+        mask: маски ряда, форма (N, 3).
+        t: строка момента выпуска; история кончается перед ней.
+        L: длина истории, ч.
+
+    Returns:
+        Пара массивов формы (наибольшая длина истории, 3): значения и маски; слева
+        нули.
+    """
+    src = np.arange(t - L, t)
+    return place_history(x[src], mask[src], L_MAX)
+
+
+def qc_context(t, L, floor, lookback=None):
+    """Сколько часов перед историей окна видит причинный QC.
+
+    Args:
+        t: начало горизонта, индекс часа.
+        L: фактическая длина истории, ч.
+        floor: самый ранний час, доступный истории окна.
+        lookback: сколько прошлых часов нужно QC; по умолчанию из порогов QC.
+
+    Returns:
+        Число часов контекста.
+    """
+    lookback = DEFAULT_QC.lookback_hours if lookback is None else int(lookback)
+    if L < L_MAX:
+        return 0
+    return int(max(0, min(lookback, t - L - floor)))
+
+
+def slice_context(raw, present, t, L, floor):
+    """Сырые часы прямо перед историей окна, контекст причинного QC.
+
+    Args:
+        raw: сырые значения ряда, форма (N, 3).
+        present: маска наличия ряда, форма (N, 3).
+        t: начало горизонта, индекс часа.
+        L: фактическая длина истории, ч.
+        floor: самый ранний час, доступный истории окна.
+
+    Returns:
+        Пара массивов (K, 3): значения и маска наличия, от старых к новым.
+    """
+    k = qc_context(t, L, floor)
+    src = np.arange(t - L - k, t - L)
+    return enforce_invariant(raw[src], present[src])
+
+
+def station_qc_elev(r):
+    """Высота для проверки давления: из цифровой модели рельефа, если есть, иначе заявленная.
+
+    Args:
+        r: строка манифеста.
+
+    Returns:
+        Высота, м.
+    """
+    return r.get("dem_elev") if r.get("dem_elev") is not None else float(r["elev"])
+
+
+def slice_target(x, mask, t):
+    """Цель - температура на горизонте после момента выпуска вместе с её маской.
+
+    Маска цели берётся только из данных: аугментации её не трогают.
+
+    Args:
+        x: значения ряда, форма (N, 3).
+        mask: маски ряда, форма (N, 3).
+        t: строка момента выпуска; горизонт начинается с неё.
+
+    Returns:
+        Пара массивов длины горизонта: температура и её маска.
+    """
+    fut = np.arange(t, t + H)
+    return enforce_invariant(x[fut, 0], mask[fut, 0])
+
+
+def norm_scale(clim, doy_f, hour_f):
+    """Нормировочный масштаб функции потерь на часах горизонта.
+
+    Args:
+        clim: климатология станции.
+        doy_f: дни года часов горизонта.
+        hour_f: часы UTC часов горизонта.
+
+    Returns:
+        Масштаб, °C, float32 длины горизонта.
+    """
+    return clim.scale(doy_f, hour_f).astype(np.float32)
+
+
+def valid_starts(mask_T, lo, hi, step=1, cfg=DEFAULT_TARGET_MASK):
+    """Кандидаты в начала горизонта внутри одного блока и те из них, что годны.
+
+    Args:
+        mask_T: маска температуры ряда, форма (N,).
+        lo: начало блока, индекс часа.
+        hi: конец блока, не входит.
+        step: шаг между кандидатами, ч.
+        cfg: правило годности цели.
+
+    Returns:
+        Пара массивов: все кандидаты и годные по маске цели.
+    """
+    cand = np.arange(lo, hi - H + 1, step, dtype=np.int64)
+    return cand, cand[target_window_ok(mask_T, cand, H, cfg)]
+
+
+def block_starts(layout, key, mask_T, step=1, cfg=DEFAULT_TARGET_MASK):
+    """Кандидаты в начала горизонта во всех блоках временного окна.
+
+    Args:
+        layout: раскладка ряда станции.
+        key: ключ временного окна.
+        mask_T: маска температуры ряда, форма (N,).
+        step: шаг между кандидатами внутри блока, ч.
+        cfg: правило годности цели.
+
+    Returns:
+        Пара массивов: все кандидаты и годные по маске цели, по возрастанию.
+    """
+    cand, ok = [], []
+    for lo, hi in layout.blocks[key]:
+        c, o = valid_starts(mask_T, lo, hi, step, cfg)
+        cand.append(c)
+        ok.append(o)
+    return np.concatenate(cand), np.concatenate(ok)
+
+
+def history_len(L, t, floor):
+    """Фактическая длина истории окна.
+
+    Args:
+        L: запрошенная длина истории, ч; None - полный буфер.
+        t: начало горизонта, индекс часа.
+        floor: самый ранний час, доступный истории окна.
+
+    Returns:
+        Длина истории, ч.
+    """
+    return int(max(0, min(L_MAX if L is None else L, L_MAX, t - floor)))
+
+
+def zone_weights(zones):
+    """Вероятности выбора станций по их полным зонам Кёппена.
+
+    Вес станции равен числу станций её зоны в степени минус одна вторая: зона из n
+    станций получает суммарную долю, пропорциональную корню из n.
+
+    Args:
+        zones: зона каждой станции.
+
+    Returns:
+        Вероятности станций, их сумма равна единице.
+    """
+    zones = [normalize_zone(z) for z in zones]
+    count = {}
+    for z in zones:
+        count[z] = count.get(z, 0) + 1
+    w = np.array([count[z] ** -0.5 for z in zones], np.float64)
+    return w / w.sum()
+
+
+def zone_distribution(zones, p):
+    """Число станций и суммарная вероятность каждой зоны.
+
+    Args:
+        zones: зона каждой станции.
+        p: вероятность каждой станции.
+
+    Returns:
+        Словарь: зона и пара из числа станций и суммарной вероятности, по убыванию
+        вероятности.
+    """
+    out = {}
+    for z, pi in zip((normalize_zone(z) for z in zones), p):
+        n, s = out.get(z, (0, 0.0))
+        out[z] = (n + 1, s + float(pi))
+    return dict(sorted(out.items(), key=lambda kv: -kv[1][1]))
+
+
+def footprint(t, L, floor):
+    """Часы, которые читает окно: от начала контекста QC до конца горизонта.
+
+    Args:
+        t: начало горизонта, индекс часа.
+        L: запрошенная длина истории, ч; None - полный буфер.
+        floor: самый ранний час, доступный истории окна.
+
+    Returns:
+        Пара (начало, конец), конец не входит.
+    """
+    n = history_len(L, t, floor)
+    return t - n - qc_context(t, n, floor), t + H
+
+
+def build_window(s, t, L, floor, qc=True, augment=None, rng=None, info=None):
+    """Окно станции: одна сборка для обучения, выбора чекпойнта, калибровки и оценки.
+
+    Порядок как у прибора: сырая история и цель, искажения датчика и отказы (если заданы
+    аугментации), запись целыми градусами и процентами, контекст и причинный QC истории,
+    затем календарь и нормировочный масштаб. Календарь считается раньше аугментаций,
+    потому что смещению станции нужен час UTC; сам он от данных окна не зависит. История
+    и цель в кэше уже записаны прибором, поэтому без аугментаций запись значений не
+    меняет.
+
+    Args:
+        s: запись станции: сырые значения и маска наличия, ряд после QC и его маска,
+            климатология, первый час ряда, координаты и высота.
+        t: начало горизонта, индекс часа.
+        L: фактическая длина истории, ч.
+        floor: самый ранний час, доступный истории окна.
+        qc: прогонять ли историю через причинный QC.
+        augment: конфиг аугментаций; None - окно без аугментаций.
+        rng: генератор аугментаций; нужен, если заданы аугментации.
+        info: если передан словарь, в него кладутся параметры аугментаций.
+
+    Returns:
+        Словарь тензоров окна: координаты и высота, история и её маска, календарь
+        истории и горизонта, цель и её маска, нормировочный масштаб.
+    """
+    doy_h, hour_h, doy_f, hour_f = issue_calendar(s["t0"], t, L_MAX, H)
+    x_hist, mask_hist = slice_history(s["raw"], s["present"], t, L)
+    y, y_mask = slice_target(s["x"], s["mask"], t)
+    w = AugWindow(x=x_hist, m=mask_hist, y=y, y_mask=y_mask, L=L, hour=hour_h,
+                  hour_fut=hour_f, lat=float(s["lat"]), lon=float(s["lon"]),
+                  elev=float(s["elev"]), qc_elev=station_qc_elev(s))
+    if augment is not None:
+        augment_window(w, augment, rng)
+    record_window(w)
+    if info is not None:
+        info.update(w.applied)
+    x_hist, mask_hist = enforce_invariant(w.x, w.m)
+    if qc and L > 0:
+        past = slice_context(s["raw"], s["present"], t, L, floor)
+        mask_hist, _ = qc_window(x_hist, mask_hist, elev=w.qc_elev, past=past)
+        x_hist, mask_hist = enforce_invariant(x_hist, mask_hist)
+    return {
+        "lat": torch.tensor(w.lat, dtype=torch.float32),
+        "lon": torch.tensor(w.lon, dtype=torch.float32),
+        "elev": torch.tensor(w.elev, dtype=torch.float32),
+        "x_hist": torch.from_numpy(x_hist),
+        "mask_hist": torch.from_numpy(mask_hist),
+        "doy_hist": torch.from_numpy(doy_h),
+        "hour_hist": torch.from_numpy(hour_h),
+        "doy_fut": torch.from_numpy(doy_f),
+        "hour_fut": torch.from_numpy(hour_f),
+        "y": torch.from_numpy(w.y),
+        "y_mask": torch.from_numpy(y_mask),
+        "norm_scale": torch.from_numpy(norm_scale(s["clim"], doy_f, hour_f)),
+    }
 
 
 class WindowDataset(Dataset):
     def __init__(self, manifest, split="train", curriculum="full",
-                 windows_per_epoch=200_000, seed=0):
+                 windows_per_epoch=200_000, seed=0, target_mask=DEFAULT_TARGET_MASK,
+                 store=None, aug_seed=None, augment=None, cache_root=None, window_qc=True):
         assert split in ("train",)
-        assert curriculum in ("full", "L0")
+        assert curriculum in HISTORY_MIX
         self.curriculum = curriculum
         self.n = windows_per_epoch
-        self.rng = np.random.default_rng(seed)
+        self.base_seed = int(seed)
+        self.aug_seed = None if aug_seed is None else int(aug_seed)
+        self.augment = augment if isinstance(augment, AugmentConfig) else \
+            AugmentConfig.from_dict(augment)
+        log.info("аугментации: профиль %s, отклонения от профиля %s",
+                 self.augment.profile, self.augment.deviations() or "нет")
+        self.window_qc = bool(window_qc)
+        self.seed_streams(worker_id=0, salt=0)
 
-        root = os.path.dirname(manifest)
-        with open(manifest) as f:
-            rows = [r for r in csv.DictReader(f) if r["split"] == "train"]
+        store = store or get_store(manifest, cache_root=cache_root)
+        self.time_key = "train"
+        rows = store.by_role(ROLE_TRAIN)
         assert rows, "нет train-станций — запустите make_splits.py"
 
         self.st = []
-        zone_count = {}
+        self.filter_stats = FilterStats()
         for r in rows:
-            d = np.load(os.path.join(root, "stations", f"{r['id']}.npz"))
-            x, mask = run_qc(d["T"], d["P"], d["RH"], d["valid"])
-            N = x.shape[0]
-            tb = time_bounds(N)
+            x, mask, N = r["x"], r["mask"], r["N"]
+            layout = time_layout(N)
+            cand, ok = block_starts(layout, self.time_key, mask[:, 0], cfg=target_mask)
+            self.filter_stats.add(len(cand), len(ok))
+            if len(ok) == 0:
+                continue
             self.st.append(dict(
-                lat=float(r["lat"]), lon=float(r["lon"]), elev=float(r["elev"]),
-                koppen=r["koppen"], x=x, mask=mask, N=N,
-                t0_doy=float(d["t0_doy"]), t0_hour=float(d["t0_hour"]),
-                tr=tb["train"]))
-            zone_count[r["koppen"]] = zone_count.get(r["koppen"], 0) + 1
+                id=r["id"], lat=float(r["lat"]), lon=float(r["lon"]), elev=float(r["elev"]),
+                koppen=r["koppen"], x=x, mask=mask, raw=r["raw"], present=r["present"], N=N,
+                t0=r["t0"], clim=r["clim"], dem_elev=r.get("dem_elev"),
+                floor=layout.history_floor(self.time_key), starts=ok))
+        self.filter_stats.report("train")
+        assert self.st, "ни у одной train-станции нет окон, прошедших маску цели"
 
-        w = np.array([1.0 / zone_count[s["koppen"]] for s in self.st])
-        self.w = w / w.sum()
+        zones = [s["koppen"] for s in self.st]
+        self.w = zone_weights(zones)
+        self.zone_report = zone_distribution(zones, self.w)
+        log.info("сэмплирование станций: вес n_зоны^(-1/2), %d станций в %d зонах; "
+                 "доли зон: %s", len(zones), len(self.zone_report),
+                 ", ".join(f"{z}:{n}ст/{p:.1%}" for z, (n, p) in self.zone_report.items()))
+
+    def seed_streams(self, worker_id=0, salt=0):
+        self.rng_sample, self.rng_aug = make_streams(self.base_seed, worker_id, salt,
+                                                     aug_seed=self.aug_seed)
+
+    def footprints(self):
+        for s in self.st:
+            t = s["starts"]
+            lo = np.maximum(s["floor"], t - L_MAX - DEFAULT_QC.lookback_hours)
+            yield dict(sid=s["id"], N=s["N"], time_key=self.time_key, lo=lo, t=t, hi=t + H)
 
     def __len__(self):
         return self.n
 
     def _sample_L(self):
-        if self.curriculum == "L0":
-            return 0
-        u = self.rng.random()
-        if u < 0.05:
-            return 0
-        if u < 0.20:
-            return int(self.rng.integers(1, 49))
-        if u < 0.45:
-            return int(self.rng.integers(2 * 24, 10 * 24 + 1))
-        return int(self.rng.integers(10 * 24, L_MAX + 1))
+        return sample_history_len(self.rng_sample, self.curriculum)
 
     def __getitem__(self, _idx):
-        si = int(self.rng.choice(len(self.st), p=self.w))
+        r = self.rng_sample
+        si = int(r.choice(len(self.st), p=self.w))
         s = self.st[si]
-        lo, hi = s["tr"]
-        t_min, t_max = lo + 1, hi - H
-        if t_max <= t_min:
-            t = t_min
-        else:
-            t = int(self.rng.integers(t_min, t_max))
+        t = int(s["starts"][r.integers(len(s["starts"]))])
 
-        L = self._sample_L()
-        L = min(L, t - lo)
+        L = history_len(self._sample_L(), t, s["floor"])
+        return self.build(s, t, L)
 
-        k = np.arange(L_MAX)
-        abs_h = t - L_MAX + k
-        doy_h, hour_h = _calendar(s["t0_doy"], s["t0_hour"], abs_h)
-        x_hist = np.zeros((L_MAX, 3), np.float32)
-        mask_hist = np.zeros((L_MAX, 3), np.float32)
-        if L > 0:
-            src = np.arange(t - L, t)
-            x_hist[L_MAX - L:] = s["x"][src]
-            mask_hist[L_MAX - L:] = s["mask"][src]
+    def build(self, s, t, L, info=None):
+        """Окно станции s с началом горизонта t и историей L, с аугментациями.
 
-        fut = np.arange(t, t + H)
-        doy_f, hour_f = _calendar(s["t0_doy"], s["t0_hour"], fut)
-        y = s["x"][fut, 0].astype(np.float32).copy()  # T в будущем
+        Тонкая обёртка над ``build_window``: аугментации и генератор - из датасета.
 
-        lat, lon, elev = s["lat"], s["lon"], s["elev"]
+        Args:
+            s: запись станции.
+            t: начало горизонта, индекс часа.
+            L: длина истории, ч.
+            info: если передан словарь, в него кладутся параметры аугментаций.
 
-        r = self.rng
-        if L > 0 and r.random() < 0.3:
-            glen = int(r.integers(1, 25))
-            gst = int(r.integers(L_MAX - L, L_MAX))
-            mask_hist[gst:min(L_MAX, gst + glen)] = 0.0
+        Returns:
+            Словарь тензоров окна.
+        """
+        return build_window(s, t, L, s["floor"], qc=self.window_qc, augment=self.augment,
+                            rng=self.rng_aug, info=info)
 
-        if r.random() < 0.1:
-            mask_hist[:, 2] = 0.0
-        if r.random() < 0.1:
-            mask_hist[:, 1] = 0.0
-
-        noise = np.stack([r.normal(0, 0.2, L_MAX),
-                          r.normal(0, 0.5, L_MAX),
-                          r.normal(0, 2.0, L_MAX)], axis=-1).astype(np.float32)
-        x_hist = x_hist + noise * mask_hist
-
-        if L > 0:
-            off = float(r.uniform(-0.7, 0.7))
-            x_hist[:, 0] = x_hist[:, 0] + off * mask_hist[:, 0]
-            y = y + off
-            lat = lat + float(r.uniform(-0.40, 0.40))
-            lon = lon + float(r.uniform(-0.40, 0.40))
-
-        x_hist[:, 2] = np.clip(x_hist[:, 2], 0, 100) * (mask_hist[:, 2] > 0)
-
-        return {
-            "lat": torch.tensor(lat, dtype=torch.float32),
-            "lon": torch.tensor(lon, dtype=torch.float32),
-            "elev": torch.tensor(elev, dtype=torch.float32),
-            "x_hist": torch.from_numpy(x_hist),
-            "mask_hist": torch.from_numpy(mask_hist),
-            "doy_hist": torch.from_numpy(doy_h),
-            "hour_hist": torch.from_numpy(hour_h),
-            "doy_fut": torch.from_numpy(doy_f),
-            "hour_fut": torch.from_numpy(hour_f),
-            "y": torch.from_numpy(y),
-        }
-
-
-class HoldoutDataset(Dataset):
-    """Детерминированные окна для валидации/оценки: фиксированный L, без аугментаций"""
-
-    def __init__(self, manifest, station_split="unseen_val", time_key="calib",
-                 every_hours=72, L=L_MAX, max_windows=8000):
-        import csv, os
-        root = os.path.dirname(manifest)
-        with open(manifest) as f:
-            rows = [r for r in csv.DictReader(f) if r["split"] == station_split]
-        self.items = []
-        self.meta = []
-        for r in rows:
-            d = np.load(os.path.join(root, "stations", f"{r['id']}.npz"))
-            x, mask = run_qc(d["T"], d["P"], d["RH"], d["valid"])
-            N = x.shape[0]
-            lo, hi = time_bounds(N)[time_key]
-            t0d, t0h = float(d["t0_doy"]), float(d["t0_hour"])
-            for t in range(lo + 1, hi - H, every_hours):
-                self.meta.append(dict(x=x, mask=mask, t=t, t0d=t0d, t0h=t0h,
-                                      lat=float(r["lat"]), lon=float(r["lon"]),
-                                      elev=float(r["elev"]), koppen=r["koppen"],
-                                      split=station_split, L=L))
-        if len(self.meta) > max_windows:
-            step = len(self.meta) // max_windows
-            self.meta = self.meta[::step][:max_windows]
-
-    def __len__(self):
-        return len(self.meta)
-
-    def __getitem__(self, i):
-        m = self.meta[i]
-        t, L = m["t"], m["L"]
-        L = min(L, t)
-        k = np.arange(L_MAX)
-        abs_h = t - L_MAX + k
-        doy_h, hour_h = _calendar(m["t0d"], m["t0h"], abs_h)
-        x_hist = np.zeros((L_MAX, 3), np.float32)
-        mask_hist = np.zeros((L_MAX, 3), np.float32)
-        if L > 0:
-            src = np.arange(t - L, t)
-            x_hist[L_MAX - L:] = m["x"][src]
-            mask_hist[L_MAX - L:] = m["mask"][src]
-        fut = np.arange(t, t + H)
-        doy_f, hour_f = _calendar(m["t0d"], m["t0h"], fut)
-        y = m["x"][fut, 0].astype(np.float32)
-        return {
-            "lat": torch.tensor(m["lat"], dtype=torch.float32),
-            "lon": torch.tensor(m["lon"], dtype=torch.float32),
-            "elev": torch.tensor(m["elev"], dtype=torch.float32),
-            "x_hist": torch.from_numpy(x_hist), "mask_hist": torch.from_numpy(mask_hist),
-            "doy_hist": torch.from_numpy(doy_h), "hour_hist": torch.from_numpy(hour_h),
-            "doy_fut": torch.from_numpy(doy_f), "hour_fut": torch.from_numpy(hour_f),
-            "y": torch.from_numpy(y),
-        }

@@ -1,9 +1,17 @@
 """Генератор синтетического метео-датасета.
+
 Запуск:
-    python scripts/make_synth.py --out data --n-stations 40 --years 2 --seed 1
+    python scripts/make_synth.py --out data --n-stations 40 --years 6 --seed 1
 """
-import argparse, csv, math, os
+import argparse
+import csv
+import math
+import os
+from datetime import datetime, timedelta
+
 import numpy as np
+
+from mayak.timeaxis import to_utc_hour, window_calendar
 
 
 def koppen_for(lat):
@@ -19,10 +27,12 @@ def koppen_for(lat):
     return "ET"
 
 
-def make_station(rng, lat, lon, elev, n_hours, t0_doy, t0_hour):
-    h = np.arange(n_hours, dtype=np.float64)
-    doy = (t0_doy + (t0_hour + h) / 24.0) % 365.24
-    hour = (t0_hour + h) % 24.0
+THERMAL_LAG_H = 2.5
+
+
+def make_station(rng, lat, lon, elev, n_hours, t0_utc_h):
+    doy, hour = window_calendar(t0_utc_h, np.arange(n_hours))
+    doy, hour = doy.astype(np.float64), hour.astype(np.float64)
     phi = math.radians(lat)
 
     annual_mean = 27.0 - 0.55 * abs(lat) - 0.0065 * elev
@@ -31,8 +41,9 @@ def make_station(rng, lat, lon, elev, n_hours, t0_doy, t0_hour):
     seasonal = annual_amp * np.cos(2 * math.pi * (doy - 200) / 365.24 + season_phase)
 
     decl = -23.44 * np.cos(2 * math.pi * (doy + 10) / 365.24)
+    t_sol = hour + lon / 15.0 - THERMAL_LAG_H
     cos_zen = (np.sin(phi) * np.sin(np.radians(decl))
-               + np.cos(phi) * np.cos(np.radians(decl)) * np.cos(np.radians(15 * (hour - 12))))
+               + np.cos(phi) * np.cos(np.radians(decl)) * np.cos(np.radians(15 * (t_sol - 12))))
     daily_amp = 3.5 + 4.0 * np.clip(np.cos(phi), 0.1, 1.0)
     diurnal = daily_amp * np.clip(cos_zen, -0.3, 1.0)
 
@@ -53,7 +64,7 @@ def make_station(rng, lat, lon, elev, n_hours, t0_doy, t0_hour):
     RH = RH_base - 1.8 * diurnal + rng.standard_normal(n_hours) * 4.0
     RH = np.clip(RH, 3, 100)
 
-    valid = np.ones(n_hours, dtype=np.uint8)
+    valid = np.ones((n_hours, 3), dtype=np.uint8)
     return (T.astype(np.float32), P.astype(np.float32), RH.astype(np.float32), valid)
 
 
@@ -61,7 +72,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="data")
     ap.add_argument("--n-stations", type=int, default=40)
-    ap.add_argument("--years", type=int, default=2)
+    ap.add_argument("--years", type=int, default=6)
     ap.add_argument("--seed", type=int, default=1)
     args = ap.parse_args()
 
@@ -73,22 +84,23 @@ def main():
     for i in range(args.n_stations):
         lat = float(rng.uniform(-70, 75))
         lon = float(rng.uniform(-180, 180))
-        elev = float(max(0.0, rng.uniform(-30, 2500) if rng.random() > 0.2 else rng.uniform(0, 200)))
-        t0_doy = float(rng.uniform(0, 365))
-        t0_hour = float(rng.integers(0, 24))
+        elev = float(max(0.0, rng.uniform(-30, 2500) if rng.random() > 0.2
+                         else rng.uniform(0, 200)))
+        t0_dt = datetime(2015, 1, 1) + timedelta(hours=int(rng.integers(0, 365 * 24)))
+        t0 = int(to_utc_hour(t0_dt))
         sid = f"S{i:03d}"
-        T, P, RH, valid = make_station(rng, lat, lon, elev, n_hours, t0_doy, t0_hour)
+        T, P, RH, valid = make_station(rng, lat, lon, elev, n_hours, t0)
         np.savez_compressed(os.path.join(args.out, "stations", f"{sid}.npz"),
-                            T=T, P=P, RH=RH, valid=valid,
-                            t0_doy=np.float32(t0_doy), t0_hour=np.float32(t0_hour))
+                            T=T, P=P, RH=RH, valid=valid, t0_utc_h=np.int64(t0))
         rows.append(dict(id=sid, lat=round(lat, 4), lon=round(lon, 4),
                          elev=round(elev, 1), koppen=koppen_for(lat)))
 
-    with open(os.path.join(args.out, "manifest.csv"), "w", newline="") as f:
+    with open(os.path.join(args.out, "manifest.csv"), "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=["id", "lat", "lon", "elev", "koppen"])
-        w.writeheader();
+        w.writeheader()
         w.writerows(rows)
-    print(f"Готово: {args.n_stations} станций × {n_hours} ч в {args.out}/stations/, манифест {args.out}/manifest.csv")
+    print(f"Готово: {args.n_stations} станций × {n_hours} ч в {args.out}/stations/, "
+          f"манифест {args.out}/manifest.csv")
 
 
 if __name__ == "__main__":
