@@ -11,15 +11,14 @@
 
 | поле | значение |
 |---|---|
-| дата прогона (UTC) | — |
-| коммит | — |
+| дата прогона (UTC) | 2026-10-16 14:59:22 (стенд оценки, `evaluate/`) |
+| коммит | `71a86bed60372e18180be9290868a19f4c4203cc`, с незакоммиченными изменениями (`dirty: true`) |
 | набор данных (`data/fetch_meta.json`, ключ кэша) | — |
-| чекпойнт МАЯК | — |
-| чекпойнты бейзлайнов | — |
-| чекпойнты абляций и сидов (`runs/mayak-<абляция>`, `runs/mayak-s1`, `runs/mayak-s2`) | — |
+| чекпойнт МАЯК | `runs/mayak/stageB/best.ckpt`, отпечаток `c0e7824d79311cc2` |
+| чекпойнты бейзлайнов | `runs/{gru,dlinear,lru,patchtst}/stageB/best.ckpt` |
+| чекпойнты абляций (`runs/mayak-<абляция>`) | — |
 | чекпойнт МАЯК без аугментаций (`augment=none`) | — |
-| чекпойнт дополнительной настройки МАЯК (этап 2) | — |
-| конформная таблица | — |
+| конформная таблица | `runs/conformal.npy`: 32 станции `unseen_val`, 4 600 окон, отпечаток окон `9881c588075daa53` |
 | устройство замеров | — |
 
 | файл | таблица README |
@@ -33,9 +32,8 @@
 | `evaluate/internal/calibrated.json`, `evaluate/internal/reliability.json` | 6. После калибровки: тестовые окна и офлайн-прогон адаптивной калибровки |
 | `calibration/conformal.report.json` | 6. Подгонка таблицы: калибровочные окна, в выборке |
 | `evaluate/internal/coldstart.json` | проверка поля при нулевой истории |
-| `ablations/internal/metrics.json`, `ablations/internal/seeds.json` | 7. Абляции и сиды, ERA5 (`unseen_test`) |
-| `ablations/external/metrics.json`, `ablations/external/seeds.json` | 7. Абляции и сиды, GHCNh (`external_test`) |
-| `ablations/significance.json` | 7. Значимость абляций: ERA5 и GHCNh |
+| `ablations/internal/metrics.json` | 7. Абляции, ERA5 (`unseen_test`) |
+| `ablations/external/metrics.json` | 7. Абляции, GHCNh (`external_test`) |
 | `evaluate/external/*.json` | 8. Внешний тест, в том числе `transfer.json` |
 | `robustness/robustness.json` | 9. Робастность |
 | `device/bench.json` | 10. Устройство |
@@ -43,6 +41,6 @@
 | `evaluate/external/metrics.json`, `augment_none/external/metrics.json` | 12. Профили аугментаций, внешний тест |
 
 Строка «МАЯК (доп. настройка)†» есть в файлах `evaluate/` только тогда, когда оценка шла с
-`--tuned-ckpt`; запись о прогоне помечает её как неравную бейзлайнам. Стенды оценки
-абляций с сидами и профиля `none` пишут в свои каталоги и остальные таблицы набора; в README
-из них берутся только перечисленные выше.
+`--tuned-ckpt`; запись о прогоне помечает её как неравную бейзлайнам, в таблицы README она
+не переносится. Стенды оценки абляций и профиля `none` пишут в свои каталоги и остальные
+таблицы набора; в README из них берутся только перечисленные выше.
