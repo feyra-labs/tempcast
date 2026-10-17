@@ -17,7 +17,7 @@
 | чекпойнт МАЯК | `runs/mayak/stageB/best.ckpt`, отпечаток `c0e7824d79311cc2` |
 | чекпойнты бейзлайнов | `runs/{gru,dlinear,lru,patchtst}/stageB/best.ckpt` |
 | чекпойнты абляций (`runs/mayak-<абляция>`) | — |
-| чекпойнт МАЯК без аугментаций (`augment=none`) | — |
+| чекпойнт МАЯК без аугментаций (`augment=none`) | `runs/mayak-aug_none/stageB/best.ckpt`; оценка 2026-10-17 07:55 UTC, коммит `000c18a` (`augment_none/`) |
 | конформная таблица | `runs/conformal.npy`: 32 станции `unseen_val`, 4 600 окон, отпечаток окон `9881c588075daa53` |
 | устройство замеров | — |
 
