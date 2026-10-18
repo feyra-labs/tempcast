@@ -1,4 +1,2 @@
 # @package data.augment
-# Профиль аугментаций «default»: профиль по умолчанию.
-# Отличия от значений по умолчанию (= default).
 profile: default

@@ -1,8 +1,4 @@
-"""Генератор синтетического метео-датасета.
-
-Запуск:
-    python scripts/make_synth.py --out data --n-stations 40 --years 6 --seed 1
-"""
+"""Генератор синтетического метео-датасета."""
 import argparse
 import csv
 import math

@@ -1,32 +1,4 @@
-r"""Робастность обученной модели без переобучения.
-
-Проверяется главное заявление проекта: при отказе входа прогноз деградирует плавно и не
-проваливается ниже того, что модель умеет без истории. Сценарий применяется на лету к
-окнам базового набора оценки; все уровни и все модели оцениваются на одних и тех же
-окнах и лидах, по сырым выходам, без калибровки.
-
-Сценарии делятся на два класса.
-
-* Отказ входа искажает только историю. Порог проверки на лиде: не хуже собственного
-  холодного старта модели на тех же окнах, если холодный старт хуже климатологии
-  станции, и не хуже климатологии иначе, в обоих случаях с допуском. Скилл холодного
-  старта относительно климатологии печатается отдельной строкой без проверки: это
-  измерение качества климат-поля, а не устойчивости.
-* Свойство прибора (смещение, масштаб, дрейф) искажает и историю, и цель. Эталон скилла
-  здесь - климатология, записанная тем же прибором, то есть искажённая тем же
-  преобразованием, что цель. Порог - минус допуск. Варианты, где искажён только вход,
-  идут отдельными кривыми без проверки.
-
-Нарушение порога - исключение RobustnessError и код выхода 1 в командной строке, а не
-строка в журнале. Для каждой строки считаются пуловые и макро-метрики с интервалами
-блочного бутстрапа по станциям, а для свойств прибора ещё величина искажения цели и
-превышение роста MAE над ним.
-
-Запуск::
-
-    python -m mayak.robustness --ckpt runs/mayak/stageB/best.ckpt \
-        --external-manifest data/ghcnh/manifest.csv
-"""
+r"""Робастность обученной модели без переобучения."""
 from __future__ import annotations
 
 import csv
@@ -71,15 +43,7 @@ def _np(v):
 
 
 def load_config(path=None):
-    """Конфиг робастности из YAML.
-
-    Args:
-        path: путь к YAML; None - файл робастности по умолчанию из каталога конфигов,
-            если он есть, иначе значения по умолчанию.
-
-    Returns:
-        Конфиг робастности.
-    """
+    """Конфиг робастности из YAML."""
     path = path or (DEFAULT_CONFIG if os.path.exists(DEFAULT_CONFIG) else None)
     if path is None:
         return RobustnessConfig()
@@ -89,16 +53,7 @@ def load_config(path=None):
 
 
 class RobustnessSet(Dataset):
-    """Окна базового набора оценки с применённым сценарием.
-
-    Args:
-        base: базовый набор окон оценки.
-        name: имя сценария.
-        level: уровень сценария.
-        params: параметры сценария.
-        qc: режим QC после сценария.
-        seed: сид сценариев.
-    """
+    """Окна базового набора оценки с применённым сценарием."""
 
     def __init__(self, base: EvalSet, name, level, params=None, qc="device", seed=0):
         if name not in SCENARIOS:
@@ -124,21 +79,7 @@ class RobustnessSet(Dataset):
         return meta
 
     def window(self, i, item=None):
-        """Окно после сценария и записи прибором вместе с эталоном скилла.
-
-        Перед сценарием, искажающим значения, записанным значениям возвращается
-        непрерывность; шум один для всех уровней, поэтому кривые по уровням парные.
-        Эталон скилла - климатология на горизонте, искажённая тем же преобразованием, что
-        цель; в сценариях, не трогающих цель, это сама климатология.
-
-        Args:
-            i: номер окна.
-            item: готовый элемент базового набора, если он уже посчитан.
-
-        Returns:
-            Четвёрка: окно после сценария, элемент базового набора, запись станции и
-            эталон скилла формы (H,).
-        """
+        """Окно после сценария и записи прибором вместе с эталоном скилла."""
         item = self.base[i] if item is None else item
         sid, t = self.base.items[i]
         s = self.base.clims[sid]
@@ -191,18 +132,7 @@ class RobustnessSet(Dataset):
 
 
 def base_eval_set(clims, manifest, cfg: RobustnessConfig, roles=None, time_key=None):
-    """Окна, на которых оцениваются все сценарии, уровни и модели.
-
-    Args:
-        clims: климатологии станций.
-        manifest: путь к манифесту.
-        cfg: конфиг робастности.
-        roles: роли станций; None - из конфига.
-        time_key: временное окно; None - из конфига.
-
-    Returns:
-        Набор окон оценки.
-    """
+    """Окна, на которых оцениваются все сценарии, уровни и модели."""
     return EvalSet(clims, station_splits=tuple(roles or cfg.roles), manifest=manifest,
                    time_key=time_key or cfg.time_key, every_hours=cfg.every_hours,
                    max_windows=None, windows_per_station=cfg.windows_per_station)
@@ -234,39 +164,14 @@ def _row(set_name, spec: ScenarioSpec, level, model, lead, summ):
 
 
 def reference_aux(aux):
-    """Данные окон, в которых эталоном скилла служит климатология того же прибора.
-
-    Статистические эталоны строятся до этой подмены, по исходной климатологии: они
-    ничего не знают об искажении прибора и прогнозируют так же, как без него.
-
-    Args:
-        aux: данные окон; эталон прибора лежит под ключом mu_ref, если набор его даёт.
-
-    Returns:
-        Те же данные, где климатология для скилла заменена эталоном прибора. Если
-        эталона нет, возвращаются исходные данные.
-    """
+    """Данные окон, в которых эталоном скилла служит климатология того же прибора."""
     if "mu_ref" not in aux:
         return aux
     return dict(aux, mu_clim=aux["mu_ref"])
 
 
 def skill_floor(row, tolerance):
-    """Порог проверки скилла для одной строки.
-
-    В сценарии отказа входа модель не должна опускаться ниже своего холодного старта на
-    тех же окнах и лиде, если он хуже климатологии, и ниже климатологии, если холодный
-    старт не хуже её. В сценарии свойства прибора порог отсчитывается от эталона того же
-    прибора. В обоих случаях из порога вычитается допуск. Если скилл холодного старта
-    не посчитан, порог остаётся строгим: отсчёт от климатологии.
-
-    Args:
-        row: строка прогона с полями kind и, если есть, Skill_L0.
-        tolerance: допуск, доля.
-
-    Returns:
-        Порог скилла, доля.
-    """
+    """Порог проверки скилла для одной строки."""
     base = 0.0
     if row["kind"] == SCENARIO_INPUT:
         l0 = row.get("Skill_L0", float("nan"))
@@ -276,14 +181,7 @@ def skill_floor(row, tolerance):
 
 
 def add_excess(rows):
-    """Добавить рост MAE относительно нулевого уровня и превышение этого роста над искажением цели.
-
-    Args:
-        rows: строки сценария по уровням.
-
-    Returns:
-        Те же строки с новыми полями.
-    """
+    """Рост MAE от нулевого уровня и его превышение над искажением цели."""
     ref = {(r["set"], r["scenario"], r["model"], r["lead"]): r["MAE"]
            for r in rows if r["level"] == 0.0}
     for r in rows:
@@ -302,26 +200,7 @@ def _predictions(named, ds, r_damped, statistical, device):
 
 def cold_start_sweep(named, base, cfg: RobustnessConfig, r_damped=None, statistical=True,
                      device="cpu", n_boot=None, boot_seed=0, set_name="internal"):
-    """Скилл каждой модели на тех же окнах без истории.
-
-    Окна, цель и эталон те же, что в сценариях; модели не видят ни одного часа истории.
-    Эталон скилла - климатология станции. Это измерение качества климат-поля и
-    одновременно пол проверки в сценариях отказа входа.
-
-    Args:
-        named: словарь из имени модели в модель.
-        base: набор окон, общий для всех сценариев.
-        cfg: настройки робастности.
-        r_damped: коэффициенты затухающей персистентности; None значит без неё.
-        statistical: добавить статистические эталоны.
-        device: устройство.
-        n_boot: итераций бутстрапа по станциям; None значит взять из настроек.
-        boot_seed: сид бутстрапа.
-        set_name: имя набора в строках.
-
-    Returns:
-        Плоский список строк: по одной на модель и лид, с метриками и интервалами.
-    """
+    """Скилл каждой модели на тех же окнах без истории."""
     n_boot = cfg.bootstrap if n_boot is None else int(n_boot)
     ds = base.with_history(0)
     preds, aux = _predictions(named, ds, r_damped, statistical, device)
@@ -341,28 +220,7 @@ def cold_start_sweep(named, base, cfg: RobustnessConfig, r_damped=None, statisti
 def robustness_sweep(named, base, cfg: RobustnessConfig, r_damped=None,
                      statistical=True, device="cpu", n_boot=None, boot_seed=0,
                      set_name="internal", cold=None):
-    """Метрики всех моделей на каждом сценарии, уровне и лиде.
-
-    Все модели оцениваются по сырым выходам, без калибровки. В сценариях свойства
-    прибора эталон скилла - климатология того же прибора. Каждая строка несёт скилл
-    холодного старта той же модели на том же лиде и порог проверки при допуске из
-    настроек.
-
-    Args:
-        named: словарь из имени модели в модель.
-        base: набор окон, общий для всех сценариев, уровней и моделей.
-        cfg: настройки робастности.
-        r_damped: коэффициенты затухающей персистентности; None значит без неё.
-        statistical: добавить статистические эталоны.
-        device: устройство.
-        n_boot: итераций бутстрапа по станциям; None значит взять из настроек.
-        boot_seed: сид бутстрапа.
-        set_name: имя набора в строках.
-        cold: готовые строки холодного старта; None значит посчитать их здесь.
-
-    Returns:
-        Плоский список строк: по одной на сценарий, уровень, модель и лид.
-    """
+    """Метрики всех моделей на каждом сценарии, уровне и лиде."""
     n_boot = cfg.bootstrap if n_boot is None else int(n_boot)
     if cold is None:
         cold = cold_start_sweep(named, base, cfg, r_damped=r_damped, statistical=statistical,
@@ -395,34 +253,13 @@ def robustness_sweep(named, base, cfg: RobustnessConfig, r_damped=None,
 
 
 def skill_violations(rows, tolerance, models=(MAIN_MODEL,)):
-    """Строки сценариев с проверкой, где скилл модели из models ниже своего порога.
-
-    Args:
-        rows: строки прогона.
-        tolerance: допуск, доля.
-        models: имена проверяемых моделей.
-
-    Returns:
-        Список нарушивших строк.
-    """
+    """Строки сценариев с проверкой, где скилл модели из models ниже своего порога."""
     return [r for r in rows if r["guard"] and r["model"] in models
             and np.isfinite(r["Skill"]) and r["Skill"] < skill_floor(r, tolerance)]
 
 
 def check_skill_guard(rows, tolerance, models=(MAIN_MODEL,)):
-    """Проверка скилла по всем сценариям с проверкой, уровням и лидам.
-
-    Args:
-        rows: строки прогона.
-        tolerance: допуск, доля.
-        models: имена проверяемых моделей.
-
-    Returns:
-        Число проверенных строк.
-
-    Raises:
-        RobustnessError: проверять нечего, или хотя бы в одной строке скилл ниже порога.
-    """
+    """Проверка скилла по всем сценариям с проверкой, уровням и лидам."""
     checked = [r for r in rows if r["guard"] and r["model"] in models]
     if not checked:
         raise RobustnessError(f"проверка скилла пуста: нет строк моделей {tuple(models)} "
@@ -446,20 +283,7 @@ def _clean(v):
 
 def save_results(rows, out_dir, cfg: RobustnessConfig, meta=None, violations=(),
                  cold_start=()):
-    """Результаты прогона в JSON и CSV.
-
-    Args:
-        rows: строки сценариев.
-        out_dir: каталог результатов.
-        cfg: настройки робастности.
-        meta: сведения о прогоне: чекпойнты, режим QC, сид бутстрапа, наборы окон с ролями
-            станций.
-        violations: строки, нарушившие проверку.
-        cold_start: строки холодного старта.
-
-    Returns:
-        Пара путей: robustness.json и robustness.csv.
-    """
+    """Результаты прогона в JSON и CSV."""
     os.makedirs(out_dir, exist_ok=True)
     clean = lambda rs: [{k: _clean(v) for k, v in r.items()} for r in rs]
     rows_c = clean(rows)
@@ -492,14 +316,7 @@ def _guard_rule(spec, tolerance):
 
 
 def print_cold_start(cold, cfg: RobustnessConfig, set_name="internal", model=MAIN_MODEL):
-    """Строка скилла холодного старта модели по лидам, без проверки.
-
-    Args:
-        cold: строки холодного старта.
-        cfg: настройки робастности.
-        set_name: имя набора.
-        model: имя модели.
-    """
+    """Строка скилла холодного старта модели по лидам, без проверки."""
     by = {r["lead"]: r for r in cold if r["set"] == set_name and r["model"] == model}
     if not by:
         return
@@ -513,18 +330,7 @@ def print_cold_start(cold, cfg: RobustnessConfig, set_name="internal", model=MAI
 
 def print_report(rows, cfg: RobustnessConfig, set_name="internal", model=MAIN_MODEL, lead=24,
                  cold=()):
-    """Таблица по каждому сценарию: скилл по лидам, метрики и порог на одном лиде.
-
-    Восклицательный знак после скилла отмечает нарушение порога проверки.
-
-    Args:
-        rows: строки сценариев.
-        cfg: настройки робастности.
-        set_name: имя набора.
-        model: имя модели.
-        lead: лид, на котором печатаются метрики и порог.
-        cold: строки холодного старта; печатаются отдельной строкой перед сценариями.
-    """
+    """Таблица по каждому сценарию: скилл по лидам, метрики и порог на одном лиде."""
     lead = lead if lead in cfg.leads else cfg.leads[len(cfg.leads) // 2]
     print_cold_start(cold, cfg, set_name=set_name, model=model)
     for spec in cfg.scenarios:
@@ -567,23 +373,7 @@ def _band(ax, xs, sel, metric, **kw):
 
 
 def plot_scenario(rows, cfg, spec, out_dir, set_name="internal", model=MAIN_MODEL):
-    """Кривые MAE, CRPS, покрытия и скилла по уровню сценария с интервалами по станциям.
-
-    Каждый лид - своя кривая. На панели скилла пунктиром того же цвета - порог проверки
-    на этом лиде. Для смещения и дрейфа поверх штрихами - вариант, где искажён только
-    вход.
-
-    Args:
-        rows: строки робастности.
-        cfg: конфиг робастности.
-        spec: сценарий.
-        out_dir: каталог картинок.
-        set_name: имя набора в имени файла.
-        model: модель на графике.
-
-    Returns:
-        Путь к картинке.
-    """
+    """Кривые MAE, CRPS, покрытия и скилла по уровню сценария с интервалами по станциям."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -633,23 +423,7 @@ def plot_scenario(rows, cfg, spec, out_dir, set_name="internal", model=MAIN_MODE
 
 
 def plot_summary(rows, cfg, out_dir, set_name="internal", model=MAIN_MODEL, lead=24):
-    """Скилл на одном лиде по доле от максимального уровня, все сценарии на одном графике.
-
-    Горизонтальные линии: скилл холодного старта модели на этом лиде и два порога -
-    для отказа входа и для свойства прибора. Если холодный старт не хуже климатологии,
-    пороги совпадают.
-
-    Args:
-        rows: строки робастности.
-        cfg: конфиг робастности.
-        out_dir: каталог картинок.
-        set_name: имя набора в имени файла.
-        model: модель на графике.
-        lead: лид, ч.
-
-    Returns:
-        Путь к картинке.
-    """
+    """Скилл на одном лиде по доле от максимального уровня, все сценарии на одном графике."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -724,7 +498,7 @@ def main(argv=None):
     args = ap.parse_args(argv)
 
     from mayak.protocol import strict_fp32
-    strict_fp32()  # TF32 только при обучении; здесь строгий fp32, как на устройстве
+    strict_fp32()  # без TF32, как на устройстве
 
     from mayak.data.splits import ROLE_EXTERNAL, ROLE_TRAIN
     from mayak.data.store import get_store

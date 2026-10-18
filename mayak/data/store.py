@@ -1,13 +1,4 @@
-"""Офлайн-кэш станций и единая точка загрузки.
-
-Сборка: исходные файлы станций, запись значений на сетку прибора (целые градусы и
-проценты, давление в десятых), центрированный QC, станционные проверки, отбор станций,
-сплиты, климатология, затем кэш и отчёт QC на диске. Кроме очищенного ряда кэш хранит
-сырые значения до QC и маску наличия от источника: из них история окна проходит тот же
-причинный QC, что на устройстве.
-
-Загрузка: кэш читается в StationStore, один объект на процесс.
-"""
+"""Офлайн-кэш станций и единая точка загрузки."""
 from __future__ import annotations
 
 import csv
@@ -77,15 +68,7 @@ def source_path(manifest, sid):
 
 
 def read_source(path):
-    """Содержимое исходного файла станции.
-
-    Args:
-        path: путь к файлу npz.
-
-    Returns:
-        Словарь: ``T``, ``P``, ``RH``, маски ``valid``, абсолютный час первой строки
-        ``t0``; если есть в файле - флаги источника ``flag`` и точка росы ``Td``.
-    """
+    """Содержимое исходного файла станции."""
     with np.load(path) as d:
         out = dict(T=d["T"], P=d["P"], RH=d["RH"], valid=d["valid"])
         for opt in ("flag", "Td"):
@@ -110,15 +93,7 @@ def _opt_float(v):
 
 
 def qc_meta(row):
-    """Метаданные станции, которые читает QC.
-
-    Args:
-        row: строка манифеста.
-
-    Returns:
-        Словарь: долгота, заявленная высота и высота из цифровой модели рельефа, если
-        они есть.
-    """
+    """Метаданные станции, которые читает QC."""
     declared = _opt_float(row.get("station_elev"))
     meta = dict(lon=_opt_float(row.get("lon")),
                 elev=declared if declared is not None else _opt_float(row.get("elev")),
@@ -129,29 +104,12 @@ def qc_meta(row):
 
 
 def qc_elev(meta):
-    """Высота для проверки давления: из цифровой модели рельефа, если есть, иначе заявленная.
-
-    Args:
-        meta: метаданные станции для QC.
-
-    Returns:
-        Высота, м, или None.
-    """
+    """Высота для проверки давления: из цифровой модели рельефа, если есть, иначе заявленная."""
     return meta["dem_elev"] if meta.get("dem_elev") is not None else meta.get("elev")
 
 
 def key_payload(manifest, rows=None, qc_cfg=DEFAULT_QC):
-    """Всё, от чего зависит содержимое кэша, по частям.
-
-    Args:
-        manifest: путь к манифесту.
-        rows: строки манифеста, если они уже прочитаны.
-        qc_cfg: пороги контроля качества.
-
-    Returns:
-        Словарь частей ключа: источники, конфиг QC, параметры климатологии,
-        раскладка сплитов и отпечатки кода правил.
-    """
+    """Всё, от чего зависит содержимое кэша, по частям."""
     rows = read_manifest(manifest) if rows is None else rows
     stations = sorted((r["id"], file_sha256(source_path(manifest, r["id"])),
                        sorted(qc_meta(r).items())) for r in rows)
@@ -174,15 +132,7 @@ def default_cache_root(manifest):
 
 
 def previous_build(root, manifest):
-    """Метаданные самой свежей готовой сборки того же манифеста.
-
-    Args:
-        root: каталог кэшей.
-        manifest: абсолютный путь к манифесту.
-
-    Returns:
-        Словарь метаданных сборки или None, если готовых сборок нет.
-    """
+    """Метаданные самой свежей готовой сборки того же манифеста."""
     if not os.path.isdir(root):
         return None
     best, best_time = None, -1
@@ -233,15 +183,7 @@ def _sources_change(old, new):
 
 
 def rebuild_reasons(old, new):
-    """Какие части ключа кэша изменились с прошлой сборки.
-
-    Args:
-        old: части ключа прошлой сборки или None, если её нет.
-        new: части ключа текущей сборки.
-
-    Returns:
-        Список строк, по одной на изменившуюся часть ключа.
-    """
+    """Какие части ключа кэша изменились с прошлой сборки."""
     if old is None:
         return ["первая сборка: готовых сборок этого манифеста нет"]
     if not set(KEY_PARTS) & set(old):
@@ -265,29 +207,12 @@ def rebuild_reasons(old, new):
 
 
 def command_line(args):
-    """Команда одной строкой, как её набирают в оболочке этой системы.
-
-    Args:
-        args: аргументы команды, первой идёт программа.
-
-    Returns:
-        Строка с кавычками по правилам Windows или POSIX.
-    """
+    """Команда одной строкой, как её набирают в оболочке этой системы."""
     return subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
 
 
 def write_source_build(out_dir, builder, command, spec):
-    """Записывает рядом с манифестом, каким кодом собраны файлы станций.
-
-    Args:
-        out_dir: каталог набора, где лежат манифест и файлы станций.
-        builder: короткое имя сборщика для сообщений.
-        command: команда, которой набор пересобирается.
-        spec: словарь: единица кода и кортеж имён определений, None означает весь файл.
-
-    Returns:
-        Путь к записанному файлу.
-    """
+    """Записывает рядом с манифестом, каким кодом собраны файлы станций."""
     code = {unit: dict(names=None if names is None else sorted(names),
                        digest=unit_digest(unit, names)) for unit, names in sorted(spec.items())}
     path = os.path.join(out_dir, SOURCE_BUILD_NAME)
@@ -300,15 +225,7 @@ def write_source_build(out_dir, builder, command, spec):
 
 
 def check_sources(manifest):
-    """Проверяет, что файлы станций собраны тем же кодом, что сейчас в репозитории.
-
-    Args:
-        manifest: путь к манифесту.
-
-    Raises:
-        RuntimeError: код сборщика изменился после сборки файлов станций. В
-            сообщении перечислены изменившиеся части и команда пересборки.
-    """
+    """Проверяет, что файлы станций собраны тем же кодом, что сейчас в репозитории."""
     folder = os.path.dirname(os.path.abspath(manifest))
     path = os.path.join(folder, SOURCE_BUILD_NAME)
     if not os.path.exists(path):
@@ -330,19 +247,7 @@ def check_sources(manifest):
 
 
 def process_station(path, meta=None, qc_cfg=DEFAULT_QC):
-    """Обработка одной станции в пуле процессов.
-
-    QC, станционные проверки, отбор и подгонка климатологии.
-
-    Args:
-        path: путь к исходному файлу станции.
-        meta: метаданные станции для QC.
-        qc_cfg: пороги контроля качества.
-
-    Returns:
-        Словарь с данными станции либо с ``error``. В обоих случаях в нём есть
-        ``report`` - строка отчёта QC - и ``reasons`` - список пар правило и пояснение.
-    """
+    """Обработка одной станции в пуле процессов."""
     meta = meta or {}
     src = read_source(path)
     raw = record_values(np.stack([src["T"], src["P"], src["RH"]], axis=-1))
@@ -410,22 +315,7 @@ def qc_summary(results, rows, all_codes, all_mask, qc_cfg=DEFAULT_QC):
 
 
 def build_cache(manifest, cache_root=None, jobs=1, force=False, qc_cfg=DEFAULT_QC):
-    """Собирает кэш станций, если для текущего ключа его ещё нет.
-
-    Args:
-        manifest: путь к манифесту.
-        cache_root: каталог кэшей; по умолчанию каталог cache рядом с манифестом.
-        jobs: число процессов обработки станций.
-        force: пересобрать, даже если кэш с таким ключом уже есть.
-        qc_cfg: пороги контроля качества.
-
-    Returns:
-        Пара: путь к каталогу кэша и признак, что он собран этим вызовом.
-
-    Raises:
-        RuntimeError: файлы станций собраны устаревшим кодом сборщика или ни одна
-            станция не прошла сборку.
-    """
+    """Собирает кэш станций, если для текущего ключа его ещё нет."""
     check_sources(manifest)
     rows = read_manifest(manifest)
     t_start = time.perf_counter()

@@ -1,14 +1,4 @@
-"""Роли станций и временная раскладка ряда.
-
-Ряд каждой станции делится на обучение, год валидации и калибровки и тест:
-
-    [ обучение ][ зазор ][ в | к | в | к | ... ][ зазор ][ тест ]
-
-Роли станций: train (обучение), unseen_val (валидация и калибровка),
-unseen_test (финальная оценка). Роль external_test - станции
-реальной сети наблюдений: из их ряда читается только тест, а обучение служит
-одной цели - климатологии самой станции. Разбиение на роли их не трогает.
-"""
+"""Роли станций и временная раскладка ряда."""
 from __future__ import annotations
 
 import logging
@@ -50,55 +40,24 @@ FULL_YEAR_MIN_MONTH_FRAC = 0.3
 
 @dataclass(frozen=True)
 class TimeLayout:
-    """Раскладка ряда одной станции по временным окнам.
-
-    Attributes:
-        n_hours: длина ряда, ч.
-        blocks: блоки каждого временного окна, по ключу окна. Блок - пара индексов
-            часа ряда (начало, конец), конец не входит. У обучения и теста по одному
-            блоку, у валидации и калибровки - по половине блоков года перед тестом.
-    """
+    """Раскладка ряда одной станции по временным окнам."""
 
     n_hours: int
     blocks: dict
 
     def span(self, key):
-        """Границы временного окна от начала первого блока до конца последнего.
-
-        Args:
-            key: ключ временного окна.
-
-        Returns:
-            Пара (начало, конец), конец не входит.
-        """
+        """Границы временного окна от начала первого блока до конца последнего."""
         b = self.blocks[key]
         return b[0][0], b[-1][1]
 
     def history_floor(self, key):
-        """Самый ранний час, который может читать история окна с этим ключом.
-
-        Args:
-            key: ключ временного окна.
-
-        Returns:
-            Индекс часа ряда.
-        """
+        """Самый ранний час, который может читать история окна с этим ключом."""
         first = self.blocks[key][0][0]
         ends = [hi for k in HISTORY_FORBIDDEN[key] for _lo, hi in self.blocks[k] if hi <= first]
         return max(ends, default=0)
 
     def block_index(self, key, start, end):
-        """Номер блока, в котором целиком лежит отрезок часов.
-
-        Args:
-            key: ключ временного окна.
-            start: начала отрезков, массив индексов часа.
-            end: концы отрезков, конец не входит, массив той же формы.
-
-        Returns:
-            Массив номеров блоков той же формы; минус один, если отрезок не лежит
-            целиком ни в одном блоке.
-        """
+        """Номер блока, в котором целиком лежит отрезок часов."""
         start, end = np.asarray(start, np.int64), np.asarray(end, np.int64)
         los = np.array([lo for lo, _hi in self.blocks[key]], np.int64)
         his = np.array([hi for _lo, hi in self.blocks[key]], np.int64)
@@ -108,16 +67,7 @@ class TimeLayout:
         return np.where(ok, idx, -1)
 
     def overlaps(self, keys, start, end):
-        """Пересекает ли отрезок часов хотя бы один блок перечисленных окон.
-
-        Args:
-            keys: ключи временных окон.
-            start: начала отрезков, массив индексов часа.
-            end: концы отрезков, конец не входит, массив той же формы.
-
-        Returns:
-            Булев массив той же формы. Пустой отрезок ничего не пересекает.
-        """
+        """Пересекает ли отрезок часов хотя бы один блок перечисленных окон."""
         start, end = np.asarray(start, np.int64), np.asarray(end, np.int64)
         hit = np.zeros(np.broadcast(start, end).shape, bool)
         for k in keys:
@@ -126,30 +76,13 @@ class TimeLayout:
         return hit
 
     def to_dict(self):
-        """Раскладка в виде, пригодном для JSON.
-
-        Returns:
-            Словарь с длиной ряда и списками блоков по ключам.
-        """
+        """Раскладка в виде, пригодном для JSON."""
         return dict(n_hours=self.n_hours,
                     blocks={k: [list(b) for b in self.blocks[k]] for k in TIME_KEYS})
 
 
 def time_layout(n_hours, **overrides):
-    """Раскладка ряда заданной длины по временным окнам.
-
-    Args:
-        n_hours: длина ряда, ч.
-        **overrides: замена параметров раскладки по умолчанию.
-
-    Returns:
-        Раскладка ряда.
-
-    Raises:
-        ValueError: зазор короче горизонта и полной истории вместе, число блоков не
-            чётное, либо ряд так короток, что обучение, тест или хотя бы один блок не
-            вмещают ни одного окна.
-    """
+    """Раскладка ряда заданной длины по временным окнам."""
     cfg = {**TIME_LAYOUT, **overrides}
     gap, n_blocks = int(cfg["gap_hours"]), int(cfg["n_blocks"])
     if gap < MIN_GAP_HOURS:
@@ -178,38 +111,13 @@ def time_layout(n_hours, **overrides):
 
 
 def layout_fingerprint():
-    """Отпечаток кода временной раскладки ряда.
-
-    Меняется при смысловой правке раскладки, её параметров по умолчанию, горизонта,
-    длины истории и правил, куда может заходить история окна. Правка комментариев и
-    документации его не меняет.
-
-    Returns:
-        Строка из шестнадцатеричных цифр.
-    """
+    """Отпечаток кода временной раскладки ряда."""
     return combined_digest(code_digests(LAYOUT_CODE))
 
 
 def full_years(mask_T, t0_utc_h, lo, hi, min_month_frac=FULL_YEAR_MIN_MONTH_FRAC,
                hours_per_year=None):
-    """Число полных лет в окне [lo, hi) ряда станции.
-
-    Окно режется на годовые куски, отсчитывая от правой границы назад; неполный
-    остаток в начале отбрасывается. Кусок - полный год, если в каждом из двенадцати
-    календарных месяцев валидна заданная доля часов этого месяца: гармоникам годового
-    хода нужен весь сезонный цикл, а не только много часов.
-
-    Args:
-        mask_T: маска валидной температуры ряда.
-        t0_utc_h: абсолютный час первой строки ряда.
-        lo: начало окна, номер строки.
-        hi: конец окна, номер строки, не входит.
-        min_month_frac: наименьшая доля валидных часов в каждом месяце.
-        hours_per_year: длина года, ч; None - из раскладки ряда.
-
-    Returns:
-        Число полных лет.
-    """
+    """Число полных лет в окне [lo, hi) ряда станции."""
     from mayak.timeaxis import window_month
     hpy = int(hours_per_year or TIME_LAYOUT["hours_per_year"])
     n_blocks = max(0, (int(hi) - int(lo)) // hpy)
@@ -229,15 +137,7 @@ def full_years(mask_T, t0_utc_h, lo, hi, min_month_frac=FULL_YEAR_MIN_MONTH_FRAC
 
 
 def min_hours_for_train_years(years, **overrides):
-    """Наименьшая длина ряда, при которой обучение занимает не меньше заданного числа лет.
-
-    Args:
-        years: сколько лет должно занимать обучение.
-        **overrides: замена параметров раскладки по умолчанию.
-
-    Returns:
-        Длина ряда, ч.
-    """
+    """Наименьшая длина ряда, при которой обучение занимает не меньше заданного числа лет."""
     cfg = {**TIME_LAYOUT, **overrides}
     need = max(1, int(years)) * int(cfg["hours_per_year"])
     n = need + 2 * int(cfg["gap_hours"])
@@ -257,14 +157,7 @@ def lat_band(lat):
 
 
 def stratum_of(row):
-    """Страта станции: пара из полной зоны Кёппена и широтного пояса.
-
-    Args:
-        row: строка манифеста.
-
-    Returns:
-        Пара: зона и пояс.
-    """
+    """Страта станции: пара из полной зоны Кёппена и широтного пояса."""
     return str(row["koppen"]).strip(), lat_band(row["lat"])
 
 
@@ -285,25 +178,7 @@ def _allocate(total, sizes, floor, cap, rng):
 
 def assign_roles(rows, n_test=None, test_frac=DEFAULT_TEST_FRAC, val_frac=DEFAULT_VAL_FRAC,
                  n_val=None, seed=0, min_stratum=3, info=None):
-    """Стратифицированное разбиение станций на три роли.
-
-    Args:
-        rows: строки манифеста с полями id, koppen, lat и, возможно, split.
-        n_test: точное число тестовых станций; None - по доле test_frac.
-        test_frac: доля тестовых станций среди участвующих в разбиении.
-        val_frac: доля валидационных среди станций вне теста.
-        n_val: точное число валидационных станций; None - по доле val_frac.
-        seed: сид разбиения.
-        min_stratum: страты от этого размера обязаны быть во всех ролях.
-        info: если передан словарь, в него кладутся запрошенное и назначенное число
-            тестовых и валидационных станций.
-
-    Returns:
-        Словарь: id станции и её роль.
-
-    Raises:
-        ValueError: min_stratum меньше трёх.
-    """
+    """Стратифицированное разбиение станций на три роли."""
     if min_stratum < 3:
         raise ValueError("min_stratum < 3: в страте не хватит станций на три роли")
     rng = np.random.default_rng(seed)
@@ -342,15 +217,7 @@ def assign_roles(rows, n_test=None, test_frac=DEFAULT_TEST_FRAC, val_frac=DEFAUL
 
 
 def strata_report(rows, roles):
-    """Число станций каждой роли в каждой страте.
-
-    Args:
-        rows: строки манифеста.
-        roles: роль каждой строки.
-
-    Returns:
-        Словарь: страта и словарь роль - число станций.
-    """
+    """Число станций каждой роли в каждой страте."""
     rep = {}
     for r in rows:
         if roles[str(r["id"])] == ROLE_EXTERNAL:

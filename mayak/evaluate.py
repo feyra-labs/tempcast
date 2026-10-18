@@ -1,40 +1,4 @@
-"""Единый стенд оценки МАЯК.
-
-Стенд собирает окна оценки, прогоняет по ним все модели и печатает таблицы.
-
-Основной внутренний набор - станции unseen_test в их тестовом окне. По нему считаются
-метрики по лидам, разрез по длине истории, сезоны и зоны, надёжность, раздел после
-калибровки с офлайн-прогоном адаптивной калибровки и сопоставление с внешним тестом.
-Обучающие станции в их тестовом окне - отдельный набор со своим каталогом результатов;
-по нему считаются только метрики по лидам. Разрез по ролям станций собирается из двух
-наборов: строка train - из набора обучающих станций, строка unseen_test - из основного.
-
-Сравнение моделей идёт только по их сырым выходам. Основные таблицы, разрезы,
-надёжность, острота против покрытия, покрытие по разрезам и их графики не зависят от
-того, задана ли конформная таблица. Таблица МАЯК даёт отдельный раздел «МАЯК после
-калибровки»: сырой и откалиброванный МАЯК рядом, покрытие по тем же разрезам с графиком
-и офлайн-прогон адаптивной калибровки устройства.
-
-Каждое окно оценивается на сетке длин истории, от холодного старта до полной истории.
-Основные таблицы считаются при полной истории. Разрез по длине истории и кривые скилла
-по длине истории строятся для всех моделей с интервалами бутстрапа по станциям. Эталоны,
-которым нужна история, видят ту же историю окна, что модели. Климатологии история не
-нужна, поэтому она считается один раз и одинакова на всей сетке.
-
-Кроме того, стенд считает таблицы в двух видах агрегирования (пуловом и макро) с
-интервалами блочного бутстрапа по станциям, разрезы по зонам Кёппена, сезонам и доле
-валидных часов истории, внешний тест на наблюдениях реальной сети с его собственными
-разрезами и сопоставлением с внутренним тестом, проверки поля при холодном старте,
-суточные амплитуды, строки переобученных абляций и разброс основной модели по сидам на
-внутреннем и внешнем наборах. Если есть абляции и не меньше трёх сидов основной модели,
-стенд сравнивает разницу каждой абляции с основной моделью с размахом сидов на каждом
-наборе и выносит вердикт о значимости по двум наборам.
-
-Модели сравниваются на равных: у каждого чекпойнта есть запись о подборе скорости
-обучения по одной и той же сетке с одним и тем же числом шагов. Прогон дополнительной
-настройки МАЯК проверку не проходит и попадает в таблицы только по явному аргументу,
-отдельной помеченной строкой рядом со строкой МАЯК.
-"""
+"""Стенд оценки МАЯК."""
 import os
 from dataclasses import dataclass
 
@@ -112,25 +76,7 @@ _OPTIONAL_AUX_KEYS = (("mu_ref", "mu_ref_fut"),)
 
 @torch.no_grad()
 def gather_all(named, dataset, device="cpu", batch_size=128):
-    """Прогон всех моделей по набору окон за один проход.
-
-    Окно собирается один раз и подаётся всем моделям. Это важно, потому что сборка окна
-    с причинным QC дороже прогона небольшой модели.
-
-    Args:
-        named: словарь из имени модели в модель; может быть пустым.
-        dataset: набор окон.
-        device: устройство, на котором считают модели.
-        batch_size: размер батча.
-
-    Returns:
-        Пара: словарь из имени модели в её медиану формы (N, H) и квантили формы
-        (N, H, 7), и словарь с целью, маской цели, климатологией на горизонте, недавней
-        аномалией, нормировочным масштабом на часах горизонта, историей окон и числом
-        часов с валидной температурой во входе модели (history_valid, по нему
-        выбирается строка конформной таблицы). Если набор окон даёт отдельный эталон
-        скилла, он лежит в том же словаре под ключом mu_ref.
-    """
+    """Прогон всех моделей по набору окон за один проход."""
     for m in named.values():
         m.eval().to(device)
     outs = {name: dict(mu=[], q=[]) for name in named}
@@ -156,17 +102,7 @@ def gather_all(named, dataset, device="cpu", batch_size=128):
 
 
 def gather(model, dataset, device="cpu", batch_size=128):
-    """Прогон одной модели по набору окон.
-
-    Args:
-        model: модель.
-        dataset: набор окон.
-        device: устройство.
-        batch_size: размер батча.
-
-    Returns:
-        Словарь: медиана, квантили и всё, что возвращает общий прогон про окна.
-    """
+    """Прогон одной модели по набору окон."""
     preds, aux = gather_all({"model": model}, dataset, device=device, batch_size=batch_size)
     return dict(aux, **preds["model"])
 
@@ -193,19 +129,7 @@ def _gather_full(model, ds, device="cpu", batch_size=128):
 
 
 def collect_predictions(named, ds, device="cpu"):
-    """Предсказания всех моделей и данные окон для таблиц.
-
-    Args:
-        named: словарь из имени модели в модель.
-        ds: набор окон.
-        device: устройство.
-
-    Returns:
-        Пара: словарь из имени модели в её медиану и квантили, и данные окон вместе с
-        метаданными для разрезов. В метаданных, кроме меток набора, число часов с
-        валидной температурой во входе модели (history_valid): по нему выбирается
-        строка конформной таблицы.
-    """
+    """Предсказания всех моделей и данные окон для таблиц."""
     preds, aux = gather_all(named, ds, device=device)
     # Новый словарь: набор может кэшировать свои метаданные между вызовами.
     aux["meta"] = dict(ds.window_meta(), history_valid=aux["history_valid"])
@@ -213,49 +137,18 @@ def collect_predictions(named, ds, device="cpu"):
 
 
 def baseline_scale(aux):
-    """Масштаб интервалов статистических эталонов на часах горизонта.
-
-    Это масштаб, на который функция потерь делит ошибку: масштаб остатка климатологии
-    станции на часах горизонта, обрезанный теми же пределами. У всех моделей и эталонов
-    поэтому один масштаб разброса.
-
-    Args:
-        aux: данные окон с нормировочным масштабом формы (N, H).
-
-    Returns:
-        Масштаб, °C, форма (N, H), float32.
-    """
+    """Масштаб интервалов статистических эталонов на часах горизонта."""
     return np.clip(np.asarray(aux["norm_scale"], np.float32), *NORM_SCALE_CLAMP)
 
 
 def history_free_baselines(aux):
-    """Эталоны, которым история окна не нужна.
-
-    Args:
-        aux: данные окон.
-
-    Returns:
-        Словарь из имени эталона в его медиану и квантили.
-    """
+    """Эталоны, которым история окна не нужна."""
     mu, q = BL.climatology_forecast(aux["mu_clim"], baseline_scale(aux))
     return {CLIMATOLOGY: dict(mu=mu, q=q)}
 
 
 def history_baselines(aux, r_damped=None):
-    """Эталоны, которые читают историю окна.
-
-    Оба эталона видят ровно ту историю, что модели: усечённую до длины истории окна и
-    прошедшую причинный QC. Недавняя аномалия затухающей персистентности считается при
-    сборке окна по этой же истории.
-
-    Args:
-        aux: данные окон.
-        r_damped: коэффициенты затухания по лидам; None значит без затухающей
-            персистентности.
-
-    Returns:
-        Словарь из имени эталона в его медиану и квантили.
-    """
+    """Эталоны, которые читают историю окна."""
     mucl, sig = aux["mu_clim"], baseline_scale(aux)
     out = {}
     if r_damped is not None:
@@ -268,34 +161,14 @@ def history_baselines(aux, r_damped=None):
 
 
 def add_statistical_baselines(preds, aux, r_damped=None, history_free=None):
-    """Добавляет к предсказаниям статистические эталоны.
-
-    Args:
-        preds: словарь предсказаний моделей; дополняется на месте.
-        aux: данные окон.
-        r_damped: коэффициенты затухания по лидам; None значит без затухающей
-            персистентности.
-        history_free: готовые предсказания эталонов, которым история не нужна. Их
-            можно взять с любой длины истории тех же окон; None значит посчитать.
-
-    Returns:
-        Тот же словарь предсказаний.
-    """
+    """Добавляет к предсказаниям статистические эталоны."""
     preds.update(history_free if history_free is not None else history_free_baselines(aux))
     preds.update(history_baselines(aux, r_damped))
     return preds
 
 
 def evaluation_for(pred, aux):
-    """Оценка одной модели по её сырым выходам.
-
-    Args:
-        pred: медиана и квантили модели.
-        aux: цель, маска цели, климатология и метаданные тех же окон.
-
-    Returns:
-        Оценка модели.
-    """
+    """Оценка одной модели по её сырым выходам."""
     return Evaluation(y=aux["y"], mu=pred["mu"], q=pred["q"], mu_clim=aux["mu_clim"],
                       w=aux["y_mask"], station=aux["meta"]["station"])
 
@@ -305,16 +178,7 @@ def evaluations(preds, aux):
 
 
 def build_tables(preds, aux, leads=FINE_LEADS):
-    """Пуловые таблицы метрик по лидам - вход для графиков кривых метрик.
-
-    Args:
-        preds: словарь: имя модели и её медиана и квантили.
-        aux: факт, маска факта и прогноз климатологии.
-        leads: лиды таблиц.
-
-    Returns:
-        Словарь: имя модели и таблица по лидам.
-    """
+    """Пуловые таблицы метрик по лидам - вход для графиков кривых метрик."""
     y, w, muc = aux["y"], aux["y_mask"], aux["mu_clim"]
     return {name: metric_table(y, p["mu"], p["q"], muc, w, leads=leads)
             for name, p in preds.items()}
@@ -359,25 +223,7 @@ def print_rows(rows, label="разрез", metrics=("Skill", "MAE", "RMSE", "CRP
 
 def all_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS, min_stations=MIN_STATIONS,
                    ci=False, history=None, **kw):
-    """Разрезы одной модели по метаданным окон одного набора.
-
-    Разреза по ролям станций здесь нет: набор состоит из станций одной роли, разрез по
-    ролям собирает role_breakdown из отдельных наборов.
-
-    Args:
-        ev: оценка модели.
-        meta: метаданные тех же окон.
-        leads: лиды, на которых считаются метрики.
-        min_windows: страта с меньшим числом окон не показывается.
-        min_stations: страта с меньшим числом станций не показывается.
-        ci: считать интервалы бутстрапа по станциям.
-        history: готовые строки разреза по длине истории, посчитанные по сетке длин на
-            тех же окнах. None значит строить разрез по метаданным набора.
-        **kw: параметры бутстрапа.
-
-    Returns:
-        Словарь из имени разреза в словарь из метки страты в её сводку.
-    """
+    """Разрезы одной модели по метаданным окон одного набора."""
     hist, hist_order = history_strata(meta)
     hvalid = np.array([bin_label(float(v), HIST_VALID_BINS) for v in meta["hist_valid"]], object)
     kwargs = dict(leads=leads, min_windows=min_windows, min_stations=min_stations, ci=ci, **kw)
@@ -392,20 +238,7 @@ def all_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS, min_stations=M
 
 def role_breakdown(parts, lead=BREAKDOWN_LEAD, min_windows=MIN_WINDOWS,
                    min_stations=MIN_STATIONS, ci=False, **kw):
-    """Разрез основной модели по ролям станций, собранный из отдельных наборов.
-
-    Args:
-        parts: пары из оценки основной модели на наборе и метаданных окон этого набора,
-            в порядке строк разреза.
-        lead: лид, ч.
-        min_windows: страта с меньшим числом окон не показывается.
-        min_stations: страта с меньшим числом станций не показывается.
-        ci: считать интервалы бутстрапа по станциям.
-        **kw: параметры бутстрапа.
-
-    Returns:
-        Словарь из роли станций в её сводку на лиде.
-    """
+    """Разрез основной модели по ролям станций, собранный из отдельных наборов."""
     rows = {}
     for ev, meta in parts:
         rows.update(breakdown(ev, meta["role"], leads=[lead], min_windows=min_windows,
@@ -415,22 +248,7 @@ def role_breakdown(parts, lead=BREAKDOWN_LEAD, min_windows=MIN_WINDOWS,
 
 def external_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS,
                         min_stations=MIN_STATIONS, ci=False, **kw):
-    """Разрезы, которые есть только у внешнего теста.
-
-    Разреза по шагу отчётности нет: во внешний тест входят только почасовые станции.
-
-    Args:
-        ev: оценка одной модели.
-        meta: метаданные тех же окон.
-        leads: лиды, на которых считаются метрики.
-        min_windows: страта с меньшим числом окон не показывается.
-        min_stations: страта с меньшим числом станций не показывается.
-        ci: считать интервалы бутстрапа по станциям.
-        **kw: параметры бутстрапа.
-
-    Returns:
-        Словарь из имени разреза в словарь из метки страты в её сводку.
-    """
+    """Разрезы, которые есть только у внешнего теста."""
     from mayak.external import TRAIN_DISTANCE_ORDER
     hvalid = np.array([bin_label(float(v), HIST_VALID_BINS) for v in meta["hist_valid"]], object)
     kwargs = dict(leads=leads, min_windows=min_windows, min_stations=min_stations, ci=ci, **kw)
@@ -444,11 +262,7 @@ def external_breakdowns(ev, meta, leads=None, min_windows=MIN_WINDOWS,
 
 
 def print_breakdowns(rows_by_dim):
-    """Печатает разрезы; интервалы печатаются, если они посчитаны.
-
-    Args:
-        rows_by_dim: словарь из имени разреза в словарь из метки страты в её сводку.
-    """
+    """Печатает разрезы; интервалы печатаются, если они посчитаны."""
     for name, rows in rows_by_dim.items():
         print(f"\n--- разрез: {name} ---")
         if not rows:
@@ -458,12 +272,7 @@ def print_breakdowns(rows_by_dim):
 
 
 def print_reliability(ev, lead_bins=LEAD_BINS):
-    """Печать гистограммы PIT по всему горизонту и по бинам лидов, надёжности и остроты.
-
-    Args:
-        ev: оценка одной модели.
-        lead_bins: бины лидов.
-    """
+    """Печать гистограммы PIT по всему горизонту и по бинам лидов, надёжности и остроты."""
     pit = ev.pit_histogram()
     edges = ["<q05"] + [f"q{int(100 * Q[i]):02d}-q{int(100 * Q[i + 1]):02d}"
                         for i in range(NQ - 1)] + [">q95"]
@@ -486,21 +295,7 @@ def print_reliability(ev, lead_bins=LEAD_BINS):
 
 
 def seed_summaries(models, res, ds, leads=SEED_LEADS):
-    """Сводки основной модели и её повторов с другими сидами по лидам на окнах одного набора.
-
-    Первая модель - основная: её сводки берутся из результата оценки набора. Остальные -
-    та же модель, обученная с другими сидами; они прогоняются по тем же окнам при полной
-    истории и оцениваются по тем же целям и эталону.
-
-    Args:
-        models: модели основной архитектуры с разными сидами, основная первой.
-        res: результат оценки набора (``evaluate_set``) с основной моделью.
-        ds: тот же набор окон.
-        leads: лиды, ч.
-
-    Returns:
-        Список по сидам, основной первой: словарь из лида в сводку.
-    """
+    """Сводки основной модели и её повторов с другими сидами по лидам на окнах одного набора."""
     aux = res["bench"].aux
     nominal = ds.with_history(NOMINAL_HISTORY)
     out = [{int(h): res["leads"][MAIN_MODEL][int(h)] for h in leads}]
@@ -511,16 +306,7 @@ def seed_summaries(models, res, ds, leads=SEED_LEADS):
 
 
 def print_seed_spread(summaries, leads=SEED_LEADS):
-    """Печатает разброс метрик основной модели по сидам на каждом лиде.
-
-    Args:
-        summaries: сводки по лидам для каждого сида, как их возвращает ``seed_summaries``.
-        leads: лиды, ч.
-
-    Returns:
-        Словарь: лиды, число сидов и по каждому лиду словарь из имени метрики в среднее,
-        минимум, максимум и стандартное отклонение.
-    """
+    """Печатает разброс метрик основной модели по сидам на каждом лиде."""
     out = {}
     for h in leads:
         spread = seed_spread([s[int(h)] for s in summaries])
@@ -536,16 +322,7 @@ def print_seed_spread(summaries, leads=SEED_LEADS):
 
 
 def significance_table(internal, external=None):
-    """Таблица значимости абляций по результатам ``ablation_significance`` на наборах.
-
-    Args:
-        internal: результат на внутреннем наборе.
-        external: результат на внешнем наборе; None - без вердикта.
-
-    Returns:
-        Словарь: правило, ячейки, строки каждого набора и вердикт; без внешнего набора
-        вердикт - None и есть пометка об этом.
-    """
+    """Таблица значимости абляций по результатам ``ablation_significance`` на наборах."""
     table = dict(rule=SIGNIFICANCE_RULE, cells=[cell_name(m, h) for m, h in ABLATION_CELLS],
                  internal=internal, external=external, verdict=None)
     if external is None:
@@ -556,11 +333,7 @@ def significance_table(internal, external=None):
 
 
 def print_significance(table):
-    """Печатает Δ абляций, размах сидов и вердикт о значимости.
-
-    Args:
-        table: таблица ``significance_table``.
-    """
+    """Печатает Δ абляций, размах сидов и вердикт о значимости."""
     cols = table["cells"]
     head = f"{'вариант':<34}" + "".join(f"{c:>14}" for c in cols)
     for set_name in ("internal", "external"):
@@ -585,20 +358,7 @@ def print_significance(table):
 
 def zone_breakdown(preds, aux, koppen=None, leads=(24, 72), model="МАЯК",
                    min_windows=MIN_WINDOWS, min_stations=MIN_STATIONS):
-    """Разрез одной модели по полным зонам Кёппена.
-
-    Args:
-        preds: словарь: имя модели и её медиана и квантили.
-        aux: факт, маска факта, прогноз климатологии и метаданные окон.
-        koppen: зона каждого окна; None - из метаданных.
-        leads: лиды разреза.
-        model: имя модели.
-        min_windows: страта с меньшим числом окон не показывается.
-        min_stations: страта с меньшим числом станций не показывается.
-
-    Returns:
-        Словарь: зона, затем лид - сводка.
-    """
+    """Разрез одной модели по полным зонам Кёппена."""
     ev = evaluation_for(preds[model], aux)
     keys = aux["meta"]["zone"] if koppen is None else np.asarray(koppen)
     out = {}
@@ -658,16 +418,7 @@ def plot_metric_curves(tables, out_dir="runs/plots"):
 
 
 def plot_reliability(ev, out_dir="runs/plots", name="МАЯК"):
-    """Диаграмма надёжности и кривая «острота против покрытия» одной картинкой.
-
-    Args:
-        ev: оценка одной модели.
-        out_dir: каталог картинок.
-        name: имя модели в заголовке и имени файла.
-
-    Returns:
-        Путь к картинке.
-    """
+    """Диаграмма надёжности и кривая «острота против покрытия» одной картинкой."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -723,17 +474,7 @@ def plot_pit(ev, out_dir="runs/plots"):
 
 
 def plot_sharpness(curves, out_dir="runs/plots", set_name="internal", nominal=0.9):
-    """Кривые «острота против покрытия» всех моделей, по панели на бин лидов.
-
-    Args:
-        curves: кривые остроты всех моделей.
-        out_dir: каталог картинок.
-        set_name: имя набора в имени файла.
-        nominal: номинал интервала.
-
-    Returns:
-        Путь к картинке.
-    """
+    """Кривые «острота против покрытия» всех моделей, по панели на бин лидов."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -761,17 +502,7 @@ def plot_sharpness(curves, out_dir="runs/plots", set_name="internal", nominal=0.
 
 
 def plot_coverage_strata(report, out_dir="runs/plots", set_name="internal", model=MAIN_MODEL):
-    """Точечный график покрытия страт с интервалами бутстрапа по всем разрезам.
-
-    Args:
-        report: отчёт о покрытии.
-        out_dir: каталог картинок.
-        set_name: имя набора в имени файла.
-        model: модель, покрытие которой показывается.
-
-    Returns:
-        Путь к картинке.
-    """
+    """Точечный график покрытия страт с интервалами бутстрапа по всем разрезам."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -813,20 +544,7 @@ def plot_coverage_strata(report, out_dir="runs/plots", set_name="internal", mode
 
 
 def plot_calibration(res, out_dir="runs/plots", set_name="internal"):
-    """Графики калибровки одного набора: острота и покрытие по разрезам.
-
-    Острота всех моделей и покрытие основной модели рисуются по сырым выходам. Если в
-    результате есть раздел после калибровки, покрытие основной модели после калибровки
-    рисуется отдельной картинкой с суффиксом ``_calibrated``.
-
-    Args:
-        res: результат оценки набора.
-        out_dir: каталог картинок.
-        set_name: имя набора в именах файлов.
-
-    Returns:
-        Пути к картинкам.
-    """
+    """Графики калибровки одного набора: острота и покрытие по разрезам."""
     main = res["main"]
     paths = [plot_sharpness(res["sharpness"], out_dir, set_name, res["config"].nominal),
              plot_coverage_strata(res["coverage"]["report"], out_dir, set_name, main)]
@@ -940,18 +658,7 @@ def plot_amplitude_scatter(model, clims, manifest="data/manifest.csv", out_dir="
 
 @dataclass
 class Bench:
-    """Прогон всех моделей по одним окнам на всей сетке длин истории.
-
-    Attributes:
-        grid: длины истории, ч, по возрастанию.
-        preds: предсказания всех моделей при полной истории.
-        aux: данные окон при полной истории.
-        history: сводки по длинам истории: словарь из имени модели в словарь из длины в
-            словарь из лида в сводку.
-        main: имя основной модели.
-        main_history: предсказания основной модели на каждой длине истории: словарь из
-            длины в медиану, квантили и метаданные окон при этой длине.
-    """
+    """Прогон всех моделей по одним окнам на всей сетке длин истории."""
 
     grid: tuple
     preds: dict
@@ -967,30 +674,7 @@ def _same_targets(a, b):
 
 def run_bench(named, base, grid=HISTORY_GRID, r_damped=None, leads=HISTORY_LEADS, ci=True,
               bootstrap=BOOTSTRAP, device="cpu", main=MAIN_MODEL):
-    """Прогоняет модели и эталоны по окнам набора на каждой длине истории из сетки.
-
-    Окна, цели и эталон одинаковы на всей сетке, меняется только длина истории. Эталоны
-    без истории считаются один раз, их сводки на всех длинах совпадают. Длины
-    обрабатываются по одной: в памяти остаются только сводки, предсказания при полной
-    истории и предсказания основной модели.
-
-    Args:
-        named: словарь из имени модели в модель.
-        base: набор окон.
-        grid: длины истории, ч; должна включать полную историю.
-        r_damped: коэффициенты затухающей персистентности; None значит без неё.
-        leads: лиды сводок по длине истории.
-        ci: считать интервалы бутстрапа по станциям.
-        bootstrap: параметры бутстрапа.
-        device: устройство.
-        main: имя основной модели.
-
-    Returns:
-        Результат прогона.
-
-    Raises:
-        RuntimeError: цели или эталон окон разошлись между длинами истории.
-    """
+    """Прогоняет модели и эталоны по окнам набора на каждой длине истории из сетки."""
     grid = check_history_grid(grid)
     kw = bootstrap if ci else {}
     history, main_history = {}, {}
@@ -1022,33 +706,12 @@ def run_bench(named, base, grid=HISTORY_GRID, r_damped=None, leads=HISTORY_LEADS
 
 
 def history_rows(bench, model, lead):
-    """Разрез по длине истории одной модели на одном лиде.
-
-    Args:
-        bench: результат прогона по сетке.
-        model: имя модели.
-        lead: лид, ч.
-
-    Returns:
-        Словарь из метки длины истории в сводку, по возрастанию длины. В нём все длины
-        сетки.
-    """
+    """Разрез по длине истории одной модели на одном лиде."""
     return {history_label(L): bench.history[model][L][int(lead)] for L in bench.grid}
 
 
 def history_evaluations(bench, shift=None):
-    """Оценки основной модели на каждой длине истории.
-
-    Оценки создаются по одной, по мере чтения, чтобы в памяти не лежали все сразу.
-
-    Args:
-        bench: результат прогона по сетке.
-        shift: конформная таблица; None значит сырые выходы. Строка выбирается по
-            числу валидных часов температуры каждого окна при этой длине сетки.
-
-    Yields:
-        Пары из метки длины истории и оценки.
-    """
+    """Оценки основной модели на каждой длине истории."""
     aux = bench.aux
     for L in bench.grid:
         p = bench.main_history[L]
@@ -1058,15 +721,7 @@ def history_evaluations(bench, shift=None):
 
 
 def calibration_config(ci, bootstrap):
-    """Настройки анализа калибровки с параметрами бутстрапа стенда оценки.
-
-    Args:
-        ci: считать ли интервалы бутстрапа.
-        bootstrap: число повторов и сид бутстрапа.
-
-    Returns:
-        Конфиг калибровки; без интервалов - с нулевым числом повторов.
-    """
+    """Настройки анализа калибровки с параметрами бутстрапа стенда оценки."""
     from dataclasses import replace
 
     from mayak.calibration import load_config
@@ -1079,37 +734,7 @@ def calibration_config(ci, bootstrap):
 
 def evaluate_set(named, base, grid=HISTORY_GRID, r_damped=None, shift=None, ci=True,
                  bootstrap=BOOTSTRAP, device="cpu", external=False, main=MAIN_MODEL):
-    """Все числа стенда на одном наборе окон.
-
-    Внутренний тест подаётся сюда набором станций unseen_test; обучающие станции
-    оцениваются отдельно, только по лидам.
-
-    Сравнительная часть считается по сырым выходам всех моделей и от конформной таблицы
-    не зависит. Таблица влияет только на раздел основной модели после калибровки; строка
-    таблицы у каждого окна - по числу часов с валидной температурой во входе модели, как
-    на устройстве. Разрезы по длине истории остаются по запрошенной длине. В этом разделе же
-    офлайн-прогон адаптивной калибровки: основная модель выпускает прогноз каждый час
-    на непрерывном периоде части станций набора, как прибор.
-
-    Args:
-        named: словарь из имени модели в модель; основная модель обязательна.
-        base: набор окон.
-        grid: длины истории, ч.
-        r_damped: коэффициенты затухающей персистентности; None значит без неё.
-        shift: конформная таблица основной модели; None значит без раздела после
-            калибровки.
-        ci: считать интервалы бутстрапа по станциям.
-        bootstrap: параметры бутстрапа.
-        device: устройство.
-        external: набор внешнего теста.
-        main: имя основной модели.
-
-    Returns:
-        Словарь. Сравнительная часть: прогон по сетке, таблицы по лидам и сводки по всему
-        горизонту для всех моделей, разрезы по длине истории для всех моделей, разрезы
-        основной модели, её надёжность, кривые остроты всех моделей и покрытие основной
-        модели по разрезам. Отдельно: раздел после калибровки или None.
-    """
+    """Все числа стенда на одном наборе окон."""
     from mayak.calibration import (aci_hourly_replay, calibration_effect, conditional_gate,
                                    coverage_report, sharpness_curves)
     bench = run_bench(named, base, grid=grid, r_damped=r_damped, ci=ci, bootstrap=bootstrap,
@@ -1150,21 +775,7 @@ def evaluate_set(named, base, grid=HISTORY_GRID, r_damped=None, shift=None, ci=T
 
 def evaluate_leads(named, base, r_damped=None, ci=True, bootstrap=BOOTSTRAP, device="cpu",
                    main=MAIN_MODEL):
-    """Метрики по лидам всех моделей и эталонов на одном наборе окон при полной истории.
-
-    Args:
-        named: словарь из имени модели в модель; основная модель обязательна.
-        base: набор окон.
-        r_damped: коэффициенты затухающей персистентности; None значит без неё.
-        ci: считать интервалы бутстрапа по станциям.
-        bootstrap: параметры бутстрапа.
-        device: устройство.
-        main: имя основной модели.
-
-    Returns:
-        Словарь: имя основной модели, сводки по лидам и по всему горизонту для всех
-        моделей, оценка основной модели и метаданные окон.
-    """
+    """Метрики по лидам всех моделей и эталонов на одном наборе окон при полной истории."""
     preds, aux = collect_predictions(named, base.with_history(NOMINAL_HISTORY), device=device)
     preds = add_statistical_baselines(preds, aux, r_damped=r_damped)
     evs = evaluations(preds, aux)
@@ -1176,13 +787,7 @@ def evaluate_leads(named, base, r_damped=None, ci=True, bootstrap=BOOTSTRAP, dev
 
 
 def print_history_table(history, lead, metric="Skill"):
-    """Печатает метрику всех моделей по длинам истории на одном лиде.
-
-    Args:
-        history: словарь из имени модели в словарь из лида в разрез по длине истории.
-        lead: лид, ч.
-        metric: имя метрики.
-    """
+    """Печатает метрику всех моделей по длинам истории на одном лиде."""
     labels = list(next(iter(history.values()))[lead])
     print(f"{'модель':>24} {'агрег.':>7} " + " ".join(f"{k:>22}" for k in labels))
     for name, by_lead_rows in history.items():
@@ -1194,12 +799,7 @@ def print_history_table(history, lead, metric="Skill"):
 
 
 def print_leads(res, tag=""):
-    """Печатает метрики всех моделей по лидам и по всему горизонту.
-
-    Args:
-        res: результат оценки набора со сводками по лидам и по всему горизонту.
-        tag: метка набора в заголовках.
-    """
+    """Печатает метрики всех моделей по лидам и по всему горизонту."""
     ci = any("ci" in s for s in res["overall"].values())
     for name, rows in res["leads"].items():
         print(f"\n=== {tag}{name} (полная история) ===")
@@ -1209,12 +809,7 @@ def print_leads(res, tag=""):
 
 
 def print_evaluation(res, bootstrap=BOOTSTRAP):
-    """Печатает все таблицы стенда на одном наборе окон.
-
-    Args:
-        res: результат оценки набора.
-        bootstrap: параметры бутстрапа, с которыми он посчитан.
-    """
+    """Печатает все таблицы стенда на одном наборе окон."""
     from mayak.calibration import (print_aci_replay, print_calibration_effect,
                                    print_coverage_report, print_sharpness)
     tag = "[внешний] " if res["external"] else ""
@@ -1247,20 +842,7 @@ def print_evaluation(res, bootstrap=BOOTSTRAP):
 
 def plot_history_curves(history, out_dir="runs/plots", set_name="internal",
                         leads=HISTORY_LEADS):
-    """Скилл всех моделей по длине истории на нескольких лидах.
-
-    Длины истории стоят на оси через равные промежутки. Полоса вокруг линии - интервал
-    бутстрапа по станциям для пуловой метрики, если он посчитан.
-
-    Args:
-        history: словарь из имени модели в словарь из лида в разрез по длине истории.
-        out_dir: каталог графика.
-        set_name: имя набора в имени файла.
-        leads: лиды, по панели на каждый.
-
-    Returns:
-        Путь к файлу.
-    """
+    """Скилл всех моделей по длине истории на нескольких лидах."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -1295,15 +877,7 @@ def plot_history_curves(history, out_dir="runs/plots", set_name="internal",
 
 
 def coldstart_L0_check(model, ds):
-    """Проверка холодного старта: при нулевой истории медиана равна полю модели.
-
-    Args:
-        model: модель МАЯК.
-        ds: окна с нулевой историей.
-
-    Returns:
-        Словарь чисел проверки.
-    """
+    """Проверка холодного старта: при нулевой истории медиана равна полю модели."""
     D = _gather_full(model, ds)
     o_abs = float(np.abs(D["o"]).mean() + np.abs(D["o_p"]).mean())
     e_mean = float(np.abs(D["e"]).mean())
@@ -1324,31 +898,7 @@ def coldstart_L0_check(model, ds):
 def evaluate_external(named, external_manifest, store, grid=HISTORY_GRID, r_damped=None,
                       shift=None, ci=True, bootstrap=BOOTSTRAP, checkpoints=(), conformal=None,
                       internal=None, transfer_level="group"):
-    """Внешний тест: станции реальной сети, только их тестовое окно.
-
-    Эталон скилла для всех моделей один: климатология каждой внешней станции по её
-    собственному обучающему окну, построенная при сборке кэша внешнего набора.
-
-    Args:
-        named: словарь из имени модели в модель; те же модели, что во внутренней оценке.
-        external_manifest: манифест внешнего набора.
-        store: основной набор, нужен чек-листу изоляции внешнего теста.
-        grid: длины истории, ч.
-        r_damped: коэффициенты затухающей персистентности; None значит без неё.
-        shift: конформная таблица основной модели; влияет только на раздел после
-            калибровки.
-        ci: считать интервалы бутстрапа по станциям.
-        bootstrap: параметры бутстрапа.
-        checkpoints: чекпойнты всех моделей, для чек-листа.
-        conformal: путь к конформной таблице, для чек-листа.
-        internal: предсказания и данные окон основного внутреннего набора (станции
-            unseen_test) при полной истории, для сопоставления внутреннего и внешнего
-            теста; None значит без сопоставления.
-        transfer_level: уровень зон в сопоставлении.
-
-    Returns:
-        Тройка: результат оценки внешнего набора, набор окон и таблицы сопоставления.
-    """
+    """Внешний тест: станции реальной сети, только их тестовое окно."""
     from mayak.data.store import get_store
     from mayak.external import nearest_train_km, print_transfer, transfer_table
     from mayak.leakage import check_external, run_checklist
@@ -1386,14 +936,7 @@ def evaluate_external(named, external_manifest, store, grid=HISTORY_GRID, r_damp
 
 
 def print_external_isolation(summary):
-    """Печатает календарный запас внешнего теста и число его станций по расстоянию.
-
-    Число станций печатается по всем бинам, даже если в таблице разреза бин скрыт
-    порогом по числу станций.
-
-    Args:
-        summary: сводка проверки изоляции внешнего теста.
-    """
+    """Печатает календарный запас внешнего теста и число его станций по расстоянию."""
     from mayak.external import NO_DATA, TRAIN_DISTANCE_ORDER
     cal = summary.get("calendar")
     if cal:
@@ -1406,16 +949,7 @@ def print_external_isolation(summary):
 
 
 def save_history_table(res, out_dir, set_name):
-    """Сводки всех моделей по длине истории в JSON рядом с графиком.
-
-    Args:
-        res: результат оценки набора.
-        out_dir: каталог.
-        set_name: имя набора в имени файла.
-
-    Returns:
-        Путь к файлу.
-    """
+    """Сводки всех моделей по длине истории в JSON рядом с графиком."""
     from mayak.results import save_json
     blob = dict(grid=list(res["bench"].grid), leads=list(HISTORY_LEADS),
                 models={n: {str(h): rows for h, rows in by_lead_rows.items()}
@@ -1424,31 +958,12 @@ def save_history_table(res, out_dir, set_name):
 
 
 def parse_grid(text):
-    """Сетка длин истории из строки вида «0,6,24,672».
-
-    Args:
-        text: длины через запятую.
-
-    Returns:
-        Кортеж длин по возрастанию.
-
-    Raises:
-        ValueError: в строке не числа или сетка негодна.
-    """
+    """Сетка длин истории из строки вида «0,6,24,672»."""
     return check_history_grid(int(v) for v in str(text).split(",") if v.strip())
 
 
 def print_parameter_counts(named, reference="МАЯК"):
-    """Печатает таблицу числа параметров нейросетевых моделей и их долю от эталона.
-
-    Args:
-        named: словарь из имени строки таблицы в модель.
-        reference: имя строки, относительно которой считается доля. Если такой строки
-            нет, доля не печатается.
-
-    Returns:
-        Словарь из имени строки в полное число параметров модели.
-    """
+    """Печатает таблицу числа параметров нейросетевых моделей и их долю от эталона."""
     from mayak.lit import parameter_counts
     counts = {name: parameter_counts(m)["total"] for name, m in named.items()}
     ref = counts.get(reference)
@@ -1522,7 +1037,7 @@ def main():
     grid = parse_grid(args.history_grid)
 
     from mayak.protocol import strict_fp32
-    strict_fp32()  # TF32 только при обучении; здесь строгий fp32, как на устройстве
+    strict_fp32()  # без TF32, как на устройстве
 
     from mayak.data.store import get_store
     from mayak.leakage import run_checklist

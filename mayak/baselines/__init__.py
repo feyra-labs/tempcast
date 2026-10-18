@@ -1,8 +1,4 @@
-"""Бейзлайны прогноза.
-
-Статистические эталоны: климатология, затухающая персистентность, сезонно-наивный
-прогноз. Обучаемые: GRU, DLinear, LRU, PatchTST; все обучаются по единому протоколу.
-"""
+"""Бейзлайны прогноза."""
 from mayak.baselines.lru import (LRUForecaster, lru_recurrent, lru_scan_associative,
                                  lru_scan_chunked)
 from mayak.baselines.neural import DLinear, GRUSeq2Seq, LeadHead, recurrent_inputs

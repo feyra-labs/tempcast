@@ -59,15 +59,7 @@ def _target_names(target):
 
 
 def defined_names(stmt):
-    """Имена, которые определяет или меняет инструкция верхнего уровня.
-
-    Args:
-        stmt: узел синтаксического дерева.
-
-    Returns:
-        Множество имён: имя функции или класса, цели присваивания. Для прочих
-        инструкций - пустое множество.
-    """
+    """Имена, которые определяет или меняет инструкция верхнего уровня."""
     if isinstance(stmt, _DEFINITIONS):
         return {stmt.name}
     if isinstance(stmt, ast.Assign):
@@ -78,20 +70,7 @@ def defined_names(stmt):
 
 
 def source_digest(source, names=None):
-    """Отпечаток исходного текста.
-
-    Args:
-        source: исходный текст файла на Python.
-        names: имена определений верхнего уровня, которые входят в отпечаток; None
-            означает весь файл. Порядок имён не важен, берётся порядок в файле.
-
-    Returns:
-        Строка из шестнадцатеричных цифр.
-
-    Raises:
-        ValueError: какого-то из имён нет среди определений верхнего уровня.
-        SyntaxError: текст не разбирается.
-    """
+    """Отпечаток исходного текста."""
     tree = _strip_docstrings(ast.parse(source))
     body = tree.body
     if names is not None:
@@ -105,18 +84,7 @@ def source_digest(source, names=None):
 
 
 def source_path(unit):
-    """Путь к файлу единицы кода.
-
-    Args:
-        unit: имя модуля через точку или путь к файлу с расширением py, абсолютный
-            либо от корня репозитория.
-
-    Returns:
-        Абсолютный путь к файлу.
-
-    Raises:
-        ModuleNotFoundError: модуль не найден или у него нет исходного файла.
-    """
+    """Путь к файлу единицы кода."""
     if unit.endswith(".py"):
         return unit if os.path.isabs(unit) else os.path.join(REPO_ROOT, unit)
     spec = importlib.util.find_spec(unit)
@@ -126,28 +94,13 @@ def source_path(unit):
 
 
 def read_unit(unit):
-    """Исходный текст единицы кода.
-
-    Args:
-        unit: имя модуля через точку или путь к файлу.
-
-    Returns:
-        Текст файла.
-    """
+    """Исходный текст единицы кода."""
     with open(source_path(unit), encoding="utf-8") as f:
         return f.read()
 
 
 def unit_digest(unit, names=None):
-    """Отпечаток одной единицы кода.
-
-    Args:
-        unit: имя модуля через точку или путь к файлу.
-        names: имена определений верхнего уровня; None означает весь файл.
-
-    Returns:
-        Строка из шестнадцатеричных цифр.
-    """
+    """Отпечаток одной единицы кода."""
     text = read_unit(unit)
     key = (hashlib.sha256(text.encode("utf-8")).hexdigest(),
            None if names is None else tuple(sorted(names)))
@@ -157,26 +110,12 @@ def unit_digest(unit, names=None):
 
 
 def code_digests(spec):
-    """Отпечатки набора единиц кода.
-
-    Args:
-        spec: словарь: единица кода и кортеж имён определений, None означает весь файл.
-
-    Returns:
-        Словарь: единица кода и её отпечаток, по алфавиту единиц.
-    """
+    """Отпечатки набора единиц кода."""
     return {unit: unit_digest(unit, spec[unit]) for unit in sorted(spec)}
 
 
 def combined_digest(digests):
-    """Один отпечаток на весь набор.
-
-    Args:
-        digests: словарь отпечатков по единицам кода.
-
-    Returns:
-        Строка из шестнадцатеричных цифр.
-    """
+    """Один отпечаток на весь набор."""
     return _digest(sorted(digests.items()))
 
 

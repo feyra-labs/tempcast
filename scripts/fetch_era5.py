@@ -1,17 +1,4 @@
-"""Скачивание почасовых рядов ERA5 для обучающих точек из архивного API Open-Meteo.
-
-Каждая точка сохраняется в отдельный файл вместе с подписью запроса. Готовые
-файлы при повторном запуске не запрашиваются. Запросы идут по очереди, пачками по
-нескольку точек, с паузой между ними. Временные сбои повторяются с растущей
-паузой. Если запрос так и не прошёл, скрипт останавливается, и его запускают ещё
-раз позже.
-
-Бесплатный API Open-Meteo ограничивает взвешенные вызовы в минуту, час и сутки; вес
-запроса растёт с числом точек, дней и переменных. Пауза между запросами выбирается так,
-чтобы держаться в доле ``--quota-share`` минутного и часового лимитов. Ответ «лимит
-исчерпан» на минуту или час пережидается; на сутки - скрипт сразу останавливается, его
-запускают на следующий день.
-"""
+"""Скачивание почасовых рядов ERA5 для обучающих точек из архивного API Open-Meteo."""
 import argparse
 import csv
 import hashlib
@@ -49,32 +36,13 @@ class QuotaExhausted(ConnectionError):
 
 
 def request_weight(n_points, signature):
-    """Вес запроса в вызовах API по правилу Open-Meteo.
-
-    Вес - число точек, умноженное на число дней, делённое на 14 (не меньше 14 дней), и на
-    число переменных, делённое на 10.
-
-    Args:
-        n_points: точек в запросе.
-        signature: подпись запроса: период и переменные.
-
-    Returns:
-        Вес запроса, вызовов.
-    """
+    """Вес запроса в вызовах API по правилу Open-Meteo."""
     days = (parse_date(signature["end_date"]) - parse_date(signature["start_date"])).days + 1
     return n_points * max(days, 14) / 14.0 * len(signature["variables"]) / 10.0
 
 
 def throttle_pause(weight, share=QUOTA_SHARE):
-    """Пауза перед запросом, при которой поток держится в доле минутного и часового лимитов.
-
-    Args:
-        weight: вес запроса, вызовов.
-        share: доля лимитов; 0 - без паузы по лимитам.
-
-    Returns:
-        Пауза, с.
-    """
+    """Пауза перед запросом, при которой поток держится в доле минутного и часового лимитов."""
     if share <= 0:
         return 0.0
     return max(60.0 * weight / (share * QUOTA_LIMITS["minute"]),
@@ -82,14 +50,7 @@ def throttle_pause(weight, share=QUOTA_SHARE):
 
 
 def quota_kind(body):
-    """Какой лимит API исчерпан, по тексту ответа 429.
-
-    Args:
-        body: тело ответа.
-
-    Returns:
-        ``day``, ``hour``, ``minute`` или None, если лимит не назван.
-    """
+    """Какой лимит API исчерпан, по тексту ответа 429."""
     text = body.lower()
     for word, kind in (("daily", "day"), ("hourly", "hour"), ("minutely", "minute")):
         if word in text:
@@ -98,15 +59,7 @@ def quota_kind(body):
 
 
 def quota_wait(kind, now=None):
-    """Сколько ждать после ответа «лимит исчерпан» на минуту или час.
-
-    Args:
-        kind: ``minute`` или ``hour``.
-        now: текущее время, секунды от эпохи; None - часы системы.
-
-    Returns:
-        Пауза, с: минута с запасом или до начала следующего часа плюс минута.
-    """
+    """Сколько ждать после ответа «лимит исчерпан» на минуту или час."""
     if kind == "minute":
         return MINUTE_WAIT
     now = time.time() if now is None else float(now)
@@ -115,29 +68,7 @@ def quota_wait(kind, now=None):
 
 def fetch_batch(points, signature, base_url=ARCHIVE_URL, retries=5, backoff=30.0,
                 timeout=180.0):
-    """Один запрос к API по пачке точек с повторами при временных сбоях.
-
-    Повторяются сетевые ошибки, таймауты и ответы HTTP 429 и 5xx. Пауза перед
-    первым повтором равна backoff и каждый раз удваивается. Ответ 429 с исчерпанным
-    минутным или часовым лимитом пережидается до его сброса, не больше ``QUOTA_WAITS``
-    раз и без учёта в числе повторов; с исчерпанным суточным - запрос сразу прекращается.
-
-    Args:
-        points: список словарей с полями id, lat, lon.
-        signature: подпись запроса.
-        base_url: адрес эндпоинта архива.
-        retries: число повторов после первой попытки.
-        backoff: пауза перед первым повтором, с.
-        timeout: таймаут одного запроса, с.
-
-    Returns:
-        Список ответов API по точкам в порядке пачки, уже проверенных разбором.
-
-    Raises:
-        ApiError: запрос отвергнут окончательно или ответ не разбирается.
-        QuotaExhausted: суточный лимит API исчерпан.
-        ConnectionError: запрос не прошёл за все попытки.
-    """
+    """Один запрос к API по пачке точек с повторами при временных сбоях."""
     query = urllib.parse.urlencode(request_params([p["lat"] for p in points],
                                                   [p["lon"] for p in points], signature))
     req = urllib.request.Request(f"{base_url}?{query}")
@@ -177,20 +108,7 @@ def fetch_batch(points, signature, base_url=ARCHIVE_URL, retries=5, backoff=30.0
 
 
 def classify(points, raw_dir, signature, refetch=False):
-    """Какие точки уже скачаны с теми же параметрами, а какие надо качать.
-
-    Args:
-        points: список точек.
-        raw_dir: каталог скачанных точек.
-        signature: подпись текущего запроса.
-        refetch: перекачивать файлы с другими параметрами вместо ошибки.
-
-    Returns:
-        Кортеж из списка готовых точек и списка точек к скачиванию.
-
-    Raises:
-        ValueError: есть файлы, скачанные с другими параметрами, а refetch не задан.
-    """
+    """Какие точки уже скачаны с теми же параметрами, а какие надо качать."""
     done, todo, clash = [], [], []
     for p in points:
         path = raw_path(raw_dir, p["id"])
@@ -222,27 +140,7 @@ def _now_iso():
 def fetch_all(points, raw_dir, signature, batch=2, pause=1.0, base_url=ARCHIVE_URL, retries=5,
               backoff=30.0, timeout=180.0, refetch=False, log_path=None,
               quota_share=QUOTA_SHARE):
-    """Скачать все недостающие точки.
-
-    Args:
-        points: список словарей с полями id, lat, lon.
-        raw_dir: каталог скачанных точек.
-        signature: подпись запроса.
-        batch: число точек в запросе.
-        pause: наименьшая пауза между запросами, с.
-        base_url: адрес эндпоинта архива.
-        retries: число повторов при временном сбое.
-        backoff: пауза перед первым повтором, с.
-        timeout: таймаут запроса, с.
-        refetch: перекачивать файлы, скачанные с другими параметрами.
-        log_path: журнал запросов в формате CSV; None отключает журнал.
-        quota_share: доля минутного и часового лимитов API, в которой держится поток
-            запросов; 0 - без паузы по лимитам.
-
-    Returns:
-        Словарь счётчиков cached, done, failed, pending и stopped с причиной
-        остановки или пустой строкой.
-    """
+    """Скачать все недостающие точки."""
     cached, todo = classify(points, raw_dir, signature, refetch)
     counts = dict(cached=len(cached), done=0, failed=0, pending=0, stopped="")
     size = max(1, int(batch))
@@ -291,17 +189,7 @@ def fetch_all(points, raw_dir, signature, batch=2, pause=1.0, base_url=ARCHIVE_U
 
 
 def read_points(path):
-    """Таблица обучающих точек.
-
-    Args:
-        path: путь к CSV с колонками id, lat, lon, koppen.
-
-    Returns:
-        Список словарей в порядке файла.
-
-    Raises:
-        ValueError: нет нужных колонок или повторяются id.
-    """
+    """Таблица обучающих точек."""
     with open(path, newline="", encoding="utf-8") as f:
         rows = list(csv.DictReader(f))
     need = {"id", "lat", "lon"}
@@ -319,17 +207,7 @@ def _sha256(path):
 
 
 def write_meta(path, signature, base_url, points_path, n_points, counts, previous=None):
-    """Запись параметров скачивания рядом с данными.
-
-    Args:
-        path: путь к файлу параметров.
-        signature: подпись запроса.
-        base_url: адрес эндпоинта архива.
-        points_path: путь к таблице точек.
-        n_points: число точек в таблице.
-        counts: счётчики скачивания.
-        previous: прежнее содержимое файла, из него сохраняется дата первого скачивания.
-    """
+    """Запись параметров скачивания рядом с данными."""
     now = _now_iso()
     info = git_info()
     meta = dict(

@@ -1,15 +1,4 @@
-r"""Экспорт модели для устройства: графы прогноза и климатологии, манифест.
-
-    python scripts/export_runtime.py --ckpt runs/mayak/stageB/best.ckpt \
-        --conformal runs/conformal.npy --aci --out runtime/model
-
-Каталог --out целиком - то, что копируется на устройство:
-``python -m mayak.runtime.run_inference --model runtime/model ...``. Архитектура берётся
-из конфига в чекпойнте; манифест хранит конфиг, размеры, пределы QC, формат состояния,
-параметры калибровки и пороги смены координат прибора. Конформная таблица должна быть
-подогнана по тому же чекпойнту. Каждый граф при экспорте сверяется с PyTorch на окне
-оценки синтетического ряда.
-"""
+r"""Экспорт модели для устройства: графы прогноза и климатологии, манифест."""
 import argparse
 
 
@@ -29,7 +18,7 @@ def main():
     args = ap.parse_args()
 
     from mayak.protocol import strict_fp32
-    strict_fp32()  # TF32 только при обучении; здесь строгий fp32, как на устройстве
+    strict_fp32()  # без TF32, как на устройстве
 
     from mayak.export import export_graphs
     from mayak.lit import load_model

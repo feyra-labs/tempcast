@@ -1,8 +1,4 @@
-"""Происхождение прогона: хеш коммита и версии ключевых библиотек.
-
-Пишется в запись о прогоне каждого чекпойнта. Сбой git (нет репозитория,
-нет git в PATH) не роняет обучение: поле становится None, и это видно в записи.
-"""
+"""Происхождение прогона: хеш коммита и версии ключевых библиотек."""
 from __future__ import annotations
 
 import os
@@ -27,12 +23,7 @@ def _git(*args, cwd=REPO_ROOT):
 
 @lru_cache(maxsize=1)
 def git_info():
-    """Коммит рабочей копии и признак незакоммиченных изменений.
-
-    Returns:
-        Словарь с ключами ``commit`` и ``dirty``. ``dirty`` истинно, если отслеживаемые
-        файлы изменены после коммита. Без git оба значения None.
-    """
+    """Коммит рабочей копии и признак незакоммиченных изменений."""
     commit = _git("rev-parse", "HEAD")
     if commit is None:
         return dict(commit=None, dirty=None)
@@ -55,12 +46,7 @@ def library_versions():
 
 
 def provenance():
-    """Запись о происхождении прогона.
-
-    Returns:
-        Словарь: сведения git, версии Python и ключевых библиотек, момент создания
-        записи в UTC.
-    """
+    """Запись о происхождении прогона."""
     return dict(git=dict(git_info()), versions=dict(library_versions()),
                 created_utc=datetime.now(timezone.utc).isoformat(timespec="seconds"))
 

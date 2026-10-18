@@ -99,10 +99,7 @@ def test_target_untouched_except_station_offset(name):
 
 
 def test_offset_shifts_history_and_target_consistently():
-    """Смещение станции одинаково на истории и цели в один и тот же солнечный час.
-
-    Долгота у истории и цели одна, поэтому один солнечный час - один час UTC.
-    """
+    """Смещение станции одинаково на истории и цели в один и тот же солнечный час."""
     cfg = dataclasses.replace(_only("offset"), offset_diurnal_frac=1.0)
     tol = A.DITHER_FRAC * 0.5 / np.array([1.0, 10.0, 1.0]) + 1e-4
     for seed in range(10):
@@ -240,11 +237,7 @@ MIN_HIT = {"stuck": 0.7, "dropout": 1.0, "gap": 1.0, "drop_channel": 1.0}
 
 
 def _detectable(name, params, w):
-    """Распознаёт ли причинный QC искажение по прошлому.
-
-    Залипание одного канала видно только после срока залипания этого канала;
-    более короткое устройство не отличит от нормы.
-    """
+    """Распознаёт ли причинный QC искажение по прошлому."""
     from mayak.data.qc import DEFAULT_QC as C
     if name != "stuck":
         return True
@@ -378,10 +371,7 @@ def test_dither_then_record_returns_the_same_record():
 
 
 def test_small_offset_shifts_the_record_like_a_real_sensor():
-    """Смещение на 0.3 градуса у настоящего датчика переворачивает запись примерно в 30 % часов.
-
-    Без непрерывности перед искажением запись не менялась бы вовсе.
-    """
+    """Смещение на 0.3 градуса у настоящего датчика переворачивает запись примерно в 30 % часов."""
     diffs, flat = [], []
     for seed in range(10):
         w0 = _recorded_window(seed)

@@ -1,14 +1,4 @@
-"""Графы экспорта на устройстве: имена и входы графов, исполнитель ONNX Runtime, манифест.
-
-Экспорт пишет в каталог два графа без состояния и манифест:
-
-* ``forecast``    - проход модели по окну истории, на выходе квантили до калибровки;
-* ``climatology`` - таблица климатологии точки для отката на каждый час високосного
-  года, считается один раз при старте устройства.
-
-Здесь графы только исполняются: модуль зависит от numpy и onnxruntime и не загружает
-torch. Построение графов и их исполнение в PyTorch - в ``mayak.export``.
-"""
+"""Графы экспорта на устройстве: имена и входы графов, исполнитель ONNX Runtime, манифест."""
 from __future__ import annotations
 
 import json
@@ -27,11 +17,7 @@ GRAPH_IO = {
 
 
 def calibration_bins():
-    """Бины лидов и длины истории калибровки в том виде, в каком они пишутся в манифест.
-
-    Returns:
-        Пара списков пар границ включительно: бины лидов и бины длины истории.
-    """
+    """Бины лидов и длины истории калибровки в том виде, в каком они пишутся в манифест."""
     from mayak.constants import HISTORY_BINS
     from mayak.metrics import LEAD_BINS
     return ([[int(a), int(b)] for a, b in LEAD_BINS],
@@ -39,12 +25,7 @@ def calibration_bins():
 
 
 class OnnxBackend:
-    """Исполнитель графов экспорта на ONNX Runtime.
-
-    Args:
-        model_dir: каталог экспорта с графами и манифестом.
-        threads: число потоков внутри операции.
-    """
+    """Исполнитель графов экспорта на ONNX Runtime."""
 
     def __init__(self, model_dir, threads=1):
         import onnxruntime as ort
@@ -66,24 +47,7 @@ class OnnxBackend:
 
 
 def manifest_conformal(manifest, model_dir):
-    """Конформная таблица экспорта по бинам лидов и длины истории.
-
-    В экспорте таблица лежит развёрнутой по лидам для каждого бина длины истории; здесь
-    она сворачивается обратно в бины, чтобы поправку применяла та же функция, что и
-    везде в проекте.
-
-    Args:
-        manifest: манифест экспорта.
-        model_dir: каталог экспорта.
-
-    Returns:
-        Таблица float32 формы (число бинов лидов, число бинов длины истории, число
-        квантилей) или None, если в экспорте таблицы нет.
-
-    Raises:
-        ValueError: бины манифеста не совпадают с бинами кода; таблица не того размера,
-            сдвигает медиану или меняется внутри бина лидов.
-    """
+    """Конформная таблица экспорта по бинам лидов и длины истории."""
     from mayak.metrics import I_MED, LEAD_BINS, conformal_table
     cal = manifest["calibration"]
     check_manifest_bins(manifest)
@@ -108,14 +72,7 @@ def manifest_conformal(manifest, model_dir):
 
 
 def check_manifest_bins(manifest):
-    """Проверяет, что бины калибровки в манифесте совпадают с бинами кода.
-
-    Args:
-        manifest: манифест экспорта.
-
-    Raises:
-        ValueError: бины лидов или длины истории другие.
-    """
+    """Проверяет, что бины калибровки в манифесте совпадают с бинами кода."""
     lead_bins, history_bins = calibration_bins()
     cal = manifest["calibration"]
     if cal.get("lead_bins") != lead_bins or cal.get("history_bins") != history_bins:
@@ -125,27 +82,7 @@ def check_manifest_bins(manifest):
 
 
 def runtime_from_export(model_dir, lat, lon, elev, threads=1, conformal=True, aci=False):
-    """Устройство на графах экспорта.
-
-    Пороги смены точки берутся из манифеста.
-
-    Args:
-        model_dir: каталог экспорта с графами и манифестом.
-        lat: широта точки.
-        lon: долгота точки.
-        elev: высота точки, м.
-        threads: число потоков исполнителя графов.
-        conformal: применять конформную таблицу экспорта.
-        aci: подстраивать множитель калибровки с параметрами из манифеста.
-
-    Returns:
-        Устройство на графах ONNX.
-
-    Raises:
-        ValueError: манифест другого формата или калибровка включена, а её параметров в
-            манифесте нет.
-        RuntimeError: граф климатологии не дал годной таблицы.
-    """
+    """Устройство на графах экспорта."""
     from mayak.config import ModelConfig, RuntimeConfig
     from mayak.metrics import ACIParams
     backend = OnnxBackend(model_dir, threads)

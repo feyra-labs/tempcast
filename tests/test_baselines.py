@@ -82,11 +82,7 @@ def test_lru_scans_match_naive_recurrence(L, chunk):
 
 
 def test_lru_scan_matches_recurrence_in_float32_on_full_window():
-    """То же во float32 на 672 ч: расхождение — ошибка округления, а не метода.
-
-    Слой развёртывает рекуррентность блоками; эталон — простой цикл по часам на тех же
-    собственных числах и том же входе.
-    """
+    """То же во float32 на 672 ч: расхождение — ошибка округления, а не метода."""
     torch.manual_seed(0)
     lay = LRULayer(16, 32, 0.7, 0.999, 0.5)
     x = torch.randn(3, L_MAX, 16)
@@ -100,12 +96,7 @@ def test_lru_scan_matches_recurrence_in_float32_on_full_window():
 
 
 def test_lru_modulus_inside_unit_disk_for_any_parameters():
-    """Экспоненциальная параметризация держит модуль собственного числа строго меньше единицы.
-
-    Это верно при любых сырых параметрах, пока модуль различим в float64. В float32 он
-    округляется к единице уже при сырых параметрах около минус семнадцати, поэтому
-    проверка идёт в float64.
-    """
+    """Экспоненциальная параметризация держит модуль собственного числа строго меньше единицы."""
     lay = LRULayer(4, 64, 0.5, 0.99, 1.0).double()
     with torch.no_grad():
         lay.nu_log.copy_(torch.linspace(-30, 5, 64, dtype=torch.float64))
@@ -117,11 +108,7 @@ def test_lru_modulus_inside_unit_disk_for_any_parameters():
 
 @pytest.mark.parametrize("modulus", [0.5, 0.9, 0.995])
 def test_lru_input_normalization_keeps_state_variance(modulus):
-    """Нормировка входа сохраняет энергию состояния.
-
-    При белом шуме на входе средняя энергия состояния примерно равна энергии входа
-    независимо от модуля собственного числа.
-    """
+    """Нормировка входа сохраняет энергию состояния."""
     torch.manual_seed(0)
     lay = LRULayer(1, 1, 0.5, 0.6, 1.0).double()
     with torch.no_grad():
@@ -143,13 +130,7 @@ NO_DECAY_PARAMS = ("bias", "gaps", "log_sig", "W_pos", "prior_m", "prior_s", "w_
 
 
 def test_weight_decay_only_on_layer_weights():
-    """Общее правило весового затухания у всех архитектур.
-
-    Затухание получают только веса слоёв Linear, Conv1d и GRU и отличия, объявленные
-    архитектурой: матрицы климат-поля МАЯК, кроме FiLM, - с затуханием поля, матрицы C
-    ядра LRU - с базовым. Смещения, нормы, скалярные и векторные параметры - без
-    затухания.
-    """
+    """Общее правило весового затухания у всех архитектур."""
     from mayak.lit import build_model, optim_groups
     from mayak.protocol import ARCH_NAMES
     wd = 0.01
@@ -221,11 +202,7 @@ def test_masked_revin_statistics():
 
 
 def test_patchtst_is_shift_and_scale_equivariant():
-    """Нормировка окна делает прогноз согласованным со сдвигом и положительным растяжением ряда.
-
-    Растяжение и сдвиг входа растягивают и сдвигают квантили так же, с точностью до
-    добавки к разбросу окна.
-    """
+    """Нормировка окна делает прогноз согласованным со сдвигом и положительным растяжением ряда."""
     m = _trained_like(_model("patchtst"))
     b = _batch(B=2, p_valid=1.0)
     a, s = 2.5, -7.0
@@ -362,11 +339,7 @@ def test_dlinear_reads_only_last_hours_of_history():
 
 
 def test_dlinear_fills_gaps_with_window_mean():
-    """Пропуски входного окна DLinear - среднее валидных часов окна, а не 0 °C.
-
-    Значение под нулевой маской на прогноз не влияет, даже нечисловое; часы до окна
-    в среднее не входят; окно без валидных часов заполняется нулём.
-    """
+    """Пропуски входного окна DLinear - среднее валидных часов окна, а не 0 °C."""
     m = _model("dlinear")
     n = m.input_len
     b = _batch(B=3, p_valid=0.7)
@@ -460,11 +433,7 @@ def test_damped_persistence_formula():
 
 
 def test_damped_coefficients_recover_known_decay():
-    """Метод наименьших квадратов без свободного члена восстанавливает коэффициент затухания лида.
-
-    Коэффициент восстанавливается точно, если будущая аномалия ровно пропорциональна
-    средней; результат обрезается в отрезок от нуля до единицы.
-    """
+    """МНК без свободного члена восстанавливает коэффициент затухания."""
     rng = np.random.default_rng(0)
     r_true = np.exp(-np.arange(1, H + 1) / 30.0)
     Sxx, Sxy = np.zeros(H), np.zeros(H)

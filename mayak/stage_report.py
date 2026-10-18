@@ -1,28 +1,4 @@
-"""Отчёт о поле после этапа холодного старта.
-
-Отчёт считается для лучшего по метрике выбора чекпойнта этапа на наборе валидации этапа:
-валидационные станции, валидационное окно, нулевая история. Это тот же набор, по
-которому выбирался чекпойнт. Считаются:
-
-* отношение MSE медианы модели к MSE эмпирической климатологии станции по всем парам
-  «окно и лид», его интервал блочного бутстрапа по станциям и то же отношение в среднем
-  по станциям;
-* покрытие 90- и 80-процентного интервалов, средняя ширина 90-процентного интервала,
-  средняя абсолютная ошибка и CRPS;
-* скилл, покрытие и ошибка по лидам;
-* станции с худшим отношением;
-* разрыв обобщения поля: отношение MSE медианы на валидационных станциях к MSE медианы на
-  обучающих станциях в том же валидационном окне при той же нулевой истории, с интервалом
-  бутстрапа по станциям.
-
-Вместе с числами отчёт записывает ограничители запоминания координат из конфига модели
-(``loc_freq_scale``, ``loc_freq_max`` и ``field_weight_decay``), если они у архитектуры есть. Отчёт
-информационный: автоматических порогов в нём нет, на ход обучения он не влияет.
-
-Числа считаются по сырым выходам моделей и нужны только медиана и квантили, поэтому
-отчёт одинаков для всех архитектур. Графики строятся по тем же числам: кривые обучения
-с отметкой лучшего чекпойнта, метрики по лидам и примеры прогнозов.
-"""
+"""Отчёт о поле после этапа холодного старта."""
 from __future__ import annotations
 
 import json
@@ -52,14 +28,7 @@ LIMIT_FIELDS = ("loc_freq_scale", "loc_freq_max", "field_weight_decay")
 
 
 def report_device(accelerator):
-    """Устройство для прогона моделей в отчёте.
-
-    Args:
-        accelerator: ускоритель обучения.
-
-    Returns:
-        Строка cuda, если обучение шло на видеокарте и она доступна, иначе cpu.
-    """
+    """Устройство для прогона моделей в отчёте."""
     import torch
     if str(accelerator) in ("gpu", "cuda", "auto") and torch.cuda.is_available():
         return "cuda"
@@ -67,14 +36,7 @@ def report_device(accelerator):
 
 
 def describe_checkpoint(path):
-    """Короткая запись о чекпойнте: путь, отпечаток, шаг и метрика выбора.
-
-    Args:
-        path: путь к чекпойнту.
-
-    Returns:
-        Словарь с полями ckpt, digest, step, val_loss и stage.
-    """
+    """Короткая запись о чекпойнте: путь, отпечаток, шаг и метрика выбора."""
     import torch
 
     from mayak.leakage import SELECTION_KEY, file_digest
@@ -86,18 +48,7 @@ def describe_checkpoint(path):
 
 
 def collect_outputs(model, dataset, device="cpu", batch_size=256):
-    """Медиана и квантили модели на наборе окон.
-
-    Args:
-        model: модель.
-        dataset: набор окон.
-        device: устройство.
-        batch_size: размер батча.
-
-    Returns:
-        Пара: медиана формы (N, H) и квантили формы (N, H, 7); данные окон: цель, маска
-        цели, климатология на горизонте, станция и час начала горизонта каждого окна.
-    """
+    """Медиана и квантили модели на наборе окон."""
     import torch
     from torch.utils.data import DataLoader
     model.eval().to(device)
@@ -119,19 +70,7 @@ def collect_outputs(model, dataset, device="cpu", batch_size=256):
 
 
 def field_metrics(pred, aux, seed=0, n_boot=N_BOOT, leads=REPORT_LEADS, n_worst=N_WORST):
-    """Числа отчёта о поле для одной модели.
-
-    Args:
-        pred: медиана и квантили модели.
-        aux: цель, маска цели, климатология и станции тех же окон.
-        seed: сид бутстрапа.
-        n_boot: число выборок бутстрапа.
-        leads: лиды таблицы по лидам, ч.
-        n_worst: сколько станций с худшим отношением показать.
-
-    Returns:
-        Словарь чисел; нечисла записаны как None.
-    """
+    """Числа отчёта о поле для одной модели."""
     from mayak.metrics import EPS, Evaluation, metric_table, quantile_ci, wmean
     y = np.asarray(aux["y"], np.float64)
     w = np.asarray(aux["y_mask"], np.float64)
@@ -173,26 +112,7 @@ def _evaluation(pred, aux):
 
 
 def memorization_gap(val_pred, val_aux, train_pred, train_aux, seed=0, n_boot=N_BOOT):
-    """Разрыв обобщения поля для одной модели.
-
-    Отношение пуловой MSE медианы на окнах валидационных станций к пуловой MSE медианы на
-    окнах обучающих станций. Интервал - блочный бутстрап по станциям: станции каждой роли
-    перевыбираются независимо, в каждой выборке берётся отношение пуловых MSE.
-
-    Args:
-        val_pred: медиана и квантили модели на окнах валидационных станций.
-        val_aux: данные тех же окон.
-        train_pred: медиана и квантили модели на окнах обучающих станций или None, если
-            таких окон нет.
-        train_aux: данные окон обучающих станций или None.
-        seed: сид бутстрапа.
-        n_boot: число выборок бутстрапа.
-
-    Returns:
-        Словарь: отношение gap_ratio, его интервал gap_ratio_ci, MSE медианы на обучающих
-        станциях gap_mse_train и число обучающих станций с валидными парами
-        gap_stations_train; нечисла записаны как None.
-    """
+    """Разрыв обобщения поля для одной модели."""
     from mayak.metrics import EPS, quantile_ci
     nan = float("nan")
     ev_val = _evaluation(val_pred, val_aux)
@@ -217,14 +137,7 @@ def memorization_gap(val_pred, val_aux, train_pred, train_aux, seed=0, n_boot=N_
 
 
 def memorization_limits(model):
-    """Ограничители запоминания координат из конфига модели.
-
-    Args:
-        model: модель.
-
-    Returns:
-        Словарь значений полей ``LIMIT_FIELDS`` или None, если в конфиге модели их нет.
-    """
+    """Ограничители запоминания координат из конфига модели."""
     cfg = getattr(model, "cfg", None)
     if cfg is None or not all(hasattr(cfg, k) for k in LIMIT_FIELDS):
         return None
@@ -238,15 +151,7 @@ def _set_record(dataset):
 
 
 def check_gap_set(dataset, train_dataset):
-    """Проверяет, что набор обучающих станций сопоставим с набором валидации.
-
-    Args:
-        dataset: набор валидации этапа.
-        train_dataset: набор окон обучающих станций.
-
-    Raises:
-        ValueError: временное окно или правило длины истории различаются.
-    """
+    """Проверяет, что набор обучающих станций сопоставим с набором валидации."""
     a, b = _set_record(dataset), _set_record(train_dataset)
     diff = [k for k in ("time_key", "history") if a[k] != b[k]]
     if diff:
@@ -256,15 +161,7 @@ def check_gap_set(dataset, train_dataset):
 
 
 def skill_at(entry, lead):
-    """Скилл записи отчёта на лиде.
-
-    Args:
-        entry: запись отчёта о чекпойнте.
-        lead: лид, ч.
-
-    Returns:
-        Скилл или None, если лида нет в таблице.
-    """
+    """Скилл записи отчёта на лиде."""
     for row in (entry or {}).get("by_lead", []):
         if row.get("lead") == lead:
             return row.get("Skill")
@@ -272,17 +169,7 @@ def skill_at(entry, lead):
 
 
 def pick_examples(pred, aux, n=N_EXAMPLES, seed=0):
-    """Окна для примеров прогнозов.
-
-    Args:
-        pred: медиана и квантили модели.
-        aux: данные окон.
-        n: число окон.
-        seed: сид выбора окон.
-
-    Returns:
-        Словарь массивов выбранных окон или None, если окон с валидной целью нет.
-    """
+    """Окна для примеров прогнозов."""
     w = aux["y_mask"]
     ok = np.flatnonzero((w > 0).any(1))
     if n <= 0 or ok.size == 0:
@@ -297,28 +184,7 @@ def pick_examples(pred, aux, n=N_EXAMPLES, seed=0):
 
 def build_field_report(best, dataset, arch, stage, train_dataset, device="cpu", seed=0,
                        n_boot=N_BOOT, n_examples=N_EXAMPLES):
-    """Отчёт о поле для лучшего чекпойнта этапа.
-
-    Разрыв обобщения считается по набору валидации и набору окон обучающих станций в том
-    же временном окне.
-
-    Args:
-        best: запись о лучшем чекпойнте этапа (``describe_checkpoint``).
-        dataset: набор валидации этапа.
-        arch: архитектура.
-        stage: имя этапа.
-        train_dataset: набор окон обучающих станций по правилу набора валидации.
-        device: устройство.
-        seed: сид бутстрапа и выбора примеров.
-        n_boot: число выборок бутстрапа.
-        n_examples: число окон с примерами прогнозов.
-
-    Returns:
-        Пара: отчёт, пригодный для записи в JSON, и массивы примеров для графиков.
-
-    Raises:
-        ValueError: набор обучающих станций не сопоставим с набором валидации.
-    """
+    """Отчёт о поле для лучшего чекпойнта этапа."""
     from mayak.lit import load_model
     check_gap_set(dataset, train_dataset)
     model = load_model(best["ckpt"])
@@ -335,12 +201,7 @@ def build_field_report(best, dataset, arch, stage, train_dataset, device="cpu", 
 
 
 def write_report(path, report):
-    """Записать отчёт в JSON атомарно.
-
-    Args:
-        path: путь к файлу.
-        report: отчёт.
-    """
+    """Записать отчёт в JSON атомарно."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -349,14 +210,7 @@ def write_report(path, report):
 
 
 def summary(entry):
-    """Короткая сводка записи отчёта для журнала.
-
-    Args:
-        entry: запись отчёта о чекпойнте или None.
-
-    Returns:
-        Словарь основных чисел или None.
-    """
+    """Короткая сводка записи отчёта для журнала."""
     if entry is None:
         return None
     out = {k: entry.get(k) for k in ("step", "mse_ratio", "mse_ratio_ci", "mse_ratio_macro",
@@ -375,14 +229,7 @@ def _pct(v):
 
 
 def format_field_report(report):
-    """Таблица отчёта о поле для консоли.
-
-    Args:
-        report: отчёт.
-
-    Returns:
-        Список строк.
-    """
+    """Таблица отчёта о поле для консоли."""
     e = report.get("best") or {}
     vs = report.get("val_set") or {}
     lines = [f"Отчёт этапа {report.get('stage')} ({report.get('arch')}): лучший по val/loss "
@@ -505,17 +352,7 @@ def _plot_examples(plt, report, examples, out_dir, title):
 
 
 def plot_field_report(report, examples=None, metrics_csv=None, out_dir="."):
-    """Графики отчёта о поле.
-
-    Args:
-        report: отчёт.
-        examples: массивы примеров прогнозов или None.
-        metrics_csv: журнал метрик обучения этапа или None.
-        out_dir: каталог для картинок.
-
-    Returns:
-        Список путей к картинкам.
-    """
+    """Графики отчёта о поле."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -532,25 +369,7 @@ def plot_field_report(report, examples=None, metrics_csv=None, out_dir="."):
 
 def write_stage_report(stage_dir, stage, arch, best, dataset, train_dataset, device="cpu",
                        seed=0, metrics_csv=None, n_examples=N_EXAMPLES):
-    """Считает отчёт о поле для лучшего чекпойнта этапа, пишет его и строит графики.
-
-    Сбой графиков не отменяет отчёт: он пишется в журнал и в поле plots_error.
-
-    Args:
-        stage_dir: каталог этапа.
-        stage: имя этапа.
-        arch: архитектура.
-        best: запись о лучшем чекпойнте (``describe_checkpoint``).
-        dataset: набор валидации этапа.
-        train_dataset: набор окон обучающих станций по правилу набора валидации.
-        device: устройство.
-        seed: сид бутстрапа и примеров.
-        metrics_csv: журнал метрик обучения этапа или None.
-        n_examples: число окон с примерами прогнозов.
-
-    Returns:
-        Тройка: отчёт, путь к нему и пути к картинкам.
-    """
+    """Считает отчёт о поле для лучшего чекпойнта этапа, пишет его и строит графики."""
     report, examples = build_field_report(best, dataset, arch=arch, stage=stage,
                                           train_dataset=train_dataset, device=device,
                                           seed=seed, n_examples=n_examples)
