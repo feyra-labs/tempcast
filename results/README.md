@@ -16,7 +16,7 @@
 | набор данных (`data/fetch_meta.json`, ключ кэша) | — |
 | чекпойнт МАЯК | `runs/mayak/stageB/best.ckpt`, отпечаток `c0e7824d79311cc2` |
 | чекпойнты бейзлайнов | `runs/{gru,dlinear,lru,patchtst}/stageB/best.ckpt` |
-| чекпойнты абляций (`runs/mayak-<абляция>`) | — |
+| чекпойнты абляций (`runs/mayak-<абляция>`) | `runs/mayak-{no_compression,no_passport,no_solar,no_mode_groups,no_offset_aug,no_correction,no_persistent}/stageB/best.ckpt`; оценка 2026-10-18 12:59 UTC, коммит `85ededa` (`ablations/`) |
 | чекпойнт МАЯК без аугментаций (`augment=none`) | `runs/mayak-aug_none/stageB/best.ckpt`; оценка 2026-10-17 07:55 UTC, коммит `000c18a` (`augment_none/`) |
 | конформная таблица | `runs/conformal.npy`: 32 станции `unseen_val`, 4 600 окон, отпечаток окон `9881c588075daa53` |
 | устройство замеров | — |

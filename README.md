@@ -339,27 +339,30 @@ ERA5, станции `unseen_test` (`internal/metrics.json`):
 
 | вариант | Skill@24 | Skill@72 | Skill@168 | CRPS@24 | PICP90@24 |
 |---|:-:|:-:|:-:|:-:|:-:|
-| МАЯК (эталон абляций, `none`) | — | — | — | — | — |
-| МАЯК [mayak-no_compression] | — | — | — | — | — |
-| МАЯК [mayak-no_passport] | — | — | — | — | — |
-| МАЯК [mayak-no_solar] | — | — | — | — | — |
-| МАЯК [mayak-no_mode_groups] | — | — | — | — | — |
-| МАЯК [mayak-no_offset_aug] | — | — | — | — | — |
-| МАЯК [mayak-no_correction] | — | — | — | — | — |
-| МАЯК [mayak-no_persistent] | — | — | — | — | — |
+| МАЯК (эталон абляций, `none`) | 0,48 | 0,12 | −0,05 | 1,17 | 0,897 |
+| МАЯК [mayak-no_compression] | 0,48 | 0,12 | −0,05 | 1,17 | 0,896 |
+| МАЯК [mayak-no_passport] | 0,48 | 0,12 | −0,04 | 1,17 | 0,900 |
+| МАЯК [mayak-no_solar] | 0,48 | 0,12 | −0,04 | 1,18 | 0,893 |
+| МАЯК [mayak-no_mode_groups] | 0,48 | 0,12 | −0,04 | 1,18 | 0,892 |
+| МАЯК [mayak-no_offset_aug] | 0,48 | 0,11 | −0,05 | 1,17 | 0,896 |
+| МАЯК [mayak-no_correction] | 0,47 | 0,11 | −0,06 | 1,18 | 0,897 |
+| МАЯК [mayak-no_persistent] | 0,48 | 0,12 | −0,04 | 1,18 | 0,895 |
 
 GHCNh, станции `external_test` (`external/metrics.json`):
 
 | вариант | Skill@24 | Skill@72 | Skill@168 | CRPS@24 | PICP90@24 |
 |---|:-:|:-:|:-:|:-:|:-:|
-| МАЯК (эталон абляций, `none`) | — | — | — | — | — |
-| МАЯК [mayak-no_compression] | — | — | — | — | — |
-| МАЯК [mayak-no_passport] | — | — | — | — | — |
-| МАЯК [mayak-no_solar] | — | — | — | — | — |
-| МАЯК [mayak-no_mode_groups] | — | — | — | — | — |
-| МАЯК [mayak-no_offset_aug] | — | — | — | — | — |
-| МАЯК [mayak-no_correction] | — | — | — | — | — |
-| МАЯК [mayak-no_persistent] | — | — | — | — | — |
+| МАЯК (эталон абляций, `none`) | 0,48 | 0,09 | −0,06 | 1,23 | 0,903 |
+| МАЯК [mayak-no_compression] | 0,48 | 0,10 | −0,06 | 1,23 | 0,904 |
+| МАЯК [mayak-no_passport] | 0,48 | 0,09 | −0,07 | 1,24 | 0,901 |
+| МАЯК [mayak-no_solar] | 0,48 | 0,09 | −0,07 | 1,24 | 0,899 |
+| МАЯК [mayak-no_mode_groups] | 0,48 | 0,08 | −0,07 | 1,24 | 0,898 |
+| МАЯК [mayak-no_offset_aug] | 0,48 | 0,09 | −0,06 | 1,23 | 0,899 |
+| МАЯК [mayak-no_correction] | 0,47 | 0,09 | −0,07 | 1,24 | 0,905 |
+| МАЯК [mayak-no_persistent] | 0,48 | 0,09 | −0,07 | 1,23 | 0,905 |
+
+Прогон абляций — 2026-10-18 12:59 UTC, коммит `85ededa`. Строка эталона — тот же
+чекпойнт `runs/mayak`, что в таблицах 1 и 8, и совпадает с ними.
 
 </details>
 
