@@ -1,28 +1,4 @@
-r"""Обучение: единственный вход. Композиция конфигов Hydra, переопределения, групповые запуски.
-
-Значения прогона берутся из YAML в conf/ и переопределений командной строки, полностью
-разрешённый конфиг пишется в каталог прогона и в каждый чекпойнт. Каталог прогона -
-``<run.out_root>/<run.tag>``, у одиночного и группового запуска он один и тот же. Тег:
-``<arch>[-<абляция>][-aug_<профиль>][-tuned][-s<сид>]``, части со значением по умолчанию
-опускаются.
-
-Одна команда на модель. ``run.lr_search=true`` проходит сетку скоростей обучения, пишет
-запись о подборе в журнал и в том же запуске обучает этап B полной длины; минимум на
-краю сетки запуск не останавливает (выбор остаётся на краю, флаг edge в журнале).
-``run.lr_from`` берёт скорость обучения из
-журнала основного МАЯК, этапы A и B идут подряд. Ошибка протокола в групповом запуске
-останавливает только свой прогон: остальные прогоны группы идут до конца, код 1 - после
-всей группы.
-
-Example:
-    python scripts/run.py train=debug run.accelerator=cpu      # отладка на CPU: runs/mayak
-    python scripts/run.py run.lr_search=true                   # подбор lr и этап B: runs/mayak
-    python scripts/run.py -m model=gru,dlinear,lru,patchtst run.lr_search=true
-    python scripts/run.py -m run.lr_from=runs/mayak ablation=no_solar,no_passport
-    python scripts/run.py -m run.lr_from=runs/mayak train.seed=1,2   # runs/mayak-s1, -s2
-    python scripts/run.py run.lr_from=runs/mayak augment=none        # runs/mayak-aug_none
-    python scripts/run.py run.extra_tuning=true run.lr_search=true model.encoder_width=96
-"""
+r"""Обучение: конфиги Hydra, переопределения, групповые запуски."""
 import logging
 import os
 
@@ -37,23 +13,7 @@ BASE_ABLATION, BASE_AUGMENT, BASE_SEED = "none", "default", 0
 
 
 def run_tag(arch, ablation, profile, extra, seed):
-    """Тег прогона, он же имя его каталога.
-
-    Схема ``<arch>[-<абляция>][-aug_<профиль>][-tuned][-s<сид>]``: абляция ``none``,
-    профиль аугментаций ``default``, прогон без дополнительной настройки и сид 0 в теге
-    не пишутся.
-
-    Args:
-        arch: имя архитектуры.
-        ablation: вариант группы ablation.
-        profile: имя профиля аугментаций.
-        extra: прогон дополнительной настройки МАЯК (этап 2 сравнения).
-        seed: базовый сид протокола.
-
-    Returns:
-        Строка вида ``mayak``, ``mayak-no_solar``, ``mayak-aug_none``, ``mayak-s1``,
-        ``mayak-tuned``, ``gru``.
-    """
+    """Тег прогона, он же имя его каталога."""
     from mayak.tuning import EXTRA_SUFFIX
     tag = str(arch)
     if ablation is not None and str(ablation) != BASE_ABLATION:
@@ -71,16 +31,7 @@ OmegaConf.register_new_resolver("run_tag", run_tag, replace=True)
 
 
 def to_run_config(cfg):
-    """Полная конфигурация прогона из конфига Hydra.
-
-    Берутся только секции модели, данных и обучения, все подстановки разрешены.
-
-    Args:
-        cfg: конфиг Hydra.
-
-    Returns:
-        Полная конфигурация прогона.
-    """
+    """Полная конфигурация прогона из конфига Hydra."""
     from mayak.config import RunConfig
     d = {k: OmegaConf.to_container(cfg[k], resolve=True) for k in RUN_SECTIONS}
     if d["model"].get("arch") != "mayak" and not d["model"].get("ablations", True):
@@ -89,17 +40,7 @@ def to_run_config(cfg):
 
 
 def to_tuning(cfg):
-    """Настройки подбора скорости обучения из секции run.
-
-    Интерполяции секции не разрешаются: имя прогона зависит от выбора Hydra, а
-    настройкам подбора оно не нужно.
-
-    Args:
-        cfg: конфиг Hydra.
-
-    Returns:
-        Настройки подбора.
-    """
+    """Настройки подбора скорости обучения из секции run."""
     from mayak.tuning import tuning_from_config
     return tuning_from_config(OmegaConf.to_container(cfg.run, resolve=False))
 

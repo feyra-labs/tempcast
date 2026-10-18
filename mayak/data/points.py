@@ -27,15 +27,7 @@ POINTS_FIELDS = ("id", "lat", "lon", "koppen")
 
 @dataclass
 class ZoneGrid:
-    """Коды зон Кёппена на регулярной сетке широт и долгот.
-
-    Attributes:
-        codes: коды зон формы (n_lat, n_lon), строки идут с севера на юг. Ноль
-            означает море, отсутствие данных или код вне таблицы зон.
-        top: широта северного края сетки, градусы.
-        left: долгота западного края сетки, градусы.
-        step: шаг сетки, градусы.
-    """
+    """Коды зон Кёппена на регулярной сетке широт и долгот."""
 
     codes: np.ndarray
     top: float
@@ -47,32 +39,15 @@ class ZoneGrid:
         return self.codes.shape
 
     def lat_centers(self):
-        """Широты центров строк сетки.
-
-        Returns:
-            Массив формы (n_lat,), градусы.
-        """
+        """Широты центров строк сетки."""
         return self.top - (np.arange(self.codes.shape[0]) + 0.5) * self.step
 
     def lon_centers(self):
-        """Долготы центров столбцов сетки.
-
-        Returns:
-            Массив формы (n_lon,), градусы.
-        """
+        """Долготы центров столбцов сетки."""
         return self.left + (np.arange(self.codes.shape[1]) + 0.5) * self.step
 
     def cell_of(self, lat, lon):
-        """Ячейки сетки, в которые попадают точки.
-
-        Args:
-            lat: широты, градусы.
-            lon: долготы, градусы.
-
-        Returns:
-            Кортеж из номеров строк, номеров столбцов и признака того, что точка
-            лежит внутри сетки. Для точек вне сетки номера обрезаются до края.
-        """
+        """Ячейки сетки, в которые попадают точки."""
         lat = np.asarray(lat, np.float64)
         lon = np.asarray(lon, np.float64)
         n_lat, n_lon = self.codes.shape
@@ -83,21 +58,7 @@ class ZoneGrid:
 
     @classmethod
     def from_raster(cls, path, step=DEFAULT_GRID_STEP):
-        """Сетка зон, снятая с растра Кёппена в центрах ячеек заданного шага.
-
-        Значение ячейки берётся из того пикселя растра, в который попадает её
-        центр. Растр читается по строкам и целиком в память не загружается.
-
-        Args:
-            path: путь к растру с кодами зон в географических координатах.
-            step: шаг сетки, градусы.
-
-        Returns:
-            Сетка зон с тем же охватом, что у растра.
-
-        Raises:
-            ValueError: растр не в географических координатах или шаг не положителен.
-        """
+        """Сетка зон, снятая с растра Кёппена в центрах ячеек заданного шага."""
         import rasterio
         from rasterio.windows import Window
 
@@ -130,18 +91,7 @@ class ZoneGrid:
 
 
 def fibonacci_lattice(n, lon_offset=0.0):
-    """Узлы решётки Фибоначчи на сфере.
-
-    Узлы идут от северного полюса к южному и почти равномерно покрывают площадь.
-
-    Args:
-        n: число узлов.
-        lon_offset: поворот решётки вокруг оси Земли, градусы.
-
-    Returns:
-        Кортеж из широт и долгот узлов, массивы формы (n,), градусы. Долготы лежат
-        в полуинтервале от минус 180 до 180.
-    """
+    """Узлы решётки Фибоначчи на сфере."""
     k = np.arange(int(n), dtype=np.float64) + 0.5
     lat = np.degrees(np.arcsin(1.0 - 2.0 * k / int(n)))
     lon = (k * GOLDEN_ANGLE_DEG + float(lon_offset)) % 360.0 - 180.0
@@ -149,61 +99,26 @@ def fibonacci_lattice(n, lon_offset=0.0):
 
 
 def unit_vectors(lat, lon):
-    """Точки сферы в виде единичных векторов, для быстрых поисков соседей.
-
-    Args:
-        lat: широты, градусы.
-        lon: долготы, градусы.
-
-    Returns:
-        Массив формы (n, 3).
-    """
+    """Точки сферы в виде единичных векторов, для быстрых поисков соседей."""
     phi = np.radians(np.asarray(lat, np.float64))
     lam = np.radians(np.asarray(lon, np.float64))
     return np.stack([np.cos(phi) * np.cos(lam), np.cos(phi) * np.sin(lam), np.sin(phi)], -1)
 
 
 def chord_of_km(dist_km):
-    """Длина хорды единичной сферы для расстояния по поверхности Земли.
-
-    Args:
-        dist_km: расстояние по дуге большого круга, км.
-
-    Returns:
-        Длина хорды между двумя точками на этом расстоянии.
-    """
+    """Длина хорды единичной сферы для расстояния по поверхности Земли."""
     return 2.0 * math.sin(float(dist_km) / (2.0 * EARTH_RADIUS_KM))
 
 
 def km_of_chord(chord):
-    """Расстояние по поверхности Земли для длины хорды единичной сферы.
-
-    Args:
-        chord: длина хорды, скаляр или массив.
-
-    Returns:
-        Расстояние по дуге большого круга, км.
-    """
+    """Расстояние по поверхности Земли для длины хорды единичной сферы."""
     c = np.clip(np.asarray(chord, np.float64) / 2.0, 0.0, 1.0)
     return 2.0 * EARTH_RADIUS_KM * np.arcsin(c)
 
 
 @dataclass
 class Selection:
-    """Результат выбора точек.
-
-    Attributes:
-        lat: широты точек, градусы.
-        lon: долготы точек, градусы.
-        codes: коды зон Кёппена точек.
-        source: откуда взялась точка: lattice для узла решётки, zone для
-            точки, добранной ради покрытия зоны.
-        n_lattice: число узлов решётки на всей сфере.
-        zones_with_land: коды зон, в которых есть суша в разрешённых широтах.
-        relaxed: коды зон, первая точка которых поставлена ближе минимального
-            расстояния, потому что иначе зона осталась бы без точек.
-        short: зоны, не добравшие минимума, и сколько точек в них получилось.
-    """
+    """Результат выбора точек."""
 
     lat: np.ndarray
     lon: np.ndarray
@@ -218,22 +133,14 @@ class Selection:
         return int(self.lat.size)
 
     def zone_counts(self):
-        """Число точек по кодам зон.
-
-        Returns:
-            Словарь из кода зоны в число точек, для всех зон с сушей.
-        """
+        """Число точек по кодам зон."""
         out = {int(z): 0 for z in self.zones_with_land}
         for c in self.codes:
             out[int(c)] = out.get(int(c), 0) + 1
         return out
 
     def rows(self):
-        """Строки выходной таблицы точек.
-
-        Returns:
-            Список словарей с полями id, lat, lon, koppen в порядке выбора.
-        """
+        """Строки выходной таблицы точек."""
         width = max(4, len(str(max(len(self) - 1, 0))))
         return [dict(id=f"p{i:0{width}d}", lat=round(float(a), 4), lon=round(float(b), 4),
                      koppen=KG_TIF_CODE[int(c)])
@@ -241,11 +148,7 @@ class Selection:
 
 
 class _Selector:
-    """Выбор точек при заданном числе узлов решётки.
-
-    Пулы кандидатов по зонам не зависят от числа узлов, поэтому считаются один раз
-    и переиспользуются при поиске размера решётки.
-    """
+    """Выбор точек при заданном числе узлов решётки."""
 
     def __init__(self, grid, min_per_zone, min_dist_km, include_antarctica, lon_offset):
         self.grid = grid
@@ -334,28 +237,7 @@ class _Selector:
 def select_points(grid, n_points=DEFAULT_N_POINTS, min_per_zone=DEFAULT_MIN_PER_ZONE,
                   min_dist_km=DEFAULT_MIN_DIST_KM, include_antarctica=False, seed=DEFAULT_SEED,
                   max_evals=400):
-    """Выбор обучающих точек на суше.
-
-    Размер решётки подбирается так, чтобы вместе с точками, добранными ради
-    покрытия зон, получилось ровно n_points точек. Если точного совпадения
-    нет, берётся ближайший размер и пишется предупреждение. Сид задаёт поворот
-    решётки вокруг оси Земли, поэтому один и тот же сид даёт один и тот же выбор.
-
-    Args:
-        grid: сетка зон Кёппена.
-        n_points: сколько точек нужно всего.
-        min_per_zone: минимум точек в каждой зоне, где есть суша.
-        min_dist_km: минимальное расстояние между точками, км.
-        include_antarctica: брать ли сушу южнее 60 градусов южной широты.
-        seed: сид поворота решётки.
-        max_evals: предел числа проверенных размеров решётки.
-
-    Returns:
-        Выбор точек с отчётом о покрытии зон.
-
-    Raises:
-        ValueError: на сетке нет суши в разрешённых широтах.
-    """
+    """Выбор обучающих точек на суше."""
     lon_offset = float(np.random.default_rng(seed).uniform(0.0, 360.0))
     sel = _Selector(grid, min_per_zone, min_dist_km, include_antarctica, lon_offset)
     if not sel.zones:
@@ -401,15 +283,7 @@ def _nearest_untried(n, tried):
 
 
 def min_pairwise_km(lat, lon):
-    """Наименьшее расстояние между двумя точками набора.
-
-    Args:
-        lat: широты, градусы.
-        lon: долготы, градусы.
-
-    Returns:
-        Расстояние в км; бесконечность, если точек меньше двух.
-    """
+    """Наименьшее расстояние между двумя точками набора."""
     if np.size(lat) < 2:
         return math.inf
     d, _ = cKDTree(unit_vectors(lat, lon)).query(unit_vectors(lat, lon), k=2)

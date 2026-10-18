@@ -1,4 +1,4 @@
-# Данные: значения прогона берутся отсюда и пишутся в чекпойнт (см. conf/config.yaml).
+# Данные и аугментации
 manifest: data/manifest.csv
 cache_root: null
 time_layout:
@@ -10,16 +10,16 @@ target_mask:
   min_valid_frac: 0.5
   first_day_hours: 24
 val_every_hours: 24
-val_windows_per_station: 96   # размер набора валидации: окон с каждой станции
-val_seed: 0                   # сид длин истории окон валидации, общий для всех архитектур
+val_windows_per_station: 96
+val_seed: 0
 augment:
   profile: default
   offset_prob: 0.4
-  offset_min: 0.1                     # постоянная часть |b|, °C, лог-равномерно, знак случаен
+  offset_min: 0.1                     # |b|, °C, лог-равномерно
   offset_max: 2.0
-  offset_diurnal_frac: 0.5            # доля смещений с суточной составляющей
-  offset_diurnal_max: 1.5             # амплитуда суточной составляющей, °C, знак случаен
-  offset_peak_hours: [13.0, 16.0]     # час максимума по среднему солнечному времени
+  offset_diurnal_frac: 0.5
+  offset_diurnal_max: 1.5             # °C
+  offset_peak_hours: [13.0, 16.0]     # местное солнечное время
   noise_prob: 1.0
   noise_sd: [0.2, 0.3, 2.0]
   rh_dewpoint_prob: 0.1
@@ -33,4 +33,3 @@ augment:
   drop_channel_prob: 0.28
   drop_channel_weights: [0.46, 0.46, 0.08]   # без P, без RH, без обоих
 window_qc: true
-# Вес станции при сэмплировании всегда n_зоны^(-1/2) по полной зоне Кёппена, в конфиг не входит.

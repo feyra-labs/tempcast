@@ -1,15 +1,4 @@
-"""Почасовые ряды реанализа ERA5 из архивного API Open-Meteo.
-
-Здесь описан сам запрос, его цена в единицах лимита API, разбор ответа и формат
-файла, в котором хранится скачанная точка. Модель реанализа зафиксирована явно:
-только ERA5, без смеси моделей по умолчанию, которая с 2017 года подмешивает
-модель высокого разрешения и меняет источник внутри ряда. Время запрашивается в
-UTC в секундах от эпохи Unix, чтобы разбор не зависел от часовых поясов.
-
-Высоту точки API берёт из цифровой модели рельефа с шагом 90 м и приводит к ней
-условия в точке. Эта высота возвращается в ответе и записывается в манифест как
-высота станции. Координаты в ответе - центр ячейки реанализа, который выбрал API.
-"""
+"""Почасовые ряды реанализа ERA5 из архивного API Open-Meteo."""
 from __future__ import annotations
 
 import gzip
@@ -42,27 +31,12 @@ class ApiError(RuntimeError):
 
 
 def parse_date(value):
-    """Дата из строки ISO или готового объекта даты.
-
-    Args:
-        value: строка вида 2025-12-31 или дата.
-
-    Returns:
-        Дата.
-    """
+    """Дата из строки ISO или готового объекта даты."""
     return value if isinstance(value, date) else date.fromisoformat(str(value))
 
 
 def default_period(end=DEFAULT_END, years=DEFAULT_YEARS):
-    """Период скачивания: заданное число лет, заканчивающихся указанным днём.
-
-    Args:
-        end: последний день периода включительно.
-        years: длина периода в годах.
-
-    Returns:
-        Кортеж из первого и последнего дня периода.
-    """
+    """Период скачивания: заданное число лет, заканчивающихся указанным днём."""
     end = parse_date(end)
     try:
         before = end.replace(year=end.year - int(years))
@@ -72,15 +46,7 @@ def default_period(end=DEFAULT_END, years=DEFAULT_YEARS):
 
 
 def request_signature(start, end):
-    """Всё, что определяет содержимое скачанных рядов, кроме координат.
-
-    Args:
-        start: первый день периода.
-        end: последний день периода включительно.
-
-    Returns:
-        Словарь параметров запроса.
-    """
+    """Всё, что определяет содержимое скачанных рядов, кроме координат."""
     return dict(endpoint="/v1/archive", model=MODEL, variables=list(VARIABLES),
                 start_date=parse_date(start).isoformat(), end_date=parse_date(end).isoformat(),
                 timezone=TIMEZONE, timeformat=TIMEFORMAT, cell_selection=CELL_SELECTION,
@@ -88,18 +54,7 @@ def request_signature(start, end):
 
 
 def request_params(lats, lons, signature):
-    """Параметры запроса к архивному API для нескольких точек сразу.
-
-    Высота не передаётся: тогда API сам берёт её из своей модели рельефа.
-
-    Args:
-        lats: широты точек, градусы.
-        lons: долготы точек, градусы.
-        signature: подпись запроса.
-
-    Returns:
-        Словарь параметров строки запроса.
-    """
+    """Параметры запроса к архивному API для нескольких точек сразу."""
     return {"latitude": ",".join(f"{float(v):.4f}" for v in lats),
             "longitude": ",".join(f"{float(v):.4f}" for v in lons),
             "start_date": signature["start_date"], "end_date": signature["end_date"],
@@ -135,19 +90,7 @@ def _series(hourly, var, n):
 
 
 def parse_location(loc):
-    """Разбор ответа API для одной точки.
-
-    Args:
-        loc: словарь ответа одной точки.
-
-    Returns:
-        Словарь с центром ячейки реанализа (cell_lat, cell_lon), высотой из модели
-        рельефа (elevation, None если её нет), часами от эпохи Unix (hours) и
-        рядами каналов T, P, RH в формате float32.
-
-    Raises:
-        ApiError: ответ с ошибкой, не в UTC, не в тех единицах или без нужных рядов.
-    """
+    """Разбор ответа API для одной точки."""
     if loc.get("error"):
         raise ApiError(str(loc.get("reason", "ошибка без описания")))
     if int(loc.get("utc_offset_seconds", 0)) != 0:
@@ -170,21 +113,7 @@ def parse_location(loc):
 
 
 def parse_response(payload, n_expected):
-    """Разбор ответа API на запрос по нескольким точкам.
-
-    Для одной точки API возвращает словарь, для нескольких - список в порядке
-    точек запроса.
-
-    Args:
-        payload: разобранный JSON ответа.
-        n_expected: сколько точек было в запросе.
-
-    Returns:
-        Список словарей, по одному на точку, в порядке запроса.
-
-    Raises:
-        ApiError: ответ с ошибкой или с другим числом точек.
-    """
+    """Разбор ответа API на запрос по нескольким точкам."""
     if isinstance(payload, dict) and payload.get("error"):
         raise ApiError(str(payload.get("reason", "ошибка без описания")))
     locs = payload if isinstance(payload, list) else [payload]
@@ -194,42 +123,19 @@ def parse_response(payload, n_expected):
 
 
 def raw_path(raw_dir, point_id):
-    """Путь к файлу скачанной точки.
-
-    Args:
-        raw_dir: каталог скачанных точек.
-        point_id: идентификатор точки.
-
-    Returns:
-        Путь к файлу.
-    """
+    """Путь к файлу скачанной точки."""
     return os.path.join(raw_dir, f"{point_id}{RAW_SUFFIX}")
 
 
 def make_raw(point, signature, response, fetched_utc):
-    """Запись скачанной точки: запрошенные координаты, подпись запроса и ответ API.
-
-    Args:
-        point: словарь с полями id, lat, lon.
-        signature: подпись запроса.
-        response: ответ API для этой точки без изменений.
-        fetched_utc: момент скачивания, строка ISO.
-
-    Returns:
-        Словарь для записи на диск.
-    """
+    """Запись скачанной точки: запрошенные координаты, подпись запроса и ответ API."""
     return dict(format=RAW_FORMAT, id=str(point["id"]), lat=float(point["lat"]),
                 lon=float(point["lon"]), request=dict(signature), fetched_utc=fetched_utc,
                 response=response)
 
 
 def write_raw(path, record):
-    """Атомарная запись файла точки: неполный файл на диске не остаётся.
-
-    Args:
-        path: путь к файлу.
-        record: запись точки.
-    """
+    """Атомарная запись файла точки: неполный файл на диске не остаётся."""
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".part"
     with gzip.open(tmp, "wt", encoding="utf-8") as f:
@@ -238,17 +144,7 @@ def write_raw(path, record):
 
 
 def read_raw(path):
-    """Чтение файла скачанной точки.
-
-    Args:
-        path: путь к файлу.
-
-    Returns:
-        Запись точки.
-
-    Raises:
-        ValueError: файл другого формата.
-    """
+    """Чтение файла скачанной точки."""
     with gzip.open(path, "rt", encoding="utf-8") as f:
         record = json.load(f)
     if record.get("format") != RAW_FORMAT:
@@ -257,16 +153,7 @@ def read_raw(path):
 
 
 def raw_matches(record, point, signature):
-    """Совпадает ли скачанный файл с точкой и параметрами текущего запроса.
-
-    Args:
-        record: запись точки с диска.
-        point: словарь с полями id, lat, lon.
-        signature: подпись текущего запроса.
-
-    Returns:
-        Пустая строка, если совпадает, иначе причина несовпадения.
-    """
+    """Совпадает ли скачанный файл с точкой и параметрами текущего запроса."""
     if str(record.get("id")) != str(point["id"]):
         return f"id {record.get('id')} вместо {point['id']}"
     if (round(float(record["lat"]), 4), round(float(record["lon"]), 4)) != \
@@ -281,17 +168,7 @@ def raw_matches(record, point, signature):
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
-    """Расстояние по поверхности Земли между парами точек.
-
-    Args:
-        lat1: широты первых точек, градусы.
-        lon1: долготы первых точек, градусы.
-        lat2: широты вторых точек, градусы.
-        lon2: долготы вторых точек, градусы.
-
-    Returns:
-        Расстояния, км.
-    """
+    """Расстояние по поверхности Земли между парами точек."""
     p1, p2 = np.radians(lat1), np.radians(lat2)
     dp, dl = p2 - p1, np.radians(np.asarray(lon2) - np.asarray(lon1))
     a = np.sin(dp / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2

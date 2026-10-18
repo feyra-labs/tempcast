@@ -108,11 +108,7 @@ def test_scale_is_positive_with_floor():
 
 
 def test_scale_uses_abs_residual_convention():
-    """Для нормального остатка масштаб равен его разбросу, а не среднему модулю.
-
-    Средний модуль нормальной величины меньше разброса в постоянное число раз, и
-    масштаб это учитывает.
-    """
+    """Для нормального остатка масштаб равен его разбросу, а не среднему модулю."""
     assert ABS_TO_SD == pytest.approx(np.sqrt(np.pi / 2))
 
 
@@ -234,11 +230,7 @@ def _lit(arch):
 
 
 def test_loss_identical_for_all_models_on_identical_inputs():
-    """Функция потерь одна у всех архитектур.
-
-    При одинаковых квантилях, цели, маске и масштабе значение и градиент по квантилям
-    совпадают, а значение совпадает с ручным расчётом.
-    """
+    """Функция потерь одна у всех архитектур."""
     batch = _toy_batch()
     q0 = _shared_q()
     vals, grads = [], []
@@ -455,11 +447,7 @@ def test_validation_set_is_the_same_for_every_architecture(runs):
 
 
 def test_validation_set_does_not_depend_on_protocol_seeds(manifest):
-    """Набор выбора чекпойнта строится из конфига данных и куррикулума этапа.
-
-    Сиды протокола (поток окон и аугментации) в него не входят, поэтому прогоны с разными
-    сидами выбирают чекпойнт на одних и тех же окнах валидационных станций.
-    """
+    """Набор выбора чекпойнта строится из конфига данных и куррикулума этапа."""
     from mayak.config import DataConfig
     from mayak.data.datamodule import MayakData
     sets = []

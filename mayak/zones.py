@@ -22,49 +22,19 @@ N_SEASONS = len(SEASONS)
 
 
 def normalize_zone(zone) -> str:
-    """Зона из манифеста, приведённая к таблице зон.
-
-    Args:
-        zone: зона Кёппена как в манифесте, любого типа.
-
-    Returns:
-        Зона из таблицы или ``UNK``, если такой зоны в таблице нет.
-    """
+    """Зона из манифеста, приведённая к таблице зон."""
     z = str(zone).strip()
     return z if z in KOPPEN_ID else UNKNOWN_ZONE
 
 
 def koppen_group(zone) -> str:
-    """Крупная группа зоны: первая буква кода или ``UNK``.
-
-    Нужна для разрезов, где в мелких зонах слишком мало станций.
-
-    Args:
-        zone: зона Кёппена как в манифесте.
-
-    Returns:
-        Одна из букв A, B, C, D, E либо ``UNK``.
-    """
+    """Крупная группа зоны: первая буква кода или ``UNK``."""
     z = normalize_zone(zone)
     return UNKNOWN_ZONE if z == UNKNOWN_ZONE else z[0]
 
 
 def season_of(month, lat) -> str:
-    """Местный сезон по месяцу и широте.
-
-    В северном полушарии зима - декабрь, январь и февраль, дальше по три месяца на
-    сезон. В южном полушарии сезоны сдвинуты на полгода.
-
-    Args:
-        month: месяц UTC от 1 до 12.
-        lat: широта, градусы.
-
-    Returns:
-        Имя сезона: ``winter``, ``spring``, ``summer`` или ``autumn``.
-
-    Raises:
-        ValueError: месяц вне диапазона от 1 до 12.
-    """
+    """Местный сезон по месяцу и широте."""
     m = int(month)
     if not 1 <= m <= 12:
         raise ValueError(f"месяц вне [1, 12]: {month}")

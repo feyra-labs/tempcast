@@ -74,11 +74,7 @@ def _fresh_process_memo():
 
 
 def _spike_reference(x, valid, half, thresh, min_valid, floor, causal):
-    """Медленный эталон проверки выброса одного канала: медиана и MAD окна циклом по часам.
-
-    Returns:
-        Булев массив (N,): True там, где точка не выброс.
-    """
+    """Медленный эталон проверки выброса одного канала: медиана и MAD окна циклом по часам."""
     x = np.asarray(x, np.float64)
     before, after = (2 * half, 0) if causal else (half, half)
     n = len(x)

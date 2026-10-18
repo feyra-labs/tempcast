@@ -1,6 +1,5 @@
 # @package data.augment
-# Профиль аугментаций «none»: без аугментаций; значения параметров те же, что у default.
-# Отличия от значений по умолчанию (= default).
+# все аугментации выключены
 profile: none
 offset_prob: 0.0
 noise_prob: 0.0

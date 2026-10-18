@@ -20,35 +20,12 @@ def _design(doy, hour, n_year=3, n_day=3):
 
 
 class Climatology:
-    """Гармоническая климатология одной станции.
-
-    Три части: среднее по годовым и суточным гармоникам, один разброс остатка на всю
-    станцию и масштаб остатка, который меняется по году и суткам.
-
-    Args:
-        n_year: число годовых гармоник среднего.
-        n_day: число суточных гармоник среднего.
-        scale_n_year: число годовых гармоник масштаба остатка.
-        scale_n_day: число суточных гармоник масштаба остатка.
-    """
+    """Гармоническая климатология одной станции."""
 
     @classmethod
     def from_params(cls, beta, sigma, scale_beta, n_year=3, n_day=3,
                     scale_n_year=2, scale_n_day=2):
-        """Климатология из сохранённых коэффициентов без повторной подгонки.
-
-        Args:
-            beta: коэффициенты среднего.
-            sigma: разброс остатка станции, °C.
-            scale_beta: коэффициенты масштаба остатка.
-            n_year: число годовых гармоник среднего.
-            n_day: число суточных гармоник среднего.
-            scale_n_year: число годовых гармоник масштаба.
-            scale_n_day: число суточных гармоник масштаба.
-
-        Returns:
-            Климатология.
-        """
+        """Климатология из сохранённых коэффициентов без повторной подгонки."""
         c = cls(n_year, n_day, scale_n_year, scale_n_day)
         c.beta = np.asarray(beta, np.float64)
         c.sigma = float(sigma)
@@ -81,18 +58,7 @@ class Climatology:
         return A @ self.beta
 
     def scale(self, doy, hour):
-        """Масштаб остатка в заданные моменты.
-
-        Масштаб не опускается ниже доли разброса остатка станции, поэтому всегда
-        положителен.
-
-        Args:
-            doy: день года с дробной частью.
-            hour: час UTC.
-
-        Returns:
-            Масштаб, °C.
-        """
+        """Масштаб остатка в заданные моменты."""
         A = _design(np.asarray(doy, float), np.asarray(hour, float),
                     self.scale_n_year, self.scale_n_day)
         return np.maximum(A @ self.scale_beta, SCALE_FLOOR_FRAC * self.sigma)
